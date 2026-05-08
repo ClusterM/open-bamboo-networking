@@ -1,0 +1,60 @@
+# Generated from cmake/patch_bambustudio_conf.cmake.in by configure_file().
+# Consumed by install(SCRIPT ...); runs at `cmake --install` time.
+#
+# First-time Bambu Studio configuration: on a fresh profile Studio will
+# try to redownload its own network plugin from the cloud unless two
+# keys in BambuStudio.conf are flipped. We do that automatically at
+# install time, but only when installing to the default BambuStudio
+# data dir -- otherwise the prefix is clearly a staging tree and we
+# should not touch the user's live config.
+
+set(_expected_prefixes "@OBN_CLIENT_EXPECTED_PREFIXES@")
+set(_conf_name         "@OBN_CLIENT_CONF_NAME@")
+
+set(_home "$ENV{HOME}")
+if(_home STREQUAL "")
+    message(STATUS "obn: HOME is not set, skipping ${_conf_name} patch")
+else()
+    set(_match FALSE)
+    foreach(_p IN LISTS _expected_prefixes)
+        if(NOT _p STREQUAL "" AND CMAKE_INSTALL_PREFIX STREQUAL _p)
+            set(_match TRUE)
+            break()
+        endif()
+    endforeach()
+    if(NOT _match)
+        message(STATUS
+            "obn: install prefix (${CMAKE_INSTALL_PREFIX}) is not the default Bambu Studio config dir; "
+            "${_conf_name} is untouched. Edit it by hand if needed: "
+            "set \"installed_networking\":\"1\" and \"update_network_plugin\":\"false\" under \"app\".")
+    else()
+        set(_conf "${CMAKE_INSTALL_PREFIX}/${_conf_name}")
+        if(NOT EXISTS "${_conf}")
+            message(STATUS
+                "obn: ${_conf} does not exist yet -- launch Bambu Studio once "
+                "to create it, then re-run 'make install' (or set "
+                "\"installed_networking\" / \"update_network_plugin\" by hand).")
+        else()
+            file(READ "${_conf}" _orig)
+            set(_body "${_orig}")
+            string(JSON _app_type ERROR_VARIABLE _err TYPE "${_body}" app)
+            if(_err OR NOT _app_type STREQUAL "OBJECT")
+                message(WARNING
+                    "obn: ${_conf} has no top-level \"app\" object; "
+                    "skipping patch. Error: ${_err}")
+            else()
+                string(JSON _body SET "${_body}" app installed_networking "\"1\"")
+                string(JSON _body SET "${_body}" app update_network_plugin "\"false\"")
+                if(NOT _body STREQUAL _orig)
+                    file(WRITE "${_conf}.obn-bak" "${_orig}")
+                    file(WRITE "${_conf}" "${_body}")
+                    message(STATUS
+                        "obn: patched ${_conf} (backup saved to ${_conf}.obn-bak)")
+                else()
+                    message(STATUS
+                        "obn: ${_conf} already has installed_networking=1 and update_network_plugin=false")
+                endif()
+            endif()
+        endif()
+    endif()
+endif()

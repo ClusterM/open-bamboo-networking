@@ -33,6 +33,7 @@ plugin.
   - [Configure, build, install](#configure-build-install)
   - `[./configure` options](#configure-options)
   - [First-time Studio configuration](#first-time-studio-configuration)
+  - [Installing for Orca Slicer](#installing-for-orca-slicer)
   - [Flatpak problems](#flatpak-problems)
 - [Logging](#logging)
   - [`libBambuSource.so` logging](#libbambusourceso-logging)
@@ -751,14 +752,15 @@ runs the smoke tests via `ctest`.
 
 | Flag                      | Default                                        | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--prefix=DIR`            | `$HOME/.config/BambuStudio` on Linux           | Where `make install` copies the shared objects and the OTA manifest. When this does not point at the default BambuStudio dir, the `BambuStudio.conf` patch is skipped automatically — you are clearly building into a staging tree.                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `--client-type=TYPE`      | `bambu_studio`                                 | Which slicer the plugin is being installed for: `bambu_studio` or `orca_slicer`. Drives the default `--prefix`, the auto-detected version source, the `.so` file name (Studio uses a fixed `libbambu_networking.so`; Orca dlopens `libbambu_networking_<network_plugin_version>.so`), the OTA manifest layout, and which conf file `make install` patches. When the resolved prefix is the slicer's Flatpak config dir (either auto-detected or passed via `--prefix=`), `--vendor-mosquitto` is enabled by default (override with `--no-vendor-mosquitto`). See [Installing for Orca Slicer](#installing-for-orca-slicer) and [Flatpak problems](#flatpak-problems). Maps to `-DOBN_CLIENT_TYPE=…`.                                                                                                                                                                                |
+| `--prefix=DIR`            | per-client native config dir on Linux, with a Flatpak fallback | Where `make install` copies the shared objects and the OTA manifest. For both clients, `./configure` prefers the native config dir and only falls back to the Flatpak config dir when the native one is missing AND the Flatpak one exists: Studio: `~/.config/BambuStudio` → `~/.var/app/com.bambulab.BambuStudio/config/BambuStudio/`. Orca: `~/.config/OrcaSlicer` → `~/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer/`. When this does not point at one of the two known dirs for the selected `--client-type`, the conf-file patch is skipped automatically — you are clearly building into a staging tree.                                                                                                                                                                                                                                                              |
 | `--build-type=TYPE`       | `Release`                                      | `Release`, `Debug`, `RelWithDebInfo`, `MinSizeRel`. Maps to `-DCMAKE_BUILD_TYPE=…`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `--with-version=VER`      | auto-detected from `<prefix>/BambuStudio.conf` | The version string `bambu_network_get_version()` reports. Studio compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.`* and a main-branch source build usually wants `02.05.03.*`. When `--with-version` is not given, `./configure` reads `app.version` from the Studio config in the install prefix and bumps the last component to `99` so our plugin always looks "newer" than the agent Studio ships with itself. If neither the flag nor the config file is available, `./configure` refuses to proceed rather than hard-code a stale default that would silently fail Studio's compatibility gate at runtime. Maps to `-DOBN_VERSION=…`. |
+| `--with-version=VER`      | auto-detected from the slicer's conf           | The version string `bambu_network_get_version()` reports. The slicer compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.`* and a main-branch source build usually wants `02.05.03.*`. When `--with-version` is not given, `./configure` auto-detects: for Studio it reads `app.version` from `<prefix>/BambuStudio.conf`; for Orca it reads `app.network_plugin_version` from `<prefix>/OrcaSlicer.conf` (falling back to `02.03.00` if absent). Either way it bumps the last component to `99` so our plugin always looks "newer" than the agent the slicer ships with itself. Maps to `-DOBN_VERSION=…`.                                       |
 | `--disable-workarounds`   | enabled                                        | Master switch for every non-stock code path (see [Workaround reference](#workaround-reference)): `home_flag` / `ipcam.file` rewrites, PrinterFileSystem FTPS bridge in `libBambuSource.so`, RTSPS→MJPEG transcode, `start_sdcard_print` over LAN MQTT. With this passed the plugin is a strict drop-in — same wire protocols, nothing else. Studio transparently loses every workaround-backed feature (the LAN file browser stays empty, Send greys out on P2S, and so on) but nothing half-done runs at runtime. Maps to `-DOBN_ENABLE_WORKAROUNDS=OFF`.                                                                                                                                                  |
 | `--disable-ftps-fastpath` | enabled                                        | Stub out the `ft_*` C ABI; Studio will fall back to its internal FTP send path. Both modes land the file in the same place on the printer — see [FileTransfer module](#filetransfer-module-ft_-c-abi) for the trade-offs. Orthogonal to `--disable-workarounds`. Maps to `-DOBN_FT_FTPS_FASTPATH=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `--video-backend=BACKEND` | `ffmpeg`                                       | Picks the RTSPS camera transcode backend baked into `libBambuSource.so`: `ffmpeg` (libav* — default) or `none` (no RTSPS support; MJPG-on-port-6000 still works). See [Video backend](#video-backend) for the system packages the FFmpeg backend needs. Maps to `-DOBN_VIDEO_BACKEND=…`.                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `--enable-tests`          | disabled                                       | Build `probe_plugin`, `ftps_parse_test`, and `*_live_test` smoke tests. Default is off for regular user builds; CI enables it explicitly. Maps to `-DOBN_BUILD_TESTS=ON`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `--no-conf-patch`         | patch enabled                                  | Do not edit `BambuStudio.conf` during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_STUDIO_CONF=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `--no-conf-patch`         | patch enabled                                  | Do not edit the slicer's conf file (`BambuStudio.conf` / `OrcaSlicer.conf`) during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_CLIENT_CONF=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `--build-dir=DIR`         | `build`                                        | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `--cmake-arg=ARG`         | none                                           | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -779,22 +781,105 @@ these two keys to the `"app"` object by hand:
 "update_network_plugin": "false"
 ```
 
-### Flatpak problems
+### Installing for Orca Slicer
 
-Bambu Studio is often installed from Flathub. That layout is workable for this
-plugin, but the Flatpak **sandbox and runtime** introduce pitfalls the default
-`make install` path does not cover.
-
-**Install prefix.** Studio loads plugins from `<data_dir>/plugins/` (see
-[NETWORK_PLUGIN.md](NETWORK_PLUGIN.md)). Under Flatpak, `data_dir` is usually
-under `~/.var/app/<ApplicationId>/config/`, not `~/.config/BambuStudio`. For the
-common Flathub id `com.bambulab.BambuStudio`, configure and install like this
-(adjust the id if yours differs — check `flatpak list --app`):
+Orca Slicer loads the same plugin ABI as Bambu Studio, so this project
+also drops in cleanly under it — pass `--client-type=orca_slicer` to
+`./configure` and the rest stays the same:
 
 ```sh
-./configure --prefix="Ё/.var/app/com.bambulab.BambuStudio/config/BambuStudio" --vendor-mosquitto
+./configure --client-type=orca_slicer
+make
+make install
+```
+
+`./configure --client-type=orca_slicer` picks Orca-specific defaults:
+
+- **Install prefix.** Native preferred: picks `~/.config/OrcaSlicer` if
+  it exists; otherwise falls back to the Flatpak config dir
+  `~/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer/` if THAT
+  exists; otherwise stays with `~/.config/OrcaSlicer` anyway. Override
+  with an explicit `--prefix=DIR` (e.g. when both installs are present
+  and you want to target the Flatpak one).
+- **`--vendor-mosquitto` for Flatpak.** Same as for Studio — when the
+  resolved prefix is a Flatpak config dir, `./configure` enables
+  `--vendor-mosquitto` automatically. See [Flatpak problems](#flatpak-problems).
+- **Plugin version.** Auto-detects `app.network_plugin_version` from
+  `<prefix>/OrcaSlicer.conf` (Orca tracks the plugin version separately
+  from the slicer version). If the key is absent — typically a brand-new
+  Orca install — falls back to `02.03.00` and bumps the last component
+  to `99`. Override with `--with-version=…`.
+- **`.so` file name.** Orca dlopens
+  `libbambu_networking_<network_plugin_version>.so` (the version is
+  part of the file name). `make install` therefore renames our build
+  artefact at install time, e.g. `libbambu_networking_02.03.00.99.so`,
+  rather than the fixed `libbambu_networking.so` Studio expects.
+  `libBambuSource.so` and `liblive555.so` keep their stock names —
+  both slicers dlopen them by fixed name.
+- **No `network_plugins.json`.** Orca does not use this file as a
+  persistent OTA manifest the way Studio does — its
+  `PresetUpdater` writes it as a transient artefact during an explicit
+  user-triggered update flow and then deletes it. Shipping it would
+  just accumulate stale state in the user's data dir, so the install
+  step skips it for `--client-type=orca_slicer`.
+- **Conf-file patch.** Instead of `BambuStudio.conf`'s two-key flip,
+  `make install` patches **`OrcaSlicer.conf`** with four keys under
+  `"app"`:
+  - `"installed_networking": "true"`
+  - `"network_plugin_version": "<OBN_VERSION>"`
+  - `"network_plugin_remind_later": "true"` (suppresses Orca's
+    "a newer plugin is available" prompt for this version)
+  - removes `<OBN_VERSION>` from `"network_plugin_skipped_versions"`
+    if it had been added previously.
+
+  As with Studio, the patch only runs when the install prefix is the
+  Orca config dir (native or Flatpak); a backup is written to
+  `OrcaSlicer.conf.obn-bak`. Disable with `./configure --no-conf-patch`.
+
+If you skipped the patch — or if Orca has never been launched so the
+file does not exist yet — set those four keys (in JSON-string form, as
+above) under `"app"` in `OrcaSlicer.conf` by hand.
+
+For a Flatpak install where the native dir also exists (so the native
+one wins by default), point `--prefix` at the Flatpak path explicitly
+— see [Flatpak problems](#flatpak-problems).
+
+### Flatpak problems
+
+Both supported slicers ship as Flathub apps (`com.bambulab.BambuStudio`
+and `com.orcaslicer.OrcaSlicer`). That layout is workable for this
+plugin, but the Flatpak **sandbox and runtime** introduce pitfalls
+the native `make install` path does not have.
+
+**Install prefix.** The slicer loads plugins from `<data_dir>/plugins/`
+(see [NETWORK_PLUGIN.md](NETWORK_PLUGIN.md)). Under Flatpak,
+`data_dir` is usually under `~/.var/app/<ApplicationId>/config/`,
+not `~/.config/<dir>/`. `./configure` handles this for you: when the
+native config dir is missing, it auto-detects the Flatpak path for the
+selected `--client-type` (and logs `configure: detected Flatpak ...
+install at ...`). When you have BOTH installed and want the Flatpak
+one, point `--prefix=` at it explicitly — same Flatpak id to expand
+yourself if it differs from the upstream one (`flatpak list --app`):
+
+```sh
+# Bambu Studio Flatpak (default --client-type)
+./configure \
+  --prefix="$HOME/.var/app/com.bambulab.BambuStudio/config/BambuStudio"
+make && make install
+
+# Orca Slicer Flatpak
+./configure --client-type=orca_slicer \
+  --prefix="$HOME/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer"
 make && make install
 ```
+
+**`libmosquitto` from the sandbox.** Flatpak's runtime usually does
+not expose `libmosquitto.so` to the plugin, so the host's
+`libmosquitto.so` cannot be `dlopen`'d from inside the sandbox.
+`./configure` defaults `--vendor-mosquitto` to ON whenever the
+resolved prefix is the slicer's Flatpak config dir (auto-detected or
+passed explicitly). Override with `--no-vendor-mosquitto` if your
+runtime does expose `libmosquitto`.
 
 **FFmpeg / camera.** `libBambuSource.so` calls into `libavcodec`,
 `libavutil`, and `libswscale` for the LAN camera path on its default
@@ -816,12 +901,15 @@ from your distribution or an **official AppImage**, or **build Studio from
 source** yourself so the plugin, wxWidgets, and multimedia stack all target the
 same environment.
 
-**AppImage compared to Flatpak.** They are not the same problem set. An
-AppImage typically carries Studio’s dependencies next to the binary and still
-uses the normal user `**~/.config/BambuStudio`** data directory on Linux, so the
-default `./configure` prefix is often correct without Flatpak’s `~/.var/app/…`
-rewiring. You may still need `**--vendor-mosquitto**` if the AppImage’s
-namespace does not expose a usable `libmosquitto` to the plugin.
+**AppImage compared to Flatpak.** They are not the same problem set.
+An AppImage typically carries the slicer's dependencies next to the
+binary and still uses the normal user `~/.config/BambuStudio` /
+`~/.config/OrcaSlicer` data directory on Linux, so the default
+`./configure` prefix is correct without Flatpak's `~/.var/app/…`
+rewiring. You may still need `--vendor-mosquitto` if the AppImage's
+namespace does not expose a usable `libmosquitto` to the plugin
+(`./configure` will not flip it on for you in the AppImage case —
+add it explicitly if needed).
 **FFmpeg in the default `OBN_VIDEO_BACKEND=ffmpeg` build is not
 affected by either container's namespace quirks**: the plugin doesn't
 link or `dlopen` libav at all, it binds to the AppImage's / Flatpak's

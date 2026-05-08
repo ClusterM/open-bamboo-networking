@@ -5,15 +5,16 @@ project(open-bambu-networking
     LANGUAGES CXX
 )
 
-# Default install location: same tree Bambu Studio uses on Linux (~/.config/BambuStudio).
-# Override with -DCMAKE_INSTALL_PREFIX=... when needed.
-if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING)
-    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-        if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
-            set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.config/BambuStudio"
-                CACHE PATH "Install prefix (plugins/ and ota/plugins/ under it)" FORCE)
-        endif()
-    endif()
+# Which slicer this build targets. Drives the install layout (.so file
+# name, OTA manifest presence, which conf file is patched). The plugin
+# code itself does NOT change between clients -- the same C ABI is used.
+set(OBN_CLIENT_TYPE "bambu_studio" CACHE STRING
+    "Target slicer for install rules (bambu_studio | orca_slicer)")
+set_property(CACHE OBN_CLIENT_TYPE PROPERTY STRINGS bambu_studio orca_slicer)
+if(NOT OBN_CLIENT_TYPE MATCHES "^(bambu_studio|orca_slicer)$")
+    message(FATAL_ERROR
+        "OBN_CLIENT_TYPE must be 'bambu_studio' or 'orca_slicer' "
+        "(got '${OBN_CLIENT_TYPE}').")
 endif()
 
 # The plugin's reported version must have the same first-8-char prefix as
@@ -71,6 +72,27 @@ _obn_byte_to_hex2(${_obn_b2} _obn_h2)
 set(OBN_ABI_VERSION_HEX "0x${_obn_h0}${_obn_h1}${_obn_h2}")
 message(STATUS "obn: ABI_VERSION=${OBN_ABI_VERSION_HEX} (from OBN_VERSION=${OBN_VERSION})")
 
+# Per-client install settings: file name of the .so, OTA manifest layout,
+# which conf file the post-install patch script targets, recommended
+# default prefix, etc. Populates OBN_CLIENT_* variables in this scope.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Clients.cmake")
+obn_resolve_client("${OBN_CLIENT_TYPE}")
+message(STATUS "obn: client=${OBN_CLIENT_TYPE} plugin=lib${OBN_CLIENT_PLUGIN_NAME}.so")
+
+# Default install location: the per-client config dir on Linux. Honoured
+# only when the user did not pass -DCMAKE_INSTALL_PREFIX (the
+# CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT flag is unset by CMake the
+# moment it picks up an explicit value, including ones cached from a
+# previous configure). The top-level ./configure wrapper independently
+# computes the same default and passes it via -DCMAKE_INSTALL_PREFIX,
+# so this branch only fires for callers that invoke cmake directly.
+if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING
+   AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT
+   AND NOT OBN_CLIENT_DEFAULT_PREFIX STREQUAL "")
+    set(CMAKE_INSTALL_PREFIX "${OBN_CLIENT_DEFAULT_PREFIX}"
+        CACHE PATH "Install prefix (plugins/ under it)" FORCE)
+endif()
+
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
 # the Print job's eMMC pre-flight speaks a real transport instead of
 # reporting an immediate I/O error. The transport is FTPS (same one we
@@ -102,15 +124,28 @@ option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
 option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
 
 # When ON, 'cmake --install' (and therefore 'make install') will also
-# edit ~/.config/BambuStudio/BambuStudio.conf so Studio trusts this
-# plugin: sets "app.installed_networking"="1" and
-# "app.update_network_plugin"="false". The patch only runs when the
-# install prefix is the default BambuStudio dir - if you installed
-# into a staging tree with --prefix=..., the per-user config is
-# untouched regardless of this flag. A backup file (*.obn-bak) is
-# written whenever the file actually changes.
-option(OBN_PATCH_STUDIO_CONF
-    "Edit ~/.config/BambuStudio/BambuStudio.conf after install" ON)
+# edit the slicer's conf file so it trusts this plugin:
+#   bambu_studio -> ~/.config/BambuStudio/BambuStudio.conf
+#                   ("installed_networking"="1", "update_network_plugin"="false")
+#   orca_slicer  -> ~/.config/OrcaSlicer/OrcaSlicer.conf (or the Flatpak
+#                   path) -- "installed_networking"="true",
+#                   "network_plugin_version"="<OBN_VERSION>",
+#                   "network_plugin_remind_later"="true", and our version
+#                   is stripped from "network_plugin_skipped_versions".
+# The patch only runs when the install prefix is a default config dir
+# for the selected --client-type; if you installed into a staging tree
+# with --prefix=..., the per-user config is untouched regardless of
+# this flag. A backup file (*.obn-bak) is written whenever the file
+# actually changes.
+#
+# OBN_PATCH_STUDIO_CONF is kept as a backward-compat alias -- existing
+# CMake caches set the old name and we want them to keep working.
+option(OBN_PATCH_CLIENT_CONF
+    "Edit the slicer's conf file after install" ON)
+if(DEFINED OBN_PATCH_STUDIO_CONF AND NOT DEFINED CACHE{OBN_PATCH_CLIENT_CONF})
+    set(OBN_PATCH_CLIENT_CONF "${OBN_PATCH_STUDIO_CONF}" CACHE BOOL
+        "Edit the slicer's conf file after install" FORCE)
+endif()
 
 # When ON, pkg-config resolves libmosquitto with --static (Libs.private,
 # transitive deps). Ignored when OBN_VENDOR_MOSQUITTO is ON.
@@ -454,84 +489,74 @@ set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
 # install (copies into <prefix>/plugins/)
 # --------------------------------------------------------------------------
 
-# A brand-new Bambu Studio profile may not have created plugins/ or
-# ota/plugins/ yet (Studio often creates them only after the first
-# official plugin download). cmake --install can then fail copying
-# into a missing parent. Create the dirs explicitly before any
+# A brand-new slicer profile may not have created plugins/ (or, for
+# Studio, ota/plugins/) yet -- the slicer often creates them only after
+# its first official plugin download. cmake --install would then fail
+# copying into a missing parent. Create the dirs explicitly before any
 # install(TARGETS|FILES) into them. Use \${CMAKE_INSTALL_PREFIX} so the
 # path is resolved at install time (honours cmake --install --prefix).
-install(CODE "
-    file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/plugins\")
-    file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/ota/plugins\")
-")
+if(OBN_CLIENT_INSTALL_OTA)
+    install(CODE "
+        file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/plugins\")
+        file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/${OBN_CLIENT_OTA_SUBPATH}\")
+    ")
+else()
+    install(CODE "
+        file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/plugins\")
+    ")
+endif()
 
-install(TARGETS bambu_networking BambuSource live555
+# BambuSource and live555 always ship under their stock names -- both
+# slicers dlopen them by fixed file name. The main plugin .so file
+# differs by client:
+#   bambu_studio -> libbambu_networking.so          (fixed name)
+#   orca_slicer  -> libbambu_networking_<VER>.so    (Orca dlopens
+#                   "libbambu_networking_${network_plugin_version}.so",
+#                   so the file name carries the version. We rename
+#                   our build artefact at install time so the source
+#                   tree still produces a single libbambu_networking.so
+#                   regardless of OBN_CLIENT_TYPE.)
+install(TARGETS BambuSource live555
     LIBRARY DESTINATION plugins
 )
+if(OBN_CLIENT_PLUGIN_NAME STREQUAL "bambu_networking")
+    install(TARGETS bambu_networking
+        LIBRARY DESTINATION plugins
+    )
+else()
+    install(FILES $<TARGET_FILE:bambu_networking>
+        DESTINATION plugins
+        RENAME "lib${OBN_CLIENT_PLUGIN_NAME}.so")
+endif()
 
-# Studio's PresetUpdater expects this JSON to declare the cached version in
-# <data_dir>/ota/plugins/; we ship the same file so the updater trusts our
-# installation.
-configure_file(packaging/network_plugins.json.in
-    ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json @ONLY)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json
-    DESTINATION ota/plugins)
+# Studio's PresetUpdater expects this JSON to declare the cached version
+# in <data_dir>/ota/plugins/; we ship the same file so the updater trusts
+# our installation. Orca does NOT use this file as a persistent manifest
+# (PresetUpdater drops it as a transient OTA artefact and deletes it
+# after the update flow finishes), so for orca_slicer we skip it
+# entirely -- shipping it would accumulate stale state in the user's
+# data dir for no benefit.
+if(OBN_CLIENT_INSTALL_OTA)
+    configure_file(packaging/network_plugins.json.in
+        ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json @ONLY)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/network_plugins.json
+        DESTINATION "${OBN_CLIENT_OTA_SUBPATH}")
+endif()
 
-# First-time Studio configuration: on a fresh profile Studio will try
-# to redownload its own network plugin from the cloud unless the user
-# flips two keys in BambuStudio.conf. We can do that automatically at
-# install time, but only when installing to the default BambuStudio
-# data dir - otherwise the prefix is clearly a staging tree and we
-# should not touch the user's live config.
-if(OBN_PATCH_STUDIO_CONF AND UNIX AND NOT APPLE)
-    install(CODE [[
-        set(_home "$ENV{HOME}")
-        if(_home STREQUAL "")
-            message(STATUS "obn: $HOME is not set, skipping BambuStudio.conf patch")
-        else()
-            set(_expected "${_home}/.config/BambuStudio")
-            if(NOT CMAKE_INSTALL_PREFIX STREQUAL _expected)
-                message(STATUS
-                    "obn: install prefix (${CMAKE_INSTALL_PREFIX}) is not ${_expected}; "
-                    "BambuStudio.conf is untouched. Edit it by hand if needed: "
-                    "set \"installed_networking\":\"1\" and \"update_network_plugin\":\"false\" under \"app\".")
-            else()
-                set(_conf "${_expected}/BambuStudio.conf")
-                if(NOT EXISTS "${_conf}")
-                    message(STATUS
-                        "obn: ${_conf} does not exist yet -- launch Bambu Studio once "
-                        "to create it, then re-run 'make install' (or set "
-                        "\"installed_networking\" / \"update_network_plugin\" by hand).")
-                else()
-                    file(READ "${_conf}" _orig)
-                    set(_body "${_orig}")
-                    string(JSON _app_type ERROR_VARIABLE _err TYPE "${_body}" app)
-                    if(_err OR NOT _app_type STREQUAL "OBJECT")
-                        message(WARNING
-                            "obn: ${_conf} has no top-level \"app\" object; "
-                            "skipping patch. Error: ${_err}")
-                    else()
-                        string(JSON _body SET "${_body}"
-                            app installed_networking "\"1\"")
-                        string(JSON _body SET "${_body}"
-                            app update_network_plugin "\"false\"")
-                        if(NOT _body STREQUAL _orig)
-                            file(WRITE "${_conf}.obn-bak" "${_orig}")
-                            file(WRITE "${_conf}" "${_body}")
-                            message(STATUS
-                                "obn: patched ${_conf} "
-                                "(backup saved to ${_conf}.obn-bak)")
-                        else()
-                            message(STATUS
-                                "obn: ${_conf} already has "
-                                "installed_networking=1 and "
-                                "update_network_plugin=false")
-                        endif()
-                    endif()
-                endif()
-            endif()
-        endif()
-    ]])
+# First-time slicer configuration: see the OBN_PATCH_CLIENT_CONF docstring
+# at the top of this file for what each client needs flipped. The patch
+# script template is per-client (cmake/patch_<client>_conf.cmake.in);
+# configure_file() expands @OBN_*@ variables into a runnable .cmake we
+# pass to install(SCRIPT). install(SCRIPT) executes at `make install`
+# time inside a CMake script-mode interpreter, so the file is allowed
+# to use string(JSON), file(READ/WRITE), foreach, etc. just like a
+# regular CMakeLists.
+if(OBN_PATCH_CLIENT_CONF AND UNIX AND NOT APPLE)
+    set(_obn_patch_out
+        "${CMAKE_CURRENT_BINARY_DIR}/patch_${OBN_CLIENT_TYPE}_conf.cmake")
+    configure_file("${OBN_CLIENT_CONF_PATCH_SCRIPT}"
+        "${_obn_patch_out}" @ONLY)
+    install(SCRIPT "${_obn_patch_out}")
 endif()
 
 # --------------------------------------------------------------------------

@@ -18,6 +18,21 @@ This document tracks how each symbol listed in [NETWORK_PLUGIN.md § 6](NETWORK_
 
 ---
 
+## Supported slicers
+
+The same plugin binary works under both **Bambu Studio** and **Orca Slicer** — they consume the same C ABI documented below. The build system handles client-specific install conventions via `./configure --client-type=bambu_studio | orca_slicer` (Studio is the default). Per-client differences:
+
+| Aspect | Bambu Studio | Orca Slicer |
+| --- | --- | --- |
+| Default install prefix (Linux) | `~/.config/BambuStudio` | `~/.config/OrcaSlicer` (or the Flatpak config dir if it exists) |
+| `.so` file name on disk | `libbambu_networking.so` (fixed) | `libbambu_networking_<network_plugin_version>.so` |
+| `network_plugins.json` OTA manifest | Installed under `ota/plugins/`; Studio reads it as a persistent manifest | Not installed — Orca only writes it as a transient OTA artefact |
+| Conf-file patch (`make install`) | `BambuStudio.conf`: `installed_networking="1"`, `update_network_plugin="false"` | `OrcaSlicer.conf`: `installed_networking="true"`, `network_plugin_version="<OBN_VERSION>"`, `network_plugin_remind_later="true"`, `<OBN_VERSION>` stripped from `network_plugin_skipped_versions` |
+
+See [README — Installing for Orca Slicer](README.md#installing-for-orca-slicer) for the full setup story.
+
+---
+
 ## 6.1. Initialization and lifecycle
 
 Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_lifecycle.cpp).
