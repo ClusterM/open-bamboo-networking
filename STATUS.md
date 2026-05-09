@@ -25,9 +25,12 @@ The same plugin binary works under both **Bambu Studio** and **Orca Slicer** —
 | Aspect | Bambu Studio | Orca Slicer |
 | --- | --- | --- |
 | Default install prefix (Linux) | `~/.config/BambuStudio` | `~/.config/OrcaSlicer` (or the Flatpak config dir if it exists) |
-| `.so` file name on disk | `libbambu_networking.so` (fixed) | `libbambu_networking_<network_plugin_version>.so` |
+| Default install prefix (Windows) | `%APPDATA%\BambuStudio\plugins\` | `%APPDATA%\OrcaSlicer\plugins\` |
+| Linux `.so` file name on disk | `libbambu_networking.so` (fixed) | `libbambu_networking_<network_plugin_version>.so` |
+| Windows DLL file name on disk | `bambu_networking.dll` (fixed) | `bambu_networking_<network_plugin_version>.dll` |
 | `network_plugins.json` OTA manifest | Installed under `ota/plugins/`; Studio reads it as a persistent manifest | Not installed — Orca only writes it as a transient OTA artefact |
 | Conf-file patch (`make install`) | `BambuStudio.conf`: `installed_networking="1"`, `update_network_plugin="false"` | `OrcaSlicer.conf`: `installed_networking="true"`, `network_plugin_version="<OBN_VERSION>"`, `network_plugin_remind_later="true"`, `<OBN_VERSION>` stripped from `network_plugin_skipped_versions` |
+| Windows camera back-end | Direct C ABI (`Bambu_*`) consumed by the new `wxMediaCtrl3` (FFmpeg in-tree). No DirectShow filter required. | Legacy `wxMediaCtrl2` over the Windows Media Player / DirectShow path. Camera live view goes through our **`BambuSource.dll`** registered as a DirectShow Source Filter (CLSID `{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}`). |
 
 See [README — Installing for Orca Slicer](README.md#installing-for-orca-slicer) for the full setup story.
 
@@ -312,11 +315,11 @@ For `bambu:///local/*` URLs the fast path serves the whole `ft_*` bus over FTPS 
 
 ## `libBambuSource.so` (second library)
 
-Bambu Studio loads two cooperating shared objects from `<data_dir>/plugins/`: `libbambu_networking.so` (everything above this section) and **`libBambuSource.so`**, a separate artefact with its own loader, its own symbol prefix (`Bambu_*`), and its own per-platform back-ends. It serves the camera **live view** and the on-printer **file browser**. See [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) for the full reverse-engineered contract.
+Bambu Studio loads two cooperating shared objects from `<data_dir>/plugins/`: `libbambu_networking.{so,dll}` (everything above this section) and **`libBambuSource.{so,dll}`** (Windows: `BambuSource.dll`), a separate artefact with its own loader, its own symbol prefix (`Bambu_*`), and its own per-platform back-ends. It serves the camera **live view** and the on-printer **file browser**. See [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) for the full reverse-engineered contract.
 
-Source: [stubs/BambuSource.cpp](stubs/BambuSource.cpp), [stubs/rtsp_client.cpp](stubs/rtsp_client.cpp), [stubs/rtsp_passthrough.cpp](stubs/rtsp_passthrough.cpp).
+Source: [stubs/BambuSource.cpp](stubs/BambuSource.cpp), [stubs/rtsp_client.cpp](stubs/rtsp_client.cpp), [stubs/rtsp_passthrough.cpp](stubs/rtsp_passthrough.cpp), [stubs/dshow_filter.cpp](stubs/dshow_filter.cpp) (Windows-only).
 
-The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `libavcodec` / `libavutil` / `libswscale` / `live555`**. RTSPS is handled by an in-process custom client (TLS + RTSP/Digest auth + RTP/TCP-interleaved depacketisation + Annex-B reassembly) that hands raw H.264 byte stream out via `Bambu_ReadSample`; the slicer-side `gstbambusrc` element does the decode (`h264parse + avdec_h264 / openh264dec / vaapih264dec`).
+The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `libavcodec` / `libavutil` / `libswscale` / `live555`**. RTSPS is handled by an in-process custom client (TLS + RTSP/Digest auth + RTP/TCP-interleaved depacketisation + Annex-B reassembly) that hands raw H.264 byte stream out via `Bambu_ReadSample`; the slicer-side decoder is platform-specific (Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec / vaapih264dec`; Windows Studio `wxMediaCtrl3`: in-tree FFmpeg `AVVideoDecoder`; Windows Orca `wxMediaCtrl2`: wmp's H.264 decoder fed via the DShow source filter described below).
 
 ### Tunnel C ABI (camera + file-browser source path)
 
@@ -341,8 +344,8 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 
 | Camera transport | Applies to | Status | Notes |
 | --- | --- | :--: | --- |
-| MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples; passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. No A-series hardware available for on-device verification. |
-| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested on P2S) | Custom in-process RTSP/RTSPS client; raw H.264 Annex-B byte stream out (same wire format the stock plugin produces). Slicer-side `gstbambusrc` decodes with `h264parse + avdec_h264 / openh264dec`. |
+| MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples. Linux: passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. Windows: same JPEG payload pushed through our DShow source filter as `MEDIASUBTYPE_MJPG`. No A-series hardware available for on-device verification. |
+| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested on P2S, both Studio and Orca) | Custom in-process RTSP/RTSPS client; raw H.264 Annex-B byte stream out (same wire format the stock plugin produces). Linux: slicer-side `gstbambusrc` decodes with `h264parse + avdec_h264 / openh264dec`. Windows Studio: decoded by the in-tree FFmpeg `AVVideoDecoder` (`wxMediaCtrl3`). Windows Orca: pushed as `MEDIASUBTYPE_H264` through our DShow source filter into wmp's H.264 decoder. |
 | Cloud camera (TUTK / Agora p2p) | any printer over WAN | 🔒 | Proprietary SDK; out of scope. Stays on the LAN/Developer-Mode path. |
 
 ### File browser (CTRL bridge)
@@ -361,12 +364,39 @@ The CTRL bridge serves Studio's "Device → Files" tab over the same camera tunn
 | `LIST_CHANGE_NOTIFY` (0x0100) | ✅ | Re-emits `LIST_INFO` toward Studio. |
 | `LIST_RESYNC_NOTIFY` (0x0101) | ✅ | Forces a full re-fetch. |
 
-### What this section deliberately does not implement
+### Windows DirectShow source filter
+
+Source: [stubs/dshow_filter.cpp](stubs/dshow_filter.cpp), [stubs/BambuSource.def](stubs/BambuSource.def).
+
+Required for camera live view in **OrcaSlicer on Windows** (which still routes through `wxMediaCtrl2` → Windows Media Player → DirectShow). Recent **Bambu Studio on Windows** (June 2024+, `wxMediaCtrl3`) decodes via FFmpeg directly through the `Bambu_*` C ABI and never reaches the filter; this section is irrelevant there.
+
+| Self-registration / COM entry | Status | Notes |
+| --- | :--: | --- |
+| `DllMain` | ✅ | Records the host process's first attach; no logging or `fopen` runs under the loader lock (avoids `STATUS_STACK_BUFFER_OVERRUN` during `regsvr32`). |
+| `DllGetClassObject` | ✅ | Hands out an `IClassFactory` for the single CLSID `{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}`. |
+| `DllCanUnloadNow` | ✅ | Tracks the global module ref-count and only returns `S_OK` when no objects are alive. |
+| `DllRegisterServer` | ✅ | Writes `HKCR\CLSID\{233E64FB-…}` + `InprocServer32` (= absolute DLL path, `ThreadingModel=Both`) and the DirectShow `Filter Categories\Source Filters` registration. |
+| `DllUnregisterServer` | ✅ | Removes both keys. |
+
+| Filter / pin interface | Status | Notes |
+| --- | :--: | --- |
+| `IBaseFilter` | ✅ | Stop / Pause / Run / GetState / EnumPins / FindPin / JoinFilterGraph all wired; `GetState` returns `S_OK` synchronously. |
+| `IFileSourceFilter::Load` | ✅ | Accepts the `bambu://` URL forms produced by both **Bambu Studio** (`bambu:///rtsps___…`, `bambu:///rtsp___…`, `bambu:///local/…`) and **OrcaSlicer**'s `MediaPlayCtrl` (which pre-canonicalises through `wxURI` and may collapse `///` to `//`). The parser tolerates 1-3 slashes after `bambu:`. |
+| `IPin` (output pin, single track) | ✅ | Connect / Disconnect / EnumMediaTypes / QueryAccept / NewSegment / EndOfStream are all implemented. We advertise `MEDIASUBTYPE_AVC1` for RTSP and `MEDIASUBTYPE_MJPG` for the local-MJPEG branch. |
+| `IMemAllocator` (downstream) | ✅ | We accept the downstream-provided allocator; `Commit()` happens in `start_streaming()`, `Decommit()` in `stop_streaming()` — matches the standard DirectShow source pattern. |
+| `IMediaSeeking` / `IAMStreamConfig` | ❌ | Not exposed: live cameras are non-seekable, single-config streams. |
+| `IQualityControl` | ✅ | Stub that always returns `S_OK` so renderers don't get `E_NOINTERFACE` from `QueryInterface`. |
+
+| Streaming back-end | Status | Notes |
+| --- | :--: | --- |
+| RTSPS → H.264 Annex-B | ✅ (tested on P2S) | Reuses the same `obn::rtsp::Passthrough` worker the Linux/macOS build uses. Annex-B access units (with SPS/PPS re-prepended on every IDR) are pushed through the downstream `IMemInputPin::Receive` until `Stop()` decommits the allocator. |
+| MJPEG / port 6000 | ✅ (not tested on hardware) | TLS dial + 80-byte auth + 16-byte framed JPEG payload, pushed as `MEDIASUBTYPE_MJPG` samples. |
+
+### macOS
 
 | Feature | Status | Notes |
 | --- | :--: | --- |
-| Windows DirectShow source filter (CLSID `{233E64FB-…}`) | ❌ | Required for camera live view on Windows; out of scope (substantial separate filter implementation). The `Bambu_*` C ABI for the file browser is portable and would work on Windows. |
-| macOS Objective-C `BambuPlayer` class | ❌ | Required for camera live view on macOS; not shipped. The `Bambu_*` C ABI for the file browser still works on macOS once the dylib is built. |
+| Objective-C `BambuPlayer` class | ❌ | Required for camera live view on macOS; not shipped. The `Bambu_*` C ABI for the file browser still works on macOS once the dylib is built. |
 
 ---
 

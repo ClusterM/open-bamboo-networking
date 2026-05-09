@@ -32,6 +32,8 @@
 #include <cstddef>
 #include <string>
 
+#include "obn/os_compat.hpp"
+
 // Forward declarations so callers in headers don't need to pull in the
 // OpenSSL umbrella -- only the .cpp side needs <openssl/ssl.h>.
 typedef struct ssl_st     SSL;
@@ -47,21 +49,26 @@ SSL_CTX* shared_ctx();
 
 // TCP-connect to host:port. Uses getaddrinfo (AF_UNSPEC), iterates
 // candidates, applies SO_SNDTIMEO/SO_RCVTIMEO + TCP_NODELAY to each
-// socket, returns the first one that connects. Returns the fd on
-// success, -1 on failure (and sets obn::source::set_last_error).
-int dial(const std::string& host, int port, int timeout_ms);
+// socket, returns the first one that connects. Returns a valid socket
+// on success, obn::os::kInvalidSocket on failure (and sets
+// obn::source::set_last_error). Use obn::os::socket_valid() to test
+// the result; the underlying type is plain int on POSIX and SOCKET on
+// Windows, which is why we no longer return -1 directly.
+obn::os::socket_t dial(const std::string& host, int port, int timeout_ms);
 
 // One-shot TLS dial: dial() + SSL_new + SSL_set_tlsext_host_name + SSL_connect.
 // On success: returns 0, *out_fd holds the connected socket, *out_ssl
 // holds the established SSL session.
-// On failure: returns -1, both out-params get cleaned up to -1/nullptr,
-// and obn::source::set_last_error carries an OpenSSL error string.
+// On failure: returns -1, both out-params get cleaned up to
+// kInvalidSocket / nullptr, and obn::source::set_last_error carries
+// an OpenSSL error string.
 int dial_tls(const std::string& host, int port, int timeout_ms,
-             int* out_fd, SSL** out_ssl);
+             obn::os::socket_t* out_fd, SSL** out_ssl);
 
 // Tear down a TLS session and the underlying socket. Safe to call with
-// already-closed values; sets *fd to -1 and *ssl to nullptr on return.
-void close_tls(int* fd, SSL** ssl);
+// already-closed values; sets *fd to kInvalidSocket and *ssl to nullptr
+// on return.
+void close_tls(obn::os::socket_t* fd, SSL** ssl);
 
 // Blocking write-all over the TLS layer. Loops on partial writes and
 // retries on SSL_ERROR_WANT_{READ,WRITE} (which can happen during a

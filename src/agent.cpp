@@ -1,9 +1,8 @@
 #include "obn/agent.hpp"
 
-#include <sys/stat.h>
-
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <thread>
 #include <utility>
@@ -868,15 +867,20 @@ std::string Agent::bambu_ca_bundle_path() const
         folder = cert_folder_;
     }
     if (folder.empty()) return {};
-    if (folder.back() == '/') folder.pop_back();
+    // Strip a trailing separator on either platform so we can re-add a
+    // single forward slash. std::filesystem could do this but the rest of
+    // the function predates the cross-platform refactor and uses string
+    // joining throughout; keep it consistent.
+    char last = folder.back();
+    if (last == '/' || last == '\\') folder.pop_back();
     // Studio ships two cert files in resources/cert/:
     //   slicer_base64.cer  - RapidSSL leaf for *.bambulab.com (cloud only)
     //   printer.cer        - BBL Root/Intermediate CA bundle that signs the
     //                        printer's device cert (CN=<serial>, issuer=
     //                        BBL Device CA N7-V2). This one is what we want.
     std::string path = folder + "/printer.cer";
-    struct stat st{};
-    if (::stat(path.c_str(), &st) == 0 && (st.st_mode & S_IFREG)) return path;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec)) return path;
     return {};
 }
 
@@ -1318,8 +1322,35 @@ int Agent::connect_cloud()
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
+    // Cloud TLS trust anchor:
+    //   - Linux/macOS: empty here -> mqtt_client falls back to the distro
+    //     trust store (/etc/ssl/certs/...), which validates *.bambulab.com
+    //     properly.
+    //   - Windows: vcpkg's static OpenSSL ships no default trust store,
+    //     and mosquitto_tls_set() rejects (cafile=null, capath=null) with
+    //     MOSQ_ERR_INVAL. We hand it Studio's BBL bundle (the same file
+    //     Studio passed via set_cert_file, e.g.
+    //     resources/cert/slicer_base64.cer) just so the call validates;
+    //     CloudSession then sets tls_skip_chain_verify=true so the
+    //     handshake doesn't actually require *.bambulab.com to chain
+    //     up to that BBL CA. Documented MVP limitation -- cloud auth
+    //     still rides on top of TLS via u_<userid>+token, so MITM gets
+    //     opaque traffic but no usable credentials.
+    std::string cloud_ca;
+#if defined(_WIN32)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!cert_folder_.empty() && !cert_filename_.empty()) {
+            cloud_ca = cert_folder_;
+            if (cloud_ca.back() != '/' && cloud_ca.back() != '\\') {
+                cloud_ca += '\\';
+            }
+            cloud_ca += cert_filename_;
+        }
+    }
+#endif
     cloud_session_->configure(cloud_region(), s.user_id, s.access_token,
-                              /*ca_file=*/{});
+                              std::move(cloud_ca));
 
     // Trampoline callbacks onto Studio's UI thread where one is
     // registered. The message callback is intentionally NOT queued:

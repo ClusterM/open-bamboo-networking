@@ -20,14 +20,16 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
     // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
 
-    OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
-             log_dir.c_str(),
+    // MSVC's preprocessor (in /Zc:preprocessor-disabled mode, which is the
+    // default for v142) refuses #ifdef directives inside macro arguments,
+    // so resolve the version string before invoking OBN_INFO.
 #ifdef OBN_VERSION_STRING
-             OBN_VERSION_STRING
+    constexpr const char* k_plugin_version = OBN_VERSION_STRING;
 #else
-             "unknown"
+    constexpr const char* k_plugin_version = "unknown";
 #endif
-             );
+    OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
+             log_dir.c_str(), k_plugin_version);
     try {
         return new Agent(std::move(log_dir));
     } catch (const std::exception& e) {

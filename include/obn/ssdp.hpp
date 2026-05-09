@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -64,7 +65,10 @@ public:
 private:
     void run_();
 
-    int                  fd_{-1};
+    // Stored as uintptr_t so we don't have to drag obn::os::socket_t (and the
+    // <winsock2.h> include behind it) into a public header. ssdp.cpp casts
+    // through obn::os::socket_t at use sites.
+    std::uintptr_t       fd_{static_cast<std::uintptr_t>(-1)};
     std::thread          worker_;
     std::atomic<bool>    running_{false};
     std::mutex           cb_mu_;

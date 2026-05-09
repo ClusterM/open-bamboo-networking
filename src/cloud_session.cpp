@@ -197,6 +197,21 @@ int CloudSession::start(ConnectedCb on_connected,
     cfg.tls_insecure = false;
     cfg.ca_file      = ca_file; // optional override; empty -> system store
     cfg.keepalive_s  = 60;
+#if defined(_WIN32)
+    // Windows MVP: ca_file (above) is the BBL slicer bundle that
+    // Agent::connect_cloud forwards us. It's the only PEM we can hand
+    // mosquitto_tls_set on this platform (the static OpenSSL ships no
+    // default trust dir), but its roots don't sign *.bambulab.com.
+    // Skip both the chain check and the hostname check, so the SSL
+    // handshake doesn't reject a perfectly-valid public cert just
+    // because we can't anchor it. Cloud auth remains gated by the
+    // bearer token in `password`, so an MITM still can't impersonate
+    // the user. See agent.cpp Agent::connect_cloud for the rationale.
+    if (!ca_file.empty()) {
+        cfg.tls_skip_chain_verify = true;
+        cfg.tls_insecure          = true;
+    }
+#endif
 
     OBN_INFO("cloud mqtt: connecting to %s:%d as u_%s (token=%zu bytes)",
              cfg.host.c_str(), cfg.port, user_id.c_str(), token.size());

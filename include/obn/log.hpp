@@ -42,8 +42,17 @@ enum Level : int {
 void configure_from_log_dir(const std::string& log_dir);
 
 // Low-level emitter. Use the OBN_* macros below instead of calling directly.
+// `__attribute__((format(printf,...)))` is GCC/Clang-only; MSVC accepts the
+// equivalent _Printf_format_string_ SAL annotation through <sal.h> but for
+// our purposes a static assertion at the call site (handled by the OBN_*
+// macros' macro-stringification trick) is enough -- so we just drop the
+// hint on MSVC.
+#if defined(__GNUC__) || defined(__clang__)
 void emit(Level lvl, const char* file, int line, const char* func, const char* fmt, ...)
     __attribute__((format(printf, 5, 6)));
+#else
+void emit(Level lvl, const char* file, int line, const char* func, const char* fmt, ...);
+#endif
 
 // Current threshold, used by macros to skip argument evaluation when muted.
 Level threshold();

@@ -36,9 +36,18 @@ set(_expected_prefixes "@OBN_CLIENT_EXPECTED_PREFIXES@")
 set(_conf_name         "@OBN_CLIENT_CONF_NAME@")
 set(_obn_version       "@OBN_VERSION@")
 
-set(_home "$ENV{HOME}")
-if(_home STREQUAL "")
-    message(STATUS "obn: HOME is not set, skipping ${_conf_name} patch")
+# See patch_bambustudio_conf.cmake.in for the rationale; Orca uses the same
+# %APPDATA% layout on Windows.
+if(CMAKE_HOST_WIN32)
+    set(_user_root "$ENV{APPDATA}")
+    set(_user_root_label "APPDATA")
+else()
+    set(_user_root "$ENV{HOME}")
+    set(_user_root_label "HOME")
+endif()
+
+if(_user_root STREQUAL "")
+    message(STATUS "obn: ${_user_root_label} is not set, skipping ${_conf_name} patch")
 else()
     set(_match FALSE)
     foreach(_p IN LISTS _expected_prefixes)
@@ -74,6 +83,13 @@ else()
                 string(JSON _body SET "${_body}" app installed_networking      "\"true\"")
                 string(JSON _body SET "${_body}" app network_plugin_version    "\"${_obn_version}\"")
                 string(JSON _body SET "${_body}" app network_plugin_remind_later "\"true\"")
+                # Mirror the Bambu Studio patch: only Windows / macOS perform
+                # signature validation, so only those platforms need the
+                # ignore_module_cert override. On Linux the key is harmless
+                # but useless; skip it to keep the .conf clean.
+                if(CMAKE_HOST_WIN32 OR CMAKE_HOST_APPLE)
+                    string(JSON _body SET "${_body}" app ignore_module_cert "\"1\"")
+                endif()
 
                 # Strip OBN_VERSION from network_plugin_skipped_versions if
                 # present. The key may be missing entirely -- ERROR_VARIABLE
@@ -100,11 +116,36 @@ else()
                     endif()
                 endif()
 
-                if(NOT _body STREQUAL _orig)
+                # Strip the trailing "# MD5 checksum <hex>" line from the
+                # original before comparison: string(JSON SET) returns the
+                # JSON object without trailing comments, so a verbatim
+                # _body vs _orig compare would always say "changed" even
+                # for a no-op patch and rewrite the file (invalidating
+                # the MD5 the user already has on disk).
+                string(REGEX REPLACE "[\r\n]+# MD5 checksum[^\r\n]*[\r\n]*$" ""
+                    _orig_json "${_orig}")
+
+                if(NOT _body STREQUAL _orig_json)
                     file(WRITE "${_conf}.obn-bak" "${_orig}")
-                    file(WRITE "${_conf}" "${_body}")
+                    # Orca Slicer (forked from PrusaSlicer/AppConfig) does
+                    # the same trailing "# MD5 checksum <32 hex>" trick
+                    # Bambu Studio inherits, and crashes with
+                    # std::out_of_range during AppConfig::load when the
+                    # line is missing. Append a placeholder in Studio's
+                    # exact format so the load path is happy; Orca will
+                    # rewrite the hash with the real one on its next
+                    # clean save.
+                    file(WRITE "${_conf}"
+                        "${_body}\n# MD5 checksum 00000000000000000000000000000000\n")
                     message(STATUS
                         "obn: patched ${_conf} (backup saved to ${_conf}.obn-bak)")
+                    if(EXISTS "${_conf}.bak")
+                        message(STATUS
+                            "obn: an Orca-managed ${_conf}.bak is present; "
+                            "Orca will refresh it on next clean save. "
+                            "If Orca still refuses to start, remove that .bak "
+                            "manually so it cannot fall back to the pre-patch copy.")
+                    endif()
                 else()
                     message(STATUS
                         "obn: ${_conf} already has installed_networking=true, "

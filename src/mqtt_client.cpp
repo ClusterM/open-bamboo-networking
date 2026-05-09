@@ -7,6 +7,18 @@
 
 #include <mosquitto.h>
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#endif
+
 #include "obn/log.hpp"
 
 namespace obn::mqtt {
@@ -37,6 +49,38 @@ void global_cleanup()
 const char* Client::err_str(int rc)
 {
     return ::mosquitto_strerror(rc);
+}
+
+std::string Client::detailed_err(int rc, int wsa_err)
+{
+    std::string s = ::mosquitto_strerror(rc);
+#if defined(_WIN32)
+    if (rc == MOSQ_ERR_ERRNO) {
+        if (wsa_err == 0) {
+            // Best-effort fallback: many call sites can't easily snapshot
+            // WSAGetLastError() at the exact failure point, so we read
+            // whatever the current value is and tag it as "(latest)".
+            wsa_err = ::WSAGetLastError();
+        }
+        char buf[256] = {};
+        DWORD len = ::FormatMessageA(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr,
+            static_cast<DWORD>(wsa_err),
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            buf, sizeof(buf) - 1, nullptr);
+        // Strip trailing CRLF FormatMessage likes to add.
+        while (len > 0 && (buf[len - 1] == '\r' || buf[len - 1] == '\n'
+                           || buf[len - 1] == ' ' || buf[len - 1] == '.')) {
+            buf[--len] = '\0';
+        }
+        s += " [WSA=" + std::to_string(wsa_err) + ": "
+             + (len > 0 ? buf : "<unknown>") + "]";
+    }
+#else
+    (void)wsa_err;
+#endif
+    return s;
 }
 
 Client::Client(std::string client_id)
@@ -121,9 +165,31 @@ int Client::connect(const ConnectConfig& cfg)
         bool        verify_peer = false;
         if (!cfg.ca_file.empty()) {
             cafile      = cfg.ca_file.c_str();
-            verify_peer = true;
-            OBN_DEBUG("mqtt using BBL CA bundle for verification: %s", cafile);
+            // skip_chain_verify wins over verify_peer: when caller has
+            // told us the supplied cafile is just a placeholder to keep
+            // mosquitto_tls_set happy (e.g. cloud-on-Windows with the
+            // BBL cert that won't actually validate *.bambulab.com),
+            // we must NOT ask SSL_VERIFY_PEER or the handshake fails.
+            verify_peer = !cfg.tls_skip_chain_verify;
+            OBN_DEBUG("mqtt using ca bundle %s (verify_peer=%d, skip_chain=%d)",
+                      cafile, verify_peer ? 1 : 0,
+                      cfg.tls_skip_chain_verify ? 1 : 0);
         } else {
+#if defined(_WIN32)
+            // Windows has no canonical /etc/ssl trust dir and OpenSSL static
+            // builds shipped via vcpkg don't carry a default cert store.
+            // Probing /etc/ssl/* and handing nonexistent paths to mosquitto
+            // makes net__tls_load_ca() fail later, so just leave both
+            // cafile and capath null and ask mosquitto to use whatever the
+            // OS exposes via OPENSSL_init_crypto's default verify paths.
+            // Caller-driven verification stays governed by tls_insecure.
+            cafile = nullptr;
+            capath = nullptr;
+            verify_peer = !cfg.tls_insecure;
+            OBN_DEBUG("mqtt no ca_file on Windows; using openssl default verify paths "
+                      "(verify_peer=%d, tls_insecure=%d)",
+                      verify_peer ? 1 : 0, cfg.tls_insecure ? 1 : 0);
+#else
             static const char* kCaCandidates[] = {
                 "/etc/ssl/certs/ca-certificates.crt",        // Debian, Ubuntu
                 "/etc/pki/tls/certs/ca-bundle.crt",          // Fedora, RHEL
@@ -136,6 +202,7 @@ int Client::connect(const ConnectConfig& cfg)
             }
             capath      = cafile ? nullptr : "/etc/ssl/certs";
             verify_peer = !cfg.tls_insecure;
+#endif
         }
         int rc = ::mosquitto_tls_set(mosq_, cafile, capath, nullptr, nullptr, nullptr);
         if (rc != MOSQ_ERR_SUCCESS) {
@@ -164,14 +231,64 @@ int Client::connect(const ConnectConfig& cfg)
                                        cfg.host.c_str(),
                                        cfg.port,
                                        cfg.keepalive_s);
+#if defined(_WIN32)
+    // Snapshot WSAGetLastError() the instant connect_async returns: any
+    // logging/formatting we do on the way to OBN_ERROR can clobber it
+    // (FormatMessage, snprintf-via-CRT, syscalls in obn::os::localtime_safe,
+    // etc. each involve Winsock-adjacent state). Without this snapshot
+    // mosquitto_strerror(MOSQ_ERR_ERRNO) collapses to "No error" because
+    // it hands errno=0 to strerror.
+    int wsa_after_async = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
+#else
+    int wsa_after_async = 0;
+#endif
     if (rc != MOSQ_ERR_SUCCESS) {
-        OBN_ERROR("mqtt connect_async rc=%d (%s)", rc, err_str(rc));
+        OBN_ERROR("mqtt connect_async rc=%d (%s)",
+                  rc, detailed_err(rc, wsa_after_async).c_str());
+
+#if defined(_WIN32)
+        // Last-ditch fallback: when connect_async dies inside libmosquitto's
+        // non-blocking connect path (e.g. the well-known v2.0.x cycle where
+        // net__try_connect_tcp's WINDOWS_SET_ERRNO sees an errno value that
+        // doesn't match COMPAT_EWOULDBLOCK), the synchronous mosquitto_connect
+        // takes a different code branch (blocking connect, sets non-blocking
+        // *after*) and routinely succeeds where async did not. Try that
+        // exactly once, also still backed by mosquitto_loop_start() for the
+        // network thread.
+        if (rc == MOSQ_ERR_ERRNO) {
+            OBN_WARN("mqtt connect_async failed with WSA=%d; retrying with "
+                     "synchronous mosquitto_connect", wsa_after_async);
+            int rc_sync = ::mosquitto_connect(mosq_,
+                                              cfg.host.c_str(),
+                                              cfg.port,
+                                              cfg.keepalive_s);
+            int wsa_after_sync = (rc_sync == MOSQ_ERR_ERRNO)
+                                 ? ::WSAGetLastError() : 0;
+            if (rc_sync == MOSQ_ERR_SUCCESS) {
+                OBN_INFO("mqtt sync connect succeeded after async failure");
+                rc = MOSQ_ERR_SUCCESS;
+            } else {
+                OBN_ERROR("mqtt sync connect rc=%d (%s)",
+                          rc_sync,
+                          detailed_err(rc_sync, wsa_after_sync).c_str());
+                return rc_sync;
+            }
+        } else {
+            return rc;
+        }
+#else
         return rc;
+#endif
     }
 
     rc = ::mosquitto_loop_start(mosq_);
     if (rc != MOSQ_ERR_SUCCESS) {
+#if defined(_WIN32)
+        int wsa = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
+        OBN_ERROR("mqtt loop_start rc=%d (%s)", rc, detailed_err(rc, wsa).c_str());
+#else
         OBN_ERROR("mqtt loop_start rc=%d (%s)", rc, err_str(rc));
+#endif
         return rc;
     }
     loop_started_.store(true, std::memory_order_release);

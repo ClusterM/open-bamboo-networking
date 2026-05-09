@@ -5,6 +5,10 @@ config.mk
 config.ps1
 .cache/
 .vcpkg/
+# vcpkg manifest-mode install tree: regenerated from vcpkg.json on every
+# fresh configure, can easily reach gigabytes (downloaded sources, debug
+# libs, etc.). Nothing in the repo should reference it directly.
+vcpkg_installed/
 compile_commands.json
 *.o
 *.so

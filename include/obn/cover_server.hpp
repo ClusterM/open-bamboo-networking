@@ -53,7 +53,10 @@ public:
 private:
     void accept_loop();
 
-    int              listen_fd_ = -1;
+    // Stored as uintptr_t to fit both POSIX `int` and Winsock `SOCKET`
+    // without dragging <winsock2.h> into a public header. cover_server.cpp
+    // casts through obn::os::socket_t at use sites.
+    std::uintptr_t   listen_fd_ = static_cast<std::uintptr_t>(-1);
     std::atomic<int> port_{0};
     std::atomic<bool> running_{false};
     std::thread      accept_thread_;

@@ -71,12 +71,26 @@
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "obn/os_compat.hpp"
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#else
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -123,7 +137,14 @@
 extern "C" {
 
 typedef void* Bambu_Tunnel;
-using tchar = char; // Linux only for now; Windows would need wchar_t here.
+// Studio's tchar contract differs by platform: Linux/macOS pass char*,
+// Windows passes wchar_t* (matches wxMediaCtrl2's Bambu_FreeLogMsg /
+// gstbambusrc's bambu_log signature).
+#if defined(_WIN32)
+using tchar = wchar_t;
+#else
+using tchar = char;
+#endif
 
 enum Bambu_StreamType { VIDE = 0, AUDI = 1 };
 enum Bambu_VideoSubType { AVC1 = 0, MJPG = 1 };
@@ -439,7 +460,7 @@ struct Tunnel {
     void*            log_ctx = nullptr;
 
     // ---- MJPG/TLS state (Scheme::Local) ----
-    int              fd      = -1;
+    obn::os::socket_t fd     = obn::os::kInvalidSocket;
     SSL*             ssl     = nullptr;
 
     // ---- RTSP(S) state (Scheme::Rtsps/Rtsp) ----
@@ -533,17 +554,17 @@ void tunnel_close(Tunnel* t)
     if (!t) return;
     t->closing.store(true, std::memory_order_release);
     log_at(LL_DEBUG, t->logger, t->log_ctx,
-           "tunnel_close: shutting down (fd=%d ssl=%p frames=%llu)",
-           t->fd, static_cast<void*>(t->ssl),
+           "tunnel_close: shutting down (fd=%lld ssl=%p frames=%llu)",
+           static_cast<long long>(t->fd), static_cast<void*>(t->ssl),
            static_cast<unsigned long long>(t->frame_count));
 
     // Step 1 (no lock): wake the reader. SSL_read on the streaming
     // thread sits in recv() up to SO_RCVTIMEO (5 s); shutting down
     // the socket from under it makes recv() return immediately so it
     // can drop mjpg_io_mu and let us free the SSL object below. This
-    // is intentionally done WITHOUT mjpg_io_mu — we'd deadlock against
+    // is intentionally done WITHOUT mjpg_io_mu -- we'd deadlock against
     // the in-flight SSL_read otherwise.
-    if (t->fd >= 0) ::shutdown(t->fd, SHUT_RDWR);
+    if (obn::os::socket_valid(t->fd)) obn::os::shutdown_both(t->fd);
 
     // Step 2: serialise with the reader. Once we hold mjpg_io_mu nobody
     // can be inside SSL_read on this tunnel, so SSL_free is safe.
@@ -557,9 +578,9 @@ void tunnel_close(Tunnel* t)
             SSL_free(t->ssl);
             t->ssl = nullptr;
         }
-        if (t->fd >= 0) {
-            ::close(t->fd);
-            t->fd = -1;
+        if (obn::os::socket_valid(t->fd)) {
+            obn::os::close_socket(t->fd);
+            t->fd = obn::os::kInvalidSocket;
         }
     }
 
@@ -572,9 +593,14 @@ void tunnel_close(Tunnel* t)
     }
 }
 
-// Resolve-and-connect with a total deadline. Returns -1 on error.
-int dial(const std::string& host, int port, int timeout_ms)
+// Resolve-and-connect with a total deadline. Returns kInvalidSocket on
+// error. Mirrors obn::tls::dial() so we share Winsock-vs-POSIX shape;
+// kept local because the TLS-less MJPG path needs the raw fd before
+// SSL_new is called.
+obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
 {
+    obn::os::winsock_init_once();
+
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -584,30 +610,48 @@ int dial(const std::string& host, int port, int timeout_ms)
     std::snprintf(port_s, sizeof(port_s), "%d", port);
     int gai = ::getaddrinfo(host.c_str(), port_s, &hints, &res);
     if (gai != 0 || !res) {
-        set_last_error(gai_strerror(gai));
-        return -1;
+#if defined(_WIN32)
+        set_last_error(::gai_strerrorA(gai));
+#else
+        set_last_error(::gai_strerror(gai));
+#endif
+        return obn::os::kInvalidSocket;
     }
 
-    int fd = -1;
+    obn::os::socket_t fd = obn::os::kInvalidSocket;
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(timeout_ms);
     for (auto* ai = res; ai; ai = ai->ai_next) {
-        fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
+        auto raw = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        fd = static_cast<obn::os::socket_t>(raw);
+        if (!obn::os::socket_valid(fd)) { fd = obn::os::kInvalidSocket; continue; }
         // Keep connect() from blocking forever; 5 s matches what the
         // stock plugin uses (observed via strace).
+#if defined(_WIN32)
+        DWORD tv_ms = static_cast<DWORD>(timeout_ms);
+        ::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_SNDTIMEO,
+                     reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+        ::setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+        BOOL one_b = TRUE;
+        ::setsockopt(static_cast<SOCKET>(fd), IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char*>(&one_b), sizeof(one_b));
+        if (::connect(static_cast<SOCKET>(fd), ai->ai_addr,
+                      static_cast<int>(ai->ai_addrlen)) == 0) break;
+#else
         timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        ::close(fd);
-        fd = -1;
+#endif
+        obn::os::close_socket(fd);
+        fd = obn::os::kInvalidSocket;
         if (std::chrono::steady_clock::now() > deadline) break;
     }
     freeaddrinfo(res);
-    if (fd < 0) set_last_error("connect failed");
+    if (!obn::os::socket_valid(fd)) set_last_error("connect failed");
     return fd;
 }
 
@@ -1136,7 +1180,7 @@ std::string format_time_studio(std::uint64_t epoch)
     if (epoch == 0) return "";
     std::time_t t = static_cast<std::time_t>(epoch);
     std::tm tm{};
-    gmtime_r(&t, &tm);
+    obn::os::gmtime_safe(t, &tm);
     char buf[32];
     std::strftime(buf, sizeof(buf), "%F %T", &tm);
     return buf;
@@ -1273,13 +1317,17 @@ std::string download_blob(Tunnel* t, const std::string& full_path,
     constexpr std::size_t kMax = 64u * 1024u * 1024u;
     auto do_retr = [&]() {
         out->clear();
-        return t->ftp->retr(full_path, [out](const void* data, std::size_t len) {
-            if (out->size() + len > kMax) return false;
-            out->insert(out->end(),
-                        static_cast<const std::uint8_t*>(data),
-                        static_cast<const std::uint8_t*>(data) + len);
-            return true;
-        });
+        // Capture kMax explicitly: MSVC requires it inside the inner
+        // lambda even though it is constexpr at namespace-adjacent
+        // scope (gcc accepts the unnamed reference, MSVC does not).
+        return t->ftp->retr(full_path,
+            [out, kMax](const void* data, std::size_t len) {
+                if (out->size() + len > kMax) return false;
+                out->insert(out->end(),
+                            static_cast<const std::uint8_t*>(data),
+                            static_cast<const std::uint8_t*>(data) + len);
+                return true;
+            });
     };
     std::string err = do_retr();
     if (err.empty()) return {};
@@ -1981,10 +2029,10 @@ int start_ctrl_mode(Tunnel* t)
         SSL_free(t->ssl);
         t->ssl = nullptr;
     }
-    if (t->fd >= 0) {
-        ::shutdown(t->fd, SHUT_RDWR);
-        ::close(t->fd);
-        t->fd = -1;
+    if (obn::os::socket_valid(t->fd)) {
+        obn::os::shutdown_both(t->fd);
+        obn::os::close_socket(t->fd);
+        t->fd = obn::os::kInvalidSocket;
     }
     t->ctrl_mode = true;
     t->ctrl_stop.store(false);
@@ -2079,12 +2127,14 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
             t->url.host.c_str(), t->url.port);
 
     t->fd = dial(t->url.host, t->url.port, /*timeout_ms=*/5000);
-    if (t->fd < 0) {
+    if (!obn::os::socket_valid(t->fd)) {
         log_fmt(t->logger, t->log_ctx, "Bambu_Open: connect failed: %s",
                 obn::source::get_last_error());
         return -1;
     }
-    log_fmt(t->logger, t->log_ctx, "Bambu_Open: TCP connected, fd=%d", t->fd);
+    log_fmt(t->logger, t->log_ctx,
+            "Bambu_Open: TCP connected, fd=%lld",
+            static_cast<long long>(t->fd));
 
     if (!g_ssl_ctx) {
         set_last_error("SSL_CTX not ready");
@@ -2097,7 +2147,10 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         tunnel_close(t);
         return -1;
     }
-    SSL_set_fd(t->ssl, t->fd);
+    // SSL_set_fd takes int. Windows SOCKET fits in 32 bits in practice
+    // (Microsoft docs that as guaranteed) so the truncating cast is
+    // safe; on POSIX socket_t IS int, so this is a no-op.
+    SSL_set_fd(t->ssl, static_cast<int>(t->fd));
     // SNI: some self-signed printer certs are issued for the device IP;
     // set it anyway so they can still inspect it server-side.
     SSL_set_tlsext_host_name(t->ssl, t->url.host.c_str());
@@ -2376,10 +2429,9 @@ OBN_EXPORT char const* Bambu_GetLastErrorMsg()
 
 OBN_EXPORT void Bambu_FreeLogMsg(tchar const* msg)
 {
-    // We allocated with strdup() in log_fmt(), so use free().
-    // gstbambusrc calls this once per log line; other callers (the
-    // Studio-side `_log` helper in GUI_App / wxMediaCtrl3) do the same.
-    if (msg) std::free(const_cast<char*>(msg));
+    // We allocated with strdup_for_logger() in log_fmt(): strdup() on
+    // POSIX, malloc(wcslen+1) on Windows. Both come back to free().
+    if (msg) std::free(const_cast<tchar*>(msg));
 }
 
 // Legacy probe: the older stub exported this so callers could tell at a

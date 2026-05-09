@@ -1,13 +1,78 @@
-// Smoke test: ensures every symbol Bambu Studio resolves via dlsym() is
-// present in the built .so, and that bambu_network_get_version() returns a
-// non-empty, SLIC3R_VERSION-compatible string.
+// Smoke test: ensures every symbol Bambu Studio resolves via GetProcAddress
+// (Windows) or dlsym (POSIX) is present in the built plugin, that
+// bambu_network_get_version() returns a non-empty, SLIC3R_VERSION-compatible
+// string, and that bambu_network_create_agent / destroy_agent round-trip a
+// std::string across the DLL boundary without crashing.
+//
+// Dual purpose: (a) cheap CI sanity check that mirrors what Studio does at
+// load time; (b) lets us validate Windows builds without depending on
+// Studio's GUI starting up successfully (it has its own pre-existing
+// initialization issues unrelated to this plugin).
 
-#include <dlfcn.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+namespace {
+
+#if defined(_WIN32)
+using lib_handle_t = HMODULE;
+
+lib_handle_t open_lib(const char* path)
+{
+    return ::LoadLibraryA(path);
+}
+
+void* lookup_sym(lib_handle_t h, const char* name)
+{
+    return reinterpret_cast<void*>(::GetProcAddress(h, name));
+}
+
+void close_lib(lib_handle_t h) { ::FreeLibrary(h); }
+
+const char* last_error_str()
+{
+    static char buf[256];
+    DWORD err = ::GetLastError();
+    std::snprintf(buf, sizeof(buf), "win32 error %lu", static_cast<unsigned long>(err));
+    return buf;
+}
+#else
+using lib_handle_t = void*;
+
+lib_handle_t open_lib(const char* path)
+{
+    return ::dlopen(path, RTLD_LAZY);
+}
+
+void* lookup_sym(lib_handle_t h, const char* name)
+{
+    return ::dlsym(h, name);
+}
+
+void close_lib(lib_handle_t h) { ::dlclose(h); }
+
+const char* last_error_str()
+{
+    const char* e = ::dlerror();
+    return e ? e : "(null)";
+}
+#endif
+
+} // namespace
 
 namespace {
 
@@ -153,34 +218,44 @@ const char* kFtSymbols[] = {
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <path-to-libbambu_networking.so>\n", argv[0]);
+        std::fprintf(stderr,
+                     "usage: %s <path-to-bambu_networking.{so,dll}>\n",
+                     argv[0]);
         return 2;
     }
 
-    void* h = dlopen(argv[1], RTLD_LAZY);
+    lib_handle_t h = open_lib(argv[1]);
     if (!h) {
-        std::fprintf(stderr, "dlopen failed: %s\n", dlerror());
+        std::fprintf(stderr, "open_lib failed: %s\n", last_error_str());
         return 1;
     }
 
     int missing = 0;
     for (const char* name : kBambuNetworkSymbols) {
-        if (!dlsym(h, name)) {
+        if (!lookup_sym(h, name)) {
             std::fprintf(stderr, "MISSING: %s\n", name);
             ++missing;
         }
     }
     for (const char* name : kFtSymbols) {
-        if (!dlsym(h, name)) {
+        if (!lookup_sym(h, name)) {
             std::fprintf(stderr, "MISSING: %s\n", name);
             ++missing;
         }
     }
 
-    using fn_ver = std::string (*)();
-    using fn_dbg = bool (*)(bool);
-    auto ver = reinterpret_cast<fn_ver>(dlsym(h, "bambu_network_get_version"));
-    auto dbg = reinterpret_cast<fn_dbg>(dlsym(h, "bambu_network_check_debug_consistent"));
+    using fn_ver       = std::string (*)();
+    using fn_dbg       = bool (*)(bool);
+    using fn_create    = void* (*)(std::string);
+    using fn_destroy   = int (*)(void*);
+    using fn_set_dir   = int (*)(void*, std::string);
+
+    auto ver       = reinterpret_cast<fn_ver>(lookup_sym(h, "bambu_network_get_version"));
+    auto dbg       = reinterpret_cast<fn_dbg>(lookup_sym(h, "bambu_network_check_debug_consistent"));
+    auto create_a  = reinterpret_cast<fn_create>(lookup_sym(h, "bambu_network_create_agent"));
+    auto destroy_a = reinterpret_cast<fn_destroy>(lookup_sym(h, "bambu_network_destroy_agent"));
+    auto set_dir   = reinterpret_cast<fn_set_dir>(lookup_sym(h, "bambu_network_set_config_dir"));
+
     if (ver) {
         std::string v = ver();
         std::printf("version: %s\n", v.c_str());
@@ -193,9 +268,32 @@ int main(int argc, char** argv)
         std::printf("debug_consistent(false)=%d true=%d\n", dbg(false), dbg(true));
     }
 
+    // Round-trip std::string across the DLL boundary. Same flow Studio uses:
+    // create_agent("<log_dir>") -> set_config_dir(agent, "<data_dir>") ->
+    // destroy_agent(agent). On Windows this also exercises the heap shared
+    // between the host (test exe) and the plugin DLL via MSVCRT/UCRT, which
+    // is the most common ABI pitfall when mixing /MT and /MD or different
+    // toolsets.
+    if (create_a && destroy_a) {
+        std::string log_dir = ".";
+        void* agent = create_a(log_dir);
+        std::printf("create_agent(\"%s\") -> %p\n", log_dir.c_str(), agent);
+        if (!agent) {
+            std::fprintf(stderr, "create_agent returned null\n");
+            ++missing;
+        } else {
+            if (set_dir) {
+                int rc = set_dir(agent, std::string("."));
+                std::printf("set_config_dir(\".\") -> %d\n", rc);
+            }
+            int rc = destroy_a(agent);
+            std::printf("destroy_agent -> %d\n", rc);
+        }
+    }
+
     // ft_abi_version must be 1 per FileTransferUtils.hpp.
     using fn_ft = int (*)();
-    auto ft_ver = reinterpret_cast<fn_ft>(dlsym(h, "ft_abi_version"));
+    auto ft_ver = reinterpret_cast<fn_ft>(lookup_sym(h, "ft_abi_version"));
     if (ft_ver) {
         int v = ft_ver();
         std::printf("ft_abi_version: %d\n", v);
@@ -205,7 +303,7 @@ int main(int argc, char** argv)
         }
     }
 
-    dlclose(h);
+    close_lib(h);
     if (missing) {
         std::fprintf(stderr, "%d problem(s) found\n", missing);
         return 1;

@@ -6,6 +6,7 @@
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/os_compat.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -63,28 +64,26 @@ std::string json_scalar_to_string(const obn::json::Value& v)
 std::int64_t parse_iso_utc(const std::string& s)
 {
     if (s.empty()) return 0;
+    // strptime is POSIX-only; MSVC has no equivalent. The format is fixed
+    // ("YYYY-MM-DD HH:MM:SS"), so a tiny sscanf does the job and is more
+    // portable than dragging in std::get_time / strptime polyfills.
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
+    if (std::sscanf(s.c_str(), "%4d-%2d-%2d %2d:%2d:%2d",
+                    &y, &mo, &d, &h, &mi, &se) != 6) {
+        return 0;
+    }
     std::tm t{};
-    // `%F %T` is POSIX strptime shorthand for "%Y-%m-%d %H:%M:%S".
-    if (!::strptime(s.c_str(), "%Y-%m-%d %H:%M:%S", &t)) return 0;
-    // timegm() interprets the struct as UTC. `timegm` is non-POSIX but
-    // available on glibc and on musl; fall back to mktime+TZ math if
-    // not. Our target is Linux/glibc so the ifdef just keeps things
-    // compiling on other libcs.
-#if defined(__GLIBC__) || defined(__APPLE__)
-    return static_cast<std::int64_t>(::timegm(&t));
-#else
-    // Not used in practice; keep it correct-ish.
-    time_t local = ::mktime(&t);
-    if (local == static_cast<time_t>(-1)) return 0;
-    std::tm gm_tm{};
-#if defined(_WIN32)
-    gmtime_s(&gm_tm, &local);
-#else
-    ::gmtime_r(&local, &gm_tm);
-#endif
-    time_t gmt = ::mktime(&gm_tm);
-    return static_cast<std::int64_t>(local + (local - gmt));
-#endif
+    t.tm_year = y - 1900;
+    t.tm_mon  = mo - 1;
+    t.tm_mday = d;
+    t.tm_hour = h;
+    t.tm_min  = mi;
+    t.tm_sec  = se;
+    // The struct is interpreted as UTC; timegm()/_mkgmtime() do not apply
+    // a TZ offset. obn::os::timegm_safe maps to the right one per platform.
+    auto tt = obn::os::timegm_safe(&t);
+    if (tt == static_cast<std::time_t>(-1)) return 0;
+    return static_cast<std::int64_t>(tt);
 }
 
 // Parse a server JSON body. Empty / unparseable bodies become an empty

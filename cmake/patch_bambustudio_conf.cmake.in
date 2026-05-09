@@ -11,9 +11,21 @@
 set(_expected_prefixes "@OBN_CLIENT_EXPECTED_PREFIXES@")
 set(_conf_name         "@OBN_CLIENT_CONF_NAME@")
 
-set(_home "$ENV{HOME}")
-if(_home STREQUAL "")
-    message(STATUS "obn: HOME is not set, skipping ${_conf_name} patch")
+# Pick the right per-user environment variable as our "config dir
+# discoverable" check. On Linux/macOS we use $HOME; on Windows we use
+# %APPDATA% (Roaming), which is what wxStandardPaths::Get().GetUserDataDir()
+# returns. Matching this exactly is what guarantees Studio reads the file
+# we just patched.
+if(CMAKE_HOST_WIN32)
+    set(_user_root "$ENV{APPDATA}")
+    set(_user_root_label "APPDATA")
+else()
+    set(_user_root "$ENV{HOME}")
+    set(_user_root_label "HOME")
+endif()
+
+if(_user_root STREQUAL "")
+    message(STATUS "obn: ${_user_root_label} is not set, skipping ${_conf_name} patch")
 else()
     set(_match FALSE)
     foreach(_p IN LISTS _expected_prefixes)
@@ -26,14 +38,15 @@ else()
         message(STATUS
             "obn: install prefix (${CMAKE_INSTALL_PREFIX}) is not the default Bambu Studio config dir; "
             "${_conf_name} is untouched. Edit it by hand if needed: "
-            "set \"installed_networking\":\"1\" and \"update_network_plugin\":\"false\" under \"app\".")
+            "set \"installed_networking\":\"1\" and \"update_network_plugin\":\"false\" under \"app\" "
+            "(plus \"ignore_module_cert\":\"1\" on Windows/macOS).")
     else()
         set(_conf "${CMAKE_INSTALL_PREFIX}/${_conf_name}")
         if(NOT EXISTS "${_conf}")
             message(STATUS
                 "obn: ${_conf} does not exist yet -- launch Bambu Studio once "
-                "to create it, then re-run 'make install' (or set "
-                "\"installed_networking\" / \"update_network_plugin\" by hand).")
+                "to create it, then re-run 'make install' / 'cmake --install' "
+                "(or set the keys by hand).")
         else()
             file(READ "${_conf}" _orig)
             set(_body "${_orig}")
@@ -45,14 +58,51 @@ else()
             else()
                 string(JSON _body SET "${_body}" app installed_networking "\"1\"")
                 string(JSON _body SET "${_body}" app update_network_plugin "\"false\"")
-                if(NOT _body STREQUAL _orig)
+                # Studio's GUI_App::on_init_network reads ignore_module_cert
+                # before LoadLibrary'ing bambu_networking.dll: it skips the
+                # IsSamePublisher check and lets unsigned plugins load.
+                # Linux Studio does not perform any signature check, so the
+                # key is a no-op there; only set it where it actually does
+                # something.
+                if(CMAKE_HOST_WIN32 OR CMAKE_HOST_APPLE)
+                    string(JSON _body SET "${_body}" app ignore_module_cert "\"1\"")
+                endif()
+
+                # Strip the trailing "# MD5 checksum <hex>" line from the
+                # original before comparison: string(JSON SET) returns the
+                # JSON object without trailing comments, so a verbatim
+                # _body vs _orig compare would always say "changed" even
+                # for a no-op patch and rewrite the file (invalidating
+                # the MD5 the user already has on disk).
+                string(REGEX REPLACE "[\r\n]+# MD5 checksum[^\r\n]*[\r\n]*$" ""
+                    _orig_json "${_orig}")
+
+                if(NOT _body STREQUAL _orig_json)
                     file(WRITE "${_conf}.obn-bak" "${_orig}")
-                    file(WRITE "${_conf}" "${_body}")
+                    # Bambu Studio refuses to load a conf without the
+                    # trailing "# MD5 checksum <32 hex>" line and throws
+                    # std::out_of_range during AppConfig::load -- this is
+                    # the "Bambu Studio GUI initialization failed: invalid
+                    # string position" dialog that pops up before our
+                    # plugin even gets a chance to load. Append a
+                    # placeholder line in the exact format Studio writes
+                    # itself; on the next clean save Studio will recompute
+                    # and overwrite the hash with the real one.
+                    file(WRITE "${_conf}"
+                        "${_body}\n# MD5 checksum 00000000000000000000000000000000\n")
                     message(STATUS
                         "obn: patched ${_conf} (backup saved to ${_conf}.obn-bak)")
+                    if(EXISTS "${_conf}.bak")
+                        message(STATUS
+                            "obn: a Studio-managed ${_conf}.bak is present; "
+                            "Studio will refresh it on next clean save. "
+                            "If Studio still refuses to start, remove that .bak "
+                            "manually so it cannot fall back to the pre-patch copy.")
+                    endif()
                 else()
                     message(STATUS
-                        "obn: ${_conf} already has installed_networking=1 and update_network_plugin=false")
+                        "obn: ${_conf} already has installed_networking=1, "
+                        "update_network_plugin=false (and ignore_module_cert=1 on Windows/macOS)")
                 endif()
             endif()
         endif()

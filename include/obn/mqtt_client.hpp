@@ -26,6 +26,15 @@ struct ConnectConfig {
     // (e.g. CN=22E8BJ610801473) as the CN, and Studio connects by IP, so
     // hostname checks never match. Kept even when ca_file is set.
     bool        tls_insecure = true;
+    // Force cert_reqs=SSL_VERIFY_NONE: SSL handshake proceeds without
+    // checking that the server's certificate is signed by anything we
+    // trust. Used for the cloud broker on Windows where we lack a
+    // public CA bundle (vcpkg's openssl-static-md ships no default
+    // trust store): we still hand mosquitto a real PEM file for
+    // tls_set's parameter validation, but the chain is intentionally
+    // not verified. Defaults to false so LAN keeps validating against
+    // Studio's printer.cer bundle.
+    bool        tls_skip_chain_verify = false;
     int         keepalive_s  = 60;
     std::string client_id;
 };
@@ -71,6 +80,14 @@ public:
 
     // Maps a libmosquitto return code to a human-readable string.
     static const char* err_str(int rc);
+
+    // Like err_str(), but on Windows also folds in the most-recent
+    // WSAGetLastError() value when rc is MOSQ_ERR_ERRNO. mosquitto_strerror
+    // for ERRNO falls back to strerror(errno), which on Windows yields
+    // "No error" because Winsock failures land in WSAGetLastError, not
+    // CRT errno. Capture the WSA code explicitly via this helper at the
+    // failure site so the log actually points to the underlying problem.
+    static std::string detailed_err(int rc, int wsa_err = 0);
 
 private:
     static void s_on_connect(::mosquitto* m, void* obj, int rc);

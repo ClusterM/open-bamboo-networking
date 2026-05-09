@@ -95,14 +95,20 @@ Please note:
 
 ## Supported platforms
 
-- Linux x86_64 (primary target, gcc 13+/15+, libstdc++new C++11 ABI).
+- Linux x86_64 (primary target, gcc 13+/15+, libstdc++ new C++11 ABI).
 - Linux aarch64 (primary target, cross-compile-friendly, see `cmake/toolchains/`).
+- Windows x64 (full feature parity, including camera live view via a
+  hand-rolled DirectShow Source Filter; see [Build for Windows](#build-for-windows)).
+  Built with **MSVC from Visual Studio 2019** (toolset v142) to match the
+  STL Bambu Studio itself ships with — anything else mangles
+  `std::string`/`std::map`/`std::function` across the DLL boundary. Studio
+  enforces a matching Authenticode publisher on the plugin DLL; we side-step
+  that by setting `ignore_module_cert = 1` in `BambuStudio.conf`
+  (the install step does this automatically).
 
-Windows and macOS are architected for but not yet built and tested: the ABI uses
-`std::string`/`std::map`/`std::function` across the boundary, which means we
-would need to match MSVC's STL on Windows and Xcode/libc++ on macOS. Studio
-also enforces a matching code-signing publisher on those OSes unless the user
-sets `ignore_module_cert = 1`.
+macOS is architected for but not yet built and tested: it would need an
+Xcode/libc++ build and the same Authenticode-equivalent escape hatch via
+`ignore_module_cert`.
 
 ## Supported Bambu Studio versions
 
@@ -273,7 +279,8 @@ except for the storage-root layout (see hardware matrix).
 | --------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Linux x86_64    | ✅              | Primary development and test target.                                                                                                                                                                                                         |
 | Linux aarch64   | ✅ (not tested) | Cross-compile toolchain in `cmake/toolchains/`; not verified on-device yet.                                                                                                                                                                  |
-| Windows / macOS | ❌              | Architected for but not built — ABI uses `std::string`/`std::map`/`std::function` across the `dlsym` boundary, which needs MSVC STL on Windows and Xcode libc++ on macOS. Plus Studio enforces code-signing publisher matches on those OSes. |
+| Windows x64     | ✅              | Built with MSVC v142 (Visual Studio 2019) so the `std::string` / `std::map` ABI matches Studio's own DLLs. Camera live view uses a hand-rolled DirectShow Source Filter (CLSID `{233E64FB-…}`) that wxMediaCtrl2 picks up via the `bambu:` URL scheme registration. See [Build for Windows](#build-for-windows). |
+| macOS           | ❌              | Architected for but not built — Studio enforces code-signing publisher matches on macOS and the camera path goes through `OBJC_CLASS_$_BambuPlayer` instead of the C ABI. Not in scope yet.                                                  |
 
 
 ### Hardware reality (what each model actually does)
@@ -706,6 +713,223 @@ runs the smoke tests via `ctest`.
 options). Driving **CMake** directly works the same way; see `OBN_`* and
 other cache variables in `CMakeLists.txt`.
 
+### Build for Windows
+
+Bambu Studio for Windows is a 64-bit MSVC build (Visual Studio 2019, see
+`3rd_party/BambuStudio/build_win.bat`). The plugin ABI passes
+`std::string`, `std::map` and `std::function` across the DLL boundary, so
+**the plugin must be built with the same compiler and STL Studio uses** —
+i.e. MSVC from Visual Studio 2019 (toolset v142). MinGW or any libstdc++
+flavour will silently mangle types and crash on the first `bambu_network_*`
+call. C++ libraries (OpenSSL, libcurl, zlib, libmosquitto) come from
+[vcpkg](https://github.com/microsoft/vcpkg) in manifest mode (`vcpkg.json`).
+
+Prerequisites:
+
+- Visual Studio 2019 with the *Desktop development with C++* workload
+  (toolset v142). Newer toolsets *may* work but the std::string layout
+  across the DLL boundary is not guaranteed.
+- CMake ≥ 3.20 (the one bundled with VS 2019 works).
+- vcpkg checked out somewhere on disk; export `VCPKG_ROOT` so PowerShell
+  can find it. The vcpkg shipped with Visual Studio 2022 (under
+  `…\VC\vcpkg\`) works as well — `vcpkg.json` pins a `builtin-baseline`
+  SHA so modern, strict-manifest vcpkg installations are happy out of
+  the box.
+
+Recommended path through the supplied PowerShell wrapper (mirrors the POSIX
+`./configure`):
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+.\configure.ps1                                # bambu_studio, x64-windows-static
+cmake --build   build --config Release
+cmake --install build --config Release
+```
+
+The wrapper's full option list is `Get-Help .\configure.ps1 -Detailed`; the
+useful ones:
+
+| Flag                           | Default                | Equivalent CMake var                                    |
+| ------------------------------ | ---------------------- | ------------------------------------------------------- |
+| `-ClientType bambu_studio`     | `bambu_studio`         | `-DOBN_CLIENT_TYPE=…` (also `orca_slicer`)              |
+| `-Prefix C:\Foo\BambuStudio`   | `%APPDATA%\<client>`   | `-DCMAKE_INSTALL_PREFIX=…`                              |
+| `-WithVersion 02.06.01.99`     | auto-detected (see below) | `-DOBN_VERSION=…`                                    |
+| `-VcpkgTriplet x64-windows-static-md` | static deps + dynamic CRT (matches Studio) | `-DVCPKG_TARGET_TRIPLET=…` (use `x64-windows` for shared deps) |
+| `-VcpkgRoot C:\vcpkg`          | `$env:VCPKG_ROOT`      | inserted into `-DCMAKE_TOOLCHAIN_FILE=…`                |
+| `-EnableTests:$true`           | `$false`               | `-DOBN_BUILD_TESTS=…` (builds `probe_plugin.exe` on Windows) |
+| `-PatchConf:$false`            | `$true`                | `-DOBN_PATCH_CLIENT_CONF=…`                             |
+| `-RegisterDShowFilter:$false`  | `$true`                | `-DOBN_REGISTER_DSHOW_FILTER=…` (skip `regsvr32` step)  |
+
+The `-WithVersion` auto-detect prefers Studio's `bambu-studio.exe` `FileVersion`
+resource (read via the Add/Remove Programs registry entry) over the
+`app.version` value in `BambuStudio.conf`, because the conf can lag the
+binary by one minor version after a Studio patch — and Studio compares the
+*binary's* `SLIC3R_VERSION` against our plugin's reported version. Picking
+the conf in that case would silently fail the compatibility gate and Studio
+would discard our DLL on every launch.
+
+Driving CMake directly is also fine:
+
+```powershell
+cmake -S . -B build -G "Visual Studio 16 2019" -A x64 `
+    -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake `
+    -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+    -DOBN_VERSION=02.06.01.99 -DOBN_CLIENT_TYPE=bambu_studio
+cmake --build   build --config Release
+cmake --install build --config Release
+```
+
+`cmake --install` drops three DLLs into `%APPDATA%\BambuStudio\plugins\`
+(or `%APPDATA%\OrcaSlicer\plugins\` for Orca):
+
+- `bambu_networking.dll` — the plugin itself. Studio: this exact name (Studio's
+  `NetworkAgent::initialize_network_module` hard-codes it). Orca: gets renamed
+  to `bambu_networking_<network_plugin_version>.dll` by `cmake --install`,
+  matching Orca's `NetworkAgent::get_filename()` lookup.
+- `BambuSource.dll` — full BambuSource port: file browser (PrinterFileSystem
+  CTRL bridge over FTPS) plus a hand-rolled DirectShow Source Filter for
+  the camera live view. Both protocols (TLS:6000 framed-JPEG used by
+  A1 / P1 / P1P and RTSPS H.264 used by X1 / P1S / P2S / H-series / X2D)
+  are implemented in-process; no live555 / ffmpeg / GStreamer is linked.
+- `live555.dll` — Bambu Studio: an empty stub (current Windows Studio
+  uses `wxMediaCtrl3` and never calls into live555). OrcaSlicer: keeps
+  the vendor-supplied `live555.dll` (~4.4 MB) that the slicer already
+  installed alongside its own networking plugin. Orca's `wxMediaCtrl2`
+  does not link directly against live555 either, but other code paths
+  inside the slicer may load it lazily, so the safe rule is "ship
+  Orca's own live555 in Orca, ship our stub in Studio."
+  `cmake --install` enforces this with a size-based heuristic: if
+  `<prefix>/plugins/live555.dll` already exists and is larger than
+  64 kB, it is presumed to be a real vendor build and left alone; if
+  it is missing or looks like a previous obn stub (≤ 64 kB), the
+  ~10 kB stub is written. Real vendor live555 builds we have observed
+  are at least 4 MB on every platform, so the threshold is generous.
+
+It also patches `%APPDATA%\BambuStudio\BambuStudio.conf` (or `OrcaSlicer.conf`):
+under the `app` object it sets `installed_networking`, `update_network_plugin`
+and **`ignore_module_cert = "1"`**. The last one is non-negotiable on
+Windows: Studio's `GUI_App::on_init_network` calls `IsSamePublisher` on the
+plugin DLL and refuses to load anything whose Authenticode certificate does
+not match Studio's own. Setting `ignore_module_cert` flips Studio into the
+no-validation path and lets our unsigned DLL through. A `.obn-bak` backup
+of the original conf is left next to it.
+
+#### Camera live view: DirectShow registration
+
+On Windows Studio's `wxMediaCtrl2` doesn't drive video through the
+`Bambu_*` C ABI like it does on Linux — it asks COM for an in-proc
+filter registered against `bambu:` URLs (CLSID
+`{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}`). To make Studio find ours
+the install step automatically runs:
+
+```powershell
+regsvr32 /s "%APPDATA%\BambuStudio\plugins\BambuSource.dll"
+```
+
+This writes four keys under `HKEY_CURRENT_USER\SOFTWARE\Classes\` (no
+admin rights required):
+
+- `CLSID\{233E64FB-…}\(Default) = "Bambu Source Filter"`
+- `CLSID\{233E64FB-…}\InprocServer32\(Default) = <full path to DLL>`,
+  `ThreadingModel = "Both"`
+- `bambu\(Default) = "URL:Bambu Source"`, `URL Protocol = ""`
+- `bambu\Source Filter\(Default) = "{233E64FB-…}"`
+
+Pass `-RegisterDShowFilter:$false` to `configure.ps1` (or
+`-DOBN_REGISTER_DSHOW_FILTER=OFF`) to skip this step; you can register
+later by running the `regsvr32 /s …` line above by hand. Uninstall via
+`regsvr32 /u "<path>\BambuSource.dll"` — that drops both the CLSID
+subtree and the `bambu` URL handler.
+
+#### Camera live view: decoder requirements
+
+Our DirectShow filter only emits raw bytes — H.264 Annex-B for
+RTSPS-class printers and JPEG payloads for the framed-JPEG class. The
+filter graph still needs a working **video decoder** downstream:
+
+- **H.264** (X1, P1S, P2S, H-series, X2D): provided by Microsoft's
+  built-in *H.264 Decoder MFT* in any standard Windows 10/11 install.
+  Editions branded *N* / *KN* (sold without media features) are an
+  exception — install the [Media Feature Pack][mfp] from Microsoft
+  Update or the symptom is "player malfunctioning" with no picture.
+- **MJPEG** (A1, A1 mini, P1, P1P): provided by Microsoft's built-in
+  *MJPEG Decoder Filter*; it is part of all Windows editions and
+  doesn't need a separate download.
+
+[mfp]: https://learn.microsoft.com/en-us/windows/uwp/audio-video-camera/media-feature-pack
+
+If a third-party codec pack (K-Lite, LAV) is installed, the graph
+builder may pick its decoder instead — that is fine, we don't
+care which downstream filter consumes the byte-stream as long as
+it accepts `MEDIASUBTYPE_H264` (Annex-B) or `MEDIASUBTYPE_MJPG`.
+
+If `cmake --install` fails to write into `%APPDATA%\…` (e.g. the user
+profile is on a network share), pass `-Prefix` to redirect the install to a
+local staging tree, then copy the `plugins\` folder over by hand. The conf
+patch is skipped automatically when the prefix does not match the default
+client dir, so a staging build never touches the live `BambuStudio.conf`.
+
+#### Windows-specific footguns to be aware of
+
+If you start poking at the source filter or the `Bambu_*` ABI on
+Windows, three sharp edges have already been ground off — they are
+worth recording so the next time someone hits a similar symptom they
+don't have to re-debug from a 0xC0000409 minidump:
+
+1. **`setvbuf(fp, NULL, _IOLBF, 0)` is undefined on the MSVC CRT.**
+   The MSVC `_setvbuf_internal` enforces "if `buffer == NULL`, the only
+   accepted mode is `_IONBF` (size 0)" via `_invalid_parameter` →
+   `__fastfail(FAST_FAIL_INVALID_ARG)` → `STATUS_STACK_BUFFER_OVERRUN`.
+   The same call is silently accepted by glibc/musl. Cross-platform
+   logger code that wants line-buffering-equivalent behaviour on
+   Windows must either supply a real buffer or fall back to `_IONBF`
+   and let each `fprintf` flush. (See [stubs/source_log.cpp][source_log_cpp]
+   `mirror_log_fp()` and [src/log.cpp][src_log_cpp] `open_file_locked()`.)
+2. **`wxURI` collapses `bambu:///rtsps___…` to `bambu://rtsps___…`.**
+   Orca/Studio's `MediaPlayCtrl` builds the triple-slash form ("scheme,
+   empty authority, path"), but wxURI's canonicaliser sees what looks
+   like userinfo (`rtsps___bblp:pwd`) and host (`ip`) inside the path,
+   reparses, and re-emits the URI with a single `//` before handing it
+   to `IFileSourceFilter::Load`. A parser keyed strictly off
+   `bambu:///rtsps___` will reject every Orca camera URL with
+   `E_INVALIDARG`. Accept any number of `/` characters after `bambu:`.
+3. **DirectShow source must push samples while the graph is `Paused`,
+   not just `Running`.** wmp/wxMediaCtrl keeps the graph in
+   `State_Paused` until the renderer receives its first sample (which
+   is what triggers the transition to `State_Running`). A worker that
+   gates `IMemInputPin::Receive` on `State_Running` deadlocks the
+   graph: renderer waits for the first sample, source waits for
+   `Running`, the user sees an infinite "playing" indicator with a
+   black frame, and the RTSP server eventually disconnects on TCP
+   back-pressure. Standard DirectShow pattern: commit the allocator in
+   `Pause()` and start streaming immediately.
+
+[source_log_cpp]: stubs/source_log.cpp
+[src_log_cpp]: src/log.cpp
+
+#### Smoke-testing the build
+
+Pass `-EnableTests:$true` to `configure.ps1` (or `-DOBN_BUILD_TESTS=ON` to
+cmake) to also build `probe_plugin.exe`. It loads the plugin DLL via
+`LoadLibrary`, resolves every `bambu_network_*` and `ft_*` symbol Studio
+asks for via `GetProcAddress`, then round-trips a `std::string` through
+`bambu_network_create_agent` / `set_config_dir` / `destroy_agent`. That
+exercises the same C++ ABI surface Studio uses, but without depending on
+Studio's own initialization succeeding — handy when triaging a Studio
+crash that fires before plugin load. Expected output ends with
+`OK (all 108 + 21 symbols present)`:
+
+```powershell
+.\build\Release\probe_plugin.exe "$env:APPDATA\BambuStudio\plugins\bambu_networking.dll"
+# version: 02.06.01.99
+# debug_consistent(false)=1 true=1
+# create_agent(".") -> 0000000000000000
+# set_config_dir(".") -> 0
+# destroy_agent -> 0
+# ft_abi_version: 1
+# OK (all 108 + 21 symbols present)
+```
+
 ### First-time Studio configuration
 
 `make install` edits `~/.config/BambuStudio/BambuStudio.conf` for you on the
@@ -854,10 +1078,16 @@ you opt in — this keeps disk noise down for everyday use.
 
 - **Default:** stderr only (`OBN_LOG_STDERR=1`), each line prefixed with
 `[obn]`  so it is easy to grep apart from Bambu Studio’s own stderr.
-- **File next to Studio’s data directory:** set `OBN_LOG_TO_FILE=1` to
-append to `<data_dir>/obn.log`, where `data_dir` is the path Studio
-passes to `bambu_network_create_agent` (typically
-`~/.config/BambuStudio/obn.log` on Linux).
+- **File next to the slicer's data directory:** set `OBN_LOG_TO_FILE=1`
+to append to `<data_dir>/obn.log`, where `data_dir` is the path the
+slicer passes to `bambu_network_create_agent`. Typical paths:
+`~/.config/BambuStudio/obn.log` (Linux Studio),
+`~/.config/OrcaSlicer/obn.log` (Linux Orca),
+`%APPDATA%\BambuStudio\obn.log` (Windows Studio),
+`%APPDATA%\OrcaSlicer\obn.log` (Windows Orca). The mirror file for
+`BambuSource.dll` (`obn-bambusource.log`) follows the same dispatch:
+it auto-detects the host slicer from the DLL's own install path so
+Studio and Orca never share a log file.
 - **Explicit path:** set `OBN_LOG_FILE` to an absolute path. Use
 `/dev/null` to disable the file sink while keeping stderr. An empty
 `OBN_LOG_FILE=` means “no file from env” (stderr only unless
@@ -931,14 +1161,17 @@ unhelpful.
 | Variable                     | Default                                                                                                                                                                                          | Effect                                                                                                                                                                |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `OBN_BAMBUSOURCE_LOG_LEVEL`  | `info`                                                                                                                                                                                           | `trace` / `debug` / `info` / `warn` / `error` / `off`. Filters both the file mirror and the callback the slicer gets.                                                 |
-| `OBN_BAMBUSOURCE_LOG_FILE`   | first writable of `$XDG_STATE_HOME/bambu-studio/obn-bambusource.log`, `$HOME/.local/state/bambu-studio/obn-bambusource.log`, `/tmp/obn-bambusource.log`                                          | Absolute path to the file mirror, or `off` / `none` / empty / `0` to disable, or `stderr` / `-` to route to stderr instead of a file.                                 |
+| `OBN_BAMBUSOURCE_LOG_FILE`   | Linux: first writable of `$XDG_STATE_HOME/bambu-studio/obn-bambusource.log`, `$HOME/.local/state/bambu-studio/obn-bambusource.log`, `/tmp/obn-bambusource.log`. Windows: first writable of `<host slicer's data dir>\obn-bambusource.log` (i.e. `%APPDATA%\BambuStudio\obn-bambusource.log` when loaded by Bambu Studio, `%APPDATA%\OrcaSlicer\obn-bambusource.log` when loaded by OrcaSlicer — auto-detected from the DLL's own install path), then `%LOCALAPPDATA%\BambuStudio\obn-bambusource.log`, then `%TEMP%\obn-bambusource.log`. | Absolute path to the file mirror, or `off` / `none` / empty / `0` to disable, or `stderr` / `-` to route to stderr instead of a file.                                 |
 
 The mirror file rolls every line through `[level]` plus a timestamp.
-Lines are tagged with `rtsp:` (handshake / DESCRIBE / SETUP / PLAY) and
+Lines are tagged with `rtsp:` (handshake / DESCRIBE / SETUP / PLAY),
 `rtsp_passthrough:` (the worker that hands the byte stream to
-gstbambusrc). If you see no video despite a successful `rtsp: PLAY ok`
-the issue is slicer-side (missing GStreamer H.264 decoder, e.g.
-`gstreamer1.0-plugins-bad` / `gstreamer1.0-libav`).
+gstbambusrc on Linux), and on Windows also `dshow:` (the DirectShow
+filter's connection / sample pump). If you see no video despite a
+successful `rtsp: PLAY ok` the issue is slicer-side: on Linux, missing
+GStreamer H.264 decoder (`gstreamer1.0-plugins-bad` /
+`gstreamer1.0-libav`); on Windows, missing H.264 MFT (Media Feature
+Pack on N/KN editions).
 
 ## License
 

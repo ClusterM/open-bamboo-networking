@@ -1,5 +1,7 @@
 #include "obn/log.hpp"
 
+#include "obn/os_compat.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -9,10 +11,6 @@
 #include <ctime>
 #include <mutex>
 #include <string>
-#include <strings.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 namespace obn::log {
 
@@ -38,7 +36,9 @@ static bool env_wants_default_file(const char* v)
 {
     if (!v || !*v) return false;
     if (v[0] == '0' && v[1] == '\0') return false;
-    if (!::strcasecmp(v, "false") || !::strcasecmp(v, "no") || !::strcasecmp(v, "off"))
+    if (!obn::os::strcasecmp_portable(v, "false") ||
+        !obn::os::strcasecmp_portable(v, "no")    ||
+        !obn::os::strcasecmp_portable(v, "off"))
         return false;
     return true;
 }
@@ -46,13 +46,13 @@ static bool env_wants_default_file(const char* v)
 Level parse_level(const char* s)
 {
     if (!s || !*s) return LVL_INFO;
-    if (!::strcasecmp(s, "trace")) return LVL_TRACE;
-    if (!::strcasecmp(s, "debug")) return LVL_DEBUG;
-    if (!::strcasecmp(s, "info"))  return LVL_INFO;
-    if (!::strcasecmp(s, "warn"))  return LVL_WARN;
-    if (!::strcasecmp(s, "warning")) return LVL_WARN;
-    if (!::strcasecmp(s, "error")) return LVL_ERROR;
-    if (!::strcasecmp(s, "off"))   return LVL_OFF;
+    if (!obn::os::strcasecmp_portable(s, "trace")) return LVL_TRACE;
+    if (!obn::os::strcasecmp_portable(s, "debug")) return LVL_DEBUG;
+    if (!obn::os::strcasecmp_portable(s, "info"))  return LVL_INFO;
+    if (!obn::os::strcasecmp_portable(s, "warn"))  return LVL_WARN;
+    if (!obn::os::strcasecmp_portable(s, "warning")) return LVL_WARN;
+    if (!obn::os::strcasecmp_portable(s, "error")) return LVL_ERROR;
+    if (!obn::os::strcasecmp_portable(s, "off"))   return LVL_OFF;
     return LVL_INFO;
 }
 
@@ -74,7 +74,10 @@ void open_file_locked(State& s, const std::string& path)
     if (s.fp && s.fp != stderr) std::fclose(s.fp);
     s.fp = std::fopen(path.c_str(), "a");
     if (s.fp) {
-        std::setvbuf(s.fp, nullptr, _IOLBF, 4096);
+        // _IOLBF combined with a NULL buffer is rejected by the MSVC CRT
+        // (FAST_FAIL_INVALID_ARG); _IONBF is the portable way to get
+        // immediate flushing without supplying our own buffer.
+        std::setvbuf(s.fp, nullptr, _IONBF, 0);
     }
 }
 
@@ -101,7 +104,7 @@ void ensure_initialized_locked(State& s)
 
 long tid()
 {
-    return static_cast<long>(::syscall(SYS_gettid));
+    return obn::os::thread_id();
 }
 
 void format_timestamp(char* buf, std::size_t n)
@@ -111,7 +114,7 @@ void format_timestamp(char* buf, std::size_t n)
     auto        tt   = system_clock::to_time_t(now);
     auto        us   = duration_cast<microseconds>(now.time_since_epoch()).count() % 1'000'000;
     std::tm     tm{};
-    ::localtime_r(&tt, &tm);
+    obn::os::localtime_safe(tt, &tm);
     std::snprintf(buf, n, "%04d-%02d-%02d %02d:%02d:%02d.%06lld",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec,
@@ -128,7 +131,10 @@ void configure_from_log_dir(const std::string& log_dir)
     if (s.explicit_path || log_dir.empty()) return;
     if (!env_wants_default_file(std::getenv("OBN_LOG_TO_FILE"))) return;
     std::string path = log_dir;
-    if (path.back() != '/') path += '/';
+    // Tolerate either separator: log_dir comes from Studio (Windows uses
+    // backslashes), and trailing-slash policy is left to the caller.
+    char last = path.back();
+    if (last != '/' && last != '\\') path += '/';
     path += "obn.log";
     open_file_locked(s, path);
     // Note: we do not log the switch here to avoid recursion.

@@ -32,9 +32,11 @@ Key players:
 | UI job "download & install" | `src/slic3r/GUI/Jobs/UpgradeNetworkJob.{hpp,cpp}` |
 | **`libBambuSource` C ABI** (`Bambu_*`) | `src/slic3r/GUI/Printer/BambuTunnel.h` |
 | **`libBambuSource` loader / shim** | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp` (`StaticBambuLib`) |
-| **GStreamer source element (Linux/Windows DShow shim)** | `src/slic3r/GUI/Printer/gstbambusrc.{c,h}` |
+| **GStreamer source element (Linux only)** | `src/slic3r/GUI/Printer/gstbambusrc.{c,h}` |
 | **macOS native player wrapper** | `src/slic3r/GUI/wxMediaCtrl2.mm`, `src/slic3r/GUI/BambuPlayer/BambuPlayer.h` |
-| **Linux/Windows wxMediaCtrl shim** | `src/slic3r/GUI/wxMediaCtrl2.{cpp,h}` |
+| **Linux wxMediaCtrl shim (gstbambusrc registration)** | `src/slic3r/GUI/wxMediaCtrl2.{cpp,h}` (`__LINUX__` branch) |
+| **Windows / Linux camera widget — Studio (current)** | `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}` (BambuStudio commit `94d91be60`, June 2024). Drives `Bambu_*` C ABI directly + decodes via `AVVideoDecoder` (FFmpeg). |
+| **Windows / Linux camera widget — Orca (and pre-`94d91be6` Studio)** | `src/slic3r/GUI/wxMediaCtrl2.{cpp,h}` Windows branch. Drives wxWidgets DirectShow backend → `bambu:` URL scheme → CLSID `{233E64FB-…}` source filter |
 | **Camera UI panel** | `src/slic3r/GUI/MediaPlayCtrl.{cpp,h}` |
 | **File browser UI / CTRL protocol consumer** | `src/slic3r/GUI/Printer/PrinterFileSystem.{cpp,h}`, `src/slic3r/GUI/MediaFilePanel.{cpp,h}` |
 
@@ -1473,7 +1475,24 @@ Built in `PrinterFileSystem::Reconnect` via `MediaFilePanel`. The format is iden
 
 ### 7.4. Per-platform camera back-end (the critical part)
 
-This is where the three platforms diverge sharply. The key insight: on **Linux** and **Windows** Studio draws video frames itself (a GStreamer pipeline / a DirectShow filter graph living *inside* Studio's binary), and only calls into `libBambuSource` for source-side I/O. On **macOS** Studio draws nothing of its own — it expects an Objective-C class **inside `libBambuSource.dylib`** to render frames straight into an `NSView`/`AVSampleBufferDisplayLayer`. The implication: a single C-ABI build of `libBambuSource` is enough for Linux and Windows; macOS additionally requires native AppKit/AVFoundation code shipped inside the same dylib.
+This used to be the section where the three platforms diverged sharply, with **Windows** routing the camera through a DirectShow source filter inside `BambuSource.dll`. **That changed upstream in BambuStudio commit `94d91be60` ("NEW: reimpl wxMediaCtrl from ffmpeg", June 2024)**, which introduced `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}`. Studio's `MediaPlayCtrl` was migrated to `wxMediaCtrl3` as part of the same series, and from that point on **Windows Studio uses the `Bambu_*` C ABI directly**, exactly like Linux: `wxMediaCtrl3::PlayThread` calls `Bambu_Create` → `Bambu_Open` → `Bambu_StartStream` → `Bambu_ReadSample`, then decodes each access unit with FFmpeg via `AVVideoDecoder` and blits the resulting `wxBitmap` into a plain `wxWindow`.
+
+`wxMediaCtrl2.{cpp,h}` is still in the BambuStudio tree and still has the Windows DirectShow stub from before the migration. It is no longer instantiated by Studio. The OrcaSlicer fork has not picked up the FFmpeg-based widget — it still uses `wxMediaCtrl2` and therefore still requires the DirectShow filter on Windows.
+
+So the matrix is now:
+
+| Slicer / version | Linux | Windows | macOS |
+|---|---|---|---|
+| **BambuStudio** post `94d91be60` (≈ v01.10+ / current `v02.06.x`) | `wxMediaCtrl3` → `Bambu_*` C ABI → `AVVideoDecoder` (FFmpeg) → wxWindow | **same**: `wxMediaCtrl3` → `Bambu_*` C ABI → `AVVideoDecoder` → wxWindow | `wxMediaCtrl2.mm` → Objective-C `BambuPlayer` class via `dlsym` |
+| **BambuStudio** pre-`94d91be60` and **OrcaSlicer (current)** | `wxMediaCtrl2` → `gstbambusrc` (statically linked into Studio) → `bambulib_get()` → `Bambu_*` C ABI | `wxMediaCtrl2` → `wxMediaCtrl::Load(wxURI("bambu:..."))` → wxWidgets DirectShow backend → COM source filter (CLSID `{233E64FB-…}`) inside `BambuSource.dll` | `wxMediaCtrl2.mm` → Objective-C `BambuPlayer` |
+
+Practical consequences for `libBambuSource` implementers:
+
+- A portable C-ABI implementation of `libBambuSource` covers **all three platforms** when the user runs current BambuStudio. The Windows DirectShow filter is no longer on the hot path.
+- For OrcaSlicer (and any pre-`94d91be60` Studio install) the Windows DirectShow filter is still required: without `CLSID {233E64FB-…}` registered against the `bambu:` URL scheme, Orca cannot play the camera at all and falls into the "BambuSource has not correctly been registered" dialog.
+- macOS still additionally requires an Objective-C `BambuPlayer` class inside the dylib regardless of Studio version; that path was not touched by the FFmpeg migration.
+
+The subsections below describe each back-end. §7.4.1 (Linux gstbambusrc) and §7.4.3 (macOS BambuPlayer) are unchanged. §7.4.2 (Windows DirectShow) is now an Orca-only / legacy-Studio path. §7.4.4 documents the new `wxMediaCtrl3` flow that current Studio actually uses on Windows.
 
 #### 7.4.1. Linux: `gstbambusrc` baked into Studio
 
@@ -1516,9 +1535,11 @@ So on Linux the camera flow is:
 
 i.e. **on Linux the C ABI is sufficient**. No Linux-specific code needs to live inside `libBambuSource.so`.
 
-#### 7.4.2. Windows: DirectShow filter, separate library
+#### 7.4.2. Windows (Orca / legacy Studio): DirectShow filter, separate library
 
-On Windows `wxMediaCtrl::Load` ends up driving a DirectShow filter graph. Studio expects a custom **DirectShow source filter** to be COM-registered against the URL scheme `bambu:`:
+Note: this is the path **OrcaSlicer** and pre-`94d91be60` BambuStudio take on Windows. Current upstream BambuStudio (`wxMediaCtrl3`, see §7.4.4) bypasses DirectShow entirely and goes straight through the `Bambu_*` C ABI like Linux does.
+
+`wxMediaCtrl2::Load` (the Windows branch) drops `wxURI("bambu:...")` into `wxMediaCtrl::Load`, which uses wxWidgets's `wxMediaBackendDirectShow`. wxWidgets resolves the URL by looking up `HKCR\bambu\Source Filter` in the registry to find the CLSID that handles `bambu:` URLs, then `CoCreateInstance`s that CLSID and asks the resulting filter to load the URL via `IFileSourceFilter::Load`. Studio expects a custom **DirectShow source filter** to be COM-registered against the URL scheme `bambu:`:
 
 ```95:138:3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp
 #define CLSID_BAMBU_SOURCE L"{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}"
@@ -1544,9 +1565,15 @@ Concretely:
 
 - `BambuSource.dll` must export `DllRegisterServer` / `DllUnregisterServer`, register `CLSID_BAMBU_SOURCE = {233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}` with `InprocServer32 = <path-to-BambuSource.dll>`, and register itself as the `Source Filter` for the `bambu:` protocol under `HKCR\bambu`.
 - The actual filter must implement `IBaseFilter` + `IFileSourceFilter` and produce video samples on its output pin.
-- The C ABI from §7.2 is **not used** for camera output on Windows — it is exclusively the file browser path. The DirectShow filter is a separate code path inside the same DLL.
+- For Orca / legacy Studio, the C ABI from §7.2 is **not used** for camera output — it is exclusively the file browser path. The DirectShow filter is a separate code path inside the same DLL.
 
-Practical consequence: a portable C-ABI implementation of `libBambuSource` covers the *file-browser* feature on Windows for free, but the camera live view requires a separate DirectShow source filter — a substantial extra engineering effort.
+Practical consequence (Orca / legacy Studio only): a portable C-ABI implementation of `libBambuSource` covers the *file-browser* feature on Windows for free, but the camera live view requires a separate DirectShow source filter — a substantial extra engineering effort.
+
+This project ships such a filter ([stubs/dshow_filter.cpp](stubs/dshow_filter.cpp), exports gated through [stubs/BambuSource.def](stubs/BambuSource.def)). It implements `IBaseFilter` + `IFileSourceFilter` + a single output `IPin`, accepts the downstream-provided `IMemAllocator`, and pushes either Annex-B H.264 (RTSPS, port 322) or framed MJPEG (port 6000) into the renderer. Self-registration writes both `HKCR\CLSID\{233E64FB-…}` and `HKCR\bambu\Source Filter` exactly as wxMediaCtrl2 expects; `regsvr32 /s BambuSource.dll` is the only setup step. Three Windows-specific pitfalls were encountered during the port and are worth recording, since each one cost meaningful debugging time:
+
+1. **`setvbuf(fp, NULL, _IOLBF, 0)` is undefined behaviour on the MSVC CRT.** The MSVC CRT's `_setvbuf_internal` enforces "if buffer is `NULL`, the only accepted mode is `_IONBF` (size 0)" via `_invalid_parameter` → `__fastfail(FAST_FAIL_INVALID_ARG)` → `STATUS_STACK_BUFFER_OVERRUN (0xC0000409)`. The same call is silently accepted on glibc/musl. Cross-platform code that wants line-buffering-equivalent behaviour on log files must either supply a real buffer or fall back to `_IONBF` and let each `fprintf` flush.
+2. **`wxURI` normalises `bambu:///rtsps___…` to `bambu://rtsps___…`** before calling `IFileSourceFilter::Load`. The triple-slash form is what `MediaPlayCtrl::load()` produces (no host, path = `/rtsps___user:pwd@ip/...`), but wxURI's "authority is empty" canonicaliser interprets `rtsps___user:pwd` as userinfo and `ip` as host, then re-emits the URI with a single `//`. A parser keyed strictly off `bambu:///rtsps___` will reject every Orca camera URL with `E_INVALIDARG`. Accept any number of `/` characters after `bambu:` (1, 2, or 3).
+3. **The source must push samples while the graph is in `Paused`, not just `Running`.** wmp/wxMediaCtrl keeps the filter graph in `State_Paused` until the renderer receives its first sample (which is what triggers the transition to `State_Running`). A worker thread that gates `IMemInputPin::Receive` on `parent->state() == State_Running` deadlocks the graph: the renderer waits for the first sample, the source waits for `Running`, the user sees an infinite "playing" indicator with a black frame, and the RTSP server eventually disconnects on TCP back-pressure. Standard DirectShow pattern is to commit the allocator in the `Pause()` transition and start streaming immediately; downstream filters apply any reference-clock pacing themselves.
 
 #### 7.4.3. macOS: Objective-C `BambuPlayer` class inside the dylib
 
@@ -1604,13 +1631,34 @@ Failure mode if the symbol is missing: `m_error = -2`, `m_player = nullptr`. Sub
 
 This is the reason a C-ABI-only `libBambuSource.dylib` build (no Objective-C `BambuPlayer` class) is enough for the Mac file browser but produces an indefinite loading state in the Mac camera tab. To make the camera tab work on macOS the dylib must additionally export an Objective-C class symbol `OBJC_CLASS_$_BambuPlayer` whose interface matches `BambuPlayer.h` above.
 
-#### 7.4.4. Recap
+#### 7.4.4. Windows (current Studio): `wxMediaCtrl3` + FFmpeg, C ABI directly
 
-| Platform | Camera back-end | What `libBambuSource` must provide for the camera to work |
-|----------|-----------------|-----------------------------------------------------------|
-| Linux    | Studio's bundled `gstbambusrc` GStreamer element (statically linked into the Studio binary) → reaches into `libBambuSource.so` via `bambulib_get()` | The `Bambu_*` C ABI (§7.2) only |
-| Windows  | DirectShow source filter registered for `bambu:` URI scheme (CLSID `{233E64FB-…}`) | A full DirectShow `IBaseFilter` implementation inside `BambuSource.dll`. The `Bambu_*` C ABI is unused for video on Windows |
-| macOS    | `wxMediaCtrl2` calls `dlsym(libBambuSource.dylib, "OBJC_CLASS_$_BambuPlayer")` and drives the resulting Objective-C object directly | Both the `Bambu_*` C ABI **and** an Objective-C class `BambuPlayer` exporting the interface from `BambuPlayer.h` |
+In commit `94d91be60` ("NEW: reimpl wxMediaCtrl from ffmpeg"), upstream BambuStudio replaced the platform-specific `wxMediaCtrl2` widget with `wxMediaCtrl3`, a self-contained widget that:
+
+1. Inherits from `BambuLib` (the `StaticBambuLib` shim from `PrinterFileSystem.cpp`) so it can call every `Bambu_*` symbol directly without going through any wxWidgets media backend.
+2. Owns a single play-thread (`PlayThread`) that walks the entire `Bambu_*` lifecycle — `Bambu_Create` → `Bambu_SetLogger` → `Bambu_Open` → spin on `Bambu_StartStream(true)` until it stops returning `Bambu_would_block` → `Bambu_GetStreamInfo` → loop on `Bambu_ReadSample` → `Bambu_Close` / `Bambu_Destroy` — exactly the way Linux's `gstbambusrc` does.
+3. Decodes each access unit with FFmpeg via the new `AVVideoDecoder` helper, packages it into a `wxBitmap` (Windows) or `wxImage` (Linux), pushes it through a small ring buffer (`m_frame_buffer`), and renders it from a wxTimer onto a plain `wxWindow`.
+
+Cross-references in the BambuStudio tree:
+
+- `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}` — the widget itself and the play-thread (`wxMediaCtrl3::PlayThread` at `wxMediaCtrl3.cpp:260-405`).
+- `src/slic3r/GUI/AVVideoDecoder.{cpp,h}` — wraps FFmpeg's `avcodec_send_packet` / `avcodec_receive_frame` and hands the raw planes back as a wxBitmap or wxImage.
+- `src/slic3r/GUI/MediaPlayCtrl.cpp:49` — the constructor takes `wxMediaCtrl3 *media_ctrl`, replacing the old `wxMediaCtrl2 *` from earlier revisions.
+
+What this means for the libBambuSource ABI: on **current Windows BambuStudio** the camera now reaches the plugin through exactly the same C-ABI surface as Linux. The Windows-only logger expects `wchar_t const*` strings (the `tchar` typedef in `BambuTunnel.h`), so a portable plugin has to convert UTF-8 → UTF-16 for the logger callback — but otherwise the Linux build is bit-for-bit appropriate as long as the plugin is built as a `.dll` with a matching MSVC ABI.
+
+Studio's `wxMediaCtrl3` does **not** consult the registry, does **not** call `CoCreateInstance`, and does **not** require the DirectShow filter to be registered. A Windows install where `BambuSource.dll` exports the `Bambu_*` C ABI but is **not** registered as a DirectShow filter will produce a perfectly functional camera in current BambuStudio, while OrcaSlicer on the same machine will fail to play any camera until the DLL is registered (`regsvr32 /s BambuSource.dll`). This is why a port of `libBambuSource` should ship both: the C ABI for current Studio + Linux + macOS file browser, and the DirectShow filter for OrcaSlicer + legacy Studio installs.
+
+#### 7.4.5. Recap
+
+| Slicer | Platform | Camera back-end | What `libBambuSource` must provide |
+|--------|----------|-----------------|------------------------------------|
+| BambuStudio post-`94d91be60` (current) | Linux | `wxMediaCtrl3` → `Bambu_*` C ABI → FFmpeg → wxWindow | The `Bambu_*` C ABI (§7.2) only |
+| BambuStudio post-`94d91be60` (current) | Windows | `wxMediaCtrl3` → `Bambu_*` C ABI → FFmpeg → wxWindow | The `Bambu_*` C ABI (§7.2) only |
+| BambuStudio post-`94d91be60` (current) | macOS | `wxMediaCtrl2.mm` → `dlsym(libBambuSource.dylib, "OBJC_CLASS_$_BambuPlayer")` *(`wxMediaCtrl3` was not adopted on macOS — the platform still goes through the Objective-C class)* | Both the `Bambu_*` C ABI **and** the Objective-C `BambuPlayer` class |
+| OrcaSlicer (current) and BambuStudio pre-`94d91be60` | Linux | `wxMediaCtrl2` → `gstbambusrc` (statically linked into Studio) → `bambulib_get()` → `Bambu_*` C ABI | The `Bambu_*` C ABI (§7.2) only |
+| OrcaSlicer (current) and BambuStudio pre-`94d91be60` | Windows | `wxMediaCtrl2` → `wxMediaCtrl::Load` → wxWidgets DirectShow backend → COM source filter (CLSID `{233E64FB-…}`) inside `BambuSource.dll` | A DirectShow `IBaseFilter`/`IFileSourceFilter` implementation registered against `bambu:`. The `Bambu_*` C ABI is **not** used for video; only for the file browser |
+| OrcaSlicer (current) and BambuStudio pre-`94d91be60` | macOS | same as current Studio (Objective-C `BambuPlayer`) | same |
 
 In every case the file-browser path uses **only** the `Bambu_*` C ABI plus the CTRL JSON wire protocol described next.
 
@@ -1830,7 +1878,7 @@ A few practical contracts that the Studio code path enforces but does not docume
 - **`Bambu_would_block` is not an error**. Both `Bambu_Open` and `Bambu_StartStream*` are expected to be polled (`PrinterFileSystem.cpp:1738-1749`, `gstbambusrc.c` does the same). Studio retries with a 100 ms backoff for up to 3-5 seconds, then gives up.
 - **`Bambu_ReadSample` controls the wakeup cadence**. On the file-browser tunnel the worker calls `Bambu_ReadSample` with no separate condvar — it relies on the plugin returning `Bambu_would_block` instead of blocking forever. A plugin that blocks indefinitely freezes the tab.
 - **Negative return values are fatal**. Anything outside `{0, Bambu_stream_end, Bambu_would_block, Bambu_buffer_limit}` makes Studio call `Bambu_Close` + `Bambu_Destroy` and try to re-open the tunnel from scratch. (`PrinterFileSystem.cpp:1577-1593`.)
-- **Logger callback is signal-safe**. `Bambu_SetLogger` is invoked from arbitrary threads; the receiving callback inside Studio (`bambu_log` in `wxMediaCtrl2.mm`, `DumpLog` in `PrinterFileSystem.cpp`) is wrapped to be reentrant. The plugin must not assume the callback runs on a particular thread.
+- **Logger callback is signal-safe**. `Bambu_SetLogger` is invoked from arbitrary threads; the receiving callback inside Studio (`bambu_log` in `wxMediaCtrl3.cpp` for current Windows/Linux Studio, `bambu_log` in `wxMediaCtrl2.mm` for macOS, `DumpLog` in `PrinterFileSystem.cpp` for the file browser everywhere) is wrapped to be reentrant. The plugin must not assume the callback runs on a particular thread. On Windows the logger receives `wchar_t const*` strings (a UTF-16 buffer), on POSIX it receives `char const*` (UTF-8); the plugin must allocate accordingly because Studio frees each message with `Bambu_FreeLogMsg`.
 - **Race between `Bambu_Close` and a streaming reader**. Studio assumes that once `Bambu_Close` returns it is safe to also call `Bambu_Destroy`, even if another thread was blocked inside `Bambu_ReadSample` a microsecond earlier. A correct plugin must therefore either gracefully unblock the reader (via `shutdown(SHUT_RDWR)` on the underlying socket, etc.) or serialise the two; failing to do so manifests as a use-after-free during reconnect.
 
 ### 7.8. Map of `libBambuSource`-related source locations
@@ -1841,8 +1889,9 @@ A few practical contracts that the Studio code path enforces but does not docume
 | Loader (`StaticBambuLib`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1817-1872` |
 | `dlopen`/`LoadLibrary` of `libBambuSource` | `3rd_party/OrcaSlicer/src/slic3r/Utils/BBLNetworkPlugin.cpp:272-311` |
 | Public accessor `get_bambu_source_entry` | `3rd_party/OrcaSlicer/src/slic3r/Utils/NetworkAgent.cpp:67-75` |
-| Linux camera (`gstbambusrc`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/gstbambusrc.c`, `gstbambusrc.h` |
-| Windows camera (DirectShow filter, COM CLSID) | `3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
+| Linux/Windows camera widget — current Studio (FFmpeg-based) | `3rd_party/BambuStudio/src/slic3r/GUI/wxMediaCtrl3.{cpp,h}`, `AVVideoDecoder.{cpp,h}` |
+| Linux camera back-end (gstbambusrc, used by Orca / legacy Studio) | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/gstbambusrc.c`, `gstbambusrc.h` |
+| Windows camera back-end (DirectShow filter, COM CLSID — Orca / legacy Studio only) | `3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
 | macOS camera (`BambuPlayer` Objective-C) | `3rd_party/OrcaSlicer/src/slic3r/GUI/wxMediaCtrl2.mm:67-141`, `BambuPlayer/BambuPlayer.h` |
 | Camera URL formats (`bambu:///local/`, `rtsps___`, `rtsp___`) | `3rd_party/OrcaSlicer/src/slic3r/GUI/MediaPlayCtrl.cpp:307-318, 551-559` |
 | File-browser `CTRL_TYPE` constant | `3rd_party/OrcaSlicer/src/slic3r/GUI/Printer/PrinterFileSystem.h:32` |
@@ -1895,8 +1944,9 @@ A few practical contracts that the Studio code path enforces but does not docume
 | Camera URL formats | `src/slic3r/GUI/MediaPlayCtrl.cpp:307-318, 551-559` |
 | File-browser CTRL command set | `src/slic3r/GUI/Printer/PrinterFileSystem.h:32-72` |
 | File-browser CTRL JSON envelope | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp:1431-1458` |
-| Linux camera (`gstbambusrc` element) | `src/slic3r/GUI/Printer/gstbambusrc.{c,h}` |
-| Windows camera (DirectShow CLSID) | `src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
+| Linux camera back-end (gstbambusrc — Orca / legacy Studio) | `src/slic3r/GUI/Printer/gstbambusrc.{c,h}` |
+| Windows / Linux camera widget — current Studio (FFmpeg, C ABI) | `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}`, `AVVideoDecoder.{cpp,h}` |
+| Windows camera back-end (DirectShow CLSID — Orca / legacy Studio only) | `src/slic3r/GUI/wxMediaCtrl2.cpp:71-138` |
 | macOS camera (`BambuPlayer` Objective-C class) | `src/slic3r/GUI/wxMediaCtrl2.mm:67-141`, `BambuPlayer/BambuPlayer.h` |
 
 ---
@@ -1912,4 +1962,4 @@ Key facts about the stock Bambu Network Plugin, distilled from the sections abov
 - **ABI surface**: roughly 100 `bambu_network_*` entry points using C linkage but `std::string` / `std::vector` / `std::map` / `std::function` at the boundary — tightly coupled to Studio's libstdc++/libc++ ABI — plus a separate, pure-C `ft_*` tunnel/job bus (`ft_abi_version() == 1`) that ships in the same `.so`/`.dll`.
 - **Initialization contract**: a deterministic call sequence `create_agent → set_config_dir → init_log → set_cert_file → set_extra_http_header → set_on_*_fn(…) → set_country_code → start → start_discovery` (`GUI_App::on_init_network`), with `QueueOnMainFn` as the only safe way back to the GUI thread.
 - **Notable Studio quirks observed during reverse engineering**: the `bambu_network_get_user_nickanme` symbol name is misspelled in the real ABI, and Studio mistakenly resolves `get_my_token` through the string `"bambu_network_get_my_profile"` — a compatible plugin must export both, with matching signatures.
-- **Second library, second contract**: camera live view and the on-printer file browser go through a *separate* library `libBambuSource` (different symbol prefix `Bambu_*`, different loader, no signature gate, no version gate). It exposes a small C ABI (`Bambu_Create` / `Bambu_Open` / `Bambu_StartStreamEx` / `Bambu_SendMessage` / `Bambu_ReadSample` / …) plus, on macOS only, an Objective-C class `BambuPlayer` resolved through `dlsym(libBambuSource.dylib, "OBJC_CLASS_$_BambuPlayer")` inside `wxMediaCtrl2.mm`. On Linux the camera back-end is the `gstbambusrc` GStreamer element baked into the Studio binary itself, on Windows it is a DirectShow source filter registered against the `bambu:` URI scheme (CLSID `{233E64FB-…}`). The file browser uses the same camera tunnel (TLS over TCP/6000) but switches it into JSON-RPC mode via `Bambu_StartStreamEx(tunnel, CTRL_TYPE = 0x3001)`; the actual file bytes travel over a *separate* implicit-FTPS connection on TCP/990 that the plugin opens itself. See **§7** for the full ABI, wire format and per-platform back-ends.
+- **Second library, second contract**: camera live view and the on-printer file browser go through a *separate* library `libBambuSource` (different symbol prefix `Bambu_*`, different loader, no signature gate, no version gate). It exposes a small C ABI (`Bambu_Create` / `Bambu_Open` / `Bambu_StartStreamEx` / `Bambu_SendMessage` / `Bambu_ReadSample` / …) plus, on macOS only, an Objective-C class `BambuPlayer` resolved through `dlsym(libBambuSource.dylib, "OBJC_CLASS_$_BambuPlayer")` inside `wxMediaCtrl2.mm`. The camera widget that consumes this ABI varies by slicer: current BambuStudio (commit `94d91be60`+, June 2024) uses `wxMediaCtrl3` which calls `Bambu_*` directly and decodes via FFmpeg on **both** Linux and Windows; OrcaSlicer and pre-`94d91be60` Studio still use the older `wxMediaCtrl2` which routes Linux through the `gstbambusrc` GStreamer element baked into the Studio binary and Windows through a DirectShow source filter registered against the `bambu:` URI scheme (CLSID `{233E64FB-…}`) — meaning a Windows `BambuSource.dll` aimed at Orca compatibility must additionally export the COM filter, while a Studio-only port can stick to the C ABI. The file browser uses the same camera tunnel (TLS over TCP/6000) but switches it into JSON-RPC mode via `Bambu_StartStreamEx(tunnel, CTRL_TYPE = 0x3001)`; the actual file bytes travel over a *separate* implicit-FTPS connection on TCP/990 that the plugin opens itself. See **§7** for the full ABI, wire format and per-platform back-ends.

@@ -77,16 +77,24 @@ message(STATUS "obn: ABI_VERSION=${OBN_ABI_VERSION_HEX} (from OBN_VERSION=${OBN_
 # default prefix, etc. Populates OBN_CLIENT_* variables in this scope.
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Clients.cmake")
 obn_resolve_client("${OBN_CLIENT_TYPE}")
-message(STATUS "obn: client=${OBN_CLIENT_TYPE} plugin=lib${OBN_CLIENT_PLUGIN_NAME}.so")
+if(WIN32)
+    message(STATUS "obn: client=${OBN_CLIENT_TYPE} plugin=${OBN_CLIENT_PLUGIN_NAME}.dll")
+elseif(APPLE)
+    message(STATUS "obn: client=${OBN_CLIENT_TYPE} plugin=lib${OBN_CLIENT_PLUGIN_NAME}.dylib")
+else()
+    message(STATUS "obn: client=${OBN_CLIENT_TYPE} plugin=lib${OBN_CLIENT_PLUGIN_NAME}.so")
+endif()
 
-# Default install location: the per-client config dir on Linux. Honoured
-# only when the user did not pass -DCMAKE_INSTALL_PREFIX (the
+# Default install location: the per-client config dir.
+# Honoured only when the user did not pass -DCMAKE_INSTALL_PREFIX (the
 # CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT flag is unset by CMake the
 # moment it picks up an explicit value, including ones cached from a
-# previous configure). The top-level ./configure wrapper independently
-# computes the same default and passes it via -DCMAKE_INSTALL_PREFIX,
-# so this branch only fires for callers that invoke cmake directly.
-if(UNIX AND NOT APPLE AND NOT CMAKE_CROSSCOMPILING
+# previous configure). The top-level ./configure / configure.ps1 wrapper
+# independently computes the same default and passes it via
+# -DCMAKE_INSTALL_PREFIX, so this branch only fires for callers that
+# invoke cmake directly. Linux native config dir, macOS Library/Application
+# Support, Windows %APPDATA%\<client>.
+if(NOT CMAKE_CROSSCOMPILING
    AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT
    AND NOT OBN_CLIENT_DEFAULT_PREFIX STREQUAL "")
     set(CMAKE_INSTALL_PREFIX "${OBN_CLIENT_DEFAULT_PREFIX}"
@@ -159,39 +167,91 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-# Bambu Studio is built against libstdc++ new C++11 ABI; match it.
-add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
-
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Hide every symbol by default, explicitly export only the ABI functions via
-# __attribute__((visibility("default"))). Keeps the library slim and avoids
-# name clashes with Studio's own symbols.
-add_compile_options(
-    -fvisibility=hidden
-    $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
-)
+if(MSVC)
+    # Match the Bambu Studio toolchain (Visual Studio 2019, MSVC STL). The ABI
+    # crosses the DLL boundary as std::string / std::map / std::function, so
+    # we must use exactly the same STL Studio is built with -- compiling with
+    # MinGW or any libstdc++ flavour will hand Studio mangled types it cannot
+    # consume. _CRT_SECURE_NO_WARNINGS silences the deprecation noise around
+    # POSIX-style I/O we still use through portable wrappers; NOMINMAX +
+    # WIN32_LEAN_AND_MEAN keep <windows.h> from clobbering std::min/max and
+    # pulling in the rarely-used GDI/RPC headers.
+    add_compile_options(/W3 /utf-8 /permissive- /Zc:__cplusplus)
+    # /wd4100: unreferenced formal parameter (intentional in many ABI stubs).
+    # /wd4101: unreferenced local variable.
+    # /wd4244 /wd4267: integer narrowing in stdlib/curl call sites we cannot
+    #                  fix from here.
+    # /wd4190: extern "C" function returning std::string. This is the whole
+    #          point of the plugin ABI: Bambu Studio is built with the same
+    #          MSVC STL and unmangles the type identically. The warning fires
+    #          all over abi_user.cpp / abi_presets.cpp / abi_http.cpp.
+    add_compile_options(/wd4100 /wd4101 /wd4244 /wd4267 /wd4190)
+    add_compile_definitions(
+        _CRT_SECURE_NO_WARNINGS
+        _WINSOCK_DEPRECATED_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _WIN32_WINNT=0x0601
+    )
+else()
+    # Bambu Studio's Linux build is compiled against libstdc++ new C++11 ABI;
+    # match it so std::string layout lines up across the boundary.
+    add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+    # Hide every symbol by default, explicitly export only the ABI functions
+    # via __attribute__((visibility("default"))) (see include/obn/abi_export.hpp).
+    add_compile_options(
+        -fvisibility=hidden
+        $<$<COMPILE_LANGUAGE:CXX>:-fvisibility-inlines-hidden>
+    )
+endif()
 
 # --------------------------------------------------------------------------
 # libbambu_networking.so  (main plugin)
 # --------------------------------------------------------------------------
 
-find_package(PkgConfig REQUIRED)
-find_package(OpenSSL COMPONENTS SSL REQUIRED)
+# Dependency resolution:
+#   - Linux uses pkg-config to discover libcurl / libmosquitto from the host
+#     distribution; OpenSSL/zlib via CMake config modules.
+#   - Windows uses vcpkg manifest mode (vcpkg.json at repo root): all four
+#     dependencies are resolved through vcpkg's CMake config files. Mosquitto
+#     in vcpkg ships as 'unofficial-mosquitto' with target
+#     unofficial::mosquitto::mosquitto. CURL has a real find module bundled
+#     with CMake plus a CONFIG package via vcpkg.
+#   - macOS is treated like Linux (Homebrew installs pkg-config-able libs).
+if(WIN32)
+    find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
+    find_package(ZLIB REQUIRED)
+    find_package(CURL CONFIG REQUIRED)
+else()
+    find_package(PkgConfig REQUIRED)
+    find_package(OpenSSL COMPONENTS SSL REQUIRED)
+    find_package(ZLIB REQUIRED)
+endif()
 
 if(OBN_VENDOR_MOSQUITTO AND OBN_STATIC_MOSQUITTO)
     message(WARNING
         "OBN_VENDOR_MOSQUITTO and OBN_STATIC_MOSQUITTO are both ON — "
-        "using the bundled mosquitto build; system static libmosquitto (pkg-config) is ignored.")
+        "using the bundled mosquitto build; system static libmosquitto is ignored.")
 endif()
 
 if(OBN_VENDOR_MOSQUITTO)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
     obn_vendor_mosquitto_setup()
+elseif(WIN32)
+    # vcpkg ships mosquitto under the 'unofficial-mosquitto' package
+    # exporting unofficial::mosquitto::mosquitto for the C client. We do
+    # not honor OBN_STATIC_MOSQUITTO on Windows: vcpkg picks shared vs
+    # static based on the selected triplet (x64-windows vs x64-windows-static).
+    find_package(unofficial-mosquitto CONFIG REQUIRED)
+    add_library(obn_mosquitto_iface INTERFACE)
+    target_link_libraries(obn_mosquitto_iface INTERFACE
+        unofficial::mosquitto::mosquitto)
 elseif(OBN_STATIC_MOSQUITTO)
     pkg_check_modules(MOSQUITTO REQUIRED libmosquitto)
     set(_obn_prev_lib_suffix "${CMAKE_FIND_LIBRARY_SUFFIXES}")
@@ -222,26 +282,29 @@ elseif(OBN_STATIC_MOSQUITTO)
         _obn_mosq_ldflags "${_obn_mosq_ldflags}")
     separate_arguments(_obn_mosq_link UNIX_COMMAND "${_obn_mosq_ldflags}")
     message(STATUS "obn: linking libmosquitto statically (${MOSQUITTO_STATIC_ARCHIVE})")
+    add_library(obn_mosquitto_iface INTERFACE)
+    target_include_directories(obn_mosquitto_iface INTERFACE ${MOSQUITTO_INCLUDE_DIRS})
+    target_link_libraries(obn_mosquitto_iface INTERFACE ${_obn_mosq_link})
 else()
     pkg_check_modules(MOSQUITTO REQUIRED IMPORTED_TARGET libmosquitto)
-endif()
-
-if(NOT OBN_VENDOR_MOSQUITTO)
     add_library(obn_mosquitto_iface INTERFACE)
-    if(OBN_STATIC_MOSQUITTO)
-        target_include_directories(obn_mosquitto_iface INTERFACE ${MOSQUITTO_INCLUDE_DIRS})
-        target_link_libraries(obn_mosquitto_iface INTERFACE ${_obn_mosq_link})
-    else()
-        target_link_libraries(obn_mosquitto_iface INTERFACE PkgConfig::MOSQUITTO)
-    endif()
+    target_link_libraries(obn_mosquitto_iface INTERFACE PkgConfig::MOSQUITTO)
 endif()
 
-pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+# CURL imported target: PkgConfig::CURL on POSIX, CURL::libcurl on Windows
+# (vcpkg's CURLConfig.cmake exports that name). We expose a unified alias
+# so the per-target target_link_libraries calls below stay platform-free.
+add_library(obn_curl_iface INTERFACE)
+if(WIN32)
+    target_link_libraries(obn_curl_iface INTERFACE CURL::libcurl)
+else()
+    pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
+    target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)
+endif()
 # zlib is shared between bambu_networking (cover_cache: unpacks
 # Metadata/plate_N.png out of /cache/<name>.3mf to show it as the
 # printing-task thumbnail) and BambuSource (same unpack, but for the
 # file browser).
-find_package(ZLIB REQUIRED)
 
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
@@ -276,6 +339,7 @@ add_library(bambu_networking SHARED
     src/lan_session.cpp
     src/log.cpp
     src/mqtt_client.cpp
+    src/os_compat.cpp
     src/print_job.cpp
     src/ssdp.cpp
     src/zip_reader.cpp
@@ -290,17 +354,36 @@ target_compile_definitions(bambu_networking PRIVATE
 )
 target_link_libraries(bambu_networking PRIVATE
     obn_mosquitto_iface
-    PkgConfig::CURL
+    obn_curl_iface
     OpenSSL::SSL
     OpenSSL::Crypto
     ZLIB::ZLIB
 )
 
-# No "lib" prefix rename: output is literally "libbambu_networking.so"
-set_target_properties(bambu_networking PROPERTIES
-    OUTPUT_NAME "bambu_networking"
-    PREFIX      "lib"
-)
+if(WIN32)
+    # Winsock2 + the typical curl/openssl Windows transitive deps. vcpkg's
+    # static triplet exports these in the curl/openssl link line, but the
+    # plugin itself also calls Winsock directly (sockets, WSAPoll) through
+    # src/os_compat.cpp.
+    target_link_libraries(bambu_networking PRIVATE
+        ws2_32 crypt32 secur32 bcrypt iphlpapi)
+endif()
+
+# Output filename:
+#   POSIX  -> libbambu_networking.so / libbambu_networking.dylib
+#   Windows -> bambu_networking.dll  (no "lib" prefix; matches what
+#              NetworkAgent::initialize_network_module hard-codes).
+if(WIN32)
+    set_target_properties(bambu_networking PROPERTIES
+        OUTPUT_NAME "bambu_networking"
+        PREFIX      ""
+    )
+else()
+    set_target_properties(bambu_networking PROPERTIES
+        OUTPUT_NAME "bambu_networking"
+        PREFIX      "lib"
+    )
+endif()
 
 # --------------------------------------------------------------------------
 # libBambuSource.so  (camera tunnel + PrinterFileSystem CTRL bridge;
@@ -345,6 +428,14 @@ find_package(ZLIB REQUIRED)
 # linking against libbambu_networking to keep the shared-object
 # self-contained (Studio dlopens BambuSource *before* it loads the
 # network plugin).
+#
+# Single source list shared by Linux/macOS/Windows: the porting of
+# BambuSource.cpp / rtsp_client.cpp / tls_socket.cpp through obn::os_compat
+# means the Windows build now exercises the same code path as Linux for
+# the C ABI half (file browser, MJPEG framing, RTSPS passthrough). The
+# camera-tab side on Windows additionally needs a DirectShow source filter
+# (stubs/dshow_filter.cpp) registered for the bambu: URL scheme; that is
+# Phase B and lives inside the same DLL.
 set(_obn_bambusource_sources
     stubs/BambuSource.cpp
     stubs/image_io.cpp
@@ -355,26 +446,56 @@ set(_obn_bambusource_sources
     src/ftps.cpp
     src/json_lite.cpp
     src/log.cpp
+    src/os_compat.cpp
     src/zip_reader.cpp
 )
+if(WIN32)
+    list(APPEND _obn_bambusource_sources
+        stubs/dshow_filter.cpp
+        # .def file lists the COM in-proc-server entry points
+        # (DllGetClassObject etc.) since they cannot use
+        # __declspec(dllexport) without clashing with <objbase.h>'s
+        # prototypes. Bambu_* exports stay on __declspec(dllexport).
+        stubs/BambuSource.def
+    )
+endif()
 
 # stb_image_write triggers -Wmissing-field-initializers on the
 # stbi__write_context partial brace initialiser. It is upstream code
 # we do not want to patch; isolate the warning suppression to the
-# translation unit that includes the stb implementations.
-set_source_files_properties(stubs/image_io.cpp PROPERTIES
-    COMPILE_FLAGS "-Wno-missing-field-initializers")
+# translation unit that includes the stb implementations. MSVC has its
+# own analogue that can flag the same code, but the warning level we
+# use does not enable it -- skip the suppression there.
+if(NOT MSVC)
+    set_source_files_properties(stubs/image_io.cpp PROPERTIES
+        COMPILE_FLAGS "-Wno-missing-field-initializers")
+endif()
 
 add_library(BambuSource SHARED ${_obn_bambusource_sources})
 target_include_directories(BambuSource PRIVATE include stubs)
 target_compile_definitions(BambuSource PRIVATE
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
-set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
-target_link_libraries(BambuSource PRIVATE
-    OpenSSL::SSL OpenSSL::Crypto
-    ZLIB::ZLIB
-)
+if(WIN32)
+    set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "")
+    # OpenSSL + zlib are common to both halves (TLS for MJPG/RTSP, zlib for
+    # the 3MF thumbnail extraction). Winsock + COM/DShow + advapi32 cover
+    # the Windows-specific paths: socket primitives, IBaseFilter etc., and
+    # registry I/O for DllRegisterServer.
+    target_link_libraries(BambuSource PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        ZLIB::ZLIB
+        ws2_32 crypt32 secur32 bcrypt iphlpapi
+        strmiids ole32 oleaut32 uuid
+        advapi32 shell32 user32
+    )
+else()
+    set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
+    target_link_libraries(BambuSource PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+endif()
 
 # RTSPS is handled by stubs/rtsp_client.cpp + stubs/rtsp_passthrough.cpp,
 # both of which only need OpenSSL (already linked above) and the C++
@@ -386,7 +507,11 @@ target_link_libraries(BambuSource PRIVATE
 # --------------------------------------------------------------------------
 
 add_library(live555 SHARED stubs/live555.cpp)
-set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
+if(WIN32)
+    set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "")
+else()
+    set_target_properties(live555 PROPERTIES OUTPUT_NAME "live555" PREFIX "lib")
+endif()
 
 # --------------------------------------------------------------------------
 # install (copies into <prefix>/plugins/)
@@ -409,27 +534,98 @@ else()
     ")
 endif()
 
-# BambuSource and live555 always ship under their stock names -- both
-# slicers dlopen them by fixed file name. The main plugin .so file
-# differs by client:
-#   bambu_studio -> libbambu_networking.so          (fixed name)
-#   orca_slicer  -> libbambu_networking_<VER>.so    (Orca dlopens
-#                   "libbambu_networking_${network_plugin_version}.so",
-#                   so the file name carries the version. We rename
-#                   our build artefact at install time so the source
-#                   tree still produces a single libbambu_networking.so
-#                   regardless of OBN_CLIENT_TYPE.)
-install(TARGETS BambuSource live555
+# BambuSource always ships under its stock name -- both slicers dlopen
+# it by fixed file name. The main plugin .so/.dll file differs by client:
+#   bambu_studio -> libbambu_networking.so / bambu_networking.dll  (fixed)
+#   orca_slicer  -> libbambu_networking_<VER>.so / bambu_networking_<VER>.dll
+#                   (Orca dlopens that exact name, including the version)
+# On Windows DLLs go to RUNTIME; on POSIX shared libraries go to LIBRARY.
+install(TARGETS BambuSource
     LIBRARY DESTINATION plugins
+    RUNTIME DESTINATION plugins
 )
+
+# liblive555 is trickier. On Linux both slicers ship it as part of their
+# own plugin bundle and nothing in the camera path of *this* port calls
+# into it -- our stub exists only to satisfy a "file exists" check in
+# PresetUpdater on Studio, so the OTA-update banner stays quiet. On
+# Windows OrcaSlicer ships a real ~4.4 MB live555.dll alongside its
+# DirectShow filter; replacing it with our 10 kB stub breaks unrelated
+# Orca code paths that load it lazily. The rule below is: only install
+# the stub if there is no existing live555 at the target, or the existing
+# one looks like a previous obn stub (small file, < 64 kB). Real
+# vendor-supplied live555 builds are at least ~4 MB on every platform we
+# have seen, so the heuristic is safe.
+if(WIN32)
+    set(_obn_live555_dst_name "live555.dll")
+elseif(APPLE)
+    set(_obn_live555_dst_name "liblive555.dylib")
+else()
+    set(_obn_live555_dst_name "liblive555.so")
+endif()
+install(CODE "
+    set(_src \"$<TARGET_FILE:live555>\")
+    set(_dst \"\${CMAKE_INSTALL_PREFIX}/plugins/${_obn_live555_dst_name}\")
+    set(_install_stub TRUE)
+    if(EXISTS \"\${_dst}\")
+        file(SIZE \"\${_dst}\" _existing_size)
+        if(_existing_size GREATER 65536)
+            message(STATUS
+                \"obn: keeping existing live555 (\${_existing_size} bytes) at \${_dst}; \"
+                \"looks like the slicer's vendor build, not our stub\")
+            set(_install_stub FALSE)
+        endif()
+    endif()
+    if(_install_stub)
+        message(STATUS \"obn: installing live555 stub to \${_dst}\")
+        file(INSTALL \"\${_src}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/plugins\")
+    endif()
+")
+
+# DirectShow Source Filter registration: BambuSource.dll exports
+# DllRegisterServer / DllUnregisterServer (HKCU only, no admin needed)
+# so wxMediaCtrl2 can find our CLSID for the bambu: URL scheme. Default
+# ON for Windows; pass -DOBN_REGISTER_DSHOW_FILTER=OFF (or
+# -RegisterDShowFilter:$false in configure.ps1) to skip if the user
+# wants to register manually.
+if(WIN32)
+    option(OBN_REGISTER_DSHOW_FILTER
+           "After install, run regsvr32 on BambuSource.dll" ON)
+    if(OBN_REGISTER_DSHOW_FILTER)
+        install(CODE [[
+            set(_obn_dll "${CMAKE_INSTALL_PREFIX}/plugins/BambuSource.dll")
+            execute_process(
+                COMMAND regsvr32.exe /s "${_obn_dll}"
+                RESULT_VARIABLE _obn_rc
+            )
+            if(NOT _obn_rc EQUAL 0)
+                message(WARNING
+                    "obn: regsvr32 failed (rc=${_obn_rc}); register manually:\n"
+                    "  regsvr32 /s \"${_obn_dll}\"")
+            else()
+                message(STATUS
+                    "obn: registered BambuSource DirectShow filter (HKCU)")
+            endif()
+        ]])
+    endif()
+endif()
+if(WIN32)
+    set(_obn_plugin_artefact "${OBN_CLIENT_PLUGIN_NAME}.dll")
+elseif(APPLE)
+    set(_obn_plugin_artefact "lib${OBN_CLIENT_PLUGIN_NAME}.dylib")
+else()
+    set(_obn_plugin_artefact "lib${OBN_CLIENT_PLUGIN_NAME}.so")
+endif()
+
 if(OBN_CLIENT_PLUGIN_NAME STREQUAL "bambu_networking")
     install(TARGETS bambu_networking
         LIBRARY DESTINATION plugins
+        RUNTIME DESTINATION plugins
     )
 else()
     install(FILES $<TARGET_FILE:bambu_networking>
         DESTINATION plugins
-        RENAME "lib${OBN_CLIENT_PLUGIN_NAME}.so")
+        RENAME "${_obn_plugin_artefact}")
 endif()
 
 # Studio's PresetUpdater expects this JSON to declare the cached version
@@ -454,7 +650,7 @@ endif()
 # time inside a CMake script-mode interpreter, so the file is allowed
 # to use string(JSON), file(READ/WRITE), foreach, etc. just like a
 # regular CMakeLists.
-if(OBN_PATCH_CLIENT_CONF AND UNIX AND NOT APPLE)
+if(OBN_PATCH_CLIENT_CONF AND ((UNIX AND NOT APPLE) OR WIN32))
     set(_obn_patch_out
         "${CMAKE_CURRENT_BINARY_DIR}/patch_${OBN_CLIENT_TYPE}_conf.cmake")
     configure_file("${OBN_CLIENT_CONF_PATCH_SCRIPT}"
@@ -469,23 +665,33 @@ endif()
 option(OBN_BUILD_TESTS "Build smoke tests" OFF)
 if(OBN_BUILD_TESTS)
     enable_testing()
+    # probe_plugin is cross-platform: dlopen/dlsym on POSIX,
+    # LoadLibrary/GetProcAddress on Windows. It also exercises
+    # bambu_network_create_agent so the heap and std::string ABI
+    # contracts get validated end-to-end without depending on Studio.
     add_executable(probe_plugin tests/probe_plugin.cpp)
     target_include_directories(probe_plugin PRIVATE include)
-    target_link_libraries(probe_plugin PRIVATE dl)
+    if(NOT WIN32)
+        target_link_libraries(probe_plugin PRIVATE dl)
+    endif()
     add_test(NAME plugin_symbols
         COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
+endif()
+if(OBN_BUILD_TESTS AND NOT WIN32)
 
     # Live test: skipped unless OBN_PRINTER_IP etc. are exported when ctest
     # runs. Links against the same library as the plugin so it can exercise
     # obn::Agent directly.
     add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
         src/log.cpp
+        src/os_compat.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
 
     add_executable(ftps_live_test tests/ftps_live_test.cpp
         src/ftps.cpp
-        src/log.cpp)
+        src/log.cpp
+        src/os_compat.cpp)
     target_include_directories(ftps_live_test PRIVATE include)
     target_link_libraries(ftps_live_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
@@ -512,6 +718,7 @@ if(OBN_BUILD_TESTS)
         src/lan_session.cpp
         src/log.cpp
         src/mqtt_client.cpp
+        src/os_compat.cpp
         src/ssdp.cpp
         src/zip_reader.cpp)
     target_include_directories(lan_live_test PRIVATE include)
@@ -521,7 +728,7 @@ if(OBN_BUILD_TESTS)
     )
     target_link_libraries(lan_live_test PRIVATE
         obn_mosquitto_iface
-        PkgConfig::CURL
+        obn_curl_iface
         OpenSSL::SSL
         OpenSSL::Crypto
         ZLIB::ZLIB

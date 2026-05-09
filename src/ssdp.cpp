@@ -1,12 +1,23 @@
 #include "obn/ssdp.hpp"
 
 #include "obn/log.hpp"
+#include "obn/os_compat.hpp"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
@@ -192,30 +203,36 @@ bool Discovery::start(int port, OnMessage cb)
         cb_ = std::move(cb);
     }
 
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        OBN_ERROR("ssdp: socket() failed: %s", std::strerror(errno));
+    obn::os::winsock_init_once();
+    obn::os::socket_t fd = static_cast<obn::os::socket_t>(::socket(AF_INET, SOCK_DGRAM, 0));
+    if (!obn::os::socket_valid(fd)) {
+        OBN_ERROR("ssdp: socket() failed: %s", std::strerror(obn::os::last_socket_error()));
         return false;
     }
 
     int yes = 1;
-    if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0) {
-        OBN_WARN("ssdp: SO_REUSEADDR failed: %s", std::strerror(errno));
+    // Winsock's setsockopt takes the option blob as `const char*`; POSIX
+    // takes `const void*`. Both reach the same kernel path; cast through char*
+    // to satisfy MSVC.
+    if (::setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_REUSEADDR,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
+        OBN_WARN("ssdp: SO_REUSEADDR failed: %s", std::strerror(obn::os::last_socket_error()));
     }
     // Required on Linux to receive packets destined for 255.255.255.255 on
-    // sockets bound to INADDR_ANY.
-    if (::setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes)) < 0) {
-        OBN_WARN("ssdp: SO_BROADCAST failed: %s", std::strerror(errno));
+    // sockets bound to INADDR_ANY. Same flag exists on Winsock.
+    if (::setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_BROADCAST,
+                     reinterpret_cast<const char*>(&yes), sizeof(yes)) < 0) {
+        OBN_WARN("ssdp: SO_BROADCAST failed: %s", std::strerror(obn::os::last_socket_error()));
     }
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port        = htons(static_cast<uint16_t>(port));
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (::bind(static_cast<int>(fd), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         OBN_ERROR("ssdp: bind(:%d) failed: %s (another SSDP listener running?)",
-                  port, std::strerror(errno));
-        ::close(fd);
+                  port, std::strerror(obn::os::last_socket_error()));
+        obn::os::close_socket(fd);
         return false;
     }
 
@@ -224,12 +241,13 @@ bool Discovery::start(int port, OnMessage cb)
     ip_mreq mreq{};
     mreq.imr_multiaddr.s_addr = ::inet_addr("239.255.255.250");
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-    if (::setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+    if (::setsockopt(static_cast<int>(fd), IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                     reinterpret_cast<const char*>(&mreq), sizeof(mreq)) < 0) {
         OBN_DEBUG("ssdp: IP_ADD_MEMBERSHIP 239.255.255.250 failed (ignored): %s",
-                  std::strerror(errno));
+                  std::strerror(obn::os::last_socket_error()));
     }
 
-    fd_ = fd;
+    fd_ = static_cast<std::uintptr_t>(fd);
     running_.store(true, std::memory_order_release);
     worker_ = std::thread([this] { run_(); });
     OBN_INFO("ssdp: listening on 0.0.0.0:%d", port_);
@@ -240,11 +258,11 @@ void Discovery::stop()
 {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
-    int fd = fd_;
-    fd_ = -1;
+    obn::os::socket_t fd = static_cast<obn::os::socket_t>(fd_);
+    fd_ = static_cast<std::uintptr_t>(obn::os::kInvalidSocket);
     // Closing the socket wakes up recvfrom() with EBADF / zero bytes.
-    if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
-    if (fd >= 0) ::close(fd);
+    obn::os::shutdown_both(fd);
+    obn::os::close_socket(fd);
 
     if (worker_.joinable()) worker_.join();
 
@@ -261,14 +279,22 @@ void Discovery::run_()
 
     while (running_.load(std::memory_order_acquire)) {
         sockaddr_in src{};
-        socklen_t   slen = sizeof(src);
-        ssize_t n = ::recvfrom(fd_, buf.data(), kBufSize, 0,
+#if defined(_WIN32)
+        int slen = sizeof(src);
+        int n = ::recvfrom(static_cast<SOCKET>(fd_), buf.data(),
+                           static_cast<int>(kBufSize), 0,
+                           reinterpret_cast<sockaddr*>(&src), &slen);
+#else
+        socklen_t slen = sizeof(src);
+        ssize_t n = ::recvfrom(static_cast<int>(fd_), buf.data(), kBufSize, 0,
                                reinterpret_cast<sockaddr*>(&src), &slen);
+#endif
         if (n <= 0) {
             if (!running_.load(std::memory_order_acquire)) break;
-            if (errno == EINTR) continue;
-            if (errno == EBADF) break;
-            OBN_WARN("ssdp: recvfrom failed: %s", std::strerror(errno));
+            int e = obn::os::last_socket_error();
+            if (e == EINTR) continue;
+            if (e == EBADF) break;
+            OBN_WARN("ssdp: recvfrom failed: %s", std::strerror(e));
             break;
         }
 

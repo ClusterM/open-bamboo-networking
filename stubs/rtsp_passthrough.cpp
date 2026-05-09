@@ -161,13 +161,22 @@ int Passthrough::start(const std::string& host,
             Nalu n;
             int rc = I.client.read_nalu(&n);
             if (rc != 0) {
+                // stop() races with read_nalu(): cancel() shuts the
+                // socket down so SSL_read returns rc=-1 with no
+                // last_error set. Treat that as a graceful shutdown
+                // rather than a stream error.
+                bool stopping = I.stop_flag.load(std::memory_order_acquire);
                 if (rc == 1) {
                     log_fmt(I.logger, I.log_ctx,
                             "rtsp_passthrough: stream end");
+                } else if (stopping) {
+                    log_fmt(I.logger, I.log_ctx,
+                            "rtsp_passthrough: read_nalu interrupted by stop()");
                 } else {
+                    const char* err = obn::source::get_last_error();
                     log_fmt(I.logger, I.log_ctx,
                             "rtsp_passthrough: read_nalu error: %s",
-                            obn::source::get_last_error());
+                            (err && *err) ? err : "(no detail)");
                 }
                 // Mark stream end via an empty, error-flag sample so
                 // the consumer can bubble it up as Pull_StreamEnd /
@@ -176,7 +185,8 @@ int Passthrough::start(const std::string& host,
                 std::unique_lock<std::mutex> lk(I.q_mu);
                 Sample marker;
                 marker.dt_100ns = 0;
-                marker.flags    = (rc == 1) ? 0x100 /*EOS*/ : 0x200 /*ERR*/;
+                marker.flags    = (rc == 1 || stopping)
+                                    ? 0x100 /*EOS*/ : 0x200 /*ERR*/;
                 I.ready.emplace_back(std::move(marker));
                 lk.unlock();
                 I.q_cv.notify_all();

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "open-bambu-networking",
+  "version-string": "0.1.0",
+  "description": "Open-source replacement for Bambu Studio's bambu_networking plugin (Windows manifest).",
+  "homepage": "https://github.com/ClusterM/open-bambu-networking",
+  "supports": "windows",
+  "dependencies": [
+    "openssl",
+    "curl",
+    "zlib",
+    "mosquitto"
+  ],
+  "builtin-baseline": "7147ac1294ef9647e8679e1183ac440a5d0a63b7"
+}

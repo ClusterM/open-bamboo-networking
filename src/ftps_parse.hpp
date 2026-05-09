@@ -18,6 +18,7 @@
 #pragma once
 
 #include "obn/ftps.hpp"
+#include "obn/os_compat.hpp"
 
 #include <cctype>
 #include <cstdint>
@@ -118,13 +119,13 @@ inline void parse_ls_line(const std::string& line, Entry* e,
             const std::time_t now_t =
                 (now_utc != 0) ? now_utc : std::time(nullptr);
             std::tm now_tm{};
-            ::gmtime_r(&now_t, &now_tm);
+            obn::os::gmtime_safe(now_t, &now_tm);
             tm.tm_year = now_tm.tm_year;
-            std::time_t candidate = ::timegm(&tm);
+            std::time_t candidate = obn::os::timegm_safe(&tm);
             constexpr std::time_t kSixMonths = 60LL * 60 * 24 * 183;
             if (candidate > now_t + kSixMonths) {
                 tm.tm_year -= 1;
-                candidate = ::timegm(&tm);
+                candidate = obn::os::timegm_safe(&tm);
             }
             if (candidate > 0)
                 e->mtime = static_cast<std::uint64_t>(candidate);
@@ -133,7 +134,7 @@ inline void parse_ls_line(const std::string& line, Entry* e,
             const int yr = std::atoi(ty.c_str());
             if (yr >= 1970) {
                 tm.tm_year = yr - 1900;
-                std::time_t candidate = ::timegm(&tm);
+                std::time_t candidate = obn::os::timegm_safe(&tm);
                 if (candidate > 0)
                     e->mtime = static_cast<std::uint64_t>(candidate);
             }

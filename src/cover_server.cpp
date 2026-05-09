@@ -12,21 +12,36 @@
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <sys/socket.h>
+#  include <sys/time.h>
+#  include <sys/types.h>
+#endif
 
 #include "obn/cover_cache.hpp"
 #include "obn/log.hpp"
+#include "obn/os_compat.hpp"
 
 namespace fs = std::filesystem;
 
 namespace obn::cover_server {
 
 namespace {
+
+using obn::os::socket_t;
+using obn::os::kInvalidSocket;
 
 // Cheap containment check: the requested filename must live under
 // cover_cache::temp_dir() and must match the "cover-XXXXXXXX-pN.png"
@@ -53,31 +68,43 @@ std::string read_file(const fs::path& p)
     return body;
 }
 
-void send_all(int fd, const std::string& data)
+void send_all(socket_t fd, const std::string& data)
 {
     std::size_t off = 0;
     while (off < data.size()) {
-        ssize_t n = ::send(fd, data.data() + off, data.size() - off, 0);
+#if defined(_WIN32)
+        int n = ::send(static_cast<SOCKET>(fd), data.data() + off,
+                       static_cast<int>(data.size() - off), 0);
+#else
+        ssize_t n = ::send(static_cast<int>(fd), data.data() + off,
+                           data.size() - off, 0);
+#endif
         if (n <= 0) return;
         off += static_cast<std::size_t>(n);
     }
 }
 
-void send_status(int fd, int code, const std::string& reason)
+void send_status(socket_t fd, int code, const std::string& reason)
 {
     std::string r = "HTTP/1.1 " + std::to_string(code) + " " + reason +
                     "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
     send_all(fd, r);
 }
 
-void handle_one(int fd)
+void handle_one(socket_t fd)
 {
     // Read request header into a bounded buffer. 4 KB is plenty for a
     // line like "GET /cover/cover-XXXXXXXX-p1.png HTTP/1.1".
     char  buf[4096];
     std::size_t got = 0;
     while (got < sizeof(buf) - 1) {
-        ssize_t n = ::recv(fd, buf + got, sizeof(buf) - 1 - got, 0);
+#if defined(_WIN32)
+        int n = ::recv(static_cast<SOCKET>(fd), buf + got,
+                       static_cast<int>(sizeof(buf) - 1 - got), 0);
+#else
+        ssize_t n = ::recv(static_cast<int>(fd), buf + got,
+                           sizeof(buf) - 1 - got, 0);
+#endif
         if (n <= 0) break;
         got += static_cast<std::size_t>(n);
         buf[got] = 0;
@@ -167,32 +194,41 @@ int Server::start()
 {
     if (running_.load()) return 0;
 
-    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return errno ? errno : -1;
+    obn::os::winsock_init_once();
+    socket_t fd = static_cast<socket_t>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (!obn::os::socket_valid(fd)) {
+        int e = obn::os::last_socket_error();
+        return e ? e : -1;
+    }
     int on = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    ::setsockopt(static_cast<int>(fd), SOL_SOCKET, SO_REUSEADDR,
+                 reinterpret_cast<const char*>(&on), sizeof(on));
 
     sockaddr_in sa{};
     sa.sin_family      = AF_INET;
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sa.sin_port        = 0;
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-        int e = errno;
-        ::close(fd);
+    if (::bind(static_cast<int>(fd), reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+        int e = obn::os::last_socket_error();
+        obn::os::close_socket(fd);
         return e ? e : -1;
     }
-    if (::listen(fd, 8) != 0) {
-        int e = errno;
-        ::close(fd);
+    if (::listen(static_cast<int>(fd), 8) != 0) {
+        int e = obn::os::last_socket_error();
+        obn::os::close_socket(fd);
         return e ? e : -1;
     }
+#if defined(_WIN32)
+    int sl = sizeof(sa);
+#else
     socklen_t sl = sizeof(sa);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &sl) != 0) {
-        int e = errno;
-        ::close(fd);
+#endif
+    if (::getsockname(static_cast<int>(fd), reinterpret_cast<sockaddr*>(&sa), &sl) != 0) {
+        int e = obn::os::last_socket_error();
+        obn::os::close_socket(fd);
         return e ? e : -1;
     }
-    listen_fd_ = fd;
+    listen_fd_ = static_cast<std::uintptr_t>(fd);
     port_.store(ntohs(sa.sin_port));
     running_.store(true);
     accept_thread_ = std::thread(&Server::accept_loop, this);
@@ -203,11 +239,11 @@ int Server::start()
 void Server::stop()
 {
     if (!running_.exchange(false)) return;
-    int fd = listen_fd_;
-    listen_fd_ = -1;
-    if (fd >= 0) {
-        ::shutdown(fd, SHUT_RDWR);
-        ::close(fd);
+    socket_t fd = static_cast<socket_t>(listen_fd_);
+    listen_fd_ = static_cast<std::uintptr_t>(kInvalidSocket);
+    if (obn::os::socket_valid(fd)) {
+        obn::os::shutdown_both(fd);
+        obn::os::close_socket(fd);
     }
     if (accept_thread_.joinable()) accept_thread_.join();
 }
@@ -216,11 +252,17 @@ void Server::accept_loop()
 {
     while (running_.load()) {
         sockaddr_in ca{};
-        socklen_t   cl = sizeof(ca);
-        int c = ::accept(listen_fd_, reinterpret_cast<sockaddr*>(&ca), &cl);
-        if (c < 0) {
+#if defined(_WIN32)
+        int cl = sizeof(ca);
+#else
+        socklen_t cl = sizeof(ca);
+#endif
+        socket_t c = static_cast<socket_t>(
+            ::accept(static_cast<int>(listen_fd_),
+                     reinterpret_cast<sockaddr*>(&ca), &cl));
+        if (!obn::os::socket_valid(c)) {
             if (!running_.load()) break;
-            if (errno == EINTR) continue;
+            if (obn::os::last_socket_error() == EINTR) continue;
             break;
         }
         char ip[INET_ADDRSTRLEN] = {};
@@ -233,13 +275,23 @@ void Server::accept_loop()
             // might send (RST-on-close otherwise eats the last segments).
             // SO_LINGER as a safety net caps the wait at 2s per connection.
             linger lo{1, 2};
-            ::setsockopt(c, SOL_SOCKET, SO_LINGER, &lo, sizeof(lo));
-            ::shutdown(c, SHUT_WR);
+            ::setsockopt(static_cast<int>(c), SOL_SOCKET, SO_LINGER,
+                         reinterpret_cast<const char*>(&lo), sizeof(lo));
+#if defined(_WIN32)
+            ::shutdown(static_cast<SOCKET>(c), SD_SEND);
+            DWORD tv = 2000;  // ms on Winsock
+            ::setsockopt(static_cast<SOCKET>(c), SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<const char*>(&tv), sizeof(tv));
+            char sink[256];
+            while (::recv(static_cast<SOCKET>(c), sink, sizeof(sink), 0) > 0) { /* drain */ }
+#else
+            ::shutdown(static_cast<int>(c), SHUT_WR);
             char  sink[256];
             timeval tv{2, 0};
-            ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            while (::recv(c, sink, sizeof(sink), 0) > 0) { /* drain */ }
-            ::close(c);
+            ::setsockopt(static_cast<int>(c), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            while (::recv(static_cast<int>(c), sink, sizeof(sink), 0) > 0) { /* drain */ }
+#endif
+            obn::os::close_socket(c);
         }).detach();
     }
 }

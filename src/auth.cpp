@@ -2,15 +2,13 @@
 
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/os_compat.hpp"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <errno.h>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace obn::auth {
 
@@ -23,7 +21,7 @@ std::string to_iso8601(clock::time_point tp)
     auto t = clock::to_time_t(tp);
     char buf[80];
     std::tm tm{};
-    gmtime_r(&t, &tm);
+    obn::os::gmtime_safe(t, &tm);
     std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                   tm.tm_hour, tm.tm_min, tm.tm_sec);
@@ -44,8 +42,7 @@ clock::time_point parse_iso8601(const std::string& s)
     tm.tm_hour = h;
     tm.tm_min  = mi;
     tm.tm_sec  = se;
-    // timegm is Linux-specific; we're targeting Linux/glibc.
-    auto t = timegm(&tm);
+    auto t = obn::os::timegm_safe(&tm);
     return clock::from_time_t(t);
 }
 
@@ -99,9 +96,15 @@ void Store::persist_locked() const
 
     std::string tmp = path_ + ".tmp";
     {
-        // Write with umask-style 0600 permissions.
-        int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd < 0) {
+        // Atomic-rename pattern: write to a sibling .tmp file, fflush, then
+        // rename over the target. On POSIX rename(2) is atomic; on Windows
+        // we have to remove the destination first because rename() refuses
+        // to overwrite by default (std::filesystem::rename mirrors POSIX
+        // semantics on Linux but on Windows it forwards to MoveFileEx
+        // without MOVEFILE_REPLACE_EXISTING -- we work around that with an
+        // explicit remove on the target).
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out.good()) {
             OBN_ERROR("auth: open(%s) failed: %s", tmp.c_str(), std::strerror(errno));
             return;
         }
@@ -125,19 +128,30 @@ void Store::persist_locked() const
         add("nick_name",     s_.nick_name);
         add("avatar",        s_.avatar, /*last=*/true);
         body += "}\n";
-        ssize_t written = ::write(fd, body.data(), body.size());
-        ::fsync(fd);
-        ::close(fd);
-        if (written < static_cast<ssize_t>(body.size())) {
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        out.flush();
+        if (!out.good()) {
             OBN_ERROR("auth: partial write on %s", tmp.c_str());
-            ::unlink(tmp.c_str());
+            out.close();
+            fs::remove(tmp, ec);
             return;
         }
+        out.close();
     }
-    if (::rename(tmp.c_str(), path_.c_str()) != 0) {
+#if defined(_WIN32)
+    // Windows MoveFileEx semantics through std::filesystem::rename do not
+    // overwrite by default. Remove the destination first so the rename
+    // succeeds; this is non-atomic on Windows but matches what every other
+    // app does here, and the worst case is the auth file disappearing for
+    // a few microseconds (the in-memory copy keeps working regardless).
+    fs::remove(path_, ec);
+#endif
+    fs::rename(tmp, path_, ec);
+    if (ec) {
         OBN_ERROR("auth: rename(%s -> %s) failed: %s",
-                  tmp.c_str(), path_.c_str(), std::strerror(errno));
-        ::unlink(tmp.c_str());
+                  tmp.c_str(), path_.c_str(), ec.message().c_str());
+        std::error_code rmec;
+        fs::remove(tmp, rmec);
     }
 }
 
@@ -182,7 +196,10 @@ void Store::clear()
 {
     std::lock_guard<std::mutex> lk(mu_);
     s_ = {};
-    if (!path_.empty()) ::unlink(path_.c_str());
+    if (!path_.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+    }
 }
 
 bool Store::needs_refresh(std::chrono::seconds margin) const

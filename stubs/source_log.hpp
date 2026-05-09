@@ -28,10 +28,17 @@
 namespace obn::source {
 
 // Studio's Logger typedef in tchar form, repeated here so submodules
-// don't need to pull in BambuTunnel.h. char* on Linux/macOS;
-// gstbambusrc and our own callers free the message with
-// Bambu_FreeLogMsg, so log_at()/log_fmt() always allocate via strdup.
-using Logger = void (*)(void* ctx, int level, char const* msg);
+// don't need to pull in BambuTunnel.h. char* on Linux/macOS,
+// wchar_t* on Windows (gstbambusrc + wxMediaCtrl2 expect a wide
+// string there). gstbambusrc and our own callers free the message
+// with Bambu_FreeLogMsg, so log_at()/log_fmt() always allocate via
+// malloc-style helpers in the platform's native character width.
+#if defined(_WIN32)
+using obn_tchar = wchar_t;
+#else
+using obn_tchar = char;
+#endif
+using Logger = void (*)(void* ctx, int level, obn_tchar const* msg);
 
 enum LogLevel {
     LL_TRACE = 0,
@@ -43,19 +50,26 @@ enum LogLevel {
 };
 
 // Default logger for tunnels where the caller hasn't set one yet.
-void noop_logger(void*, int, char const*);
+void noop_logger(void*, int, obn_tchar const*);
 
 // Honor-OBN_BAMBUSOURCE_LOG_LEVEL formatter. Drops messages below the
 // configured threshold for both the file mirror and the Studio
 // callback (so OBN_BAMBUSOURCE_LOG_LEVEL=debug enables extra detail
 // without spamming Studio's own log when set higher).
-[[gnu::format(printf, 4, 5)]]
+#if defined(__GNUC__) || defined(__clang__)
+#  define OBN_SOURCE_LOG_PRINTF_ATTR(fmt_idx, args_idx) \
+       [[gnu::format(printf, fmt_idx, args_idx)]]
+#else
+#  define OBN_SOURCE_LOG_PRINTF_ATTR(fmt_idx, args_idx)
+#endif
+
+OBN_SOURCE_LOG_PRINTF_ATTR(4, 5)
 void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...);
 
 // Backwards-compatible default (INFO) so existing call sites keep
 // working unchanged. New code should prefer log_at() with an explicit
 // level when the message is debug/warn/error in nature.
-[[gnu::format(printf, 3, 4)]]
+OBN_SOURCE_LOG_PRINTF_ATTR(3, 4)
 void log_fmt(Logger logger, void* ctx, const char* fmt, ...);
 
 // Threshold derived from OBN_BAMBUSOURCE_LOG_LEVEL. Cached on first use.

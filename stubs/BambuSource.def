@@ -1,0 +1,44 @@
+; Module-definition file for BambuSource.dll (Windows).
+;
+; The Bambu_* C ABI is exported via __declspec(dllexport) in
+; stubs/BambuSource.cpp; we still re-list them here for clarity and to
+; ensure the names show up in dumpbin/objdump even if a future MSVC
+; tightens its dead-code-strip pass.
+;
+; The COM in-proc-server entry points (DllGetClassObject etc.) cannot
+; use __declspec(dllexport) because <objbase.h> already declares them
+; without a dllexport storage class -- adding it later confuses MSVC
+; ("different linkage"). Listing them here gets them exported without
+; touching the function signatures.
+
+LIBRARY BambuSource
+
+EXPORTS
+    ; --- COM in-proc server (dshow_filter.cpp) ---
+    DllGetClassObject       PRIVATE
+    DllCanUnloadNow         PRIVATE
+    DllRegisterServer       PRIVATE
+    DllUnregisterServer     PRIVATE
+
+    ; --- Bambu_* C ABI (BambuSource.cpp) ---
+    Bambu_Init
+    Bambu_Deinit
+    Bambu_Create
+    Bambu_Destroy
+    Bambu_SetLogger
+    Bambu_Open
+    Bambu_StartStream
+    Bambu_StartStreamEx
+    Bambu_GetStreamCount
+    Bambu_GetStreamInfo
+    Bambu_GetDuration
+    Bambu_Seek
+    Bambu_ReadSample
+    Bambu_SendMessage
+    Bambu_RecvMessage
+    Bambu_Close
+    Bambu_GetLastErrorMsg
+    Bambu_FreeLogMsg
+
+    ; --- legacy probe export (BambuSource.cpp) ---
+    bambu_source_is_stub

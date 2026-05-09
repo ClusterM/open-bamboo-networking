@@ -21,12 +21,25 @@
 #include "source_log.hpp"
 #include "tls_socket.hpp"
 
+#include "obn/os_compat.hpp"
+
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 
-#include <sys/socket.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <windows.h>
+#else
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -489,8 +502,8 @@ struct Client::Impl {
     Logger logger;
     void*  log_ctx;
 
-    int  fd  = -1;
-    SSL* ssl = nullptr;
+    obn::os::socket_t fd  = obn::os::kInvalidSocket;
+    SSL*              ssl = nullptr;
 
     // Mutex protects ssl/fd against the keepalive thread writing
     // GET_PARAMETER requests while the data thread is reading
@@ -1113,7 +1126,7 @@ int Client::start(const Url& url, int connect_timeout_ms)
                 SSL_get_cipher(I.ssl));
     } else {
         I.fd = obn::tls::dial(url.host, url.port, connect_timeout_ms);
-        if (I.fd < 0) {
+        if (!obn::os::socket_valid(I.fd)) {
             log_fmt(I.logger, I.log_ctx, "rtsp: dial failed: %s",
                     obn::source::get_last_error());
             return -1;
@@ -1121,8 +1134,8 @@ int Client::start(const Url& url, int connect_timeout_ms)
         // No TLS path: we'd need a second helper to read/write plain
         // TCP. Bambu never uses it, so for now refuse cleanly.
         set_last_error("rtsp: plain rtsp:// is not supported");
-        ::close(I.fd);
-        I.fd = -1;
+        obn::os::close_socket(I.fd);
+        I.fd = obn::os::kInvalidSocket;
         return -1;
     }
 
@@ -1184,7 +1197,7 @@ void Client::stop()
     auto& I = *impl_;
     if (I.stop_flag.exchange(true)) return;
     I.keepalive_cv.notify_all();
-    if (I.fd >= 0) ::shutdown(I.fd, SHUT_RDWR);
+    if (obn::os::socket_valid(I.fd)) obn::os::shutdown_both(I.fd);
     if (I.keepalive.joinable()) I.keepalive.join();
     I.do_teardown_best_effort();
     std::lock_guard<std::mutex> lk(I.io_mu);
@@ -1195,7 +1208,7 @@ void Client::cancel()
 {
     if (!impl_) return;
     auto& I = *impl_;
-    if (I.fd >= 0) ::shutdown(I.fd, SHUT_RDWR);
+    if (obn::os::socket_valid(I.fd)) obn::os::shutdown_both(I.fd);
     I.keepalive_cv.notify_all();
 }
 
