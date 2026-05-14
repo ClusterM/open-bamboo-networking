@@ -97,7 +97,7 @@ bool download_ftps_file(const std::string& host,
     cfg.ca_file  = ca_file;
 
     obn::ftps::Client c;
-    if (std::string err = c.connect(cfg); !err.empty()) {
+    if (std::string err = obn::ftps::connect_with_fallback(c, cfg); !err.empty()) {
         OBN_DEBUG("cover_cache: ftps connect %s: %s",
                   host.c_str(), err.c_str());
         return false;

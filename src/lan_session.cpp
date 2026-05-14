@@ -71,50 +71,61 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     OBN_INFO("LanSession start dev=%s ip=%s user=%s ssl=%d",
              dev_id_.c_str(), dev_ip_.c_str(), username_.c_str(), use_ssl_);
 
-    try {
-        client_ = std::make_unique<mqtt::Client>(make_client_id());
-    } catch (const std::exception& e) {
-        OBN_ERROR("LanSession mqtt::Client ctor failed: %s", e.what());
-        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
-    } catch (...) {
-        OBN_ERROR("LanSession mqtt::Client ctor failed: unknown");
-        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    // Helper: creates a fresh mqtt::Client and wires up all three callbacks.
+    // Must be called each time we (re-)create the client, because TLS settings
+    // are baked into the mosquitto instance and cannot be removed.
+    auto make_and_wire = [this]() -> bool {
+        try {
+            client_ = std::make_unique<mqtt::Client>(make_client_id());
+        } catch (const std::exception& e) {
+            OBN_ERROR("LanSession mqtt::Client ctor failed: %s", e.what());
+            return false;
+        } catch (...) {
+            OBN_ERROR("LanSession mqtt::Client ctor failed: unknown");
+            return false;
+        }
+
+        client_->set_on_connect([this](int rc) {
+            if (rc == 0) {
+                // Subscribe to the printer's report topic as soon as we are
+                // connected; the printer answers LAN command requests by pushing
+                // status updates to this topic.
+                OBN_INFO("LanSession connected, subscribing to %s", report_topic_().c_str());
+                client_->subscribe(report_topic_(), 0);
+                if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
+            } else {
+                OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
+                         rc, mqtt::Client::err_str(rc));
+                if (on_connected_)
+                    on_connected_(BBL::ConnectStatusFailed,
+                                  std::string("mqtt connect rc=") + mqtt::Client::err_str(rc));
+            }
+        });
+
+        client_->set_on_disconnect([this](int rc) {
+            OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
+            if (on_connected_) {
+                on_connected_(rc == 0 ? BBL::ConnectStatusOk : BBL::ConnectStatusLost,
+                              std::string("mqtt disconnect rc=") + mqtt::Client::err_str(rc));
+            }
+        });
+
+        client_->set_on_message([this](const mqtt::Message& msg) {
+            OBN_DEBUG("LanSession msg dev=%s bytes=%zu",
+                      dev_id_.c_str(), msg.payload.size());
+            if (on_message_) on_message_(dev_id_, msg.payload);
+        });
+
+        return true;
+    };
+
+    if (!use_ssl_) {
+        OBN_DEBUG("LanSession: use_ssl=false, connecting plain on port 1883");
     }
-
-    client_->set_on_connect([this](int rc) {
-        if (rc == 0) {
-            // Subscribe to the printer's report topic as soon as we are
-            // connected; the printer answers LAN command requests by pushing
-            // status updates to this topic.
-            OBN_INFO("LanSession connected, subscribing to %s", report_topic_().c_str());
-            client_->subscribe(report_topic_(), 0);
-            if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
-        } else {
-            OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
-                     rc, mqtt::Client::err_str(rc));
-            if (on_connected_)
-                on_connected_(BBL::ConnectStatusFailed,
-                              std::string("mqtt connect rc=") + mqtt::Client::err_str(rc));
-        }
-    });
-
-    client_->set_on_disconnect([this](int rc) {
-        OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
-        if (on_connected_) {
-            on_connected_(rc == 0 ? BBL::ConnectStatusOk : BBL::ConnectStatusLost,
-                          std::string("mqtt disconnect rc=") + mqtt::Client::err_str(rc));
-        }
-    });
-
-    client_->set_on_message([this](const mqtt::Message& msg) {
-        OBN_DEBUG("LanSession msg dev=%s bytes=%zu",
-                  dev_id_.c_str(), msg.payload.size());
-        if (on_message_) on_message_(dev_id_, msg.payload);
-    });
 
     mqtt::ConnectConfig cfg;
     cfg.host         = dev_ip_;
-    cfg.port         = 8883;
+    cfg.port         = use_ssl_ ? 8883 : 1883;
     cfg.username     = username_;
     cfg.password     = password_;
     cfg.use_tls      = use_ssl_;
@@ -124,13 +135,33 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     cfg.tls_insecure = true;
     cfg.keepalive_s  = 60;
 
-    OBN_INFO("LanSession tls ca_file=%s",
+    OBN_INFO("LanSession tls=%d ca_file=%s",
+             use_ssl_ ? 1 : 0,
              ca_file_.empty() ? "<none, accepting any>" : ca_file_.c_str());
+
+    if (!make_and_wire()) return BAMBU_NETWORK_ERR_CONNECT_FAILED;
 
     int rc = client_->connect(cfg);
     if (rc != 0) {
         OBN_ERROR("mqtt connect to %s:%d failed rc=%d (%s)",
                   cfg.host.c_str(), cfg.port, rc, mqtt::Client::err_str(rc));
+
+        if (use_ssl_ && rc != MOSQ_ERR_INVAL) {
+            // Any TLS connect failure -> retry plain on port 1883.
+            // MOSQ_ERR_INVAL means invalid parameters (a code bug), not a
+            // network issue, so a plain retry would not help.
+            // The mosquitto instance has TLS baked in; must create a new one.
+            OBN_WARN("LanSession: retrying plain (no TLS) on port 1883");
+            client_.reset();
+            if (!make_and_wire()) return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+            cfg.port    = 1883;
+            cfg.use_tls = false;
+            rc = client_->connect(cfg);
+            if (rc != 0) {
+                OBN_ERROR("mqtt plain connect to %s:1883 also failed rc=%d (%s)",
+                          cfg.host.c_str(), rc, mqtt::Client::err_str(rc));
+            }
+        }
     }
     return map_mqtt_err(rc);
 }

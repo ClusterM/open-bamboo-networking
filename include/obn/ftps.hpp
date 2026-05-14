@@ -1,8 +1,8 @@
 #pragma once
 
-// Implicit-TLS FTPS client for Bambu printers.
+// FTP/FTPS client for Bambu printers.
 //
-// Bambu printers speak a quirky flavour of FTPS:
+// Bambu printers typically speak a quirky flavour of FTPS:
 //   * Implicit TLS on port 990 (the TLS handshake starts immediately after
 //     TCP connect; there is no AUTH TLS command).
 //   * Self-signed server certificate. We verify against the bundled
@@ -13,6 +13,13 @@
 //   * The data channel also runs TLS (PROT P), and some firmwares expect
 //     the data socket to reuse the control socket's TLS session, which we
 //     opt into via SSL_SESSION_dup when available.
+//
+// At least one P1S unit was reported to have TLS ports (8883/990) closed
+// while plain-text equivalents (1883/21) remained accessible. The root cause
+// is unknown -- possibly a firmware variant or configuration issue. Set
+// use_tls=false in ConnectConfig to speak plain FTP, or use
+// connect_with_fallback() which tries TLS first and falls back to plain on
+// transport/TLS failures (not on authentication failures).
 //
 // Only the operations needed by print and probe paths are implemented:
 // connect/login, STOR (upload), DELE, SIZE, LIST, QUIT.
@@ -30,6 +37,13 @@ struct ConnectConfig {
     int         port       = 990;
     std::string username   = "bblp";
     std::string password;
+
+    // When true (default), use implicit TLS on the control and data
+    // channels (FTPS, port 990). When false, connect without TLS
+    // (plain FTP, typically port 21); ca_file is ignored.
+    // If use_tls is false and port is still the default 990, connect_transport()
+    // and connect_with_fallback() remap it to 21 automatically.
+    bool        use_tls    = true;
 
     // Path to a CA bundle (PEM). If empty, TLS verification is disabled
     // (matching the behaviour we already use for MQTT against printers
@@ -70,9 +84,20 @@ public:
     Client(const Client&)            = delete;
     Client& operator=(const Client&) = delete;
 
-    // Establishes the TLS control connection, authenticates, switches to
-    // binary mode and enables PROT P on data transfers. Returns an empty
-    // string on success or a human-readable error description.
+    // Establishes the TCP connection and, if cfg.use_tls is true, performs
+    // the TLS handshake. Does NOT authenticate. Returns empty on success.
+    // Separating transport from login lets connect_with_fallback() fall back
+    // only on transport errors, not on credential failures.
+    std::string connect_transport(const ConnectConfig& cfg);
+
+    // Runs the FTP login sequence on an already-established transport
+    // (USER/PASS, TYPE I, and PBSZ 0 + PROT P when use_tls is set).
+    // Must be called after a successful connect_transport(). Returns empty
+    // on success.
+    std::string login(const ConnectConfig& cfg);
+
+    // Convenience: connect_transport() followed by login(). Returns empty on
+    // success or a human-readable error description.
     std::string connect(const ConnectConfig& cfg);
 
     // Uploads the file at `local_path` to `remote_path` on the printer's
@@ -122,5 +147,12 @@ public:
 private:
     std::unique_ptr<Impl> p_;
 };
+
+// Tries to connect with TLS (port 990) first. If use_tls is already false
+// in cfg, connects plain immediately (port 21 unless cfg.port was overridden).
+// On any transport/TLS failure (TCP connect, handshake, missing 220 banner)
+// retries plain on port 21. Auth failures (wrong credentials) are NOT retried
+// on plain. Returns empty string on success; error description on failure.
+std::string connect_with_fallback(Client& client, ConnectConfig cfg);
 
 } // namespace obn::ftps

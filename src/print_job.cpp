@@ -320,10 +320,11 @@ int ftp_upload(const BBL::PrintParams&    p,
     cfg.username = p.username.empty() ? std::string{"bblp"} : p.username;
     cfg.password = p.password;
     cfg.ca_file  = ca_file;
+    cfg.use_tls  = p.use_ssl_for_ftp;
 
     obn::ftps::Client cli;
-    if (std::string err = cli.connect(cfg); !err.empty()) {
-        OBN_ERROR("print_job: ftps connect %s: %s", p.dev_ip.c_str(), err.c_str());
+    if (std::string err = obn::ftps::connect_with_fallback(cli, cfg); !err.empty()) {
+        OBN_ERROR("print_job: ftp(s) connect %s: %s", p.dev_ip.c_str(), err.c_str());
         if (update_fn) update_fn(BBL::PrintingStageERROR, err_code_on_failure, err);
         return err_code_on_failure;
     }

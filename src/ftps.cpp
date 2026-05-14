@@ -181,6 +181,60 @@ int ssl_read_some(SSL* ssl, socket_t fd, void* buf, std::size_t max_len, int tim
     }
 }
 
+// Plain-socket equivalents of ssl_write_all / ssl_read_some.
+// Used when the printer does not support TLS (plain FTP on port 21).
+
+bool plain_write_all(socket_t fd, const void* buf, std::size_t len, int timeout_ms)
+{
+    const char* p   = static_cast<const char*>(buf);
+    std::size_t off = 0;
+    while (off < len) {
+        if (wait_fd(fd, POLLOUT, timeout_ms) <= 0) return false;
+#if defined(_WIN32)
+        int r = ::send(static_cast<SOCKET>(fd), p + off,
+                       static_cast<int>(len - off), 0);
+        if (r < 0) {
+            int e = ::WSAGetLastError();
+            if (e == WSAEWOULDBLOCK || e == WSAEINTR) continue;
+            return false;
+        }
+#else
+        int r = ::send(fd, p + off, static_cast<int>(len - off), 0);
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return false;
+        }
+#endif
+        if (r == 0) return false;
+        off += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+// Returns >0 bytes read, 0 on clean EOF, -1 on error/timeout.
+int plain_read_some(socket_t fd, void* buf, std::size_t max_len, int timeout_ms)
+{
+    for (;;) {
+        if (wait_fd(fd, POLLIN, timeout_ms) <= 0) return -1;
+#if defined(_WIN32)
+        int r = ::recv(static_cast<SOCKET>(fd), static_cast<char*>(buf),
+                       static_cast<int>(max_len), 0);
+        if (r < 0) {
+            int e = ::WSAGetLastError();
+            if (e == WSAEWOULDBLOCK || e == WSAEINTR) continue;
+            return -1;
+        }
+#else
+        int r = ::recv(fd, static_cast<char*>(buf), static_cast<int>(max_len), 0);
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return -1;
+        }
+#endif
+        return r;  // 0 = clean EOF, >0 = bytes received
+    }
+}
+
 } // namespace
 
 // -------------------------------------------------------------------
@@ -194,6 +248,8 @@ struct Client::Impl {
     std::string host;
     int      control_timeout_ms = 10000;
     int      data_timeout_ms    = 60000;
+    bool     use_tls            = true;
+    int      ctrl_connect_port  = 0; // actual TCP port used (after plain 990->21 remap)
 
     // Line-oriented read buffer for the control channel.
     std::string ctrl_buf;
@@ -206,6 +262,27 @@ struct Client::Impl {
             ctrl_fd = kInvalidSocket;
         }
         if (ctx) { SSL_CTX_free(ctx); ctx = nullptr; }
+    }
+
+    // Unified control-channel read/write that dispatches to TLS or plain.
+    // Returns failure gracefully when TLS was requested but SSL* was never
+    // created (e.g. connect() bailed out between TCP connect and SSL_new).
+    int ctrl_read(void* buf, std::size_t max_len)
+    {
+        if (use_tls) {
+            if (!ctrl_ssl) return -1;
+            return ssl_read_some(ctrl_ssl, ctrl_fd, buf, max_len, control_timeout_ms);
+        }
+        return plain_read_some(ctrl_fd, buf, max_len, control_timeout_ms);
+    }
+
+    bool ctrl_write(const void* buf, std::size_t len)
+    {
+        if (use_tls) {
+            if (!ctrl_ssl) return false;
+            return ssl_write_all(ctrl_ssl, ctrl_fd, buf, len, control_timeout_ms);
+        }
+        return plain_write_all(ctrl_fd, buf, len, control_timeout_ms);
     }
 
     // Reads one CRLF-terminated line (without the CRLF) from the control
@@ -222,7 +299,7 @@ struct Client::Impl {
                 return line;
             }
             char tmp[512];
-            int n = ssl_read_some(ctrl_ssl, ctrl_fd, tmp, sizeof(tmp), control_timeout_ms);
+            int n = ctrl_read(tmp, sizeof(tmp));
             if (n <= 0) { *ok = false; return {}; }
             ctrl_buf.append(tmp, tmp + n);
         }
@@ -263,8 +340,12 @@ struct Client::Impl {
     {
         std::string wire = cmd + "\r\n";
         OBN_DEBUG("ftps ctrl > %s", redact ? "<redacted>" : cmd.c_str());
-        if (!ssl_write_all(ctrl_ssl, ctrl_fd, wire.data(), wire.size(), control_timeout_ms)) {
-            OBN_WARN("ftps: write %s failed: %s", cmd.c_str(), openssl_last_error().c_str());
+        if (!ctrl_write(wire.data(), wire.size())) {
+            if (use_tls)
+                OBN_WARN("ftps: write %s failed: %s", cmd.c_str(), openssl_last_error().c_str());
+            else
+                OBN_WARN("ftps: write %s failed: %s", cmd.c_str(),
+                         std::strerror(obn::os::last_socket_error()));
             return -1;
         }
         std::string body;
@@ -282,55 +363,83 @@ struct Client::Impl {
 Client::Client() : p_(std::make_unique<Impl>()) { init_openssl_once(); }
 Client::~Client() { quit(); }
 
-std::string Client::connect(const ConnectConfig& cfg)
+std::string Client::connect_transport(const ConnectConfig& cfg)
 {
+    // Tear down any prior connection so we never leak sockets or SSL objects
+    // when this method is called on an already-connected (or half-open) client.
+    quit();
+
     p_->control_timeout_ms = cfg.control_timeout_s * 1000;
     p_->data_timeout_ms    = cfg.data_timeout_s * 1000;
     p_->host               = cfg.host;
+    p_->use_tls            = cfg.use_tls;
+    p_->ctrl_buf.clear();
+    p_->ctrl_connect_port  = 0;
+
+    int port = cfg.port;
+    if (!cfg.use_tls && port == 990) port = 21;
 
     std::string err;
-    socket_t fd = connect_tcp(cfg.host, cfg.port, p_->control_timeout_ms, err);
+    socket_t fd = connect_tcp(cfg.host, port, p_->control_timeout_ms, err);
     if (!obn::os::socket_valid(fd)) return "tcp: " + err;
-    p_->ctrl_fd = fd;
+    p_->ctrl_fd           = fd;
+    p_->ctrl_connect_port = port;
 
-    p_->ctx = SSL_CTX_new(TLS_client_method());
-    if (!p_->ctx) return "SSL_CTX_new: " + openssl_last_error();
-    SSL_CTX_set_options(p_->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
-    // Bambu's firmware presents TLS 1.2-era ciphers; leave defaults.
-    // Printer cert has no matching SAN for the IP, so we always skip
-    // hostname verification. Chain verification is enabled only if a CA
-    // bundle was provided.
-    if (!cfg.ca_file.empty()) {
-        if (SSL_CTX_load_verify_locations(p_->ctx, cfg.ca_file.c_str(), nullptr) != 1) {
-            OBN_WARN("ftps: load_verify_locations(%s) failed: %s (falling back to no-verify)",
-                     cfg.ca_file.c_str(), openssl_last_error().c_str());
-            SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
-        } else {
-            SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_PEER, nullptr);
+    if (cfg.use_tls) {
+        p_->ctx = SSL_CTX_new(TLS_client_method());
+        if (!p_->ctx) {
+            quit();
+            return "SSL_CTX_new: " + openssl_last_error();
         }
-    } else {
-        SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
-    }
-    // Bambu firmware uses X25519 + session tickets and is happy with TLS
-    // session reuse; we don't need to opt-in explicitly.
-    SSL_CTX_set_session_cache_mode(p_->ctx, SSL_SESS_CACHE_CLIENT);
+        SSL_CTX_set_options(p_->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+        // Bambu's firmware presents TLS 1.2-era ciphers; leave defaults.
+        // Printer cert has no matching SAN for the IP, so we always skip
+        // hostname verification. Chain verification is enabled only if a CA
+        // bundle was provided.
+        if (!cfg.ca_file.empty()) {
+            if (SSL_CTX_load_verify_locations(p_->ctx, cfg.ca_file.c_str(), nullptr) != 1) {
+                OBN_WARN("ftps: load_verify_locations(%s) failed: %s (falling back to no-verify)",
+                         cfg.ca_file.c_str(), openssl_last_error().c_str());
+                SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
+            } else {
+                SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_PEER, nullptr);
+            }
+        } else {
+            SSL_CTX_set_verify(p_->ctx, SSL_VERIFY_NONE, nullptr);
+        }
+        // Bambu firmware uses X25519 + session tickets and is happy with TLS
+        // session reuse; we don't need to opt-in explicitly.
+        SSL_CTX_set_session_cache_mode(p_->ctx, SSL_SESS_CACHE_CLIENT);
 
-    p_->ctrl_ssl = SSL_new(p_->ctx);
-    if (!p_->ctrl_ssl) return "SSL_new: " + openssl_last_error();
-    SSL_set_fd(p_->ctrl_ssl, static_cast<int>(fd));
-    SSL_set_tlsext_host_name(p_->ctrl_ssl, cfg.host.c_str());
-    if (drive_ssl(p_->ctrl_ssl, fd, SSL_connect, p_->control_timeout_ms) <= 0) {
-        return "TLS handshake: " + openssl_last_error();
+        p_->ctrl_ssl = SSL_new(p_->ctx);
+        if (!p_->ctrl_ssl) {
+            quit();
+            return "SSL_new: " + openssl_last_error();
+        }
+        SSL_set_fd(p_->ctrl_ssl, static_cast<int>(fd));
+        SSL_set_tlsext_host_name(p_->ctrl_ssl, cfg.host.c_str());
+        if (drive_ssl(p_->ctrl_ssl, fd, SSL_connect, p_->control_timeout_ms) <= 0) {
+            quit();
+            return "TLS handshake: " + openssl_last_error();
+        }
     }
 
-    // Bambu firmware sends the 220 banner as the first thing after the
-    // TLS handshake.
+    // Plain FTP sends the 220 banner immediately after TCP connect.
+    // FTPS sends it after the TLS handshake. Either way we read it now.
     std::string banner;
     int code = p_->read_reply(&banner);
-    if (code != 220) return "no 220 banner (got " + std::to_string(code) + "): " + banner;
+    if (code != 220) {
+        std::string msg = "no 220 banner (got " + std::to_string(code) + "): " + banner;
+        quit();
+        return msg;
+    }
     OBN_DEBUG("ftps: banner <%s>", banner.c_str());
+    return {};
+}
 
-    code = p_->send_cmd("USER " + cfg.username);
+std::string Client::login(const ConnectConfig& cfg)
+{
+    int code = p_->send_cmd("USER " + cfg.username);
     if (code != 331 && code != 230) return "USER rejected: code=" + std::to_string(code);
     if (code == 331) {
         code = p_->send_cmd("PASS " + cfg.password, nullptr, /*redact=*/true);
@@ -338,11 +447,25 @@ std::string Client::connect(const ConnectConfig& cfg)
     }
     code = p_->send_cmd("TYPE I");
     if (code != 200) return "TYPE I rejected: code=" + std::to_string(code);
-    code = p_->send_cmd("PBSZ 0");
-    if (code != 200) return "PBSZ rejected: code=" + std::to_string(code);
-    code = p_->send_cmd("PROT P");
-    if (code != 200) return "PROT P rejected: code=" + std::to_string(code);
-    OBN_INFO("ftps: logged in to %s as %s", cfg.host.c_str(), cfg.username.c_str());
+    if (p_->use_tls) {
+        // PBSZ and PROT P are TLS-only commands; plain FTP daemons reject them.
+        code = p_->send_cmd("PBSZ 0");
+        if (code != 200) return "PBSZ rejected: code=" + std::to_string(code);
+        code = p_->send_cmd("PROT P");
+        if (code != 200) return "PROT P rejected: code=" + std::to_string(code);
+    }
+    OBN_INFO("ftps: logged in to %s:%d as %s (tls=%d)",
+             cfg.host.c_str(), p_->ctrl_connect_port, cfg.username.c_str(), p_->use_tls ? 1 : 0);
+    return {};
+}
+
+std::string Client::connect(const ConnectConfig& cfg)
+{
+    if (std::string err = connect_transport(cfg); !err.empty()) return err;
+    if (std::string err = login(cfg); !err.empty()) {
+        quit();
+        return err;
+    }
     return {};
 }
 
@@ -428,8 +551,11 @@ std::string Client::stor(const std::string& local_path,
         return "STOR rejected: code=" + std::to_string(code);
     }
 
-    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    SSL* data_ssl = nullptr;
+    if (p_->use_tls) {
+        data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+        if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    }
 
     std::vector<char>  buf(64 * 1024);
     std::uint64_t      sent = 0;
@@ -438,13 +564,16 @@ std::string Client::stor(const std::string& local_path,
         f.read(buf.data(), buf.size());
         std::streamsize n = f.gcount();
         if (n <= 0) break;
-        if (!ssl_write_all(data_ssl, data_fd, buf.data(), static_cast<std::size_t>(n),
-                           p_->data_timeout_ms))
-        {
-            SSL_shutdown(data_ssl);
-            SSL_free(data_ssl);
+        bool write_ok = data_ssl
+            ? ssl_write_all(data_ssl, data_fd, buf.data(), static_cast<std::size_t>(n),
+                            p_->data_timeout_ms)
+            : plain_write_all(data_fd, buf.data(), static_cast<std::size_t>(n),
+                              p_->data_timeout_ms);
+        if (!write_ok) {
+            if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
             obn::os::close_socket(data_fd);
-            return "data write: " + openssl_last_error();
+            return data_ssl ? "data write: " + openssl_last_error()
+                            : "data write: " + std::string(std::strerror(obn::os::last_socket_error()));
         }
         sent += static_cast<std::uint64_t>(n);
         if (progress) {
@@ -454,8 +583,7 @@ std::string Client::stor(const std::string& local_path,
             if (pct != last_progress) {
                 last_progress = pct;
                 if (!progress(sent, total)) {
-                    SSL_shutdown(data_ssl);
-                    SSL_free(data_ssl);
+                    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
                     obn::os::close_socket(data_fd);
                     return "upload cancelled";
                 }
@@ -463,12 +591,9 @@ std::string Client::stor(const std::string& local_path,
         }
     }
 
-    // Close the data channel politely. SSL_shutdown() may return 0 which
-    // is fine (remote hasn't sent close_notify yet). Some printers block
-    // on the final 226 until the data socket is fully closed, so we do
-    // it before reading the reply.
-    SSL_shutdown(data_ssl);
-    SSL_free(data_ssl);
+    // Close the data channel politely. Some printers block on the final 226
+    // until the data socket is fully closed, so we do it before reading reply.
+    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
     obn::os::close_socket(data_fd);
 
     std::string body;
@@ -493,18 +618,22 @@ std::string Client::list(const std::string& path, std::string& err_out)
         return {};
     }
 
-    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { obn::os::close_socket(data_fd); err_out = err; return {}; }
+    SSL* data_ssl = nullptr;
+    if (p_->use_tls) {
+        data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+        if (!data_ssl) { obn::os::close_socket(data_fd); err_out = err; return {}; }
+    }
 
     std::string body;
     char buf[1024];
     while (true) {
-        int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+        int n = data_ssl
+            ? ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms)
+            : plain_read_some(data_fd, buf, sizeof(buf), p_->data_timeout_ms);
         if (n <= 0) break;
         body.append(buf, buf + n);
     }
-    SSL_shutdown(data_ssl);
-    SSL_free(data_ssl);
+    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
     obn::os::close_socket(data_fd);
 
     int done = p_->read_reply(nullptr);
@@ -554,15 +683,21 @@ std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
         obn::os::close_socket(data_fd);
         return "RETR rejected: code=" + std::to_string(code);
     }
-    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    SSL* data_ssl = nullptr;
+    if (p_->use_tls) {
+        data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+        if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    }
 
     char buf[64 * 1024];
     bool aborted = false;
     while (true) {
-        int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+        int n = data_ssl
+            ? ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms)
+            : plain_read_some(data_fd, buf, sizeof(buf), p_->data_timeout_ms);
         if (n < 0) {
-            err = "data read: " + openssl_last_error();
+            err = data_ssl ? "data read: " + openssl_last_error()
+                           : "data read: " + std::string(std::strerror(obn::os::last_socket_error()));
             aborted = true;
             break;
         }
@@ -573,8 +708,7 @@ std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
             break;
         }
     }
-    SSL_shutdown(data_ssl);
-    SSL_free(data_ssl);
+    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
     obn::os::close_socket(data_fd);
 
     std::string body;
@@ -606,17 +740,21 @@ std::string Client::list_entries(const std::string& path,
         obn::os::close_socket(data_fd);
         return "LIST rejected: code=" + std::to_string(code);
     }
-    SSL* data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
-    if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    SSL* data_ssl = nullptr;
+    if (p_->use_tls) {
+        data_ssl = wrap_data_tls(*p_, p_->ctrl_ssl, data_fd, p_->host, err);
+        if (!data_ssl) { obn::os::close_socket(data_fd); return err; }
+    }
     std::string body;
     char buf[1024];
     while (true) {
-        int n = ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms);
+        int n = data_ssl
+            ? ssl_read_some(data_ssl, data_fd, buf, sizeof(buf), p_->data_timeout_ms)
+            : plain_read_some(data_fd, buf, sizeof(buf), p_->data_timeout_ms);
         if (n <= 0) break;
         body.append(buf, buf + n);
     }
-    SSL_shutdown(data_ssl);
-    SSL_free(data_ssl);
+    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
     obn::os::close_socket(data_fd);
     int done = p_->read_reply(nullptr);
     if (done != 226 && done != 250) return "LIST finish code=" + std::to_string(done);
@@ -652,16 +790,18 @@ std::string Client::cwd(const std::string& path)
 void Client::quit()
 {
     if (!p_) return;
+    if (obn::os::socket_valid(p_->ctrl_fd)) {
+        // Best-effort QUIT + drain; use a short timeout so teardown does not
+        // block for the full control_timeout_ms (e.g. 10s) on broken links.
+        const int prev_ms = p_->control_timeout_ms;
+        p_->control_timeout_ms = 1000;
+        std::string wire = "QUIT\r\n";
+        p_->ctrl_write(wire.data(), wire.size());
+        std::string body;
+        p_->read_reply(&body);
+        p_->control_timeout_ms = prev_ms;
+    }
     if (p_->ctrl_ssl) {
-        // Best-effort: send QUIT if the channel is still usable, then
-        // shutdown TLS.
-        if (obn::os::socket_valid(p_->ctrl_fd)) {
-            std::string wire = "QUIT\r\n";
-            ssl_write_all(p_->ctrl_ssl, p_->ctrl_fd, wire.data(), wire.size(), 1000);
-            // Drain the 221 reply if it arrives promptly.
-            std::string body;
-            p_->read_reply(&body);
-        }
         SSL_shutdown(p_->ctrl_ssl);
         SSL_free(p_->ctrl_ssl);
         p_->ctrl_ssl = nullptr;
@@ -671,6 +811,47 @@ void Client::quit()
         p_->ctrl_fd = kInvalidSocket;
     }
     if (p_->ctx) { SSL_CTX_free(p_->ctx); p_->ctx = nullptr; }
+}
+
+std::string connect_with_fallback(Client& client, ConnectConfig cfg)
+{
+    if (!cfg.use_tls) {
+        // Caller explicitly requested plain FTP; use port 21 unless overridden.
+        if (cfg.port == 990) cfg.port = 21;
+        OBN_DEBUG("ftps: use_tls=false, connecting plain to %s:%d",
+                  cfg.host.c_str(), cfg.port);
+        return client.connect(cfg);
+    }
+
+    // Try TLS transport first. On any transport error (TCP / TLS handshake /
+    // missing banner) fall back to plain. Auth errors (wrong credentials etc.)
+    // are not retried on plain because the same credentials will fail there
+    // too, and we avoid sending them in cleartext unnecessarily.
+    std::string transport_err = client.connect_transport(cfg);
+    if (transport_err.empty()) {
+        // Transport is up; run login. No fallback for login failures,
+        // but leave client in a clean disconnected state if login fails.
+        if (std::string err = client.login(cfg); !err.empty()) {
+            client.quit();
+            return err;
+        }
+        return {};
+    }
+
+    OBN_WARN("ftps: TLS connect to %s:%d failed (%s), retrying plain on port 21",
+             cfg.host.c_str(), cfg.port, transport_err.c_str());
+    // connect_transport() already called quit() internally; no extra cleanup needed.
+    cfg.use_tls = false;
+    cfg.port    = 21;
+    if (std::string err = client.connect_transport(cfg); !err.empty()) {
+        client.quit();
+        return err;
+    }
+    if (std::string err = client.login(cfg); !err.empty()) {
+        client.quit();
+        return err;
+    }
+    return {};
 }
 
 } // namespace obn::ftps

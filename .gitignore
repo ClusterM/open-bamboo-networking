@@ -32,3 +32,4 @@ obn_session_log_*.txt
 exports_*.txt
 cmake_bambu_out.txt
 debug_*.log.*
+mosquitto*/

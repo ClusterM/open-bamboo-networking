@@ -318,7 +318,7 @@ std::string tunnel_ensure_ftp(FT_Tunnel* t)
     cfg.ca_file  = {};
 
     auto c = std::make_unique<obn::ftps::Client>();
-    if (std::string err = c->connect(cfg); !err.empty()) {
+    if (std::string err = obn::ftps::connect_with_fallback(*c, cfg); !err.empty()) {
         return err;
     }
     t->ftp = std::move(c);
