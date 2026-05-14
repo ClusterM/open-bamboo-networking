@@ -60,7 +60,9 @@ int list(Agent* agent,
 // shape `PresetCollection::load_user_preset()` expects: every key/value
 // from `setting` (stringified), plus `setting_id`, `name`, `type`,
 // `version`, `base_id`, `filament_id`, `updated_time` (unix seconds
-// as string), `user_id` (from the authenticated session). Returns
+// as string), `user_id` (from the authenticated session). The sync
+// loop may merge list metadata (`setting_id`, `inherits`, …) when GET
+// returns nulls or omits keys Studio still requires. Returns
 // BAMBU_NETWORK_* code.
 int get_full(Agent*                              agent,
              const std::string&                  setting_id,

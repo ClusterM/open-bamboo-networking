@@ -120,6 +120,7 @@ namespace BBL {
 #define IOT_JSON_KEY_SETTING_ID         "setting_id"
 #define IOT_JSON_KEY_FILAMENT_ID        "filament_id"
 #define IOT_JSON_KEY_USER_ID            "user_id"
+#define IOT_JSON_KEY_INHERITS           "inherits"
 
 // user callbacks
 typedef std::function<void(int online_login, bool login)> OnUserLoginFn;

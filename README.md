@@ -298,6 +298,10 @@ around:
 2. **Filament presets**
 3. **Printer presets** (machine profiles)
 
+> **Note:** To sync custom filaments to the printer so they show up in its filament menu, temporarily
+> disable LAN-only mode and bind the printer to Bambu Cloud. Afterward, you can turn LAN-only mode and
+> Developer Mode back on.
+
 **Running without sign-in** is fully supported: go straight to 
 "Device → Connect via LAN with access code",
 and LAN printing / camera / discovery / FTPS all work. You'll just

@@ -67,15 +67,28 @@ int sync_user_presets(obn::Agent*          a,
                 // Make sure the values_map has everything the Studio
                 // loader is going to look at (type/setting_id are
                 // always present in the envelope; inject defensively).
-                if (values.find(IOT_JSON_KEY_TYPE) == values.end())
+                if (values.find(IOT_JSON_KEY_TYPE) == values.end() ||
+                    values[IOT_JSON_KEY_TYPE].empty())
                     values[IOT_JSON_KEY_TYPE] = m.type;
-                if (values.find(IOT_JSON_KEY_SETTING_ID) == values.end())
+                if (values.find(IOT_JSON_KEY_SETTING_ID) == values.end() ||
+                    values[IOT_JSON_KEY_SETTING_ID].empty())
                     values[IOT_JSON_KEY_SETTING_ID] = m.setting_id;
-                if (values.find(IOT_JSON_KEY_NAME) == values.end())
+                if (values.find(IOT_JSON_KEY_NAME) == values.end() ||
+                    values[IOT_JSON_KEY_NAME].empty())
                     values[IOT_JSON_KEY_NAME] = m.name;
                 if (values.find(IOT_JSON_KEY_VERSION) == values.end() ||
                     values[IOT_JSON_KEY_VERSION].empty())
                     values[IOT_JSON_KEY_VERSION] = m.version;
+                if (!m.inherits.empty() &&
+                    (values.find(IOT_JSON_KEY_INHERITS) == values.end() ||
+                     values[IOT_JSON_KEY_INHERITS].empty())) {
+                    values[IOT_JSON_KEY_INHERITS] = m.inherits;
+                }
+                if (m.type == IOT_FILAMENT_STRING && !m.filament_id.empty() &&
+                    (values.find(IOT_JSON_KEY_FILAMENT_ID) == values.end() ||
+                     values[IOT_JSON_KEY_FILAMENT_ID].empty())) {
+                    values[IOT_JSON_KEY_FILAMENT_ID] = m.filament_id;
+                }
                 a->preset_cache_put(m.name, std::move(values));
             } else {
                 OBN_WARN("preset sync: skipped %s (get_full rc=%d)",
