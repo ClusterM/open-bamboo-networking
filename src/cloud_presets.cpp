@@ -240,6 +240,15 @@ void fill_values_from_full(const obn::json::Value& root,
     }
     out[IOT_JSON_KEY_UPDATED_TIME] = std::to_string(unix_ts);
 
+    // Studio's load_user_preset() requires base_id to be present in the
+    // flat map (Preset.cpp). copy_str() skips JSON null; many cloud
+    // filament rows have base_id null at the envelope and omit it from
+    // `setting`, so the key is missing and every such preset is dropped
+    // without surfacing an error through the plugin.
+    if (out.find(IOT_JSON_KEY_BASE_ID) == out.end()) {
+        out[IOT_JSON_KEY_BASE_ID] = "";
+    }
+
     // Studio's loader rejects presets without user_id. The server
     // doesn't echo it, so inject our authenticated user_id here.
     if (!user_id.empty()) {

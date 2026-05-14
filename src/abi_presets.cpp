@@ -73,6 +73,9 @@ int sync_user_presets(obn::Agent*          a,
                     values[IOT_JSON_KEY_SETTING_ID] = m.setting_id;
                 if (values.find(IOT_JSON_KEY_NAME) == values.end())
                     values[IOT_JSON_KEY_NAME] = m.name;
+                if (values.find(IOT_JSON_KEY_VERSION) == values.end() ||
+                    values[IOT_JSON_KEY_VERSION].empty())
+                    values[IOT_JSON_KEY_VERSION] = m.version;
                 a->preset_cache_put(m.name, std::move(values));
             } else {
                 OBN_WARN("preset sync: skipped %s (get_full rc=%d)",
