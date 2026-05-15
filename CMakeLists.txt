@@ -5,6 +5,13 @@ project(open-bambu-networking
     LANGUAGES CXX
 )
 
+# Vendored mosquitto pulls cJSON via FetchContent; released cJSON tags still
+# declare cmake_minimum_required(VERSION 3.0) or older. CMake 3.31+ rejects
+# that unless we raise the policy floor (same effect as -DCMAKE_POLICY_VERSION_MINIMUM=3.5).
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.31")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 # Which slicer this build targets. Drives the install layout (.so file
 # name, OTA manifest presence, which conf file is patched). The plugin
 # code itself does NOT change between clients -- the same C ABI is used.
