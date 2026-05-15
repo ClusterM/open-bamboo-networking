@@ -12,10 +12,12 @@
 // is injected from -DOBN_VERSION=... at CMake configure time; the
 // top-level ./configure auto-detects it from the installed
 // BambuStudio.conf, refusing to pick a stale default.
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
 OBN_ABI std::string bambu_network_get_version()
 {
     return std::string(OBN_VERSION_STRING);
 }
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END
 
 // Studio passes `true` for debug builds and `false` for release. A plugin
 // compiled for the other mode should return false; we always claim

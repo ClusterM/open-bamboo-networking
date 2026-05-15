@@ -132,6 +132,7 @@ OBN_ABI int bambu_network_get_user_presets(
 // Called from sync_preset() on the "create a new cloud preset" path.
 // values_map already has every serialized option; on success we
 // return the new setting_id and refresh values_map["updated_time"].
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
 OBN_ABI std::string bambu_network_request_setting_id(
     void* agent,
     std::string  name,
@@ -143,6 +144,7 @@ OBN_ABI std::string bambu_network_request_setting_id(
     if (!a || !values_map) return {};
     return obn::cloud_presets::create(a, name, *values_map, http_code);
 }
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END
 
 // Called from sync_preset() on the "update existing cloud preset"
 // path. Returns 0 on success; refreshes values_map["updated_time"].

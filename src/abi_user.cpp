@@ -10,6 +10,8 @@
 
 using obn::as_agent;
 
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
+
 OBN_ABI int bambu_network_change_user(void* agent, std::string user_info)
 {
     auto* a = as_agent(agent);
@@ -240,3 +242,5 @@ OBN_ABI int bambu_network_set_user_selected_machine(void* agent, std::string dev
     }
     return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 }
+
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END

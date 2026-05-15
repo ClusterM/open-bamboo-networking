@@ -210,6 +210,12 @@ else()
     # match it so std::string layout lines up across the boundary.
     add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
     add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+    # Clang/AppleClang always; GNU only since GCC 8 (older toolchains reject the flag).
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang" OR
+            (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
+                CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "8"))
+        add_compile_options(-Wno-unused-lambda-capture)
+    endif()
     # Hide every symbol by default, explicitly export only the ABI functions
     # via __attribute__((visibility("default"))) (see include/obn/abi_export.hpp).
     add_compile_options(

@@ -13,10 +13,12 @@
 
 using obn::as_agent;
 
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
 OBN_ABI std::string bambu_network_get_studio_info_url(void* /*agent*/)
 {
     return {};
 }
+OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END
 
 OBN_ABI int bambu_network_set_extra_http_header(void* agent,
                                                 std::map<std::string, std::string> extra_headers)
