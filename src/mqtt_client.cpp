@@ -333,7 +333,11 @@ void Client::disconnect()
     if (!mosq_) return;
     ::mosquitto_disconnect(mosq_);
     if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
-        ::mosquitto_loop_stop(mosq_, /*force=*/false);
+        // Must match ~Client()'s force=true path: loop_stop(false) can return
+        // before the network thread releases the TLS socket; immediate
+        // destroy() then races (Windows: connect_async -> MOSQ_ERR_ERRNO /
+        // EBADF when Orca disconnects+reconnects LAN MQTT in one UI tick
+        ::mosquitto_loop_stop(mosq_, /*force=*/true);
     }
 }
 
