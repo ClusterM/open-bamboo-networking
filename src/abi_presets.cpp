@@ -27,6 +27,36 @@ meta_to_check_map(const obn::cloud_presets::Meta& m)
     return out;
 }
 
+// Studio calls remove_users_preset() using the *key set* from get_user_presets.
+// Stock plugin always includes every cloud catalogue name, often with thin
+// metadata when need_sync was false. We must do the same: skipping get_full
+// when chk_fn says "no" must still put an entry so preset names are not
+// treated as deleted-from-cloud (which erases local files).
+static std::map<std::string, std::string>
+meta_to_minimal_values_map(const obn::cloud_presets::Meta& m,
+                           const std::string&             user_id)
+{
+    std::map<std::string, std::string> values;
+    values[IOT_JSON_KEY_TYPE]       = m.type;
+    values[IOT_JSON_KEY_NAME]       = m.name;
+    values[IOT_JSON_KEY_SETTING_ID] = m.setting_id;
+    values[IOT_JSON_KEY_UPDATED_TIME] =
+        std::to_string(m.updated_time_unix);
+    if (!m.update_time.empty())
+        values[IOT_JSON_KEY_UPDATE_TIME] = m.update_time;
+    if (!m.version.empty())
+        values[IOT_JSON_KEY_VERSION] = m.version;
+    if (!m.base_id.empty())
+        values[IOT_JSON_KEY_BASE_ID] = m.base_id;
+    if (!m.inherits.empty())
+        values[IOT_JSON_KEY_INHERITS] = m.inherits;
+    if (m.type == IOT_FILAMENT_STRING && !m.filament_id.empty())
+        values[IOT_JSON_KEY_FILAMENT_ID] = m.filament_id;
+    if (!user_id.empty())
+        values[IOT_JSON_KEY_USER_ID] = user_id;
+    return values;
+}
+
 // Drive the common sync core shared by get_setting_list and
 // get_setting_list2. The only difference is whether a per-item
 // "should we download this?" check exists; when it's absent we
@@ -48,17 +78,39 @@ int sync_user_presets(obn::Agent*          a,
 
     a->preset_cache_reset();
     const int total = static_cast<int>(metas.size());
+    OBN_INFO("preset sync catalogue=%d bundle_version=%s chk_fn=%s", total,
+             bundle_version.c_str(), chk_fn ? "yes" : "no(all)");
+
     if (total == 0) {
         if (pro_fn) pro_fn(100);
         return BAMBU_NETWORK_SUCCESS;
     }
 
-    int done = 0;
+    int              done           = 0;
+    int              n_full_cached  = 0;
+    int              n_meta_cached  = 0;
+    int              n_chk_skipped  = 0;
+    int              n_get_fail     = 0;
+    int              n_empty_body   = 0;
+    const std::string user_id       = a->cloud_user_id();
     for (const auto& m : metas) {
-        if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
+        if (cancel_fn && cancel_fn()) {
+            OBN_WARN("preset sync cancelled at %d/%d (full_cached=%d "
+                     "meta_cached=%d chk_skipped=%d so far)",
+                     done, total, n_full_cached, n_meta_cached, n_chk_skipped);
+            return BAMBU_NETWORK_ERR_CANCELED;
+        }
 
         bool want = true;
         if (chk_fn) want = chk_fn(meta_to_check_map(m));
+
+        if (!want) {
+            ++n_chk_skipped;
+            OBN_TRACE("preset sync chk_fn skip type=%s name=%s id=%s",
+                      m.type.c_str(), m.name.c_str(), m.setting_id.c_str());
+            a->preset_cache_put(m.name, meta_to_minimal_values_map(m, user_id));
+            ++n_meta_cached;
+        }
 
         if (want) {
             std::map<std::string, std::string> values;
@@ -90,9 +142,20 @@ int sync_user_presets(obn::Agent*          a,
                     values[IOT_JSON_KEY_FILAMENT_ID] = m.filament_id;
                 }
                 a->preset_cache_put(m.name, std::move(values));
+                ++n_full_cached;
+            } else if (gr == BAMBU_NETWORK_SUCCESS) {
+                ++n_empty_body;
+                OBN_WARN("preset sync empty body type=%s name=%s id=%s",
+                         m.type.c_str(), m.name.c_str(), m.setting_id.c_str());
+                a->preset_cache_put(m.name, meta_to_minimal_values_map(m, user_id));
+                ++n_meta_cached;
             } else {
-                OBN_WARN("preset sync: skipped %s (get_full rc=%d)",
-                         m.setting_id.c_str(), gr);
+                ++n_get_fail;
+                OBN_WARN("preset sync get_full failed type=%s name=%s id=%s "
+                         "rc=%d",
+                         m.type.c_str(), m.name.c_str(), m.setting_id.c_str(), gr);
+                a->preset_cache_put(m.name, meta_to_minimal_values_map(m, user_id));
+                ++n_meta_cached;
             }
         }
 
@@ -103,6 +166,9 @@ int sync_user_presets(obn::Agent*          a,
         }
     }
     if (pro_fn) pro_fn(100);
+    OBN_INFO("preset sync done full_cached=%d meta_cached=%d chk_skipped=%d "
+             "get_full_fail=%d empty_body=%d (get_user_presets drains full+meta)",
+             n_full_cached, n_meta_cached, n_chk_skipped, n_get_fail, n_empty_body);
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -120,11 +186,18 @@ OBN_ABI int bambu_network_get_user_presets(
     auto* a = as_agent(agent);
     if (!a) {
         if (user_presets) user_presets->clear();
+        OBN_WARN("bambu_network_get_user_presets: invalid agent handle");
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
+
     auto drained = a->preset_cache_drain();
-    OBN_INFO("bambu_network_get_user_presets: returning %zu presets",
+    OBN_INFO("bambu_network_get_user_presets: drained=%zu presets",
              drained.size());
+    if (drained.empty()) {
+        OBN_DEBUG("bambu_network_get_user_presets: empty drain — second call in "
+                  "the same Studio cycle, or no sync ran, or early drain before "
+                  "put finished");
+    }
     if (user_presets) *user_presets = std::move(drained);
     return BAMBU_NETWORK_SUCCESS;
 }
