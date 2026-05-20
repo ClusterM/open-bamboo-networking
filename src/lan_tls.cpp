@@ -11,6 +11,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include <atomic>
 
 #include <filesystem>
 
@@ -35,7 +36,7 @@ std::string g_config_dir;
 std::string g_ca_file;
 std::unordered_map<std::string, std::string> g_ip_to_serial;
 std::unordered_map<std::string, std::string> g_ip_to_peer_cert;
-bool g_skip_warn_logged = false;
+std::atomic<bool> g_skip_warn_logged{false};
 
 #if defined(_WIN32)
 bool set_env_var(const char* key, const char* value)
@@ -77,6 +78,12 @@ bool is_lan_tls_ipc_key(const char* key)
     return key && std::strncmp(key, "OBN_LAN_TLS_", 12) == 0;
 }
 
+std::string config_dir_snapshot()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_config_dir;
+}
+
 std::vector<std::filesystem::path> state_file_search_paths()
 {
     std::vector<std::filesystem::path> out;
@@ -84,7 +91,7 @@ std::vector<std::filesystem::path> state_file_search_paths()
         if (base.empty()) return;
         out.push_back(base / kLanTlsStateFile);
     };
-    if (!g_config_dir.empty()) add(g_config_dir);
+    if (const std::string cfg = config_dir_snapshot(); !cfg.empty()) add(cfg);
     if (const char* cfg = env_var_get_os(kEnvConfigDir)) add(cfg);
 #if defined(_WIN32)
     if (const char* appdata = std::getenv("APPDATA")) {
@@ -137,8 +144,9 @@ void hydrate_env_from_state_file_once()
 void write_state_file_locked()
 {
     if (g_config_dir.empty()) return;
-    const std::filesystem::path out = std::filesystem::path(g_config_dir) / kLanTlsStateFile;
-    const std::filesystem::path tmp = out.string() + ".tmp";
+    namespace fs = std::filesystem;
+    const fs::path out = fs::path(g_config_dir) / kLanTlsStateFile;
+    const fs::path tmp = out.string() + ".tmp";
     std::ofstream f(tmp, std::ios::binary);
     if (!f) {
         OBN_WARN("lan_tls: cannot write %s", tmp.string().c_str());
@@ -158,14 +166,22 @@ void write_state_file_locked()
     }
     if (!f) {
         OBN_WARN("lan_tls: write failed for %s", tmp.string().c_str());
+        f.close();
+        std::error_code rmec;
+        fs::remove(tmp, rmec);
         return;
     }
     f.close();
     std::error_code ec;
-    std::filesystem::rename(tmp, out, ec);
+#if defined(_WIN32)
+    fs::remove(out, ec);
+#endif
+    fs::rename(tmp, out, ec);
     if (ec) {
         OBN_WARN("lan_tls: rename %s -> %s failed", tmp.string().c_str(),
                  out.string().c_str());
+        std::error_code rmec;
+        fs::remove(tmp, rmec);
         return;
     }
     OBN_TRACE("lan_tls: wrote %s", out.string().c_str());
@@ -208,8 +224,7 @@ void sync_registry_locked()
 
 void warn_skip_once()
 {
-    if (g_skip_warn_logged) return;
-    g_skip_warn_logged = true;
+    if (g_skip_warn_logged.exchange(true)) return;
     OBN_WARN("OBN_SKIP_TLS_VERIFY set — printer TLS verification disabled");
 }
 

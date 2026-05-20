@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 namespace {
@@ -67,12 +68,11 @@ const char* last_error_str()
 
 void add_plugin_dir_to_dll_search(const char* plugin_path)
 {
-    std::string dir(plugin_path);
-    const auto pos = dir.find_last_of("\\/");
-    if (pos == std::string::npos) return;
-    dir.resize(pos);
+    const std::filesystem::path dir =
+        std::filesystem::path(plugin_path).parent_path();
+    if (dir.empty()) return;
     // Let LoadLibrary resolve deps colocated with the plugin (CI build dir).
-    ::SetDllDirectoryA(dir.c_str());
+    ::SetDllDirectoryA(dir.string().c_str());
 }
 #else
 using lib_handle_t = void*;
