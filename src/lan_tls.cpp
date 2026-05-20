@@ -168,7 +168,7 @@ void write_state_file_locked()
                  out.string().c_str());
         return;
     }
-    OBN_DEBUG("lan_tls: wrote %s", out.string().c_str());
+    OBN_TRACE("lan_tls: wrote %s", out.string().c_str());
 }
 
 void sync_ca_env_locked()
@@ -236,6 +236,7 @@ bool verify_enabled()
 void registry_set_config_dir(const std::string& dir)
 {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_config_dir == dir) return;
     g_config_dir = dir;
     if (!dir.empty()) {
         (void)set_env_var(kEnvConfigDir, dir.c_str());
@@ -247,8 +248,10 @@ void registry_set_config_dir(const std::string& dir)
 void registry_set_ca_file(const std::string& path)
 {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_ca_file == path) return;
     g_ca_file = path;
-    sync_registry_locked();
+    sync_ca_env_locked();
+    write_state_file_locked();
     if (path.empty()) {
         OBN_WARN("lan_tls: ca_file empty (printer.cer missing?)");
     } else {
@@ -260,8 +263,11 @@ void registry_put_ip_serial(const std::string& ip, const std::string& serial)
 {
     if (ip.empty() || serial.empty()) return;
     std::lock_guard<std::mutex> lk(g_mu);
+    const auto it = g_ip_to_serial.find(ip);
+    if (it != g_ip_to_serial.end() && it->second == serial) return;
     g_ip_to_serial[ip] = serial;
-    sync_registry_locked();
+    sync_ip_env_locked(ip, serial);
+    write_state_file_locked();
     OBN_DEBUG("lan_tls: ip=%s serial=%s", ip.c_str(), serial.c_str());
 }
 
@@ -270,11 +276,14 @@ void registry_set_peer_cert(const std::string& ip, const std::string& path)
     if (ip.empty()) return;
     std::lock_guard<std::mutex> lk(g_mu);
     if (path.empty()) {
-        g_ip_to_peer_cert.erase(ip);
+        if (g_ip_to_peer_cert.erase(ip) == 0) return;
     } else {
+        const auto it = g_ip_to_peer_cert.find(ip);
+        if (it != g_ip_to_peer_cert.end() && it->second == path) return;
         g_ip_to_peer_cert[ip] = path;
     }
-    sync_registry_locked();
+    sync_peer_env_locked(ip, path);
+    write_state_file_locked();
     OBN_DEBUG("lan_tls: ip=%s peer_cert=%s", ip.c_str(), path.c_str());
 }
 
