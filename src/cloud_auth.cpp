@@ -26,6 +26,7 @@ void fill_auth_fields(const obn::json::Value& root, AuthResult& r)
     r.access_token  = root.find("accessToken").as_string();
     r.refresh_token = root.find("refreshToken").as_string();
     r.expires_in    = root.find("expiresIn").as_int(0);
+    r.refresh_expires_in = root.find("refreshExpiresIn").as_int(0);
     r.login_type    = root.find("loginType").as_string();
     // tfaKey is sometimes called "tfa_key"; check both.
     auto tfa1 = root.find("tfaKey").as_string();

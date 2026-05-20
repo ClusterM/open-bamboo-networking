@@ -26,7 +26,8 @@ struct AuthResult {
                                 // of "login_info" gets the real thing.
     std::string access_token;
     std::string refresh_token;
-    long        expires_in   = 0; // seconds until access_token dies, as reported
+    long        expires_in         = 0; // seconds until access_token dies, as reported
+    long        refresh_expires_in = 0; // seconds until refresh_token dies, as reported
     std::string login_type;      // "", "verifyCode", "tfa"
     std::string tfa_key;         // present when login_type == "tfa"
     std::string error_message;   // human-readable; populated on !ok
