@@ -41,6 +41,21 @@ if(NOT OBN_VERSION)
     )
 endif()
 
+set(OBN_CLOUD_API_URL      "" CACHE STRING "Override cloud REST API base URL (e.g. https://api.example.com).")
+set(OBN_CLOUD_WEB_URL      "" CACHE STRING "Override cloud web portal base URL (e.g. https://example.com).")
+set(OBN_CLOUD_MQTT_HOSTNAME "" CACHE STRING "Override cloud MQTT broker hostname (no scheme, no port).")
+if(OBN_CLOUD_API_URL OR OBN_CLOUD_WEB_URL OR OBN_CLOUD_MQTT_HOSTNAME)
+    message(STATUS "obn: cloud endpoint overrides")
+    if(OBN_CLOUD_API_URL)
+        message(STATUS "  api  = ${OBN_CLOUD_API_URL}")
+    endif()
+    if(OBN_CLOUD_WEB_URL)
+        message(STATUS "  web  = ${OBN_CLOUD_WEB_URL}")
+    endif()
+    if(OBN_CLOUD_MQTT_HOSTNAME)
+        message(STATUS "  mqtt = ${OBN_CLOUD_MQTT_HOSTNAME}")
+    endif()
+endif()
 # First three dotted components of OBN_VERSION (MM.mm.pp from MM.mm.pp.rr)
 # as a single preprocessor integer 0xMMmmpp for #if ABI_VERSION in
 # include/obn/bambu_networking.hpp (matches Studio's 8-char prefix gate).
@@ -305,6 +320,9 @@ target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
+    OBN_CLOUD_API_URL_DEFAULT="${OBN_CLOUD_API_URL}"
+    OBN_CLOUD_WEB_URL_DEFAULT="${OBN_CLOUD_WEB_URL}"
+    OBN_CLOUD_MQTT_HOSTNAME_DEFAULT="${OBN_CLOUD_MQTT_HOSTNAME}"
     ${_obn_git_compile_defs}
 )
 target_link_libraries(bambu_networking PRIVATE

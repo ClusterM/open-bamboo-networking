@@ -14,6 +14,9 @@ CLIENT_TYPE=bambu_studio
 WORKAROUNDS=ON
 TESTS=OFF
 PATCH_CONF=ON
+CLOUD_API_URL=""
+CLOUD_WEB_URL=""
+CLOUD_MQTT_HOSTNAME=""
 EXTRA_CMAKE_ARGS=""
 
 usage() {
@@ -81,6 +84,23 @@ Optional features:
                              OrcaSlicer.conf). Use this for staging or
                              if you manage the conf yourself.
 
+Cloud endpoint overrides:
+  Each value below replaces the built-in Bambu default at build time. The
+  matching runtime environment variable always wins over the compiled-in
+  value.
+  --cloud-api-url=URL        Cloud REST API base URL (no trailing slash),
+                             e.g. https://api.example.com. Replaces
+                             https://api.bambulab.com / .bambulab.cn.
+                             Runtime env: OBN_CLOUD_API_URL.
+  --cloud-web-url=URL        Cloud web portal base URL (no trailing slash),
+                             e.g. https://example.com. Replaces
+                             https://bambulab.com / .bambulab.cn.
+                             Runtime env: OBN_CLOUD_WEB_URL.
+  --cloud-mqtt-hostname=HOST Cloud MQTT broker hostname (no scheme, no port),
+                             e.g. mqtt.example.com. Replaces
+                             us.mqtt.bambulab.com / cn.mqtt.bambulab.com.
+                             Runtime env: OBN_CLOUD_MQTT_HOSTNAME.
+
 Other:
   --cmake-arg=ARG        Extra flag passed verbatim to cmake; repeat for
                          multiple flags (e.g. --cmake-arg=-GNinja).
@@ -107,6 +127,9 @@ for arg in "$@"; do
         --enable-tests)            TESTS=ON ;;
         --no-conf-patch)           PATCH_CONF=OFF ;;
         --with-conf-patch)         PATCH_CONF=ON ;;
+        --cloud-api-url=*)         CLOUD_API_URL="${arg#*=}" ;;
+        --cloud-web-url=*)         CLOUD_WEB_URL="${arg#*=}" ;;
+        --cloud-mqtt-hostname=*)   CLOUD_MQTT_HOSTNAME="${arg#*=}" ;;
         --video-backend=*)
             printf 'configure: --video-backend is deprecated and ignored '\
 '(libBambuSource now passes raw H.264 straight to gstbambusrc, '\
@@ -314,8 +337,11 @@ EOF
 fi
 
 set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
-[ -n "$PREFIX" ]      && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
-[ -n "$OBN_VERSION" ] && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
+[ -n "$PREFIX" ]              && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
+[ -n "$OBN_VERSION" ]         && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
+[ -n "$CLOUD_API_URL" ]       && set -- "$@" -DOBN_CLOUD_API_URL="$CLOUD_API_URL"
+[ -n "$CLOUD_WEB_URL" ]       && set -- "$@" -DOBN_CLOUD_WEB_URL="$CLOUD_WEB_URL"
+[ -n "$CLOUD_MQTT_HOSTNAME" ] && set -- "$@" -DOBN_CLOUD_MQTT_HOSTNAME="$CLOUD_MQTT_HOSTNAME"
 set -- "$@" \
     -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \
