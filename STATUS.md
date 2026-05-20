@@ -47,8 +47,8 @@ Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_li
 | `bambu_network_create_agent` | ✅ | Allocates the internal agent and bootstraps logging from the supplied `log_dir`. |
 | `bambu_network_destroy_agent` | ✅ | Deletes the agent instance. |
 | `bambu_network_init_log` | ✅ | No-op here: log sinks are configured inside `create_agent`, before the first log line. |
-| `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache and transient state. |
-| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder; **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
+| `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache, device-cert snapshots, and `<config_dir>/obn.lan_tls.env` (LAN TLS IPC to `libBambuSource`). Also publishes `OBN_CONFIG_DIR` in the process environment. |
+| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder (synced to env + `obn.lan_tls.env` as `OBN_LAN_TLS_CA_FILE`); **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
 | `bambu_network_set_country_code` | ✅ | Stored; drives cloud region selection (`api_host`, `web_host`). |
 | `bambu_network_start` | ✅ | Starts worker threads. If a cached session is present the plugin also kicks off `connect_cloud()` here — the stock call chain normally goes through `EVT_USER_LOGIN_HANDLE`, but that cascade can silently stall for cached sign-ins; starting from `start()` guarantees cloud MQTT gets initiated. |
 
@@ -193,12 +193,27 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_connect_printer` | ✅ | Opens a LAN MQTT session (TLS to `mqtts://<ip>:8883`, user `bblp`, password = access code). |
+| `bambu_network_connect_printer` | ✅ | Opens a LAN MQTT session (TLS to `mqtts://<ip>:8883`, user `bblp`, password = access code). With verify enabled (default): `printer.cer` + optional snapshotted device leaf, SNI/CN = serial (`dev_id`). |
 | `bambu_network_disconnect_printer` | ✅ | Tears the LAN MQTT session down. |
 | `bambu_network_send_message_to_printer` | ✅ | Publishes on the active LAN MQTT session; payload is log-redacted. |
 | `bambu_network_update_cert` | ✅ | No-op: the CA bundle is loaded once in `set_cert_file` and re-used for the lifetime of the agent. |
-| `bambu_network_install_device_cert` | ✅ | Per-device TLS material is installed on the agent the first time it is seen; subsequent calls are deduplicated. |
-| `bambu_network_start_discovery` | ✅ | Starts the SSDP multicast listener on `239.255.255.250:1990`. |
+| `bambu_network_install_device_cert` | ✅ | Snapshots the device leaf to `<config_dir>/certs/<serial>.pem` (bootstrap connect uses verify-off once); subsequent LAN TLS loads that leaf with `X509_V_FLAG_PARTIAL_CHAIN`. Deduped per device. |
+| `bambu_network_start_discovery` | ✅ | Starts the SSDP multicast listener on `239.255.255.250:1990`. SSDP updates populate the LAN TLS registry (IP → serial) when values change. |
+
+### 6.4.1. LAN TLS verification (MQTT, FTPS, RTSPS, MJPEG)
+
+Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp), [NETWORK_PLUGIN.md §6.1.1](NETWORK_PLUGIN.md#611-certificate-files-set_cert_file).
+
+| Aspect | Status | Notes |
+| --- | :--: | --- |
+| Verify enabled by default | ✅ | `SSL_VERIFY_PEER` + `X509_V_FLAG_PARTIAL_CHAIN` on LAN paths. Escape hatch: `OBN_SKIP_TLS_VERIFY=1`. |
+| Trust anchors | ✅ | **`printer.cer`** (BBL CA bundle from Studio) plus optional **snapshotted device leaf** (`<config_dir>/certs/<serial>.pem`). On N7/P2S firmware the printer sends leaf-only; the per-series Device CA is not in `printer.cer` — leaf pin is required for chain verify. |
+| Hostname check | ✅ | Connect by IP; cert CN = serial, no usable SAN. SNI and post-handshake CN check use the printer serial (`dev_id`), not the IP. |
+| MQTT :8883 | ✅ (tested P2S) | Vendored libmosquitto patched for `mosquitto_tls_verify_hostname_set` when connecting to an IP. |
+| FTPS :990 | ✅ (tested P2S) | Print job, `ft_*` fastpath, BambuSource file browser. |
+| RTSPS :322 / MJPEG :6000 | ✅ (tested P2S) | Implemented in `libBambuSource` (`stubs/tls_socket.cpp`). |
+| Cross-library IPC | ✅ | `libbambu_networking` and `libBambuSource` are separate dlopen loads. Networking syncs registry → process env + **`<config_dir>/obn.lan_tls.env`**. BambuSource reads env (Linux: `getenv`; Windows: `GetEnvironmentVariableA`) and hydrates from the state file on miss. |
+| Bootstrap snapshot | ✅ | `cert_store.cpp` uses verify-off **once** to capture the device leaf PEM before trust anchors exist; not used for normal LAN sessions. |
 
 ---
 
@@ -337,7 +352,7 @@ Every `ft_*` entry point is a polite-failure stub that fires its callback synchr
 
 Bambu Studio loads two cooperating shared objects from `<data_dir>/plugins/`: `libbambu_networking.{so,dll}` (everything above this section) and **`libBambuSource.{so,dll}`** (Windows: `BambuSource.dll`), a separate artefact with its own loader, its own symbol prefix (`Bambu_*`), and its own per-platform back-ends. It serves the camera **live view** and the on-printer **file browser**. See [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) for the full reverse-engineered contract.
 
-Source: [stubs/BambuSource.cpp](stubs/BambuSource.cpp), [stubs/rtsp_client.cpp](stubs/rtsp_client.cpp), [stubs/rtsp_passthrough.cpp](stubs/rtsp_passthrough.cpp), [stubs/dshow_filter.cpp](stubs/dshow_filter.cpp) (Windows-only).
+Source: [stubs/BambuSource.cpp](stubs/BambuSource.cpp), [stubs/rtsp_client.cpp](stubs/rtsp_client.cpp), [stubs/rtsp_passthrough.cpp](stubs/rtsp_passthrough.cpp), [stubs/tls_socket.cpp](stubs/tls_socket.cpp), [src/lan_tls.cpp](src/lan_tls.cpp), [stubs/dshow_filter.cpp](stubs/dshow_filter.cpp) (Windows-only).
 
 The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `libavcodec` / `libavutil` / `libswscale` / `live555`**. RTSPS is handled by an in-process custom client (TLS + RTSP/Digest auth + RTP/TCP-interleaved depacketisation + Annex-B reassembly) that hands raw H.264 byte stream out via `Bambu_ReadSample`; the slicer-side decoder is platform-specific (Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec / vaapih264dec`; Windows Studio `wxMediaCtrl3`: in-tree FFmpeg `AVVideoDecoder`; Windows Orca `wxMediaCtrl2`: wmp's H.264 decoder fed via the DShow source filter described below).
 
@@ -365,7 +380,7 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 | Camera transport | Applies to | Status | Notes |
 | --- | --- | :--: | --- |
 | MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples. Linux: passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. Windows: same JPEG payload pushed through our DShow source filter as `MEDIASUBTYPE_MJPG`. No A-series hardware available for on-device verification. |
-| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested on P2S, both Studio and Orca) | Custom in-process RTSP/RTSPS client; raw H.264 Annex-B byte stream out (same wire format the stock plugin produces). Linux: slicer-side `gstbambusrc` decodes with `h264parse + avdec_h264 / openh264dec`. Windows Studio: decoded by the in-tree FFmpeg `AVVideoDecoder` (`wxMediaCtrl3`). Windows Orca: pushed as `MEDIASUBTYPE_H264` through our DShow source filter into wmp's H.264 decoder. |
+| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested P2S/N7: Linux Orca, Windows Bambu Studio `wxMediaCtrl3`, Windows Orca DShow) | Custom in-process RTSP/RTSPS client with LAN TLS verify (see §6.4.1); raw H.264 Annex-B byte stream out. Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec`. Windows Studio: FFmpeg `AVVideoDecoder`. Windows Orca: DShow `MEDIASUBTYPE_H264`. |
 | Cloud camera (TUTK / Agora p2p) | any printer over WAN | 🔒 | Proprietary SDK; out of scope. Stays on the LAN/Developer-Mode path. |
 
 ### PrinterFileSystem (MediaFilePanel)
@@ -447,6 +462,9 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 3. **DirectShow sources must push samples while the graph is `Paused`, not only `Running`.**  
    wmp/wxMediaCtrl keeps the graph in `State_Paused` until the renderer gets the first sample (which triggers `State_Running`). A worker that gates `IMemInputPin::Receive` on `State_Running` deadlocks: renderer waits for the first sample, source waits for `Running` → black frame, endless “playing”, RTSP disconnect on back-pressure. Standard pattern: commit the allocator in `Pause()` and start streaming immediately.
 
+4. **`SetEnvironmentVariableA` (write) vs `getenv` (read) are not the same environment on MSVC.**  
+   `libbambu_networking` and `BambuSource.dll` are separate loads in one process. Networking used to publish LAN TLS state with Win32 env APIs while BambuSource read with CRT `getenv` — BambuSource never saw `OBN_LAN_TLS_CA_FILE` (RTSPS failed before TLS handshake). Fix: reads use `GetEnvironmentVariableA`; writes also mirror to `_putenv_s`; **`obn.lan_tls.env`** in `<data_dir>` is the file-backed fallback. See §6.4.1 and [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp).
+
 ### macOS
 
 | Feature | Status | Notes |
@@ -466,6 +484,7 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 | `ft_*` FTPS fastpath vs `OBN_FT_FTPS_FASTPATH` | [STATUS.md § 6.14.1](STATUS.md#6141-ftps-fastpath-vs-stock-port-6000-framer) |
 | PrinterFileSystem / Device → Files (CTRL → FTPS, `ipcam.file`) | [STATUS.md — PrinterFileSystem (MediaFilePanel)](STATUS.md#printerfilesystem-mediafilepanel) |
 | FTPS dialect quirks (used by `libBambuSource` CTRL bridge and by `ft_*`) | [NETWORK_PLUGIN.md § 7.6.3](NETWORK_PLUGIN.md#763-ftps-dialect-quirks) |
-| Windows: MSVC `setvbuf`, wxURI `bambu://` slashes, DirectShow `Paused` vs `Running` | [STATUS.md — Windows-specific footguns](STATUS.md#windows-specific-footguns) |
+| LAN TLS verification & IPC | [STATUS.md § 6.4.1](STATUS.md#641-lan-tls-verification-mqtt-ftps-rtsps-mjpeg) |
+| Windows: MSVC `setvbuf`, wxURI `bambu://` slashes, DirectShow `Paused` vs `Running`, Win32 env IPC | [STATUS.md — Windows-specific footguns](STATUS.md#windows-specific-footguns) |
 | Feature-level status tables (per-model) | [README.md](README.md) |
 | Workaround rationale | [README.md § Workaround reference](README.md#workaround-reference) |
