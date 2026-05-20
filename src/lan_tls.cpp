@@ -165,7 +165,7 @@ void write_state_file_locked()
         OBN_WARN("lan_tls: cannot write %s", tmp.string().c_str());
         return;
     }
-    f << "# Open Bambu Networking LAN TLS IPC (auto-generated)\n";
+    f << "# Open Bamboo Networking LAN TLS IPC (auto-generated)\n";
     if (!g_ca_file.empty()) {
         f << kEnvCaFile << '=' << g_ca_file << '\n';
     }
