@@ -119,6 +119,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/lan_tls_env.hpp"
+#include "obn/tunnel_local.hpp"
 #include "obn/zip_reader.hpp"
 
 #include "source_log.hpp"
@@ -238,6 +239,9 @@ struct TunnelUrl {
     std::string user = "bblp";
     std::string passwd;
     std::string device;
+    std::string cli_id;
+    std::string cli_ver;
+    std::string net_ver;
     std::string path = "/streaming/live/1"; // RTSP(S) only
 };
 
@@ -356,6 +360,9 @@ bool parse_url(const std::string& url, TunnelUrl* out)
         else if (key == "user")   { out->user = val; }
         else if (key == "passwd") { out->passwd = val; }
         else if (key == "device") { out->device = val; }
+        else if (key == "cli_id") { out->cli_id = val; }
+        else if (key == "cli_ver") { out->cli_ver = val; }
+        else if (key == "net_ver") { out->net_ver = val; }
         i = amp + 1;
     }
 
@@ -500,12 +507,19 @@ struct Tunnel {
     // file tells us "stream is alive" without drowning in per-frame spam.
     std::uint64_t frame_count = 0;
 
+    // Local MJPEG auth is deferred until Bambu_StartStream (file browser
+    // uses Bambu_StartStreamEx without the 80-byte 0x3000 auth packet).
+    bool mjpg_authed = false;
+
     // ---- PrinterFileSystem CTRL state (Scheme::Local + CTRL_TYPE) ----
     // When Studio calls Bambu_StartStreamEx(CTRL_TYPE) on us, we close
     // the MJPG TCP socket we opened in Bambu_Open and switch to CTRL
     // mode: the tunnel now multiplexes JSON request/response messages
-    // against FTPS on the same printer.
+    // against FTPS on the same printer (legacy) or native :6000 passthrough.
     bool             ctrl_mode = false;
+    bool             native_ctrl_path = false;
+
+    std::unique_ptr<obn::tunnel_local::Session> tl_session;
 
     std::unique_ptr<obn::ftps::Client> ftp;
     // True if FTPS root == storage mount (P2S / USB-only printers).
@@ -532,6 +546,7 @@ struct Tunnel {
     std::unordered_set<int>    ctrl_cancelled;
     std::atomic<bool>          ctrl_stop{false};
     std::thread                ctrl_worker;
+    std::thread                ctrl_recv_worker;
 
     // Scratch storage for the CtrlReply currently exposed via
     // Bambu_ReadSample's `sample->buffer`. We keep it alive until the
@@ -993,6 +1008,18 @@ bool parse_ctrl_request(const std::string& wire, int* cmdtype, int* sequence,
     *sequence = static_cast<int>(sq.as_number());
     *req      = v->find("req");
     return true;
+}
+
+// Extract the `result` field from a wire/ABI JSON response (ignores binary tail).
+static int parse_wire_result(const std::string& wire)
+{
+    const std::size_t j_end = wire.find("\n\n");
+    const std::string j =
+        (j_end == std::string::npos) ? wire : wire.substr(0, j_end);
+    std::string perr;
+    const auto v = obn::json::parse(j, &perr);
+    if (!v) return -1;
+    return static_cast<int>(v->find("result").as_int(-1));
 }
 
 // Connects a fresh FTPS client on demand (the first CTRL request).
@@ -1904,8 +1931,116 @@ void handle_task_cancel(Tunnel* t, int sequence, const obn::json::Value& req)
     push_reply(t, {make_wire_reply(env, nullptr, 0)});
 }
 
+#if OBN_ENABLE_WORKAROUNDS
+static bool use_ftps_ctrl_bridge()
+{
+    const char* e = std::getenv("OBN_CTRL_FTPS_FALLBACK");
+    return e && e[0] == '1';
+}
+#else
+static bool use_ftps_ctrl_bridge() { return false; }
+#endif
+
+static void native_ctrl_send_worker(Tunnel* t)
+{
+    log_fmt(t->logger, t->log_ctx, "ctrl: native send worker started");
+    while (!t->ctrl_stop.load(std::memory_order_acquire)) {
+        CtrlRequest req;
+        {
+            std::unique_lock<std::mutex> lk(t->ctrl_mu);
+            t->ctrl_cv.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                return t->ctrl_stop.load(std::memory_order_acquire) ||
+                       !t->ctrl_in.empty();
+            });
+            if (t->ctrl_stop.load(std::memory_order_acquire)) break;
+            if (t->ctrl_in.empty()) continue;
+            req = std::move(t->ctrl_in.front());
+            t->ctrl_in.pop_front();
+        }
+        if (!t->ssl || !t->tl_session) continue;
+        int cmdtype = 0, sequence = 0;
+        obn::json::Value body;
+        if (parse_ctrl_request(req.body, &cmdtype, &sequence, &body)) {
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: native forward cmd=0x%04x seq=%d (%zu bytes)",
+                    cmdtype, sequence, req.body.size());
+        } else {
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: native forward %zu bytes (unparsed)", req.body.size());
+        }
+        if (t->tl_session->send_abi_json(t->ssl, req.body, &t->mjpg_io_mu) != 0) {
+            log_fmt(t->logger, t->log_ctx, "ctrl: native send failed");
+            set_last_error("BambuTunnelLocal send failed");
+            continue;
+        }
+        for (;;) {
+            std::vector<std::uint8_t> wire;
+            if (t->tl_session->recv_payload(t->ssl, &wire, &t->mjpg_io_mu) != 0) {
+                log_fmt(t->logger, t->log_ctx, "ctrl: native recv failed");
+                set_last_error("BambuTunnelLocal recv failed");
+                break;
+            }
+            CtrlReply reply;
+            reply.data.assign(reinterpret_cast<const char*>(wire.data()),
+                              wire.size());
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: native recv %zu bytes", reply.data.size());
+            const int result = parse_wire_result(reply.data);
+            push_reply(t, std::move(reply));
+            if (result != kResContinue) break;
+        }
+    }
+    log_fmt(t->logger, t->log_ctx, "ctrl: native send worker exited");
+}
+
+static int start_native_ctrl_handshake(Tunnel* t)
+{
+    if (!t->ssl) {
+        set_last_error("CTRL: TLS session not open");
+        return -1;
+    }
+    // StartStreamEx is polled (Bambu_would_block between steps). Keep one
+    // Session across polls — recreating it here re-sent login on every tick.
+    if (!t->tl_session) {
+        t->tl_session = std::make_unique<obn::tunnel_local::Session>(
+            static_cast<std::uint32_t>(std::rand()));
+    }
+    obn::tunnel_local::Config cfg;
+    cfg.username    = t->url.user;
+    cfg.access_code = t->url.passwd;
+    cfg.client_id   = t->url.cli_id;
+    if (!t->url.cli_ver.empty()) {
+        cfg.client_ver = t->url.cli_ver;
+    } else if (!t->url.net_ver.empty()) {
+        cfg.client_ver = t->url.net_ver;
+    }
+
+    const int hs = t->tl_session->handshake_step(t->ssl, cfg, &t->mjpg_io_mu);
+    if (hs < 0) {
+        const auto ph = t->tl_session->phase();
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: native handshake failed (phase=%d)",
+                static_cast<int>(ph));
+        t->tl_session.reset();
+        set_last_error("BambuTunnelLocal handshake failed");
+        return -1;
+    }
+    if (hs > 0) return Bambu_would_block;
+
+    if (!t->ctrl_mode) {
+        t->native_ctrl_path = true;
+        t->ctrl_mode        = true;
+        t->ctrl_stop.store(false, std::memory_order_release);
+        t->ctrl_worker      = std::thread(native_ctrl_send_worker, t);
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: native :6000 passthrough ready (pid=%s ver=%s)",
+                cfg.client_id.c_str(), cfg.client_ver.c_str());
+    }
+    return Bambu_success;
+}
+
 // --------------------------------------------------------------------
-// Worker thread entry point.
+// Worker thread entry point (FTPS bridge fallback).
 // --------------------------------------------------------------------
 void ctrl_worker_main(Tunnel* t)
 {
@@ -1989,6 +2124,13 @@ void stop_ctrl_mode(Tunnel* t)
         t->ctrl_cv.notify_all();
     }
     if (t->ctrl_worker.joinable()) t->ctrl_worker.join();
+    if (t->ctrl_recv_worker.joinable()) t->ctrl_recv_worker.join();
+    if (t->ftp) {
+        t->ftp->quit();
+        t->ftp.reset();
+    }
+    t->tl_session.reset();
+    t->native_ctrl_path = false;
     t->ctrl_mode = false;
 }
 
@@ -2080,33 +2222,33 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
             "Bambu_Open: TLS established (cipher=%s)",
             SSL_get_cipher(t->ssl));
 
-    // Auth packet.
-    uint8_t auth[80];
-    build_auth_packet(t->url, auth);
-    if (ssl_write_all(t->ssl, auth, sizeof(auth)) != 0) {
-        log_fmt(t->logger, t->log_ctx, "Bambu_Open: auth write failed");
-        tunnel_close(t);
-        return -1;
-    }
-
     t->t0      = std::chrono::steady_clock::now();
     t->started = true;
     log_fmt(t->logger, t->log_ctx,
-            "Bambu_Open: sent %zu-byte auth packet (user=%s pw_len=%zu)",
-            sizeof(auth), t->url.user.c_str(), t->url.passwd.size());
+            "Bambu_Open: TLS ready (MJPEG auth deferred to StartStream)");
     return Bambu_success;
 }
 
 OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
 {
-    // Both protocols start streaming implicitly:
-    //   * MJPG: printer begins pushing frames right after auth.
-    //   * RTSP: Bambu_Open already started the passthrough worker.
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return -1;
+
+    if (t->url.scheme == Scheme::Local && !t->ctrl_mode && !t->mjpg_authed) {
+        uint8_t auth[80];
+        build_auth_packet(t->url, auth);
+        std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+        if (obn::tls::ssl_write_all(t->ssl, auth, sizeof(auth)) != 0) {
+            set_last_error("MJPEG auth write failed");
+            return -1;
+        }
+        t->mjpg_authed = true;
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_StartStream: sent %zu-byte MJPEG auth", sizeof(auth));
+    }
     return Bambu_success;
 }
 
@@ -2120,17 +2262,15 @@ OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
     // tunnel. We tear down the MJPG TCP connection (which Bambu_Open
     // already brought up) and spin up the FTPS-backed worker.
     if (type == kCtrlType) {
+        if (use_ftps_ctrl_bridge()) {
 #if OBN_ENABLE_WORKAROUNDS
-        return start_ctrl_mode(t);
+            return start_ctrl_mode(t);
 #else
-        // Stock plugin speaks a proprietary CTRL wire we don't
-        // implement. Without the workaround the MediaFilePanel stays
-        // empty / "Browsing file in storage is not supported".
-        set_last_error("PrinterFileSystem bridge disabled (OBN_ENABLE_WORKAROUNDS=OFF)");
-        log_fmt(t->logger, t->log_ctx,
-                "Bambu_StartStreamEx(CTRL): refused, workarounds disabled");
-        return -1;
+            set_last_error("FTPS CTRL fallback disabled");
+            return -1;
 #endif
+        }
+        return start_native_ctrl_handshake(t);
     }
     return Bambu_StartStream(tunnel, true);
 }
@@ -2288,9 +2428,17 @@ OBN_EXPORT int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl,
     // pipe-dead); stock firmware uses the same channel number.
     if (ctrl != kCtrlType) return Bambu_success;
     if (!t->ctrl_mode) {
-        // Auto-switch into CTRL if Studio skipped StartStreamEx. This
-        // shouldn't happen, but it's cheap insurance.
-        start_ctrl_mode(t);
+#if OBN_ENABLE_WORKAROUNDS
+        if (use_ftps_ctrl_bridge()) {
+            start_ctrl_mode(t);
+        } else {
+            set_last_error("CTRL channel not ready");
+            return -1;
+        }
+#else
+        set_last_error("CTRL channel not ready");
+        return -1;
+#endif
     }
     CtrlRequest req;
     req.body.assign(data, static_cast<std::size_t>(len));

@@ -293,6 +293,7 @@ add_library(bambu_networking SHARED
     src/os_compat.cpp
     src/print_job.cpp
     src/ssdp.cpp
+    src/tunnel_local.cpp
     src/zip_reader.cpp
 )
 
@@ -396,6 +397,7 @@ set(_obn_bambusource_sources
     stubs/rtsp_passthrough.cpp
     src/ftps.cpp
     src/json_lite.cpp
+    src/tunnel_local.cpp
     src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp
@@ -656,6 +658,14 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/os_compat.cpp)
     target_include_directories(ftps_parse_test PRIVATE include src)
     add_test(NAME ftps_parse COMMAND ftps_parse_test)
+
+    add_executable(tunnel_local_test tests/tunnel_local_test.cpp
+        src/tunnel_local.cpp
+        src/json_lite.cpp
+        src/os_compat.cpp)
+    target_include_directories(tunnel_local_test PRIVATE include stubs)
+    target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME tunnel_local COMMAND tunnel_local_test)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp

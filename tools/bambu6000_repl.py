@@ -78,7 +78,7 @@ def build_ctrl_setup_json(pid: str, *, client_ver: str = "02.03.00.00") -> bytes
         "sequence": 0,
         "mtype": MTYPE_CTRL_SETUP,
         "req": {
-            "t_av": 1,
+            "t_av": 0,
             "mtype": MTYPE_CTRL_JSON,
             "peer_t": 3,
             "pid": pid,
