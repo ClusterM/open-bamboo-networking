@@ -1,12 +1,20 @@
 #include "obn/tunnel_local.hpp"
 
 #include "obn/json_lite.hpp"
+#include "obn/os_compat.hpp"
+#include "obn/tls_dial.hpp"
 
+#include "obn/net_compat.hpp"
+
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <istream>
 
 namespace obn::tunnel_local {
 namespace {
@@ -49,21 +57,30 @@ int read_some(SSL* ssl, std::uint8_t* buf, std::size_t cap)
 
 int ssl_write_all(SSL* ssl, const void* buf, std::size_t len)
 {
-    const auto* p = static_cast<const std::uint8_t*>(buf);
-    std::size_t sent = 0;
-    while (sent < len) {
-        const int n = SSL_write(ssl, p + sent, static_cast<int>(len - sent));
-        if (n <= 0) {
-            const int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
-            return -1;
-        }
-        sent += static_cast<std::size_t>(n);
-    }
+    if (obn::tls::ssl_write_all(ssl, buf, len) != 0) return -1;
     return 0;
 }
 
+const char* ssl_fail_reason(SSL* ssl)
+{
+    static thread_local char buf[256];
+    const unsigned long err = ERR_peek_last_error();
+    if (err) {
+        ERR_error_string_n(err, buf, sizeof(buf));
+        return buf;
+    }
+    if (!ssl) return "ssl=null";
+    const int e = SSL_get_error(ssl, -1);
+    std::snprintf(buf, sizeof(buf), "SSL_get_error=%d", e);
+    return buf;
+}
+
 } // namespace
+
+const char* describe_ssl_io_error(SSL* ssl)
+{
+    return ssl_fail_reason(ssl);
+}
 
 std::array<std::uint8_t, 16> build_frame_header(std::uint32_t payload_len,
                                                 std::uint32_t magic,
@@ -95,7 +112,7 @@ std::string build_setup_json(const std::string& client_id,
                              const std::string& client_ver)
 {
     obn::json::Object req;
-    req["t_av"]   = obn::json::Value(0.0);
+    req["t_av"]   = obn::json::Value(1.0);
     req["mtype"]  = obn::json::Value(static_cast<double>(kMtypeCtrlJson));
     req["peer_t"] = obn::json::Value(3.0);
     req["pid"]    = obn::json::Value(client_id);
@@ -127,6 +144,289 @@ std::string wrap_ctrl_abi(const std::string& abi_json)
     return abi_json;
 }
 
+std::string wrap_ctrl_abi_with_binary(const std::string& abi_json,
+                                      const void* bin, std::size_t bin_len)
+{
+    std::string wire = wrap_ctrl_abi(abi_json);
+    if (bin && bin_len) {
+        wire += "\n\n";
+        wire.append(static_cast<const char*>(bin), bin_len);
+    }
+    return wire;
+}
+
+bool split_json_prefix(const std::uint8_t* data, std::size_t len,
+                       std::string* json_out, std::vector<std::uint8_t>* bin_out)
+{
+    if (json_out) json_out->clear();
+    if (bin_out) bin_out->clear();
+    if (!data || !len) return false;
+
+    std::size_t i = 0;
+    if (data[0] != '{') return false;
+    int depth = 0;
+    bool in_str = false;
+    bool esc = false;
+    for (; i < len; ++i) {
+        const char c = static_cast<char>(data[i]);
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true;
+        else if (c == '{') ++depth;
+        else if (c == '}') {
+            --depth;
+            if (depth == 0) {
+                ++i;
+                break;
+            }
+        }
+    }
+    if (depth != 0) return false;
+    if (json_out) {
+        json_out->assign(reinterpret_cast<const char*>(data), i);
+    }
+    while (i < len && (data[i] == '\n' || data[i] == '\r' || data[i] == ' ' ||
+                       data[i] == '\t')) {
+        ++i;
+    }
+    if (bin_out && i < len) {
+        bin_out->assign(data + i, data + len);
+    }
+    return true;
+}
+
+std::string build_media_ability_abi(std::uint32_t sequence)
+{
+    // Match PrinterFileSystem::RequestMediaAbility (peer + api_version).
+    // Empty req{} yields firmware result=2 (kResErrJson) on P2S.
+    obn::json::Object req;
+    req["peer"]        = obn::json::Value("studio");
+    req["api_version"] = obn::json::Value(2.0);
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdMediaAbility));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+std::string build_file_upload_init_abi(std::uint32_t sequence,
+                                       const std::string& dest_storage,
+                                       const std::string& dest_name,
+                                       std::uint64_t total)
+{
+    obn::json::Object req;
+    req["type"]  = obn::json::Value("model");
+    req["path"]  = obn::json::Value(dest_name);
+    req["total"] = obn::json::Value(static_cast<double>(total));
+    if (!dest_storage.empty()) {
+        req["storage"] = obn::json::Value(dest_storage);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileUpload));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+std::string build_file_delete_abi(std::uint32_t sequence,
+                                  const std::string& dest_storage,
+                                  const std::string& dest_name)
+{
+    obn::json::Array names;
+    names.emplace_back(obn::json::Value(dest_name));
+
+    obn::json::Object req;
+    req["delete"] = obn::json::Value(std::move(names));
+    if (!dest_storage.empty()) {
+        req["storage"] = obn::json::Value(dest_storage);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileDel));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+std::string build_file_upload_chunk_abi(std::uint32_t sequence,
+                                        std::uint32_t frag_id,
+                                        std::uint64_t offset,
+                                        std::uint32_t size,
+                                        const std::string& file_md5_lower)
+{
+    obn::json::Object req;
+    req["frag_id"] = obn::json::Value(static_cast<double>(frag_id));
+    req["offset"]  = obn::json::Value(static_cast<double>(offset));
+    req["size"]    = obn::json::Value(static_cast<double>(size));
+    if (!file_md5_lower.empty()) {
+        req["file_md5"] = obn::json::Value(file_md5_lower);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileUpload));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+bool parse_upload_init_reply(const std::string& wire_json,
+                             std::uint32_t* chunk_size_kb,
+                             std::uint64_t* offset,
+                             int* result_code)
+{
+    if (result_code) *result_code = parse_wire_result(wire_json);
+    const int rc = result_code ? *result_code : parse_wire_result(wire_json);
+    // PrinterFileSystem: SUCCESS=0, CONTINUE=1, FILE_EXIST=19
+    if (rc != 1 && rc != 19) return false;
+
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return false;
+
+    auto reply = root->find("reply");
+    if (!reply.is_object()) return false;
+
+    const std::uint32_t kb =
+        static_cast<std::uint32_t>(reply.find("chunk_size").as_int(0));
+    if (!kb) return false;
+
+    if (chunk_size_kb) *chunk_size_kb = kb;
+    if (offset) {
+        *offset = static_cast<std::uint64_t>(reply.find("offset").as_int(0));
+    }
+    return true;
+}
+
+std::string build_file_upload_abi(std::uint32_t sequence,
+                                  const std::string& dest_storage,
+                                  const std::string& dest_name,
+                                  std::uint64_t size, const std::string& md5)
+{
+    std::string path = "/";
+    if (!dest_storage.empty()) {
+        path += dest_storage;
+        if (path.back() != '/') path += '/';
+    }
+    obn::json::Object req;
+    req["path"] = obn::json::Value(path);
+    req["file"] = obn::json::Value(dest_name);
+    req["size"] = obn::json::Value(static_cast<double>(size));
+    req["md5"]  = obn::json::Value(md5);
+    if (!dest_storage.empty()) {
+        req["storage"] = obn::json::Value(dest_storage);
+    }
+    req["peer"]        = obn::json::Value("studio");
+    req["api_version"] = obn::json::Value(3.0);
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileUpload));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+std::string parse_ability_reply_to_ft_json(const std::string& wire_json)
+{
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return {};
+
+    const int result = static_cast<int>(root->find("result").as_int(-1));
+    if (result != 0) return {};
+
+    auto reply = root->find("reply");
+    if (!reply.is_object()) return {};
+
+    obn::json::Array storages;
+    auto pick_array = [&](const char* key) {
+        auto v = reply.find(key);
+        if (v.is_array()) storages = v.as_array();
+    };
+    pick_array("storage");
+    if (storages.empty()) pick_array("storage_list");
+    if (storages.empty()) pick_array("storages");
+    if (storages.empty()) {
+        auto ab = reply.find("ability");
+        if (ab.is_object()) {
+            auto v = ab.find("storage");
+            if (v.is_array()) storages = v.as_array();
+        }
+    }
+    if (storages.empty()) return {};
+
+    std::string out = "[";
+    for (std::size_t i = 0; i < storages.size(); ++i) {
+        if (i) out += ',';
+        const std::string s = storages[i].as_string();
+        out += '"';
+        for (char c : s) {
+            if (c == '"') out += "\\\"";
+            else out += c;
+        }
+        out += '"';
+    }
+    out += ']';
+    return out;
+}
+
+int parse_upload_progress(const std::string& wire_json, int* result_code)
+{
+    const double v = parse_upload_progress_value(wire_json, result_code);
+    if (v < 0.0) return -1;
+    return static_cast<int>(v + 0.5);
+}
+
+double parse_upload_progress_value(const std::string& wire_json, int* result_code)
+{
+    if (result_code) *result_code = parse_wire_result(wire_json);
+    if (result_code && *result_code < 0) return -1.0;
+
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return -1.0;
+
+    auto pick = [](const obn::json::Value& obj) -> double {
+        if (!obj.is_object()) return -1.0;
+        const auto v = obj.find("progress");
+        if (!v.is_number()) return -1.0;
+        return v.as_number();
+    };
+
+    double progress = pick(root->find("reply"));
+    if (progress < 0.0) progress = pick(*root);
+    return progress;
+}
+
+int parse_wire_result(const std::string& wire_json)
+{
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return -1;
+    return static_cast<int>(root->find("result").as_int(-1));
+}
+
+int parse_wire_cmdtype(const std::string& wire_json)
+{
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return -1;
+    return static_cast<int>(root->find("cmdtype").as_int(-1));
+}
+
+int parse_wire_sequence(const std::string& wire_json)
+{
+    std::string perr;
+    auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return -1;
+    return static_cast<int>(root->find("sequence").as_int(-1));
+}
+
 std::size_t consume_frames(const std::uint8_t* data, std::size_t len,
                            std::vector<std::vector<std::uint8_t>>* bodies)
 {
@@ -145,6 +445,32 @@ std::size_t consume_frames(const std::uint8_t* data, std::size_t len,
         i += frame_len;
     }
     return i;
+}
+
+std::vector<std::string> take_pending_wire_json(std::vector<std::uint8_t>* recv_buf)
+{
+    std::vector<std::string> msgs;
+    if (!recv_buf) return msgs;
+    for (;;) {
+        std::vector<std::vector<std::uint8_t>> bodies;
+        const std::size_t consumed =
+            consume_frames(recv_buf->data(), recv_buf->size(), &bodies);
+        if (!consumed) break;
+        recv_buf->erase(recv_buf->begin(),
+                        recv_buf->begin() + static_cast<std::ptrdiff_t>(consumed));
+        for (const auto& body : bodies) {
+            if (body.empty()) continue;
+            std::string json;
+            std::vector<std::uint8_t> bin;
+            if (split_json_prefix(body.data(), body.size(), &json, &bin)) {
+                if (!json.empty()) msgs.push_back(std::move(json));
+            } else {
+                msgs.emplace_back(reinterpret_cast<const char*>(body.data()),
+                                  body.size());
+            }
+        }
+    }
+    return msgs;
 }
 
 Session::Session(std::uint32_t seq_seed) : seq_(seq_seed) {}
@@ -177,7 +503,53 @@ int Session::try_read_frames(SSL* ssl, std::mutex* io_mu)
     if (n == -2) return 1; // WANT_READ/WRITE — poll again
     if (n < 0) return -1;
     if (n == 0) return -1; // peer closed
-    recv_buf_.insert(recv_buf_.end(), chunk, chunk + n);
+    {
+        std::lock_guard<std::mutex> lk(recv_buf_mu_);
+        recv_buf_.insert(recv_buf_.end(), chunk, chunk + n);
+    }
+    return 0;
+}
+
+int Session::poll_incoming_wire(SSL* ssl, std::mutex* io_mu,
+                                const WireJsonCallback& on_wire)
+{
+    if (!ssl || !on_wire) return 0;
+    const int fd = SSL_get_fd(ssl);
+    if (fd < 0) return 0;
+    const obn::os::socket_t sock = static_cast<obn::os::socket_t>(fd);
+    if (!obn::os::socket_valid(sock)) return 0;
+
+    auto dispatch = [&]() -> bool {
+        std::vector<std::string> pending;
+        {
+            std::lock_guard<std::mutex> lk(recv_buf_mu_);
+            pending = take_pending_wire_json(&recv_buf_);
+        }
+        for (const auto& json : pending) {
+            if (!on_wire(json)) return false;
+        }
+        return true;
+    };
+
+    dispatch();
+
+    for (int pass = 0; pass < 64; ++pass) {
+        int rr = 0;
+        {
+            std::unique_lock<std::mutex> lk;
+            if (io_mu) lk = std::unique_lock<std::mutex>(*io_mu);
+            rr = try_read_frames(ssl, io_mu);
+        }
+        if (rr < 0) return -1;
+        if (!dispatch()) return -2;
+        if (rr > 0) break; // WANT_READ/WRITE — retry from write path
+
+        short revents = 0;
+        if (obn::os::poll_one(sock, obn::net::poll_event::in, 0, &revents) <= 0 ||
+            !(revents & obn::net::poll_event::in)) {
+            break;
+        }
+    }
     return 0;
 }
 
@@ -285,18 +657,109 @@ int Session::send_abi_json(SSL* ssl, const std::string& abi_body, std::mutex* io
                       wire.size(), io_mu);
 }
 
+int Session::send_abi_json_with_binary(SSL* ssl, const std::string& abi_json,
+                                       const void* bin, std::size_t bin_len,
+                                       std::mutex* io_mu,
+                                       bool poll_rx_after_send)
+{
+    if (!bin || !bin_len) {
+        return send_abi_json(ssl, abi_json, io_mu);
+    }
+    struct MemBuf : std::streambuf {
+        MemBuf(const char* p, std::size_t n)
+        {
+            char* begin = const_cast<char*>(p);
+            setg(begin, begin, begin + n);
+        }
+    };
+    MemBuf mbuf(static_cast<const char*>(bin), bin_len);
+    std::istream in(&mbuf);
+    return send_abi_json_with_binary_stream(ssl, abi_json, in, bin_len, io_mu,
+                                            {}, poll_rx_after_send);
+}
+
+int Session::send_abi_json_with_binary_stream(SSL* ssl, const std::string& abi_json,
+                                              std::istream& bin_in,
+                                              std::size_t bin_len,
+                                              std::mutex* io_mu,
+                                              WireJsonCallback on_wire,
+                                              bool poll_rx_after_send)
+{
+    if (!ssl) return -1;
+    const std::string wire = wrap_ctrl_abi(abi_json);
+    static constexpr char kSep[] = "\n\n";
+
+    std::vector<std::uint8_t> body;
+    body.reserve(wire.size() + (bin_len ? sizeof(kSep) - 1 + bin_len : 0));
+    body.assign(wire.begin(), wire.end());
+    if (bin_len > 0) {
+        body.insert(body.end(), kSep, kSep + sizeof(kSep) - 1);
+        const std::size_t base = body.size();
+        body.resize(base + bin_len);
+        bin_in.read(reinterpret_cast<char*>(body.data() + base),
+                    static_cast<std::streamsize>(bin_len));
+        if (static_cast<std::size_t>(bin_in.gcount()) != bin_len) return -1;
+    }
+
+    const auto hdr = build_frame_header(static_cast<std::uint32_t>(body.size()),
+                                        kMagicCtrlClient, seq_++);
+
+    {
+        std::unique_lock<std::mutex> lk;
+        if (io_mu) lk = std::unique_lock<std::mutex>(*io_mu);
+        if (ssl_write_all(ssl, hdr.data(), hdr.size()) != 0) return -1;
+        if (!body.empty() &&
+            ssl_write_all(ssl, body.data(), body.size()) != 0) {
+            return -1;
+        }
+    }
+
+    if (!poll_rx_after_send) return 0;
+
+    if (on_wire) {
+        for (int pass = 0; pass < 8; ++pass) {
+            const int rr = try_read_frames(ssl, io_mu);
+            if (rr < 0) break;
+        }
+        std::vector<std::string> pending;
+        {
+            std::lock_guard<std::mutex> lk(recv_buf_mu_);
+            pending = take_pending_wire_json(&recv_buf_);
+        }
+        for (const auto& json : pending) {
+            if (!on_wire(json)) return -2;
+        }
+    } else {
+        for (int pass = 0; pass < 8; ++pass) {
+            const int rr = try_read_frames(ssl, io_mu);
+            if (rr <= 0) break;
+        }
+    }
+    return 0;
+}
+
+std::vector<std::string> Session::drain_pending_wire_json()
+{
+    std::lock_guard<std::mutex> lk(recv_buf_mu_);
+    return take_pending_wire_json(&recv_buf_);
+}
+
 int Session::recv_payload(SSL* ssl, std::vector<std::uint8_t>* out, std::mutex* io_mu)
 {
     if (!ssl || !out) return -1;
     out->clear();
     for (;;) {
         std::vector<std::vector<std::uint8_t>> bodies;
-        const std::size_t consumed =
-            consume_frames(recv_buf_.data(), recv_buf_.size(), &bodies);
-        if (consumed) {
-            recv_buf_.erase(recv_buf_.begin(),
-                            recv_buf_.begin() +
-                                static_cast<std::ptrdiff_t>(consumed));
+        std::size_t consumed = 0;
+        {
+            std::lock_guard<std::mutex> lk(recv_buf_mu_);
+            consumed =
+                consume_frames(recv_buf_.data(), recv_buf_.size(), &bodies);
+            if (consumed) {
+                recv_buf_.erase(recv_buf_.begin(),
+                                recv_buf_.begin() +
+                                    static_cast<std::ptrdiff_t>(consumed));
+            }
         }
         if (!bodies.empty()) {
             *out = std::move(bodies.front());

@@ -1160,6 +1160,139 @@ Studio expects `ft_abi_version() == 1` (the default `abi_required` in `InitFTMod
 
 Semantically, this ABI describes a "tunnel + job" bus: open a connection to the printer (`ft_tunnel_create` from a `url`), start jobs on it, listen for results and messages.
 
+#### 6.14.1. Stock wire transport (TLS :6000)
+
+Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the same **BambuTunnelLocal** framing as Device → Files (§7.5.1.1): TLS `:6000`, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289).
+
+**Send to Printer uses only `:6000`, not FTPS.** On P2S, LAN tcpdump of stock Studio during Send to Printer → Cache shows all upload bytes on TCP **:6000**; there are **zero** packets on **:990** for that flow. FTPS remains a separate fallback path in our plugin (`OBN_FT_FTPS_FALLBACK`) when `:6000` is unavailable.
+
+| `ft_job` `cmd_type` | Wire `cmdtype` | Request (after framing) | Response → `ft_job_result.json` |
+|---------------------|------------------|-------------------------|----------------------------------|
+| `7` (media ability) | `0x0007` | `{"cmdtype":7,"sequence":N,"req":{"peer":"studio","api_version":2}}` | JSON **array of storage labels**, e.g. `["emmc","udisk"]` on P2S |
+| `5` (upload) | `0x0005` | **Chunked** upload — see §6.14.2 (not the legacy one-shot `{path,file,size,md5}` shape) | `resp_ec=0` on success; progress via `msg_cb({"progress":N})` while sending |
+
+Manual probes:
+
+| Tool | Role |
+|------|------|
+| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive `:6000` client — `/ability`, `/upload <local> <storage> <name>` (pipelined chunks) |
+| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Repeated delete-free pipeline uploads on one or many sessions (regression harness) |
+| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of wire variants (confirms P2S rejects one-shot / per-chunk-ACK multi-chunk) |
+
+Our open plugin implements this path when `OBN_FT_TUNNEL_LOCAL=ON` (default), with FTPS `:990` as fallback (`OBN_FT_FTPS_FALLBACK=ON`). Implementation: `src/abi_ft.cpp` (`run_upload_job_native`), `src/tunnel_local.cpp` (framing + send helpers).
+
+#### 6.14.2. P2S `FILE_UPLOAD` (`cmdtype` 5) — chunked pipeline (May 2026)
+
+Reverse-engineered on **P2S** (`02.07.00.99` firmware) with stock tcpdump, Frida, and the REPL tools above. This is what **Send to Printer → Cache / External (emmc / udisk)** uses via `ft_job_create` / `cmd_type=5`.
+
+##### Wire shape (three phases, one `sequence` for the whole transfer)
+
+All JSON bodies are wrapped for the wire as `{"mtype":12289,…}` (§7.5.1.1) and sent inside a 16-byte frame header (`magic=0x0102013f`). Chunk payloads append `\n\n` + raw bytes **inside the same frame** as the chunk JSON.
+
+**Phase 1 — init (JSON only, no binary):**
+
+```json
+{"cmdtype":5,"sequence":N,"req":{"type":"model","storage":"emmc","path":"skadis_spool-Body.gcode.3mf","total":2625211}}
+```
+
+Printer reply (must be read before any chunk is sent):
+
+```json
+{"cmdtype":5,"mtype":12289,"result":1,"sequence":N,"reply":{"chunk_size":255,"offset":0}}
+```
+
+| Init `result` | Meaning on P2S |
+|---------------|-----------------|
+| `1` (`CONTINUE`) | New upload session — proceed with chunks |
+| `19` (`FILE_EXIST`) | Target name already present — **still proceed** with chunks (overwrite). **Do not** send `FILE_DEL` first |
+
+`reply.chunk_size` is in **kilobytes** (P2S returns **255** → 261 120-byte fragments). `reply.offset` is a resume byte offset (always `0` in observed Send-to-Printer flows).
+
+**Phase 2 — data chunks (same `sequence` N, increasing `frag_id`):**
+
+```json
+{"cmdtype":5,"sequence":N,"req":{"frag_id":0,"offset":0,"size":261120}}
+```
+
+```text
+<frame hdr> + {"mtype":12289,"cmdtype":5,"sequence":N,"req":{…}} + "\n\n" + <261120 bytes>
+```
+
+On the **last** chunk only, add lowercase MD5 of the **entire file**:
+
+```json
+{"cmdtype":5,"sequence":N,"req":{"frag_id":10,"offset":2611200,"size":14011,"file_md5":"abc123…"}}
+```
+
+**Phase 3 — completion:** after **all** chunk frames are on the wire, read **one** printer JSON reply:
+
+```json
+{"cmdtype":5,"mtype":12289,"result":0,"sequence":N}
+```
+
+Stock tcpdump (2.6 MiB `.3mf`, Studio → P2S): **~0.75 s** on the wire, **two** printer→client JSON replies total (init + final), **no** per-chunk replies between them.
+
+##### Pipeline rules (critical on P2S)
+
+| Rule | Why |
+|------|-----|
+| **Send every chunk back-to-back without `recv` between them** | Waiting for an ACK after chunk 0 on files **> 255 KiB** yields `result:-9203` on the first chunk reply |
+| **Do not call `SSL_read` / frame poll after each chunk send** | Our first implementation polled the socket after every chunk; the first poll blocked ~10 s, the printer timed out the upload session, and the final reply was `-9203` even though Studio showed 100 % sent bytes |
+| **Read exactly one terminal reply** after the last chunk | Matches stock behaviour; intermediate `result:1` progress replies are absent in pipelined mode on P2S |
+| Files **≤ 261 120 bytes** fit in a single chunk | Single-chunk uploads succeed even with per-chunk ACK in REPL experiments; the threshold is the firmware chunk size, not a separate code path |
+
+Implementation note: `Session::send_abi_json_with_binary(…, poll_rx_after_send=false)` during the chunk loop; a single `recv_wire_json(…, cmdtype=5, sequence=N)` after the loop.
+
+##### Do **not** send proactive `FILE_DEL` (`cmdtype` 3)
+
+Early open-plugin attempts deleted the destination name before every upload. That is **wrong** for P2S:
+
+- **Unnecessary** — init with `result:19` already means “file exists; continue uploading”.
+- **Harmful** — extra round-trip on a **reused** `ft_*` tunnel races with the upload init; we observed init receiving a stale **delete** reply (`cmdtype:3`, `result:0`) instead of the upload init reply, which surfaced as `-9203` or a false success path.
+- **Buggy on firmware** — `DELETE` with `storage:"emmc"` sometimes reports paths under `/media/usb0/timelapse/…` rather than the emmc model cache (firmware quirk; do not rely on delete-before-upload for cache hygiene).
+
+Use `FILE_DEL` only when Studio's file-browser UI explicitly deletes a file, not as a Send-to-Printer preamble.
+
+##### Reused `ft_*` tunnel — stale replies
+
+Unlike the file-browser path in `libBambuSource` (strictly one request in flight), `ft_*` keeps one TLS `:6000` session open across **`cmd_type=7` ability** and **`cmd_type=5` upload** jobs. The printer may still have JSON replies buffered from a prior job, or deliver them out of order relative to a naive single-`recv` client.
+
+Open-plugin mitigations (`src/abi_ft.cpp`):
+
+1. **`drain_pending_wire_json()`** immediately before upload init — log and discard already-framed JSON sitting in the session recv buffer.
+2. **`recv_wire_json(…, want_cmdtype, want_seq)`** — accept only replies whose wire `cmdtype` and `sequence` match the outstanding upload step; log and skip anything else (e.g. a belated delete or ability reply).
+
+Always validate **`cmdtype:5` + matching `sequence`** for both init and final replies. Never treat a bare `result:0` on the wrong `cmdtype` as upload success.
+
+##### Storage labels (`dest_storage` in `ft_job_create`)
+
+P2S `REQUEST_MEDIA_ABILITY` returns `["emmc","udisk"]` (not legacy `sdcard` / `usb`). Send to Printer maps:
+
+| `dest_storage` | Studio UI | Verified behaviour |
+|----------------|-----------|-------------------|
+| `"emmc"` | **Cache** (internal model cache) | `LIST_INFO` `type:model` shows uploaded `.3mf` on printer screen |
+| `"udisk"` | **External** (USB-side cache when stick present) | Same wire protocol; storage label selects mount |
+
+MQTT capability flags (`print.fun` / `print.fun2`) govern which tabs Studio **shows** (e.g. model internal storage); they are orthogonal to the upload wire format.
+
+##### Legacy one-shot upload (rejected by P2S)
+
+Orca/Bambu Studio sources also describe a **single-frame** upload:
+
+```json
+{"cmdtype":5,"sequence":N,"req":{"path":"/emmc/","file":"…","size":N,"md5":"…","peer":"studio","api_version":3}}
+```
+
+followed by `\n\n` + entire file. P2S firmware **rejects** this for multi-megabyte Send-to-Printer jobs (connection reset or `-9203`). Keep the chunked init + `frag_id` / `offset` / `size` / `file_md5` path documented above. The one-shot builder remains in `tunnel_local.hpp` for tests and older models only.
+
+##### Error code `-9203`
+
+Not listed in Studio's `PrinterFileSystem.h` success enum (§7.5.3). On P2S we consistently saw `-9203` when violating the pipeline rules (per-chunk recv, or post-send SSL poll mid-pipeline). Fixing send/read ordering resolved Send-to-Printer failures without changing JSON field values.
+
+##### Progress reporting to Studio
+
+During pipeline send, the plugin reports `msg_cb` progress from **bytes written** (`offset / total`), not from per-chunk wire ACKs (there are none until the final reply). Set socket I/O timeout generously for the final blocking recv after a large pipelined send (~120 s in our implementation).
+
 ### 6.15. Filament Manager (cloud spool catalogue)
 
 Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through.
@@ -1730,7 +1863,7 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 
 **Multiple clients.** Unlike an earlier working assumption, the printer **does allow several simultaneous TLS :6000 sessions** (verified with two independent REPL connections while Studio also had Files open). There is no exclusive lock on the port.
 
-**Do not conflate with FTPS :990.** The printer's implicit FTPS service (§7.6.3) is used for LAN print uploads and the `ft_*` FileTransfer ABI. On P2S it is **not** involved in stock Device → Files traffic (see also §7.6.1.1 for what FTPS exports on that model).
+**Do not conflate with FTPS :990.** The printer's implicit FTPS service (§7.6.3) is a **fallback** for our open `ft_*` plugin and is used for some LAN print flows. Stock **Send to Printer → Cache** on P2S goes over **TLS :6000 only** (§6.14.2); stock Device → Files browsing also stays on :6000 (see §7.6.1.1 for what FTPS exports on that model).
 
 **Do not conflate with MJPEG auth.** The 80-byte `0x3000` auth block in [`video.md`](../3rd_party/OpenBambuAPI/video.md) applies to **MJPEG live view on A1 / P1 / P1P** (`BambuTunnelLocal` is still used on some paths, but the camera stream uses different post-auth bytes). Sending that 80-byte packet on a P2S file-browser session yields a 24-byte `0x0003013f` ack and the peer closes — it is the wrong handshake.
 
@@ -1803,7 +1936,9 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 
 | Tool | Role |
 |------|------|
-| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS :6000 client; performs login + `mtype` 12291 setup; auto-framed JSON lines |
+| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS :6000 client; performs login + `mtype` 12291 setup; auto-framed JSON lines; `/upload` uses chunked pipeline (§6.14.2) |
+| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Batch regression: repeated pipeline uploads, optional delete, same-session stress |
+| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of upload wire variants (one-shot, per-chunk ACK, md5/separator permutations) |
 | [`tools/tutk_ssl_log.js`](../tools/tutk_ssl_log.js) + [`tools/frida_tutk_attach.sh`](../tools/frida_tutk_attach.sh) | Frida hooks on stock `libBambuSource.so` (`Bambu_SendMessage`, `Bambu_ReadSample`, `tutk_third_SSL_*`) |
 
 **Example `LIST_INFO` round-trip** (External timelapse, after handshake):
@@ -1920,7 +2055,7 @@ Per-command request shape (the `req` object — line numbers for the assemblers 
 | `SUB_FILE` | `0x0002` | thumbnail / partial fetch (`...:500-540`) | `{ path, name, offset, size, ... }` | :6000 firmware wire |
 | `FILE_DEL` | `0x0003` | `DeleteFiles` (`...:776-799`) | `{ paths: [...] }` or `{ path, file }` | :6000 firmware wire |
 | `FILE_DOWNLOAD` | `0x0004` | `DownloadFiles` (`...:811-829`) | `{ path, file }` (or `mem:/<idx>` for in-memory thumbnails) | :6000 firmware wire |
-| `FILE_UPLOAD` | `0x0005` | `UploadFile` (`...:1258-1280`) | `{ path, file, size, md5, ... }` + binary param | :6000 firmware wire (Studio also has the separate `ft_*` upload path in `libbambu_networking`) |
+| `FILE_UPLOAD` | `0x0005` | **Chunked** (§6.14.2): init `{type,storage,path,total}` → N× `{frag_id,offset,size[,file_md5]}` + binary; **or** legacy one-shot `{path,file,size,md5,…}` + binary (P2S: one-shot fails for large files) | :6000 firmware wire; Send to Printer uses `ft_*` in `libbambu_networking`, not `libBambuSource` |
 | `REQUEST_MEDIA_ABILITY` | `0x0007` | media abilities probe (`...:1228-1240`) | `{}` | static answer from stock plugin / firmware |
 | `TASK_CANCEL` | `0x1000` | `CancelRequests` (`...:1469-1483`) | `{ tasks: [seq, seq, ...] }` | cancel in-flight work on the :6000 session |
 | `LIST_CHANGE_NOTIFY` | `0x0100` | printer-initiated | "the file list changed, please refresh" | re-emits `LIST_INFO` to Studio |
@@ -1957,6 +2092,8 @@ FTPS storage layout on other printer families has **not** been probed for this d
 #### 7.6.2. The tunnel keeps Studio requests sequenced
 
 There are no concurrent CTRL requests on the same tunnel: `PrinterFileSystem::RunRequests` serialises everything on the worker thread, holding `m_mutex` between `Bambu_SendMessage` and the matching `Bambu_ReadSample`. Stock `libBambuSource` forwards each request/response pair over its single :6000 socket in that order.
+
+**`ft_*` is different.** Send to Printer (`libbambu_networking.so`) opens its **own** TLS `:6000` session and may run **`cmd_type=7` ability** then **`cmd_type=5` upload** back-to-back on the same socket without re-handshaking. Clients must drain stale framed JSON and match `cmdtype` + `sequence` on every reply (§6.14.2). Do not assume the strict request/response pairing of the file-browser worker thread applies verbatim to `ft_*`.
 
 #### 7.6.3. FTPS dialect quirks
 

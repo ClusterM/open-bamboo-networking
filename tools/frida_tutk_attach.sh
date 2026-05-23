@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Attach Frida TUTKSSL logger to a running Bambu Studio process.
+# Send to Printer (ft_*) uses libbambu_networking.so — see tools/frida_ft_attach.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

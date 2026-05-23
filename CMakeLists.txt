@@ -110,16 +110,15 @@ endif()
 
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
 # the Print job's eMMC pre-flight speaks a real transport instead of
-# reporting an immediate I/O error. The transport is FTPS (same one we
-# use for LAN print uploads), not the proprietary port-6000 tunnel, so
-# only `bambu:///local/*` URLs are served; TUTK/Agora URLs still get
-# FT_EIO. With this OFF, every ft_* entry point is a polite-failure
-# stub and Studio falls back to its internal FTP path (our
-# start_send_gcode_to_sdcard / start_local_print entry points). Both
-# modes produce the same file in the same place on the printer; the
-# FTPS fastpath gives the more native dialog sequence (ability probe
-# / storage picker / percent progress).
-option(OBN_FT_FTPS_FASTPATH "Serve ft_* ABI calls over FTPS for LAN URLs" ON)
+# reporting an immediate I/O error.
+#   OBN_FT_TUNNEL_LOCAL   — native BambuTunnelLocal over TLS :6000 (stock path)
+#   OBN_FT_FTPS_FALLBACK  — fall back to FTPS :990 when :6000 fails
+# With both OFF every ft_* entry point is a polite-failure stub and Studio
+# falls back to its internal FTP send path.
+option(OBN_FT_TUNNEL_LOCAL "Serve ft_* over TLS :6000 (BambuTunnelLocal)" ON)
+option(OBN_FT_FTPS_FALLBACK "Fall back to FTPS for ft_* when :6000 fails" ON)
+# Deprecated alias kept for configure scripts:
+option(OBN_FT_FTPS_FASTPATH "Deprecated: use OBN_FT_FTPS_FALLBACK" OFF)
 
 # Toggles every non-stock behaviour in the plugin. With this ON the plugin
 # makes choices the original bambu_networking.so never would in order to
@@ -294,6 +293,7 @@ add_library(bambu_networking SHARED
     src/print_job.cpp
     src/ssdp.cpp
     src/tunnel_local.cpp
+    src/tls_dial.cpp
     src/zip_reader.cpp
 )
 
@@ -301,7 +301,8 @@ target_include_directories(bambu_networking PRIVATE include)
 target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
-    OBN_FT_FTPS_FASTPATH=$<BOOL:${OBN_FT_FTPS_FASTPATH}>
+    OBN_FT_TUNNEL_LOCAL=$<BOOL:${OBN_FT_TUNNEL_LOCAL}>
+    OBN_FT_FTPS_FALLBACK=$<IF:$<BOOL:${OBN_FT_FTPS_FALLBACK}>,1,$<BOOL:${OBN_FT_FTPS_FASTPATH}>>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 target_link_libraries(bambu_networking PRIVATE
@@ -398,6 +399,7 @@ set(_obn_bambusource_sources
     src/ftps.cpp
     src/json_lite.cpp
     src/tunnel_local.cpp
+    src/tls_dial.cpp
     src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp

@@ -12,6 +12,9 @@ This is **not** the 80-byte 0x3000 auth from OpenBambuAPI/video.md (MJPEG camera
 Frida tutk_third_SSL_write shows only channel-0x02 traffic after the session is up;
 the login + 12291 handshake happen earlier inside Bambu_Open / Bambu_StartStreamEx.
 
+Send to Printer uses libbambu_networking.so (ft_*), not BambuSource — sniff with
+tools/frida_ft_attach.sh (stock plugin) or probe upload here with /upload.
+
 Usage:
     python3 tools/bambu6000_repl.py 10.13.1.30 ABCD1234
 
@@ -20,6 +23,8 @@ Example LIST (External timelapse) — type one JSON line; framing is added autom
 
 REPL commands:
     /quit, /exit          — close session
+    /ability              — REQUEST_MEDIA_ABILITY (cmdtype 7)
+    /upload <local> <storage> <remote_name> — FILE_UPLOAD (cmdtype 5)
     /hex 404142...        — send raw bytes (even length hex string)
     /file path.bin        — send file contents
     /raw on|off           — send typed lines as raw bytes (no framing)
@@ -29,6 +34,7 @@ Requires: Python 3.10+, stdlib only.
 """
 from __future__ import annotations
 
+import hashlib
 import argparse
 import json
 import random
@@ -37,7 +43,9 @@ import ssl
 import struct
 import sys
 import threading
-from typing import Any, Optional
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 # Client -> printer (byte 7 of magic = 0x01). Server replies use 0x00.
 MAGIC_LOGIN = 0x0101013F
@@ -78,7 +86,7 @@ def build_ctrl_setup_json(pid: str, *, client_ver: str = "02.03.00.00") -> bytes
         "sequence": 0,
         "mtype": MTYPE_CTRL_SETUP,
         "req": {
-            "t_av": 0,
+            "t_av": 1,
             "mtype": MTYPE_CTRL_JSON,
             "peer_t": 3,
             "pid": pid,
@@ -219,6 +227,8 @@ class LocalCtrlSession:
         self._append_nl = append_nl
         self._recv_hex_limit = recv_hex_limit
         self._stop = threading.Event()
+        self._sync_depth = 0
+        self._rx_buf = bytearray()
         self._lock = threading.Lock()
         self._reader = threading.Thread(target=self._recv_loop, daemon=True)
 
@@ -268,6 +278,45 @@ class LocalCtrlSession:
             self._ssl.settimeout(None)
         return b"".join(chunks)
 
+    @contextmanager
+    def _sync_recv(self) -> Iterator[None]:
+        self._sync_depth += 1
+        try:
+            yield
+        finally:
+            self._sync_depth -= 1
+
+    def _pop_json_frame(self, timeout: float) -> Optional[dict[str, Any]]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                frames = parse_frames(bytes(self._rx_buf))
+                if frames:
+                    pl, _magic, _seq, body = frames[0]
+                    del self._rx_buf[: 16 + pl]
+                    text, _bin = split_text_and_binary(body)
+                    if text:
+                        try:
+                            obj = json.loads(text)
+                        except json.JSONDecodeError:
+                            return None
+                        if isinstance(obj, dict):
+                            return obj
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._lock:
+                self._ssl.settimeout(min(1.0, remaining))
+                try:
+                    chunk = self._ssl.recv(65536)
+                except socket.timeout:
+                    chunk = b""
+                finally:
+                    self._ssl.settimeout(None)
+            if chunk:
+                self._rx_buf.extend(chunk)
+        return None
+
     def handshake(self, username: str, access_code: str) -> None:
         login = build_login_payload(username, access_code)
         self._send_frame(MAGIC_LOGIN, login)
@@ -294,12 +343,15 @@ class LocalCtrlSession:
     def _recv_loop(self) -> None:
         self._ssl.settimeout(None)
         while not self._stop.is_set():
+            if self._sync_depth > 0:
+                time.sleep(0.02)
+                continue
             try:
-                data = self._ssl.recv(65536)
+                with self._lock:
+                    data = self._ssl.recv(65536)
             except ssl.SSLWantReadError:
                 continue
             except socket.timeout:
-                # Optional future: idle probe; never treat as disconnect.
                 continue
             except OSError as exc:
                 if not self._stop.is_set():
@@ -310,6 +362,67 @@ class LocalCtrlSession:
                 self._stop.set()
                 break
             print(format_recv(data, self._recv_hex_limit), flush=True)
+
+    def send_ability(self) -> None:
+        self.send_ctrl_json({
+            "cmdtype": 7,
+            "sequence": 1,
+            "req": {"peer": "studio", "api_version": 2},
+        })
+
+    def send_upload(self, local_path: str, storage: str, remote_name: str) -> None:
+        with open(local_path, "rb") as fh:
+            data = fh.read()
+        with self._sync_recv():
+            seq = 2
+            init_req = {
+                "type": "model",
+                "storage": storage,
+                "path": remote_name,
+                "total": len(data),
+            }
+            self.send_ctrl_json({"cmdtype": 5, "sequence": seq, "req": init_req})
+            reply = self._pop_json_frame(30.0)
+            if reply is None:
+                raise OSError("no init reply")
+            print(f"init reply: {reply}", flush=True)
+            result = reply.get("result")
+            if result not in (1, 19):
+                raise OSError(f"init failed result={result}")
+            resp = reply.get("reply") or {}
+            chunk_kb = int(resp.get("chunk_size") or 0)
+            offset = int(resp.get("offset") or 0)
+            if chunk_kb <= 0:
+                raise OSError("missing chunk_size in init reply")
+            chunk_size = chunk_kb * 1024
+            md5 = hashlib.md5()
+            frag_id = 0
+            while offset < len(data):
+                end = min(offset + chunk_size, len(data))
+                chunk = data[offset:end]
+                md5.update(chunk)
+                req: dict[str, Any] = {
+                    "frag_id": frag_id,
+                    "offset": offset,
+                    "size": len(chunk),
+                }
+                if end >= len(data):
+                    req["file_md5"] = md5.hexdigest().lower()
+                body = wrap_ctrl_json({"cmdtype": 5, "sequence": seq, "req": req})
+                payload = body + b"\n\n" + chunk
+                self._send_frame(MAGIC_CTRL, payload)
+                offset = end
+                frag_id += 1
+            # P2S expects all chunks on the wire before reading replies.
+            chunk_reply = self._pop_json_frame(180.0)
+            if chunk_reply is None:
+                raise OSError("no reply after pipelined upload")
+            print(f"upload reply: {chunk_reply}", flush=True)
+            cr = chunk_reply.get("result")
+            if cr in (0, 19):
+                print("upload done", flush=True)
+                return
+            raise OSError(f"upload failed result={cr}")
 
     def run_interactive(self) -> None:
         mode = "raw" if self._send_raw else "framed JSON (mtype 12289)"
@@ -335,6 +448,19 @@ class LocalCtrlSession:
                 arg = low.split(maxsplit=1)[-1]
                 self._append_nl = arg in ("on", "1", "true", "yes")
                 print(f"append newline: {self._append_nl}", flush=True)
+                continue
+            if low.startswith("/upload "):
+                parts = cmd.split(maxsplit=3)
+                if len(parts) < 4:
+                    print("usage: /upload <local_path> <storage> <remote_name>", flush=True)
+                    continue
+                try:
+                    self.send_upload(parts[1], parts[2], parts[3])
+                except OSError as exc:
+                    print(f"upload failed: {exc}", flush=True)
+                continue
+            if low == "/ability":
+                self.send_ability()
                 continue
             if low.startswith("/hex "):
                 hex_str = "".join(cmd.split(maxsplit=1)[1].split())

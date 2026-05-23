@@ -298,9 +298,9 @@ Source: [src/abi_track.cpp](src/abi_track.cpp). Telemetry is intentionally not f
 
 Source: [src/abi_ft.cpp](src/abi_ft.cpp).
 
-Statuses below assume `OBN_FT_FTPS_FASTPATH=ON` (the default). With it `OFF`, every active entry point collapses into a polite-failure stub (`FT_EIO`) and Studio transparently falls back to its internal FTP send path (`bambu_network_start_send_gcode_to_sdcard`). The file ends up in the same place; the UI just skips the storage-ability probe and per-percent progress from the fast path.
+Statuses below assume `OBN_FT_TUNNEL_LOCAL=ON` and `OBN_FT_FTPS_FALLBACK=ON` (defaults). With both `OFF` (`configure --disable-ftps-fastpath`), every active entry point collapses into a polite-failure stub (`FT_EIO`) and Studio transparently falls back to its internal FTP send path.
 
-For `bambu:///local/*` URLs the fast path serves the whole `ft_*` bus over FTPS (port 990) — `CWD /sdcard` / `CWD /usb` probes satisfy `cmd_type=7` (media ability), and `STOR` satisfies `cmd_type=5` (upload). Cloud / TUTK URLs return `FT_EIO`; that proprietary transport is out of scope.
+For `bambu:///local/*` URLs the plugin serves `ft_*` over **native TLS :6000** (BambuTunnelLocal — same wire as stock). If `:6000` fails, it falls back to **FTPS :990**. Cloud / TUTK URLs return `FT_EIO`.
 
 | Function | Status | Notes |
 | --- | :--: | --- |
@@ -308,43 +308,30 @@ For `bambu:///local/*` URLs the fast path serves the whole `ft_*` bus over FTPS 
 | `ft_free` | ✅ | No-op (handles are owned by the plugin). |
 | `ft_job_result_destroy` | ✅ | No-op. |
 | `ft_job_msg_destroy` | ✅ | No-op. |
-| `ft_tunnel_create` | ✨ | Parses `bambu:///local/<ip>?port=…&user=…&passwd=…` into a LAN descriptor; non-local URLs fall through to the stub path. |
+| `ft_tunnel_create` | ✨ | Parses `bambu:///local/<ip>?port=…&user=…&passwd=…` (+ optional `device`, `cli_id`, `cli_ver`, `net_ver`). |
 | `ft_tunnel_retain` | ✅ | Refcount. |
 | `ft_tunnel_release` | ✅ | Refcount. |
 | `ft_tunnel_set_status_cb` | ✅ | Stored on the tunnel. |
-| `ft_tunnel_start_connect` | ✨ | LAN: synchronously establishes the FTPS control channel (sub-second on LAN) and fires the callback. Non-LAN: fires a synthetic `FT_EIO` immediately so Studio's state machine never hangs. |
-| `ft_tunnel_sync_connect` | ✨ | LAN: same FTPS handshake. Non-LAN: returns `FT_EIO`. |
-| `ft_tunnel_shutdown` | ✅ | Tears down the FTPS control channel and flags the tunnel as shut down. |
+| `ft_tunnel_start_connect` | ✨ | LAN: TLS :6000 handshake (primary) or FTPS fallback; fires callback synchronously. |
+| `ft_tunnel_sync_connect` | ✨ | LAN: same as start_connect. |
+| `ft_tunnel_shutdown` | ✅ | Closes TLS :6000 and/or FTPS session. |
 | `ft_job_create` | ✅ | Parses `cmd_type` / `dest_storage` / `dest_name` / `file_path` out of the params JSON. |
-| `ft_job_retain` | ✅ | Refcount. |
-| `ft_job_release` | ✅ | Refcount. |
-| `ft_job_set_result_cb` | ✅ | Stored on the job. |
-| `ft_job_set_msg_cb` | ✅ | Stored on the job; progress is pushed through it from the STOR loop. |
-| `ft_tunnel_start_job` | ✨ | LAN: spawns a worker thread that dispatches on `cmd_type` (media-ability probe, STOR upload with percent progress). Non-LAN: delivers a synthetic `FT_EIO` result. |
-| `ft_job_get_result` | ✅ | Blocks with timeout on the job's condition variable; returns `FT_ETIMEOUT` on timeout, the job result otherwise. |
-| `ft_job_cancel` | ✅ | Sets an atomic flag observed by the STOR progress callback; the upload aborts cleanly with `FT_ECANCELLED`. |
-| `ft_job_try_get_msg` | ❌ | Always returns `FT_EIO`. Progress messages are pushed through `msg_cb` rather than polled, matching how Studio actually consumes them. |
-| `ft_job_get_msg` | ❌ | Always returns `FT_EIO`, same reason as above. |
+| `ft_tunnel_start_job` | ✨ | `cmd_type=7` → wire REQUEST_MEDIA_ABILITY; `cmd_type=5` → FILE_UPLOAD + binary + progress. |
+| `ft_job_cancel` | ✅ | Sets cancel flag; upload aborts with `FT_ECANCELLED`. |
+| `ft_job_try_get_msg` / `get_msg` | ❌ | Progress via `msg_cb` only. |
 
-### 6.14.1. FTPS fastpath vs stock port-6000 framer
+### 6.14.1. Native :6000 vs FTPS fallback
 
-Studio uses the `ft_*` ABI for the **Send to Printer** dialog (upload without printing), the eMMC pre-flight check in the regular Print job, and media-ability queries. The proprietary `libbambu_networking.so` serves these over a **port-6000 TLS tunnel** with a JSON command framer we have **not** reimplemented. See [NETWORK_PLUGIN.md § 6.14](NETWORK_PLUGIN.md#614-file-transfer-abi-ft_) for the ABI contract.
+Stock `libbambu_networking.so` serves LAN `ft_*` over **TLS :6000** with the same BambuTunnelLocal framing as Device → Files (§7.5.1.1). Our plugin implements that path when `OBN_FT_TUNNEL_LOCAL=ON` (default):
 
-Two build modes, toggled with `-DOBN_FT_FTPS_FASTPATH=ON|OFF` (default **ON**):
+- `cmd_type=7` → wire `REQUEST_MEDIA_ABILITY` (`0x0007`); firmware reply mapped to a JSON array for Studio (may include `"emmc"` on P2S — not visible over FTPS).
+- `cmd_type=5` → wire `FILE_UPLOAD` (`0x0005`) with `\n\n` + file bytes; progress from `reply.progress` while `result==1`.
 
-**`OBN_FT_FTPS_FASTPATH=ON` (default).**  
-For `bambu:///local/…` URLs the plugin implements the ABI over the **same FTPS connection** the print job uses:
+When `:6000` fails and `OBN_FT_FTPS_FALLBACK=ON` (default), the previous FTPS workaround applies (`CWD` probes + `STOR`).
 
-- `cmd_type=7` (media ability) is answered by probing `CWD /sdcard` and `CWD /usb` on the printer. X1/P1P/A1 and first-gen A1 mini have the SD-card mount; P2S has a USB port instead. Printers with both get both back. If *neither* path answers but the FTPS login succeeded (the P2S case), the fastpath treats the FTPS root as the storage mount and reports `["sdcard"]` so Studio's picker lights up. `emmc` is never reported — on Bambu firmware that storage is for system files, not user uploads.
-- `cmd_type=5` (upload) runs `STOR /<dest_storage>/<dest_name>` with byte-level progress forwarded to Studio as `{"progress":N}` via `msg_cb` (skipping 99, which Studio reserves as a timeout tripwire). When the tunnel is in root-is-storage mode the `STOR` target is just `/<dest_name>`.
-- TUTK/Agora URLs still return `FT_EIO` — we don't speak the cloud p2p transport.
+Runtime overrides: `OBN_FT_TUNNEL_LOCAL=0|1`, `OBN_FT_FTPS_FALLBACK=0|1`.
 
-Net effect: the Send to Printer dialog walks through the same UI states as with the stock plugin (Reading storage → picker → sending with real % progress), the eMMC pre-flight in the regular Print job gets a clean `["sdcard"]` / `["usb"]` answer and Studio stops logging a fallback every time.
-
-**`OBN_FT_FTPS_FASTPATH=OFF`.**  
-Every `ft_*` entry point is a polite-failure stub that fires its callback synchronously with `FT_EIO` and a "fall back to FTP" message. Studio's internal fallback kicks in and the 3mf is uploaded through `bambu_network_start_send_gcode_to_sdcard`, which also uses FTPS. Same file lands in the same place — the UI skips the media-ability step and per-percent progress comes from the fallback instead.
-
-**Scope:** the fastpath is a deliberate shortcut, not a clean reimplementation of the proprietary port-6000 protocol. MakerWorld-style project metadata, eMMC-as-primary-storage, or the "Send to multiple machines" batch UI remain limited to what the fallback path supports.
+**Scope:** TUTK/cloud `ft_*` URLs remain `FT_EIO`. MakerWorld batch UI limits unchanged.
 
 ---
 
@@ -491,7 +478,7 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 | Common cloud HTTPS transport (hosts, bearer, response envelopes) | [NETWORK_PLUGIN.md § 6.10.1](NETWORK_PLUGIN.md#6101-common-cloud-transport) |
 | Filament Manager REST shapes (MITM) | [NETWORK_PLUGIN.md § 6.15](NETWORK_PLUGIN.md#615-filament-manager-cloud-spool-catalogue) |
 | `libBambuSource` C ABI, camera URL formats, CTRL bridge | [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) |
-| `ft_*` FTPS fastpath vs `OBN_FT_FTPS_FASTPATH` | [STATUS.md § 6.14.1](STATUS.md#6141-ftps-fastpath-vs-stock-port-6000-framer) |
+| `ft_*` native :6000 vs FTPS fallback | [STATUS.md § 6.14.1](STATUS.md#6141-native-6000-vs-ftps-fallback) |
 | PrinterFileSystem / Device → Files (CTRL → FTPS, `ipcam.file`) | [STATUS.md — PrinterFileSystem (MediaFilePanel)](STATUS.md#printerfilesystem-mediafilepanel) |
 | FTPS dialect quirks (used by `libBambuSource` CTRL bridge and by `ft_*`) | [NETWORK_PLUGIN.md § 7.6.3](NETWORK_PLUGIN.md#763-ftps-dialect-quirks) |
 | LAN TLS verification & IPC | [STATUS.md § 6.4.1](STATUS.md#641-lan-tls-verification-mqtt-ftps-rtsps-mjpeg) |

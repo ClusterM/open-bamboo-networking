@@ -1,6 +1,7 @@
 'use strict';
 
 // Log stock libBambuSource traffic for Device -> Files RE.
+// Send to Printer (ft_*) is libbambu_networking.so — see tools/frida_ft_upload.js
 //
 // Primary hooks: Bambu_SendMessage / Bambu_ReadSample (JSON plaintext at ABI).
 // Secondary: tutk_third_SSL_* and TUTKSSL_* (wire encryption layer).
@@ -12,6 +13,20 @@
 const MOD_NAME = 'libBambuSource.so';
 const LOG_PATH = '/tmp/tutk_ssl.log';
 const MAX_HEX_CONSOLE = 2048;
+
+function globalExport(name) {
+  if (typeof Module.getGlobalExportByName === 'function') {
+    try {
+      return Module.getGlobalExportByName(name);
+    } catch (e) {
+      return null;
+    }
+  }
+  if (typeof Module.findExportByName === 'function') {
+    return Module.findExportByName(null, name);
+  }
+  return null;
+}
 
 const ANSI = {
   reset: '\x1b[0m',
@@ -360,7 +375,7 @@ function waitForModule() {
   if (installHooks()) return;
   emit('[*] waiting for ' + MOD_NAME + ' (open Device tab)...');
 
-  const dlopen = Module.findExportByName(null, 'dlopen');
+  const dlopen = globalExport('dlopen');
   if (dlopen) {
     Interceptor.attach(dlopen, {
       onLeave() {
