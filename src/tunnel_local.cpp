@@ -534,12 +534,7 @@ int Session::poll_incoming_wire(SSL* ssl, std::mutex* io_mu,
     dispatch();
 
     for (int pass = 0; pass < 64; ++pass) {
-        int rr = 0;
-        {
-            std::unique_lock<std::mutex> lk;
-            if (io_mu) lk = std::unique_lock<std::mutex>(*io_mu);
-            rr = try_read_frames(ssl, io_mu);
-        }
+        const int rr = try_read_frames(ssl, io_mu);
         if (rr < 0) return -1;
         if (!dispatch()) return -2;
         if (rr > 0) break; // WANT_READ/WRITE — retry from write path

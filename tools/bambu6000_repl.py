@@ -341,14 +341,14 @@ class LocalCtrlSession:
         self._send_frame(MAGIC_CTRL, body)
 
     def _recv_loop(self) -> None:
-        self._ssl.settimeout(None)
+        # Do not hold _lock across recv: handshake/send paths need the same lock.
+        self._ssl.settimeout(1.0)
         while not self._stop.is_set():
             if self._sync_depth > 0:
                 time.sleep(0.02)
                 continue
             try:
-                with self._lock:
-                    data = self._ssl.recv(65536)
+                data = self._ssl.recv(65536)
             except ssl.SSLWantReadError:
                 continue
             except socket.timeout:

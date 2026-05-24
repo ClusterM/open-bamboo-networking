@@ -4,7 +4,6 @@
 // See NETWORK_PLUGIN.md §7.5.1.1 and tools/bambu6000_repl.py.
 
 #include <array>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
