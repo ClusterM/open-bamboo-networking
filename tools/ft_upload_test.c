@@ -9,6 +9,7 @@
 //   OBN_PRINTER_IP=192.168.1.10 OBN_ACCESS_CODE=abcd1234 \
 //     ./ft_upload_test [libbambu_networking.so] [local_file_path]
 #include <dlfcn.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,12 +27,17 @@ typedef struct {
     unsigned bin_size;
 } ft_job_result;
 
+typedef struct {
+    int kind;
+    const char* json;
+} ft_job_msg;
+
 typedef ft_err (*fn_create)(const char*, FT_TunnelHandle**);
 typedef ft_err (*fn_sync_connect)(FT_TunnelHandle*);
 typedef ft_err (*fn_job_create)(const char*, FT_JobHandle**);
 typedef ft_err (*fn_start_job)(FT_TunnelHandle*, FT_JobHandle*);
 typedef ft_err (*fn_set_result_cb)(FT_JobHandle*, void (*)(void*, ft_job_result), void*);
-typedef ft_err (*fn_set_msg_cb)(FT_JobHandle*, void (*)(void*, int, const char*), void*);
+typedef ft_err (*fn_set_msg_cb)(FT_JobHandle*, void (*)(void*, ft_job_msg), void*);
 typedef void (*fn_release_tunnel)(FT_TunnelHandle*);
 typedef void (*fn_release_job)(FT_JobHandle*);
 
@@ -41,8 +47,20 @@ static const char* env_or(const char* name)
     return (v && v[0]) ? v : NULL;
 }
 
-static volatile int g_done;
+static atomic_int g_done;
 static int g_ec, g_resp_ec;
+
+static void* require_sym(void* handle, const char* name)
+{
+    dlerror();
+    void* sym = dlsym(handle, name);
+    const char* err = dlerror();
+    if (err || !sym) {
+        fprintf(stderr, "dlsym(%s): %s\n", name, err ? err : "missing symbol");
+        return NULL;
+    }
+    return sym;
+}
 
 static void on_result(void* user, ft_job_result r)
 {
@@ -50,13 +68,13 @@ static void on_result(void* user, ft_job_result r)
     g_ec = r.ec;
     g_resp_ec = r.resp_ec;
     printf("result ec=%d resp_ec=%d json=%s\n", r.ec, r.resp_ec, r.json ? r.json : "");
-    g_done = 1;
+    atomic_store_explicit(&g_done, 1, memory_order_release);
 }
 
-static void on_msg(void* user, int kind, const char* json)
+static void on_msg(void* user, ft_job_msg msg)
 {
     (void)user;
-    printf("msg kind=%d json=%s\n", kind, json ? json : "");
+    printf("msg kind=%d json=%s\n", msg.kind, msg.json ? msg.json : "");
 }
 
 int main(int argc, char** argv)
@@ -83,22 +101,30 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    fn_create create = (fn_create)dlsym(h, "ft_tunnel_create");
-    fn_sync_connect sync = (fn_sync_connect)dlsym(h, "ft_tunnel_sync_connect");
-    fn_job_create job_create = (fn_job_create)dlsym(h, "ft_job_create");
-    fn_start_job start_job = (fn_start_job)dlsym(h, "ft_tunnel_start_job");
-    fn_set_result_cb set_res = (fn_set_result_cb)dlsym(h, "ft_job_set_result_cb");
-    fn_set_msg_cb set_msg = (fn_set_msg_cb)dlsym(h, "ft_job_set_msg_cb");
-    fn_release_tunnel rel_t = (fn_release_tunnel)dlsym(h, "ft_tunnel_release");
-    fn_release_job rel_j = (fn_release_job)dlsym(h, "ft_job_release");
+    fn_create create = (fn_create)require_sym(h, "ft_tunnel_create");
+    fn_sync_connect sync = (fn_sync_connect)require_sym(h, "ft_tunnel_sync_connect");
+    fn_job_create job_create = (fn_job_create)require_sym(h, "ft_job_create");
+    fn_start_job start_job = (fn_start_job)require_sym(h, "ft_tunnel_start_job");
+    fn_set_result_cb set_res = (fn_set_result_cb)require_sym(h, "ft_job_set_result_cb");
+    fn_set_msg_cb set_msg = (fn_set_msg_cb)require_sym(h, "ft_job_set_msg_cb");
+    fn_release_tunnel rel_t = (fn_release_tunnel)require_sym(h, "ft_tunnel_release");
+    fn_release_job rel_j = (fn_release_job)require_sym(h, "ft_job_release");
+    if (!create || !sync || !job_create || !start_job || !set_res || !set_msg ||
+        !rel_t || !rel_j) {
+        dlclose(h);
+        return 1;
+    }
 
     FT_TunnelHandle* tunnel = NULL;
     if (create(url, &tunnel) != 0 || !tunnel) {
         fprintf(stderr, "create failed\n");
+        dlclose(h);
         return 1;
     }
     if (sync(tunnel) != 0) {
         fprintf(stderr, "sync_connect failed\n");
+        rel_t(tunnel);
+        dlclose(h);
         return 1;
     }
 
@@ -111,17 +137,27 @@ int main(int argc, char** argv)
     FT_JobHandle* job = NULL;
     if (job_create(params, &job) != 0 || !job) {
         fprintf(stderr, "job_create failed\n");
+        rel_t(tunnel);
+        dlclose(h);
         return 1;
     }
     set_res(job, on_result, NULL);
     set_msg(job, on_msg, NULL);
     start_job(tunnel, job);
 
-    for (int i = 0; i < 300 && !g_done; ++i) usleep(100000);
+    for (int i = 0; i < 300 &&
+                    !atomic_load_explicit(&g_done, memory_order_acquire);
+         ++i) {
+        usleep(100000);
+    }
 
-    if (!g_done) printf("timeout waiting for result\n");
+    if (!atomic_load_explicit(&g_done, memory_order_acquire)) {
+        printf("timeout waiting for result\n");
+    }
     rel_j(job);
     rel_t(tunnel);
     dlclose(h);
-    return g_done ? (g_ec == 0 ? 0 : 2) : 3;
+    return atomic_load_explicit(&g_done, memory_order_acquire)
+               ? (g_ec == 0 ? 0 : 2)
+               : 3;
 }

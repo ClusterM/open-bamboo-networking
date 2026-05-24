@@ -3,6 +3,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
+#include "obn/net_compat.hpp"
 #include "obn/tls_dial.hpp"
 #include "obn/tunnel_local.hpp"
 
@@ -73,6 +74,19 @@ const char* tls_serial_for(const ConnectParams& p)
     return nullptr;
 }
 
+int wait_ssl_readable(SSL* ssl, int timeout_ms)
+{
+    const int fd = SSL_get_fd(ssl);
+    if (fd < 0) return -1;
+    const obn::os::socket_t sock = static_cast<obn::os::socket_t>(fd);
+    if (!obn::os::socket_valid(sock)) return -1;
+    short revents = 0;
+    if (obn::os::poll_one(sock, obn::net::poll_event::in, timeout_ms, &revents) <= 0) {
+        return 0;
+    }
+    return (revents & obn::net::poll_event::in) ? 1 : 0;
+}
+
 int recv_json_payload(obn::tunnel_local::Session* session, SSL* ssl,
                       std::mutex* io_mu, std::string* json_out)
 {
@@ -81,6 +95,7 @@ int recv_json_payload(obn::tunnel_local::Session* session, SSL* ssl,
         const int rc = session->recv_payload(ssl, &payload, io_mu);
         if (rc == 0) break;
         if (rc < 0) return -1;
+        if (wait_ssl_readable(ssl, 100) < 0) return -1;
     }
     std::vector<std::uint8_t> bin;
     if (!obn::tunnel_local::split_json_prefix(payload.data(), payload.size(),
@@ -207,6 +222,7 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
     std::vector<char> buffer(buffer_size);
     std::uint32_t frag_id = 0;
     int last_reported_pct = -1;
+    std::string digest_lower;
 
     while (offset < fsize) {
         if (cb.cancelled && cb.cancelled()) {
@@ -235,7 +251,8 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
         const bool last_chunk = (offset + read_size >= fsize);
         std::string file_md5;
         if (last_chunk) {
-            file_md5 = md5_finalize_lower(md5_ctx.get());
+            digest_lower = md5_finalize_lower(md5_ctx.get());
+            file_md5 = digest_lower;
             md5_ctx.reset();
         }
 
@@ -282,6 +299,7 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
     }
 
     out.bytes = fsize;
+    out.md5_lower = digest_lower;
     out.wire_result = result_code;
     if (result_code == 0 || result_code == 19) {
         out.ok = true;

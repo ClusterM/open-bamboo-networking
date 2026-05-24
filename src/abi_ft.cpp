@@ -201,6 +201,7 @@ struct FT_Tunnel {
     std::unique_ptr<obn::tunnel_upload::Connection> conn;
     std::string ability_cache;
     bool        ability_probed{false};
+    std::mutex  lan_mu;  // serializes connect/query/upload on one TLS session
 #endif
 };
 
@@ -355,6 +356,7 @@ std::string connect_lan_tunnel(FT_Tunnel* t)
 
 void run_ability_job(FT_Tunnel* t, FT_Job* j)
 {
+    std::lock_guard<std::mutex> lk(t->lan_mu);
     if (t->ability_probed) {
         OBN_INFO("ft: ability (cached): %s", t->ability_cache.c_str());
         deliver_result(j, 0, 0, t->ability_cache);
@@ -380,6 +382,7 @@ void run_ability_job(FT_Tunnel* t, FT_Job* j)
 
 void run_upload_job(FT_Tunnel* t, FT_Job* j)
 {
+    std::lock_guard<std::mutex> lk(t->lan_mu);
     if (std::string err = connect_lan_tunnel(t); !err.empty()) {
         OBN_WARN("ft: upload: connect failed: %s", err.c_str());
         deliver_result(j, FT_EIO, 0, {});
@@ -444,6 +447,7 @@ OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb 
 
 #if OBN_FT_TUNNEL_LOCAL
     if (t->is_lan) {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
         if (std::string err = connect_lan_tunnel(t); !err.empty()) {
             OBN_WARN("ft: start_connect: %s", err.c_str());
             if (cb) cb(user, /*ok=*/1, /*err=*/FT_EIO, err.c_str());
@@ -474,6 +478,7 @@ OBN_ABI ft_err ft_tunnel_sync_connect(FT_TunnelHandle* h)
 
 #if OBN_FT_TUNNEL_LOCAL
     if (t->is_lan) {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
         OBN_INFO("ft: sync_connect: opening tunnel to %s", t->lan.ip.c_str());
         std::string err = connect_lan_tunnel(t);
         if (err.empty()) {
@@ -496,7 +501,10 @@ OBN_ABI ft_err ft_tunnel_shutdown(FT_TunnelHandle* h)
     t->shut_down.store(true, std::memory_order_release);
 
 #if OBN_FT_TUNNEL_LOCAL
-    if (t->conn) t->conn->disconnect();
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (t->conn) t->conn->disconnect();
+    }
 #endif
 
     return FT_OK;
