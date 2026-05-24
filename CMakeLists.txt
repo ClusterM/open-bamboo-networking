@@ -671,7 +671,10 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     add_executable(tunnel_local_test tests/tunnel_local_test.cpp
         src/tunnel_local.cpp
+        src/tls_dial.cpp
+        src/lan_tls.cpp
         src/json_lite.cpp
+        src/log.cpp
         src/os_compat.cpp)
     target_include_directories(tunnel_local_test PRIVATE include stubs)
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
