@@ -74,53 +74,6 @@ std::string json_escape(const std::string& in)
 
 std::string to_bool(bool v) { return v ? "true" : "false"; }
 
-std::string basename_of(const std::string& path)
-{
-    auto slash = path.find_last_of("/\\");
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
-// Replaces characters that cause trouble on FTP or in the MQTT URL we
-// embed in the project_file command. The original Bambu plugin keeps
-// spaces and commas (we see files like "0.16mm layer, 2 walls, 15%
-// infill.gcode.3mf" on the SD card), so we stay conservative and only
-// strip control bytes, slashes, backslashes and leading dots (which the
-// printer's filesystem hides in LIST output, breaking lookup from the
-// firmware's side).
-std::string sanitize_remote_name(std::string name)
-{
-    while (!name.empty() && (name.front() == '.' || name.front() == '/' ||
-                             name.front() == '\\' || name.front() == ' '))
-        name.erase(name.begin());
-    while (!name.empty() && (name.back() == ' ' || name.back() == '.'))
-        name.pop_back();
-    for (char& c : name) {
-        unsigned char u = static_cast<unsigned char>(c);
-        if (u < 0x20 || c == '/' || c == '\\') c = '_';
-    }
-    return name;
-}
-
-// Strips a trailing `.gcode.3mf` or `.3mf` extension if present. Used
-// before re-adding `.gcode.3mf` in pick_remote_name so we don't end up
-// with names like `foo.gcode.3mf.gcode.3mf` when Studio hands us a
-// `project_name` that already includes the extension (which it does in
-// the Send-to-Printer flow - the dialog uses the source filename as
-// the task name verbatim).
-std::string strip_3mf_extension(std::string name)
-{
-    auto ends_with = [](const std::string& s, const char* suf) {
-        std::size_t n = std::strlen(suf);
-        return s.size() >= n &&
-               std::equal(suf, suf + n, s.end() - n);
-    };
-    if (ends_with(name, ".gcode.3mf"))
-        name.resize(name.size() - std::strlen(".gcode.3mf"));
-    else if (ends_with(name, ".3mf"))
-        name.resize(name.size() - std::strlen(".3mf"));
-    return name;
-}
-
 // Returns a millisecond-resolution epoch timestamp string suitable for
 // use as a sequence_id; matches the Bambu plugin's style.
 std::string now_seq_id()
@@ -213,20 +166,6 @@ std::string format_ams_mapping(const std::string& mapping, bool use_ams)
 }
 
 } // namespace
-
-std::string pick_remote_name(const BBL::PrintParams& p)
-{
-    std::string project = p.project_name;
-    if (project.empty()) project = p.task_name;
-    project = sanitize_remote_name(project);
-    project = strip_3mf_extension(project);
-
-    if (!project.empty()) return project + ".gcode.3mf";
-
-    std::string name = sanitize_remote_name(basename_of(p.filename));
-    if (!name.empty()) return name;
-    return "print.gcode.3mf";
-}
 
 namespace {
 
@@ -679,23 +618,17 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
 
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
 
-    // Studio reuses this entry point for two flows:
-    //   * the "verify_job" probe - Studio sets project_name = "verify_job"
-    //     and passes a tiny temp file. The Bambu plugin uploads it to
-    //     `/verify_job` (bare name, printer root).
-    //   * the "Send to printer SD card" action - a full 3mf that should
-    //     land next to the other user-visible files, i.e. the printer
-    //     root.
+    std::string remote_name = print_job::dest_name_for_send_gcode(params);
+    if (remote_name.empty()) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
+                                 "empty project_name");
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
+
     std::string remote_folder = params.ftp_folder;
     if (!remote_folder.empty() && remote_folder.back() != '/') remote_folder += '/';
     if (!remote_folder.empty() && remote_folder.front() == '/') remote_folder.erase(0, 1);
-
-    std::string remote_name;
-    if (params.project_name == "verify_job") {
-        remote_name = "verify_job";
-    } else {
-        remote_name = print_job::pick_remote_name(params);
-    }
     std::string remote_path = "/" + remote_folder + remote_name;
 
     std::string ca_file = bambu_ca_bundle_path();

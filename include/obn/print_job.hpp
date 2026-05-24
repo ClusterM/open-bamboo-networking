@@ -21,6 +21,11 @@ namespace obn::print_job {
 // possible and falls back to the basename of params.filename.
 std::string pick_remote_name(const BBL::PrintParams& p);
 
+// Remote STOR basename for start_send_gcode_to_sdcard: sanitized
+// project_name verbatim (no .gcode.3mf suffix). Empty when project_name
+// is unset — stock libbambu_networking.so fails the upload in that case.
+std::string dest_name_for_send_gcode(const BBL::PrintParams& p);
+
 // Performs the actual FTPS STOR of params.filename to remote_path,
 // streaming progress through update_fn as PrintingStageUpload. Obeys
 // cancel_fn. Returns 0 on success or a BAMBU_NETWORK_ERR_* code

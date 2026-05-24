@@ -291,6 +291,7 @@ add_library(bambu_networking SHARED
     src/mqtt_client.cpp
     src/os_compat.cpp
     src/print_job.cpp
+    src/print_job_naming.cpp
     src/ssdp.cpp
     src/tunnel_local.cpp
     src/tls_dial.cpp
@@ -660,6 +661,13 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/os_compat.cpp)
     target_include_directories(ftps_parse_test PRIVATE include src)
     add_test(NAME ftps_parse COMMAND ftps_parse_test)
+
+    add_executable(remote_name_test tests/remote_name_test.cpp
+        src/print_job_naming.cpp)
+    target_include_directories(remote_name_test PRIVATE include)
+    target_compile_definitions(remote_name_test PRIVATE
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    add_test(NAME remote_name COMMAND remote_name_test)
 
     add_executable(tunnel_local_test tests/tunnel_local_test.cpp
         src/tunnel_local.cpp

@@ -146,9 +146,8 @@ public:
                             BBL::OnUpdateStatusFn     update_fn,
                             BBL::WasCancelledFn       cancel_fn);
 
-    // Implements bambu_network_start_send_gcode_to_sdcard: upload only,
-    // no MQTT command. Used by Studio's access-code probe and by
-    // "Send to printer without starting a print".
+    // Implements bambu_network_start_send_gcode_to_sdcard: FTPS upload
+    // only, no MQTT. Remote filename = PrintParams::project_name.
     int run_send_gcode_to_sdcard(const BBL::PrintParams& params,
                                  BBL::OnUpdateStatusFn   update_fn,
                                  BBL::WasCancelledFn     cancel_fn);

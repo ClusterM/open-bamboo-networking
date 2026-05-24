@@ -677,7 +677,7 @@ The `PrintParams` struct (`src/slic3r/Utils/bambu_networking.hpp:192-241`) carri
 |--------|-----------|
 | `bambu_network_start_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — cloud |
 | `bambu_network_start_local_print_with_record` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — LAN + metadata upload |
-| `bambu_network_start_send_gcode_to_sdcard` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — also used for the FTPS **`verify_job`** storage probe when `project_name=="verify_job"` (§6.14.3) |
+| `bambu_network_start_send_gcode_to_sdcard` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn, OnWaitFn)` — FTPS upload of `filename` to printer storage; **destination name = `project_name`** (sanitized). No MQTT print command. See §6.14.3 for Studio callers |
 | `bambu_network_start_local_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn)` — LAN only |
 | `bambu_network_start_sdcard_print` | `int(void*, PrintParams, OnUpdateStatusFn, WasCancelledFn)` |
 
@@ -693,11 +693,45 @@ This section documents **what Bambu Studio itself calls** when the user starts a
 |---|---|---|
 | **Slice → Print plate** (normal send) | `SelectMachineDialog` → `PrintJob` | `"from_normal"` |
 | **Device → Files → Print** on an existing `.3mf` | `SelectMachineDialog` → `PrintJob` | `"from_sdcard_view"`; `dst_file` = path on printer storage |
-| **Send to Printer** (upload to cache/USB, no print) | `SendToPrinterDialog` | Does **not** use `PrintJob`; calls `ft_*` directly (§6.14) |
-| **Send to SD card** (legacy upload-only) | `SendJob` | Upload via `start_send_gcode_to_sdcard` only |
-| **Access-code / IP validation** | Preflight inside `PrintJob` / `SendJob` | `project_name="verify_job"`, tiny temp file |
+| **Send to Printer** (upload to cache/USB, no print) | `SendToPrinterDialog` | **`ft_*`** when `is_support_brtc` + LAN/TUTK tunnel (`SendToPrinter.cpp:947`); else fallback **`SendJob`** → `start_send_gcode_to_sdcard` (FTPS, pre-brtc printers) |
+| **Access-code / IP validation** | `PrintJob` preflight, `SendJob` check mode (`ReleaseNote.cpp` IP dialog) | Same ABI with `project_name="verify_job"` and a tiny temp file — see §6.14.3 |
 
 Studio wraps every `bambu_network_start_*` call through `NetworkAgent::{start_print,start_local_print,…}` (`NetworkAgent.cpp:1363-1425`), which forwards to the loaded plugin unchanged.
+
+##### Printer capability flags (`print.fun` / `print.fun2`)
+
+Studio does **not** pass these booleans into `PrintParams`. They live on `MachineObject`, parsed from MQTT `push_status.print` on every status update (`DeviceManager.cpp:4266-4308`). They **gate UI and orchestration** before any plugin call.
+
+| Field | MQTT source | Meaning in Studio | Affects print flow? |
+|---|---|---|---|
+| **`is_support_brtc`** | `print.fun` **bit 31** | Firmware supports the **`:6000` binary file-transfer tunnel** (`ft_*` ABI) and related **`brtc://`** print-start URLs. Comment in `DeviceManager.hpp:540`: *“support tcp and upload protocol”*. | **Send to Printer only** — chooses `ft_*` upload vs legacy FTPS `SendJob`. **Not** read in `PrintJob::process()`. |
+| **`is_support_print_with_emmc`** | `print.fun2` **bit 0** | Printer can print from **internal model cache** without a removable SD card. | **`PrintJob` / Select Machine** — copied to `PrintJob::could_emmc_print` (`SelectMachine.cpp:3114`); enables `:6000` connect probe in LAN preflight and allows `start_local_print` when `!has_sdcard`. |
+| **`is_support_send_to_sdcard`** | (separate flag) | “Send to Printer” feature enabled for this model. | `SendToPrinterDialog` entry guard (`SendToPrinter.cpp:1297`). |
+
+**What “brtc” means here.** In Studio sources the name covers two layers that appeared together (~2025-10, commits `76e45bde2` / `662b7fdac`, §6.14.3):
+
+1. **Upload wire** — `FileTransferTunnel` / `ft_tunnel_*` on TCP port **`:6000`** (LAN IP or TUTK relay), chunked `cmd_type=5` (§6.14.2).
+2. **Print-start URL** — MQTT `project_file` with `url` like `brtc://emmc/<filename>` so firmware resolves the file in model cache (§6.8.2 **URL schemes**).
+
+P2S-class printers set **`is_support_brtc=true`**; classic LAN printers often do not and keep the FTPS **`SendJob`** fallback.
+
+##### `SendToPrinterDialog` branch (uses `is_support_brtc`, not `PrintJob`)
+
+When the user clicks **Send** in Send to Printer, Studio picks the upload channel **before** any `bambu_network_start_*` call:
+
+```mermaid
+flowchart TD
+  S[SendToPrinterDialog::send_job] --> B{is_support_brtc AND\nm_tcp_try_connect OR m_tutk_try_connect?}
+  B -->|yes| F["CreateUploadFileJob → ft_tunnel_* + ft_job cmd_type=5\n(:6000 cache upload, §6.14.2)"]
+  B -->|no| L["SendJob → start_send_gcode_to_sdcard\n(full .3mf over FTPS, legacy)"]
+  L --> C{LAN-only printer?}
+  C -->|yes| P["SendJob check mode first\n(project_name=verify_job probe)"]
+  C -->|no| R["SendJob start"]
+```
+
+On dialog open, brtc printers **prefer TCP/TUTK** over FTP for the connection handshake (`SendToPrinter.cpp:1304-1342`): if `is_support_brtc && !m_ftp_try_connect`, Studio calls `GetConnection()` instead of showing the old FTP-only ready state.
+
+**Contrast with `PrintJob` LAN preflight** (`PrintJob.cpp:224-252`): always runs **`start_send_gcode_to_sdcard(verify_job)`** (FTPS write probe). Optionally **also** opens a `:6000` tunnel when `could_emmc_print` (`is_support_print_with_emmc`), but that flag is independent of `is_support_brtc`. Normal slice→print still ends in **`start_local_print`** / hybrid cloud paths — not the Send-to-Printer `ft_*` pipeline.
 
 ##### Decision tree: `PrintJob::process()` (`PrintJob.cpp:149-624`)
 
@@ -732,11 +766,11 @@ flowchart TD
 
 | Channel | Who calls it | Upload transport | Print start | Starts a print? |
 |---|---|---|---|:---:|
-| **`bambu_network_start_*`** | `PrintJob`, `SendJob` | Inside plugin (stock: cloud S3 + optional FTPS, or LAN FTPS / `:6000` depending on entry point — see STATUS) | Plugin publishes MQTT `project_file` (except upload-only entries) | PrintJob yes; SendJob no |
+| **`bambu_network_start_*`** | `PrintJob` (print paths), `SendJob` (Send-to-Printer fallback only) | Inside plugin (stock: cloud S3 + optional FTPS, or LAN FTPS / `:6000` depending on entry point — see STATUS) | Plugin publishes MQTT `project_file` (except upload-only / probe entries) | PrintJob yes; SendJob / verify_job no |
 | **`ft_*` ABI** | `SendToPrinterDialog`, `FileTransferTunnel` in `PrintJob` preflight | Studio → `ft_tunnel_*` + `ft_job_create` / `ft_tunnel_start_job` (`FileTransferUtils.cpp`) | **Never** — upload completes with `get_send_finished_event()` | No |
 | **`bambu_network_send_message_to_printer`** | `MachineObject::publish_json()` | N/A (opaque JSON passthrough) | Timelapse preflight, AMS queries, user commands — **not** the print job itself | No |
 
-**Important:** “Send to Printer” in the UI (`SendToPrinterDialog`) uploads via **`ft_*` `cmd_type=5`** and never calls `bambu_network_start_send_gcode_to_sdcard`. The latter is still used by the legacy **`SendJob`** path and by the **`verify_job`** preflight probe.
+**Important:** On **brtc-capable** printers (P2S, etc.) the **Send to Printer** dialog uploads the `.3mf` via **`ft_*` `cmd_type=5`** when `MachineObject::is_support_brtc` and the dialog connected over LAN TCP or TUTK (`SendToPrinter.cpp:947-962`). That path does not call `start_send_gcode_to_sdcard` for the model. **`start_send_gcode_to_sdcard`** is still the FTPS upload ABI; on current Studio it is mostly invoked with **`project_name="verify_job"`** (write probe) plus a rare **`SendJob` fallback** when `!is_support_brtc` (`SendToPrinter.cpp:977-1027`). The plugin must **not** treat `"verify_job"` as magic — it is only the destination filename Studio set (§6.14.3).
 
 ##### Scenario reference
 
@@ -747,8 +781,8 @@ flowchart TD
 | **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Same as LAN path first; cloud REST + task record if LAN leg succeeds; cloud fallback if not | `wait_fn` on hybrid path; `params.comments` records fallback reason |
 | **`lan_mode_only` config** | **`start_local_print_with_record`** only (no cloud fallback in the success path) | LAN upload + MQTT + best-effort cloud `create_task` inside plugin | Same as hybrid LAN leg |
 | **Print existing file** (`from_sdcard_view`) | **`start_sdcard_print`** | MQTT `project_file` only (`dst_file` / `url` point at on-printer path) | UI labels it “cloud service” but plugin call is the same ABI |
-| **Upload only** (`SendJob`) | `verify_job` probe → **`start_send_gcode_to_sdcard`** (full `.3mf`) | Nothing — no MQTT print command | Progress via `update_fn` |
-| **Send to Printer dialog** | `ft_tunnel_create` → `ft_tunnel_start_connect` → `ft_job` **`cmd_type=7`** → **`cmd_type=5`** | Nothing | Progress via `ft_job` `msg_cb` JSON `{"progress":N}` |
+| **Upload only** (Send to Printer, brtc printers) | `ft_tunnel_*` + `ft_job` **`cmd_type=7`** → **`cmd_type=5`** | Nothing | Progress via `ft_job` `msg_cb` |
+| **Upload only** (Send to Printer, **no** `is_support_brtc`) | `verify_job` probe → **`SendJob`** → **`start_send_gcode_to_sdcard`** (full `.3mf` over FTPS) | Nothing | Legacy fallback; not P2S |
 
 ##### Before `PrintJob` — Studio-side steps (no print ABI)
 
@@ -790,9 +824,9 @@ Studio opens the LAN MQTT session through **`connect_printer`** when the user se
 
 Studio fills `PrintParams` in `PrintJob::process()` (`PrintJob.cpp:214-386`) from the select-machine dialog checkboxes and `MachineObject` capabilities. Fields that **directly affect the print wire** end up in MQTT `project_file` (§6.8.2) or the cloud REST bodies (§6.8.1). Fields Studio sets but **does not embed in `project_file`**: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments` — they feed cloud task creation or diagnostics only.
 
-Notable special cases:
+Notable `PrintParams` cases:
 
-- **`project_name=="verify_job"`** — not a print; tiny upload to test FTPS write access (`PrintJob.cpp:236`, `SendJob.cpp:134`).
+- **`project_name="verify_job"`** — Studio's name for the FTPS write probe (`PrintJob.cpp:236`, `SendJob.cpp:134`). Same ABI as any other upload; not a separate plugin code path.
 - **`print_type=="from_sdcard_view"`** — sets **`dst_file`** instead of local **`filename`**; triggers **`start_sdcard_print`** only.
 - **`ftp_folder`** — passed through but **never assigned by Studio** in the public tree (`PrintJob.cpp:256` reads `obj_->get_ftp_folder()` which is usually empty); stock plugin uploads to FTPS root when empty.
 - **`try_emmc_print` / `could_emmc_print`** — gates the `:6000` preflight tunnel test; does not appear on the MQTT wire.
@@ -1415,22 +1449,81 @@ Not listed in Studio's `PrinterFileSystem.h` success enum (§7.5.3). On P2S we c
 
 During pipelined send, stock reports upload progress from **bytes written** (`offset / total`), not from per-chunk wire ACKs (there are none until the final reply). Open-plugin timeout and callback details: [STATUS.md §6.14.2](STATUS.md#6142-chunked-6000-upload-open-plugin).
 
-#### 6.14.3. FTPS `verify_job` probe (external-storage preflight, May 2026)
+#### 6.14.3. `start_send_gcode_to_sdcard` (FTPS upload, no print)
 
-Stock `libbambu_networking.so` opens **FTPS :990** briefly in some **Send to Printer / external-target** flows. This is **not** where the `.3mf` lands — it is a legacy **writeability probe** that uploads a tiny stub file named `verify_job`, then **always closes the FTPS session** (`QUIT`). All subsequent model bytes use **`:6000` chunked upload** (§6.14.2).
+**ABI contract (plugin side).** Upload the local file `PrintParams.filename` to the printer over FTPS. The object name on the printer is **`PrintParams.project_name`** (sanitized only — **no** automatic `.gcode.3mf` suffix). **`"verify_job"` is not special** — it is just the filename Studio passes for the write-access probe. The plugin must not branch on that string.
 
-##### How Studio triggers it
+**Do not reuse `pick_remote_name` here.** That helper (used by `start_local_print` / cloud FTPS legs) always derives `<basename>.gcode.3mf`. Stock **`start_send_gcode_to_sdcard`** does **not** — see **Stock plugin verification** below.
 
-Studio reuses `bambu_network_start_send_gcode_to_sdcard` for two distinct purposes:
+**No MQTT `project_file`.** Session ends after `STOR` (+ `QUIT` in observed stock flows). Upload progress via `update_fn(PrintingStageUpload, 0-100, …)` when callbacks are provided.
 
-| `PrintParams.project_name` | Meaning |
-|----------------------------|---------|
-| `"verify_job"` | Preflight probe only — upload tiny temp file as `/verify_job` on FTPS root |
-| anything else | Full "Send to SD card" path (legacy FTPS `STOR` of the whole `.3mf`) |
+##### Stock plugin verification ([`tools/probe_remote_naming.sh`](../tools/probe_remote_naming.sh))
 
-For the probe, Studio passes a small temp file; the plugin uploads it under the bare name `verify_job` at the printer FTPS root (`/`), not under `/timelapse/` or `/emmc/`.
+Empirical check via [`tools/plugin_runner.sh`](../tools/plugin_runner.sh) (see [`tools/plugin_runner/README.md`](../tools/plugin_runner/README.md)) against cached `libbambu_networking.so` (ABIs **02.05.03** and **02.06.01**, May 2026), then `curl` FTPS `LIST` on the printer root:
 
-##### Observed FTPS transcript (decrypted, P2S)
+| `PrintParams.project_name` | Stock STOR name (`send_gcode_to_sdcard`) | Stock `start_local_print` MQTT `file` / `url` |
+|---|---|---|
+| `"verify_job"` | `verify_job` | — |
+| `"obn_probe_bare"` (bare) | **`obn_probe_bare`** (no suffix) | — |
+| `"obn_probe_bare.gcode.3mf"` | `obn_probe_bare.gcode.3mf` | — |
+| `""` (empty, `task_name` set) | **ERROR `-5010`** (*URL without a file name*) | — |
+| `"obn_print_bare"` (bare) | — | **`obn_print_bare.gcode.3mf`** / `ftp://obn_print_bare.gcode.3mf`; `subtask_name` = bare |
+
+Reproduce:
+
+```bash
+OBN_DEV_ID=… OBN_DEV_IP=… OBN_ACCESS_CODE=… \
+  tools/probe_remote_naming.sh
+# optional: OBN_ABI=02.05.03  OBN_ACTION=local_print  (last table row)
+# compare open build: OBN_PLUGIN_PATH=build/libbambu_networking.so
+```
+
+Hermetic naming logic (no printer): [`tests/remote_name_test.cpp`](../tests/remote_name_test.cpp) — `ctest -R remote_name` with `-DOBN_BUILD_TESTS=ON`.
+
+| Tool | Role |
+|------|------|
+| [`tools/probe_remote_naming.sh`](../tools/probe_remote_naming.sh) | Matrix of `project_name` values → stock/open STOR name via `send_gcode_to_sdcard` / `local_print` |
+| [`tools/plugin_runner.sh`](../tools/plugin_runner.sh) | Load any cached/CDN `libbambu_networking.so` and drive print ABIs with JSON `PrintParams` |
+| [`tools/bambu_ftp_proxy.py`](../tools/bambu_ftp_proxy.py) | Plain FTP ↔ printer FTPS bridge (debug clients that cannot speak implicit TLS :990) |
+| [`tools/check_abi_compat.sh`](../tools/check_abi_compat.sh) | Diff `PrintParams` / symbol exports against [`tools/abi_snapshot/`](../tools/abi_snapshot/) |
+
+Studio today passes **`m_project_name + ".gcode.3mf"`** for SendJob uploads (`SendJob.cpp:206`, since `46dc96fd` 2022-11); bare names on this ABI are mainly historical or headless callers.
+
+##### `pick_remote_name` (print upload + MQTT `file` / `url`)
+
+Used by **`start_local_print`**, **`start_local_print_with_record`**, and the cloud FTPS leg — **not** by `start_send_gcode_to_sdcard`. Logic (open plugin = stock behaviour on N7, May 2026):
+
+| Input | Output STOR / MQTT `file` | MQTT `subtask_name` |
+|---|---|---|
+| `project_name="my-print"` | `my-print.gcode.3mf` | `my-print` |
+| `project_name=""`, `task_name="task"` | `task.gcode.3mf` | `task` |
+| `project_name="foo.gcode.3mf"` | `foo.gcode.3mf` (no double suffix) | `foo.gcode.3mf` |
+| both empty, `filename="/path/x.gcode.3mf"` | `x.gcode.3mf` | (from `task_name`, often empty) |
+| all empty | `print.gcode.3mf` | — |
+
+Unit tests: [`tests/remote_name_test.cpp`](../tests/remote_name_test.cpp) (`ctest -R remote_name` when built with `-DOBN_BUILD_TESTS=ON`).
+
+##### Studio callers (current tree)
+
+| Caller | `project_name` | Notes |
+|--------|----------------|-------|
+| `PrintJob::process()` — LAN normal print preflight | `"verify_job"` | Tiny `resources/check_access_code.txt`; then `start_local_print` (`PrintJob.cpp:236-240`) |
+| `SendJob::process()` — check mode | `"verify_job"` | IP / access-code dialog; returns after probe (`SendJob.cpp:134-148`, `ReleaseNote.cpp:1994`) |
+| `SendJob` via `SendToPrinterDialog` **else** branch | `<project>.gcode.3mf` | When `!is_support_brtc` — full model over FTPS (`SendToPrinter.cpp:977-1027`) |
+
+On **P2S / brtc** hardware, Send to Printer model bytes use **`ft_*` / `:6000`** (§6.14.2), not this ABI.
+
+##### Evolution (BambuStudio git history)
+
+| When | Commit (approx.) | Change |
+|------|------------------|--------|
+| 2023-02 | `a94b78d29` *add network verification process for LAN printing* | `verify_job` probe added to `PrintJob` / `SendJob` preflight — still `start_send_gcode_to_sdcard` + FTPS |
+| 2024-10 | `0ec49c358` *Support direct connection to LAN printers* | LAN IP dialog reuses `SendJob` check mode with the same probe |
+| 2025-10 | `76e45bde2` *print with emmc* + `662b7fdac` *change send mode* | **`ft_*` `:6000` cache upload** when **`MachineObject::is_support_brtc`** (`print.fun` bit 31); SendToPrinter prefers TCP/TUTK tunnel + `CreateUploadFileJob`; FTPS `SendJob` path kept as **else** fallback — see §6.8.0 **Printer capability flags** |
+
+So **FTPS via `start_send_gcode_to_sdcard` predates the `:6000` / brtc path**; the newer upload transport is **`ft_*`**, not a different reading of the same ABI. We infer “old vs new” from Studio commit order, not from plugin symbols alone.
+
+##### Observed FTPS transcript — write probe (`project_name="verify_job"`, P2S)
 
 ```text
 220 (vsFTPd 3.0.5)
@@ -2062,8 +2155,9 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 | Use | Library | When | Upload transport |
 |-----|---------|------|------------------|
 | Device → Files browse (external USB) | `libBambuSource` (stock: `:6000`; our workaround: FTPS) | File browser tab | N/A (lists/downloads only) |
-| **`verify_job` preflight** | `libbambu_networking` | Send to Printer when stock needs external write test | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
-| Legacy LAN print / SD send | `libbambu_networking` | `start_local_print`, non-probe `start_send_gcode_to_sdcard` | Full `.3mf` over FTPS `STOR` (older path; P2S cache send prefers `:6000`) |
+| **`verify_job` preflight** | `libbambu_networking` | `PrintJob` LAN preflight; optional before Send to Printer | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
+| Legacy Send-to-Printer fallback | `libbambu_networking` | `SendJob` when `!is_support_brtc` | Full `.3mf` over FTPS `STOR` — not used on P2S |
+| Legacy LAN print upload | `libbambu_networking` | `start_local_print` / cloud `_with_record` FTPS leg | Full `.3mf` over FTPS `STOR` (P2S print-start prefers `:6000` + `brtc://` — see STATUS) |
 
 Stock **Send to Printer → cache** on P2S: **`verify_job` FTPS probe (optional) + `:6000` chunked upload** — not a full FTPS model transfer.
 
@@ -2132,7 +2226,7 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 
    i.e. the Studio-side object from §7.5.2 gains a leading `"mtype":12289,` (+14 bytes) before framing. Large replies (e.g. `SUB_FILE` thumbnails) append `\n\n` + binary **inside the payload** after the JSON; stock `Bambu_ReadSample` returns the combined buffer to Studio unchanged.
 
-**Frida / packet-capture caveat.** Hooking `tutk_third_SSL_write` **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing; attach early or use `tools/bambu6000_repl.py` to capture the full handshake.
+**Frida / packet-capture caveat.** Hooking `tutk_third_SSL_write` **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing; attach early or use [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) to capture the full handshake.
 
 **RE tools in this repo:**
 
