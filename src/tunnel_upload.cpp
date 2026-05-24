@@ -9,6 +9,7 @@
 #include "obn/tls_dial.hpp"
 #include "obn/tunnel_local.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -207,6 +208,160 @@ void maybe_dump_download(const std::vector<std::uint8_t>& data)
               static_cast<std::streamsize>(data.size()));
     OBN_DEBUG("tunnel_upload: dumped download -> %s (%zu bytes)", path,
              data.size());
+}
+
+struct ModelFileEntry {
+    std::string  name;
+    std::string  path;
+    std::int64_t time = 0;
+};
+
+struct ListInfoOutcome {
+    bool                        ok = false;
+    std::vector<ModelFileEntry> files;
+    int                         wire_result = 0;
+    std::string                 error;
+};
+
+struct SubFileRequest {
+    std::vector<std::string> paths;
+    std::string              storage;
+};
+
+struct SubFileOutcome {
+    bool                      ok = false;
+    std::vector<std::uint8_t> data;
+    int                       wire_result = 0;
+    std::string               error;
+};
+
+bool wire_chunk_is_image(const std::vector<std::uint8_t>& chunk)
+{
+    if (chunk.size() >= 8 &&
+        std::memcmp(chunk.data(), "\x89PNG\r\n\x1a\n", 8) == 0) {
+        return true;
+    }
+    return chunk.size() >= 2 && chunk[0] == 0xff && chunk[1] == 0xd8;
+}
+
+SubFileOutcome run_sub_file(obn::tunnel_local::Session* session,
+                            SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
+                            const SubFileRequest& req)
+{
+    SubFileOutcome out;
+    if (req.paths.empty()) {
+        out.error = "missing sub_file paths";
+        return out;
+    }
+
+    drain_stale_wire_json(session, "pre-sub_file");
+
+    const std::string abi =
+        obn::tunnel_local::build_sub_file_abi(seq, req.paths, req.storage);
+    if (session->send_abi_json(ssl, abi, io_mu) != 0) {
+        out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+        return out;
+    }
+
+    for (;;) {
+        std::vector<std::uint8_t> payload;
+        for (;;) {
+            const int rc = session->recv_payload(ssl, &payload, io_mu);
+            if (rc == 0) break;
+            if (rc < 0) {
+                out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+                return out;
+            }
+            if (wait_ssl_readable(ssl, 100) < 0) {
+                out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+                return out;
+            }
+        }
+
+        std::string wire_json;
+        std::vector<std::uint8_t> chunk;
+        if (!obn::tunnel_local::split_json_prefix(payload.data(), payload.size(),
+                                                  &wire_json, &chunk)) {
+            wire_json.assign(reinterpret_cast<const char*>(payload.data()),
+                             payload.size());
+        }
+
+        const int cmd = obn::tunnel_local::parse_wire_cmdtype(wire_json);
+        const int rs  = obn::tunnel_local::parse_wire_sequence(wire_json);
+        if (cmd == obn::tunnel_local::kCmdSubFile &&
+            static_cast<std::uint32_t>(rs) == seq) {
+            if (!chunk.empty() && wire_chunk_is_image(chunk)) {
+                out.data = chunk;
+            }
+            const int result = obn::tunnel_local::parse_wire_result(wire_json);
+            out.wire_result = result;
+            if (result == 1) continue;
+            if (result == 0) {
+                out.ok = !out.data.empty();
+                if (!out.ok) out.error = "sub_file empty payload";
+                return out;
+            }
+            if (!out.data.empty()) {
+                out.ok = true;
+                return out;
+            }
+            out.error = "sub_file failed wire result=" + std::to_string(result);
+            return out;
+        }
+    }
+}
+
+ListInfoOutcome run_list_info(obn::tunnel_local::Session* session,
+                              SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
+                              const std::string& storage)
+{
+    ListInfoOutcome out;
+    drain_stale_wire_json(session, "pre-list_info");
+
+    const std::string abi =
+        obn::tunnel_local::build_list_info_abi(seq, "model", storage);
+    if (session->send_abi_json(ssl, abi, io_mu) != 0) {
+        out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+        return out;
+    }
+
+    std::string wire_json;
+    if (recv_wire_json(session, ssl, io_mu, &wire_json,
+                       obn::tunnel_local::kCmdListInfo, seq,
+                       "list_info") != 0) {
+        out.error = "list_info reply timeout";
+        return out;
+    }
+
+    out.wire_result = obn::tunnel_local::parse_wire_result(wire_json);
+    if (out.wire_result != 0) {
+        out.error = "list_info wire result=" + std::to_string(out.wire_result);
+        return out;
+    }
+
+    std::string perr;
+    const auto root = obn::json::parse(wire_json, &perr);
+    if (!root) {
+        out.error = perr.empty() ? "list_info parse failed" : perr;
+        return out;
+    }
+    const auto lists = root->find("reply.file_lists");
+    if (!lists.is_array()) {
+        out.error = "list_info missing file_lists";
+        return out;
+    }
+    for (const auto& item : lists.as_array()) {
+        if (!item.is_object()) continue;
+        ModelFileEntry entry;
+        entry.name = item.find("name").as_string();
+        entry.path = item.find("path").as_string();
+        entry.time = item.find("time").as_int(0);
+        if (!entry.path.empty()) {
+            out.files.push_back(std::move(entry));
+        }
+    }
+    out.ok = true;
+    return out;
 }
 
 DownloadOutcome run_download(obn::tunnel_local::Session* session,
@@ -485,6 +640,98 @@ UploadOutcome run_chunked_upload(obn::tunnel_local::Session* session,
     return out;
 }
 
+bool ends_with(const std::string& s, const std::string& suf)
+{
+    return s.size() >= suf.size() &&
+           std::equal(suf.rbegin(), suf.rend(), s.rbegin());
+}
+
+bool name_matches_model(const std::string& listing_name,
+                        const std::string& model_name)
+{
+    if (listing_name == model_name) return true;
+    if (!ends_with(model_name, ".3mf")) {
+        if (listing_name == model_name + ".gcode.3mf") return true;
+        if (listing_name == model_name + ".3mf") return true;
+    }
+    return false;
+}
+
+const ModelFileEntry* find_model_entry(const ListInfoOutcome& list,
+                                       const std::string&     model_name)
+{
+    const ModelFileEntry* best = nullptr;
+    int match_count = 0;
+
+    auto consider = [&](const ModelFileEntry& f) {
+        if (!name_matches_model(f.name, model_name)) {
+            const auto slash = f.path.rfind('/');
+            const std::string base =
+                slash != std::string::npos ? f.path.substr(slash + 1) : f.path;
+            if (!name_matches_model(base, model_name)) return;
+        }
+        ++match_count;
+        if (!best) {
+            best = &f;
+            return;
+        }
+        const auto in_cache = [](const std::string& path) {
+            return path.find("/cache/") != std::string::npos;
+        };
+        const int cache_a = in_cache(f.path) ? 1 : 0;
+        const int cache_b = in_cache(best->path) ? 1 : 0;
+        if (cache_a != cache_b) {
+            if (cache_a > cache_b) best = &f;
+            return;
+        }
+        if (f.time != best->time) {
+            if (f.time > best->time) best = &f;
+            return;
+        }
+        const bool gcode_a = ends_with(f.name, ".gcode.3mf");
+        const bool gcode_b = ends_with(best->name, ".gcode.3mf");
+        if (gcode_a != gcode_b && gcode_a) best = &f;
+    };
+
+    for (const auto& f : list.files) consider(f);
+
+    if (best && match_count > 1) {
+        OBN_DEBUG("tunnel_upload: %d listing(s) match '%s', picked %s",
+                  match_count, model_name.c_str(), best->path.c_str());
+    }
+    return best;
+}
+
+std::vector<std::string> model_list_storages()
+{
+    return {"", "internal", "emmc"};
+}
+
+std::vector<std::string> sub_file_storage_labels(const std::string& list_storage)
+{
+    if (list_storage.empty()) return {"udisk", ""};
+    if (list_storage == "internal") return {"internal", "emmc"};
+    if (list_storage == "emmc") return {"emmc", "internal"};
+    return {list_storage};
+}
+
+std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
+                                                  int                plate_idx)
+{
+    if (plate_idx < 1) plate_idx = 1;
+    const std::string n = std::to_string(plate_idx);
+    std::vector<std::string> out = {
+        path + "#Metadata/plate_" + n + ".png",
+        path + "#Metadata/plate_no_light_" + n + ".png",
+        path + "#thumbnail",
+    };
+    if (plate_idx != 1) {
+        out.push_back(path + "#Metadata/plate_1.png");
+        out.push_back(path + "#Metadata/plate_no_light_1.png");
+    }
+    return out;
+}
+
 } // namespace
 
 struct Connection::Impl {
@@ -646,6 +893,67 @@ DownloadOutcome Connection::download(const DownloadRequest& req, DownloadCallbac
     }
 
     return run_download(session, ssl, &impl_->io_mu, seq, req, cb);
+}
+
+ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
+    const std::string& model_name, int plate_idx)
+{
+    ModelThumbnailOutcome out;
+    if (!is_connected()) {
+        out.error = "not connected";
+        return out;
+    }
+    if (model_name.empty()) {
+        out.error = "missing model name";
+        return out;
+    }
+    if (plate_idx < 1) plate_idx = 1;
+
+    for (const auto& list_storage : model_list_storages()) {
+        std::uint32_t seq = 0;
+        SSL* ssl = nullptr;
+        obn::tunnel_local::Session* session = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(impl_->io_mu);
+            seq = impl_->wire_seq++;
+            ssl = impl_->ssl;
+            session = impl_->session.get();
+        }
+
+        const ListInfoOutcome list =
+            run_list_info(session, ssl, &impl_->io_mu, seq, list_storage);
+        if (!list.ok) continue;
+
+        const ModelFileEntry* hit = find_model_entry(list, model_name);
+        if (!hit) continue;
+
+        for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
+            {
+                std::lock_guard<std::mutex> lk(impl_->io_mu);
+                seq = impl_->wire_seq++;
+                ssl = impl_->ssl;
+                session = impl_->session.get();
+            }
+
+            SubFileRequest req;
+            req.paths   = tile_thumbnail_sub_paths(hit->path, plate_idx);
+            req.storage = wire_storage;
+            const SubFileOutcome sf =
+                run_sub_file(session, ssl, &impl_->io_mu, seq, req);
+            if (!sf.ok || sf.data.empty() || !wire_chunk_is_image(sf.data)) {
+                continue;
+            }
+            out.ok   = true;
+            out.path = hit->path;
+            out.data = sf.data;
+            return out;
+        }
+        out.error = "SUB_FILE thumbnail failed";
+        return out;
+    }
+
+    out.error = "model not in LIST_INFO";
+    return out;
 }
 
 int upload_file(const ConnectParams& connect,

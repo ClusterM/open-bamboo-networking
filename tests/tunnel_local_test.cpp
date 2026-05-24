@@ -138,6 +138,28 @@ static void test_build_file_download_abi()
     CHECK(abi.find("is_mem_file") == std::string::npos);
 }
 
+static void test_build_sub_file_abi()
+{
+    const std::string abi = obn::tunnel_local::build_sub_file_abi(
+        4, {"/cache/foo.gcode.3mf#thumbnail"}, "udisk");
+    CHECK(abi.find("\"cmdtype\":2") != std::string::npos);
+    CHECK(abi.find("\"sequence\":4") != std::string::npos);
+    CHECK(abi.find("#thumbnail") != std::string::npos);
+    CHECK(abi.find("\"peer\":\"studio\"") != std::string::npos);
+    CHECK(abi.find("\"storage\":\"udisk\"") != std::string::npos);
+}
+
+static void test_build_list_info_abi()
+{
+    const std::string abi =
+        obn::tunnel_local::build_list_info_abi(1, "model", "internal");
+    CHECK(abi.find("\"cmdtype\":1") != std::string::npos);
+    CHECK(abi.find("\"type\":\"model\"") != std::string::npos);
+    CHECK(abi.find("\"api_version\":2") != std::string::npos);
+    CHECK(abi.find("\"notify\":\"DETAIL\"") != std::string::npos);
+    CHECK(abi.find("\"storage\":\"internal\"") != std::string::npos);
+}
+
 int main()
 {
     test_frame_header();
@@ -146,6 +168,8 @@ int main()
     test_login_payload();
     test_ft_wire_helpers();
     test_build_file_download_abi();
+    test_build_sub_file_abi();
+    test_build_list_info_abi();
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
         return 1;

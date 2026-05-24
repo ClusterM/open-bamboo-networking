@@ -706,6 +706,7 @@ Studio does **not** pass these booleans into `PrintParams`. They live on `Machin
 |---|---|---|---|
 | **`is_support_brtc`** | `print.fun` **bit 31** | Firmware supports the **`:6000` binary file-transfer tunnel** (`ft_*` ABI) and related **`brtc://`** print-start URLs. Comment in `DeviceManager.hpp:540`: *“support tcp and upload protocol”*. | **Send to Printer only** — chooses `ft_*` upload vs legacy FTPS `SendJob`. **Not** read in `PrintJob::process()`. |
 | **`is_support_print_with_emmc`** | `print.fun2` **bit 0** | Printer can print from **internal model cache** without a removable SD card. | **`PrintJob` / Select Machine** — copied to `PrintJob::could_emmc_print` (`SelectMachine.cpp:3114`); enables `:6000` connect probe in LAN preflight and allows `start_local_print` when `!has_sdcard`. |
+| **`is_support_model_internal_storage`** | `print.fun2` **bit 17** | Internal **model cache** tab in Device → Storage → Model (`storage=internal` on `LIST_INFO`). | **`MediaFilePanel`** — `updateStorageTabVisibility()` when `F_MODEL` is selected. P2S firmware often omits bit 17 on unbound LAN; stock hides the tab. |
 | **`is_support_send_to_sdcard`** | (separate flag) | “Send to Printer” feature enabled for this model. | `SendToPrinterDialog` entry guard (`SendToPrinter.cpp:1297`). |
 
 **What “brtc” means here.** In Studio sources the name covers two layers that appeared together (~2025-10, commits `76e45bde2` / `662b7fdac`, §6.14.3):
@@ -2439,7 +2440,7 @@ Older Studio builds also used logical labels **`sdcard`** / **`usb`** in `REQUES
 
 #### 7.6.1.1. Observed FTPS filesystem layout (LAN probe)
 
-FTPS :990 on the printer is a separate service from the stock file browser (§7.5.1). Layout below is from direct `CWD`/`LIST` probes against the printer's FTPS daemon — relevant for **`verify_job` preflight** (§6.14.3), legacy LAN print `STOR`, and our `libBambuSource` FTPS browsing workaround. **Not** where P2S cache Send-to-Printer uploads the `.3mf` (that is `:6000`, §6.14.2).
+FTPS :990 is a **separate** service from the stock file browser (§7.5.1). Layout below is from direct `CWD`/`LIST` probes — relevant for **`verify_job` preflight** (§6.14.3), legacy LAN print `STOR`, and the optional `OBN_CTRL_FTPS_FALLBACK` file-browser path. **Not** used for normal P2S Device → Files (native `:6000`) or Send-to-Printer cache upload (`:6000` `ft_*`, §6.14.2).
 
 **P2S (May 2026):**
 

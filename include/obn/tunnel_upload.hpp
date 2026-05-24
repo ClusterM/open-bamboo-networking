@@ -61,6 +61,13 @@ struct DownloadOutcome {
     std::string               json_body;  // final wire reply JSON
 };
 
+struct ModelThumbnailOutcome {
+    bool                      ok = false;
+    std::vector<std::uint8_t> data;
+    std::string               path;
+    std::string               error;
+};
+
 class Connection {
 public:
     Connection();
@@ -79,8 +86,12 @@ public:
     // cmd_type=7 media ability; returns JSON array string on success.
     UploadOutcome query_media_ability();
 
-// cmd_type=4 FILE_DOWNLOAD (mem:/N printer preview). See NETWORK_PLUGIN.md §6.14.4.
+    // cmd_type=4 FILE_DOWNLOAD (mem:/N printer preview). See NETWORK_PLUGIN.md §6.14.4.
     DownloadOutcome download(const DownloadRequest& req, DownloadCallbacks cb = {});
+
+    // LIST_INFO + SUB_FILE tile thumbnail (Device → Storage → Model wire path).
+    ModelThumbnailOutcome fetch_model_tile_thumbnail(const std::string& model_name,
+                                                     int                plate_idx = 1);
 
     std::uint32_t next_wire_seq();
 

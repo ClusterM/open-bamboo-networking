@@ -537,9 +537,8 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
             }
         }
         if (!host.empty()) {
-            cover_cache::ensure(host, user, pass, ca,
-                                  print_params_get_use_ssl_for_ftp(),
-                                  subtask_name, plate_idx, cover_version);
+            cover_cache::ensure(host, dev_id, user, pass, ca,
+                                subtask_name, plate_idx, cover_version);
         }
     }
 

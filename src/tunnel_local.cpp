@@ -275,6 +275,48 @@ std::string build_file_download_abi(std::uint32_t sequence,
     return obn::json::Value(std::move(root)).dump();
 }
 
+std::string build_sub_file_abi(std::uint32_t sequence,
+                               const std::vector<std::string>& paths,
+                               const std::string& storage)
+{
+    obn::json::Array path_arr;
+    for (const auto& p : paths) {
+        path_arr.push_back(obn::json::Value(p));
+    }
+    obn::json::Object req;
+    req["paths"] = obn::json::Value(std::move(path_arr));
+    req["api_version"] = obn::json::Value(2.0);
+    req["peer"]        = obn::json::Value("studio");
+    if (!storage.empty()) {
+        req["storage"] = obn::json::Value(storage);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdSubFile));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
+std::string build_list_info_abi(std::uint32_t sequence,
+                                const std::string& type,
+                                const std::string& storage)
+{
+    obn::json::Object req;
+    req["type"]         = obn::json::Value(type);
+    req["api_version"]  = obn::json::Value(2.0);
+    req["notify"]       = obn::json::Value("DETAIL");
+    if (!storage.empty()) {
+        req["storage"] = obn::json::Value(storage);
+    }
+
+    obn::json::Object root;
+    root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdListInfo));
+    root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["req"]      = obn::json::Value(std::move(req));
+    return obn::json::Value(std::move(root)).dump();
+}
+
 std::string build_file_upload_chunk_abi(std::uint32_t sequence,
                                         std::uint32_t frag_id,
                                         std::uint64_t offset,

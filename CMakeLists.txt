@@ -111,19 +111,12 @@ endif()
 # When ON, the ft_* C ABI used by Studio's "Send to Printer" dialog and
 # the Print job's eMMC pre-flight speaks native BambuTunnelLocal (TLS :6000),
 # same as stock libbambu_networking.so.
-option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
-# makes choices the original bambu_networking.so never would in order to
-# get Developer-Mode LAN printers (most notably the P2S, which has a USB
-# stick in place of an SD card) fully functional in Studio. With this
-# OFF the plugin stays a strict drop-in: the same MQTT/HTTP/FTPS/MJPEG
-# paths the stock plugin uses, and nothing else. Features that only exist
-# via a workaround disappear cleanly (no partial UI, no runtime errors):
-#   - push_status `home_flag` SDCARD-bits rewrite (P2S reports NO_SDCARD)
-#   - push_status `ipcam.file` block injection (unblocks MediaFilePanel on P2S)
-#   - `start_sdcard_print` routed over LAN MQTT instead of the cloud API
-#   - PrinterFileSystem CTRL bridge served from a worker thread over FTPS
-#     (stock speaks a proprietary port-6000 CTRL protocol)
-# See "What works" and "Workaround reference" in README.md.
+#
+# Non-stock paths gated by OBN_ENABLE_WORKAROUNDS (see README):
+#   - push_status home_flag / ipcam.file rewrites (Studio UI on P2S)
+#   - in-print Device-panel cover (get_subtask_info + cover_cache)
+#   - start_sdcard_print over LAN MQTT instead of signed cloud REST
+#   - libBambuSource FTPS CTRL fallback (OBN_CTRL_FTPS_FALLBACK=1 only)
 option(OBN_ENABLE_WORKAROUNDS "Enable non-stock workaround paths (see README)" ON)
 
 # When ON, 'cmake --install' (and therefore 'make install') will also
@@ -240,10 +233,8 @@ else()
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)
 endif()
-# zlib is shared between bambu_networking (cover_cache: unpacks
-# Metadata/plate_N.png out of /cache/<name>.3mf to show it as the
-# printing-task thumbnail) and BambuSource (same unpack, but for the
-# file browser).
+# zlib is shared between BambuSource (FTPS fallback: client-side ZIP
+# extract for file-browser thumbnails) and other zlib users in the tree.
 
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
@@ -696,6 +687,9 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
         src/ssdp.cpp
+        src/tls_dial.cpp
+        src/tunnel_local.cpp
+        src/tunnel_upload.cpp
         src/zip_reader.cpp)
     target_include_directories(lan_live_test PRIVATE include)
     target_compile_definitions(lan_live_test PRIVATE

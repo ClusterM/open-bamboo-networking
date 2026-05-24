@@ -74,6 +74,8 @@ constexpr int kCmdMediaAbility  = 7;
 constexpr int kCmdFileUpload    = 5;
 constexpr int kCmdFileDownload  = 4;
 constexpr int kCmdFileDel       = 3;
+constexpr int kCmdSubFile       = 2;
+constexpr int kCmdListInfo      = 1;
 
 std::string build_media_ability_abi(std::uint32_t sequence);
 // Legacy one-shot upload (rejected by P2S firmware; kept for tests / older models).
@@ -100,6 +102,16 @@ std::string build_file_download_abi(std::uint32_t sequence,
                                     const std::string& path,
                                     std::uint64_t offset = 0,
                                     const std::string& target_path = {});
+
+// SUB_FILE — paths with #suffix (Model tab tile thumbnail).
+std::string build_sub_file_abi(std::uint32_t sequence,
+                               const std::vector<std::string>& paths,
+                               const std::string& storage = {});
+
+// LIST_INFO (PrinterFileSystem::ListAllFiles).
+std::string build_list_info_abi(std::uint32_t sequence,
+                                const std::string& type,
+                                const std::string& storage = {});
 
 // Chunked upload phase 2: one fragment + optional file_md5 on the last chunk.
 std::string build_file_upload_chunk_abi(std::uint32_t sequence,
