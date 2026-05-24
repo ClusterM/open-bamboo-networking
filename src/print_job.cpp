@@ -4,7 +4,8 @@
 // `connection_type == "lan"` branch of PrintJob::process():
 //
 //   1. Tell Studio we started (PrintingStageCreate).
-//   2. FTPS-upload the .3mf to the printer's internal storage.
+//   2. Upload the .3mf to the printer (:6000 emmc cache when
+//      try_emmc_print, else FTPS STOR on N7-class hardware).
 //      Progress is streamed back as PrintingStageUpload with code=percent.
 //   3. Publish a `{"print":{"command":"project_file",...}}` MQTT message
 //      to the existing LanSession (PrintingStageSending).
@@ -22,6 +23,7 @@
 #include "obn/ftps.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
+#include "obn/tunnel_upload.hpp"
 
 #include <algorithm>
 #include <array>
@@ -450,10 +452,40 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
 
     std::uint64_t total = 0;
     std::string   stored_path;
-    int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
+    int rc = 0;
+
+    if (print_job::use_brtc_cache_upload(params)) {
+        obn::tunnel_upload::ConnectParams cp =
+            obn::tunnel_upload::connect_params_from_print(
+                params.dev_ip, params.dev_id, params.password);
+        obn::tunnel_upload::UploadRequest ureq;
+        ureq.local_path   = params.filename;
+        ureq.dest_storage = "emmc";
+        ureq.dest_name    = remote_name;
+
+        obn::tunnel_upload::UploadCallbacks cb;
+        cb.cancelled = [&]() {
+            return cancel_fn && cancel_fn();
+        };
+        cb.progress = [&](int pct) {
+            if (update_fn) update_fn(BBL::PrintingStageUpload, pct, "");
+        };
+
+        obn::tunnel_upload::UploadOutcome outcome;
+        rc = obn::tunnel_upload::upload_file(
+            cp, ureq, cb, &outcome,
+            BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED);
+        if (rc != 0) return rc;
+        total = outcome.bytes;
+        stored_path = remote_name;
+        OBN_INFO("local_print: brtc upload %llu bytes to emmc/%s",
+                 static_cast<unsigned long long>(total), remote_name.c_str());
+    } else {
+        rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
                                    BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total,
                                    &stored_path);
-    if (rc != 0) return rc;
+        if (rc != 0) return rc;
+    }
 
     if (cancel_fn && cancel_fn()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "cancelled");
@@ -464,16 +496,10 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
 
     print_job::ProjectFileOpts opts;
     opts.file_path = stored_path;
-    // Stock plugin parity: when the upload landed in the FTPS root the
-    // wire URL is `"ftp://<name>"` (single slash). Concatenating
-    // `"ftp://"` with `/<name>` would produce `ftp:///<name>`; drop the
-    // lead slash for the URL form. The LAN firmware accepts both, but
-    // the wire-level diff against a captured stock frame stays clean
-    // only when it's gone. See NETWORK_PLUGIN.md §6.8.2.
-    {
-        std::string rel = stored_path;
-        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-        opts.url = "ftp://" + rel;
+    if (print_job::use_brtc_cache_upload(params)) {
+        opts.url = print_job::build_brtc_emmc_url(remote_name);
+    } else {
+        opts.url = print_job::build_ftp_url(stored_path);
     }
     // Stock plugin parity: it always populates `print.md5` itself —
     // Studio's PrintJob never sets `params.ftp_file_md5`. Hash the
@@ -564,15 +590,7 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
 
     print_job::ProjectFileOpts opts;
     opts.file_path  = remote_path;
-    // Stock plugin parity: drop the lead slash for the URL form so we
-    // emit `"ftp://<path>"` instead of `"ftp:///<path>"` when the file
-    // sits at FTPS root. See the matching block in run_local_print_job
-    // and NETWORK_PLUGIN.md §6.8.2.
-    {
-        std::string rel = remote_path;
-        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-        opts.url = "ftp://" + rel;
-    }
+    opts.url        = print_job::build_file_url(remote_path);
     opts.md5        = "";  // not known for a pre-existing file on storage
     opts.project_id = "0";
     opts.profile_id = "0";

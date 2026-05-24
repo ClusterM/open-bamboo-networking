@@ -1,12 +1,11 @@
 #pragma once
 
-// Shared helpers for LAN-FTPS + project_file MQTT print submission.
+// Shared helpers for LAN print submission (FTPS legacy + :6000/brtc).
 //
 // The LAN `run_local_print_job` and the cloud `run_cloud_print_job`
 // pipelines both need to (a) pick a printer-friendly remote filename,
-// (b) push the .3mf over FTPS to /cache/ on the printer, and (c) build
-// a `{"print":{"command":"project_file", ...}}` payload for MQTT. We
-// keep those three concerns here so both pipelines stay in sync.
+// (b) push the .3mf to the printer (FTPS or :6000 cache upload), and
+// (c) build a `{"print":{"command":"project_file", ...}}` payload for MQTT.
 
 #include <cstdint>
 #include <functional>
@@ -25,6 +24,18 @@ std::string pick_remote_name(const BBL::PrintParams& p);
 // project_name verbatim (no .gcode.3mf suffix). Empty when project_name
 // is unset — stock libbambu_networking.so fails the upload in that case.
 std::string dest_name_for_send_gcode(const BBL::PrintParams& p);
+
+// True when the print job should upload via :6000 + MQTT brtc:// (P2S/emmc).
+bool use_brtc_cache_upload(const BBL::PrintParams& p);
+
+// MQTT url for model-cache print-start after :6000 upload.
+std::string build_brtc_emmc_url(const std::string& remote_name);
+
+// MQTT url for print-from-device (absolute path on printer storage).
+std::string build_file_url(const std::string& absolute_path);
+
+// MQTT url for legacy LAN print after FTPS upload.
+std::string build_ftp_url(const std::string& stored_path);
 
 // Performs the actual FTPS STOR of params.filename to remote_path,
 // streaming progress through update_fn as PrintingStageUpload. Obeys
@@ -51,10 +62,10 @@ int ftp_upload(const BBL::PrintParams& p,
 
 // Options controlling the project_file payload we publish over MQTT.
 // Cloud print fills in the real ids/url; LAN print uses "0" for ids
-// and ftp://<file> for url.
+// and brtc://emmc/, file://, or ftp:// for url.
 struct ProjectFileOpts {
-    std::string file_path;    // leading-slash path on the printer FS ("/cache/x.gcode.3mf")
-    std::string url;          // "ftp://<file_path>" for LAN, or a presigned HTTPS URL for cloud
+    std::string file_path;    // basename or absolute path on printer FS
+    std::string url;          // brtc://emmc/, file://, ftp://, or presigned https
     std::string md5;          // hex MD5 of the uploaded file; "" if unknown
     std::string project_id{"0"};
     std::string profile_id{"0"};

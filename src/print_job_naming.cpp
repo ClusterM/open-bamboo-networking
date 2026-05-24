@@ -63,4 +63,37 @@ std::string dest_name_for_send_gcode(const BBL::PrintParams& p)
     return sanitize_remote_name(p.project_name);
 }
 
+std::string strip_leading_slash(const std::string& s)
+{
+    if (!s.empty() && s.front() == '/') return s.substr(1);
+    return s;
+}
+
+bool use_brtc_cache_upload(const BBL::PrintParams& p)
+{
+#if OBN_FT_TUNNEL_LOCAL
+    return p.try_emmc_print;
+#else
+    (void)p;
+    return false;
+#endif
+}
+
+std::string build_brtc_emmc_url(const std::string& remote_name)
+{
+    return "brtc://emmc/" + strip_leading_slash(remote_name);
+}
+
+std::string build_file_url(const std::string& absolute_path)
+{
+    std::string norm = absolute_path;
+    if (norm.empty() || norm.front() != '/') norm = "/" + norm;
+    return "file://" + norm;
+}
+
+std::string build_ftp_url(const std::string& stored_path)
+{
+    return "ftp://" + strip_leading_slash(stored_path);
+}
+
 } // namespace obn::print_job

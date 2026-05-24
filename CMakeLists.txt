@@ -112,13 +112,9 @@ endif()
 # the Print job's eMMC pre-flight speaks a real transport instead of
 # reporting an immediate I/O error.
 #   OBN_FT_TUNNEL_LOCAL   — native BambuTunnelLocal over TLS :6000 (stock path)
-#   OBN_FT_FTPS_FALLBACK  — fall back to FTPS :990 when :6000 fails
-# With both OFF every ft_* entry point is a polite-failure stub and Studio
+# With OFF every ft_* entry point is a polite-failure stub and Studio
 # falls back to its internal FTP send path.
 option(OBN_FT_TUNNEL_LOCAL "Serve ft_* over TLS :6000 (BambuTunnelLocal)" ON)
-option(OBN_FT_FTPS_FALLBACK "Fall back to FTPS for ft_* when :6000 fails" ON)
-# Deprecated alias kept for configure scripts:
-option(OBN_FT_FTPS_FASTPATH "Deprecated: use OBN_FT_FTPS_FALLBACK" OFF)
 
 # Toggles every non-stock behaviour in the plugin. With this ON the plugin
 # makes choices the original bambu_networking.so never would in order to
@@ -294,6 +290,7 @@ add_library(bambu_networking SHARED
     src/print_job_naming.cpp
     src/ssdp.cpp
     src/tunnel_local.cpp
+    src/tunnel_upload.cpp
     src/tls_dial.cpp
     src/zip_reader.cpp
 )
@@ -303,7 +300,6 @@ target_compile_definitions(bambu_networking PRIVATE
     OBN_VERSION_STRING="${OBN_VERSION}"
     ABI_VERSION=${OBN_ABI_VERSION_HEX}
     OBN_FT_TUNNEL_LOCAL=$<BOOL:${OBN_FT_TUNNEL_LOCAL}>
-    OBN_FT_FTPS_FALLBACK=$<IF:$<BOOL:${OBN_FT_FTPS_FALLBACK}>,1,$<BOOL:${OBN_FT_FTPS_FASTPATH}>>
     OBN_ENABLE_WORKAROUNDS=$<BOOL:${OBN_ENABLE_WORKAROUNDS}>
 )
 target_link_libraries(bambu_networking PRIVATE
@@ -668,6 +664,14 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_compile_definitions(remote_name_test PRIVATE
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     add_test(NAME remote_name COMMAND remote_name_test)
+
+    add_executable(print_url_test tests/print_url_test.cpp
+        src/print_job_naming.cpp)
+    target_include_directories(print_url_test PRIVATE include)
+    target_compile_definitions(print_url_test PRIVATE
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+        OBN_FT_TUNNEL_LOCAL=$<BOOL:${OBN_FT_TUNNEL_LOCAL}>)
+    add_test(NAME print_url COMMAND print_url_test)
 
     add_executable(tunnel_local_test tests/tunnel_local_test.cpp
         src/tunnel_local.cpp

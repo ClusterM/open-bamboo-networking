@@ -731,9 +731,11 @@ flowchart TD
 
 On dialog open, brtc printers **prefer TCP/TUTK** over FTP for the connection handshake (`SendToPrinter.cpp:1304-1342`): if `is_support_brtc && !m_ftp_try_connect`, Studio calls `GetConnection()` instead of showing the old FTP-only ready state.
 
-**Contrast with `PrintJob` LAN preflight** (`PrintJob.cpp:224-252`): always runs **`start_send_gcode_to_sdcard(verify_job)`** (FTPS write probe). Optionally **also** opens a `:6000` tunnel when `could_emmc_print` (`is_support_print_with_emmc`), but that flag is independent of `is_support_brtc`. Normal slice→print still ends in **`start_local_print`** / hybrid cloud paths — not the Send-to-Printer `ft_*` pipeline.
+**Contrast with `PrintJob` LAN preflight** (`PrintJob.cpp:224-252`): always runs **`start_send_gcode_to_sdcard(verify_job)`** (FTPS write probe). Optionally **also** opens a `:6000` tunnel when `could_emmc_print` (`is_support_print_with_emmc`), but that flag is independent of `is_support_brtc`. Normal slice→print ends in **`start_local_print`** / hybrid cloud paths — **not** the Send-to-Printer `ft_*` pipeline (see decision tree below).
 
 ##### Decision tree: `PrintJob::process()` (`PrintJob.cpp:149-624`)
+
+**Note:** The Send-to-Printer mermaid above is upload-only. Print jobs use the tree below; open plugin upload inside `start_local_print` / `_with_record` mirrors stock P2S when Studio sets `try_emmc_print` (`:6000` emmc + MQTT `brtc://emmc/`).
 
 After `SelectMachineDialog::on_send_print()` exports the plate `.3mf` (and, for cloud-bound printers, a config `.3mf`), it fills `PrintParams` and starts the background `PrintJob`.
 
@@ -750,7 +752,7 @@ flowchart TD
   F -->|from_sdcard_view| G["start_sdcard_print"]
   F -->|from_normal| H{connection_type?}
   H -->|lan| I{has_sdcard OR could_emmc_print?}
-  I -->|yes| J["start_local_print"]
+  I -->|yes| J["start_local_print\n(:6000+brtc if try_emmc_print)"]
   I -->|no| K["abort: no storage"]
   H -->|cloud / farm| L{lan_mode_only?}
   L -->|yes| M["start_local_print_with_record"]
@@ -776,11 +778,11 @@ flowchart TD
 
 | Scenario | Plugin calls (in order) | Required for firmware to start printing | Tracking / UI only |
 |---|---|---|---|
-| **LAN print** (`connection_type=="lan"`, normal) | Preflight: optional `:6000` tunnel test + `start_send_gcode_to_sdcard(verify_job)` → **`start_local_print`** | Plugin upload + MQTT `project_file` (§6.8.2) | Preflight probes; `update_fn` progress |
+| **LAN print** (`connection_type=="lan"`, normal) | Preflight: optional `:6000` tunnel test + `start_send_gcode_to_sdcard(verify_job)` → **`start_local_print`** (`:6000`+`brtc://` when `try_emmc_print`, else FTPS+`ftp://`) | Plugin upload + MQTT `project_file` (§6.8.2) | Preflight probes; `update_fn` progress |
 | **Cloud print** (no LAN credentials) | **`start_print`** | Cloud S3 upload + signed cloud MQTT `project_file` | `wait_fn` waits for `job_id` / printing status; `Record` stage = cloud task metadata |
-| **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Same as LAN path first; cloud REST + task record if LAN leg succeeds; cloud fallback if not | `wait_fn` on hybrid path; `params.comments` records fallback reason |
-| **`lan_mode_only` config** | **`start_local_print_with_record`** only (no cloud fallback in the success path) | LAN upload + MQTT + best-effort cloud `create_task` inside plugin | Same as hybrid LAN leg |
-| **Print existing file** (`from_sdcard_view`) | **`start_sdcard_print`** | MQTT `project_file` only (`dst_file` / `url` point at on-printer path) | UI labels it “cloud service” but plugin call is the same ABI |
+| **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Same LAN upload as above; cloud REST + task record if LAN leg succeeds | `wait_fn` on hybrid path; `params.comments` records fallback reason |
+| **`lan_mode_only` config** | **`start_local_print_with_record`** only | LAN `:6000`/FTPS + MQTT + best-effort cloud `create_task` | Same as hybrid LAN leg |
+| **Print existing file** (`from_sdcard_view`) | **`start_sdcard_print`** | MQTT `project_file` with `url=file:///<path>` | UI labels it “cloud service” but plugin call is the same ABI |
 | **Upload only** (Send to Printer, brtc printers) | `ft_tunnel_*` + `ft_job` **`cmd_type=7`** → **`cmd_type=5`** | Nothing | Progress via `ft_job` `msg_cb` |
 | **Upload only** (Send to Printer, **no** `is_support_brtc`) | `verify_job` probe → **`SendJob`** → **`start_send_gcode_to_sdcard`** (full `.3mf` over FTPS) | Nothing | Legacy fallback; not P2S |
 

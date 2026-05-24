@@ -25,9 +25,8 @@
 //   [J]  MQTT publish project_file on the appropriate channel.
 //
 // In the LAN-channel ("start_local_print_with_record") variant we also
-// run an FTPS STOR to /cache/<remote_name>.gcode.3mf so the printer
-// fetches the file over LAN; the cloud record exists purely for the
-// MakerWorld task history on the mobile app / web.
+// push the .3mf to the printer (:6000 emmc cache on brtc hardware, else
+// FTPS STOR); the cloud record exists for MakerWorld task history.
 //
 // Anything that needs to be kept in sync with Studio's internal
 // format is commented inline rather than factored out, because small
@@ -44,6 +43,7 @@
 #include "obn/log.hpp"
 #include "obn/print_job.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
+#include "obn/tunnel_upload.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -710,21 +710,40 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         rc != 0) return rc;
 
     // -------------------------------------------------------------
-    // [9/I] LAN-only: STOR the file so the printer can pull it via
-    // FTPS, then POST the task record with mode=lan_file. Cloud
-    // variant skips STOR and uses mode=cloud_file.
+    // [9/I] LAN-only: upload to printer storage, then POST task with
+    // mode=lan_file. Cloud variant skips local upload.
     // -------------------------------------------------------------
-    std::string lan_remote_path; // empty for cloud variant
+    std::string lan_remote_path; // wire path / basename for MQTT
     if (use_lan_channel) {
         if (p.dev_ip.empty() || p.password.empty()) {
             OBN_WARN("cloud_print: lan channel requested but no dev_ip/access_code "
                      "-> degrading to cloud channel");
             use_lan_channel = false;
+        } else if (print_job::use_brtc_cache_upload(p)) {
+            obn::tunnel_upload::ConnectParams cp =
+                obn::tunnel_upload::connect_params_from_print(
+                    p.dev_ip, p.dev_id, p.password);
+            obn::tunnel_upload::UploadRequest ureq;
+            ureq.local_path   = p.filename;
+            ureq.dest_storage = "emmc";
+            ureq.dest_name    = remote_name;
+
+            obn::tunnel_upload::UploadCallbacks cb;
+            cb.cancelled = [&]() { return cancel_fn && cancel_fn(); };
+            cb.progress = [&](int pct) {
+                if (update_fn) update_fn(BBL::PrintingStageUpload, pct, "");
+            };
+
+            obn::tunnel_upload::UploadOutcome outcome;
+            if (int rc = obn::tunnel_upload::upload_file(
+                    cp, ureq, cb, &outcome,
+                    BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED);
+                rc != 0) return rc;
+            lan_remote_path = remote_name;
+            OBN_INFO("cloud_print: brtc upload %llu bytes to emmc/%s",
+                     static_cast<unsigned long long>(outcome.bytes),
+                     remote_name.c_str());
         } else {
-            // Stock plugin parity: when ftp_folder is empty the file
-            // lands in the FTPS root, not /cache/. See run_local_print
-            // in src/print_job.cpp and NETWORK_PLUGIN.md §6.8.2 for the
-            // wire-level evidence (sniffed against N7 in Developer Mode).
             std::string folder = p.ftp_folder;
             if (!folder.empty() && folder.back() != '/') folder += '/';
             if (!folder.empty() && folder.front() == '/') folder.erase(0, 1);
@@ -767,12 +786,11 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     opts.md5        = md5;
     if (use_lan_channel) {
         opts.file_path = lan_remote_path;
-        // Stock plugin parity: drop the lead slash so we emit
-        // "ftp://<path>" instead of "ftp:///<path>" when the file is
-        // at FTPS root. See NETWORK_PLUGIN.md §6.8.2.
-        std::string rel = lan_remote_path;
-        if (!rel.empty() && rel.front() == '/') rel.erase(0, 1);
-        opts.url       = "ftp://" + rel;
+        if (print_job::use_brtc_cache_upload(p)) {
+            opts.url = print_job::build_brtc_emmc_url(remote_name);
+        } else {
+            opts.url = print_job::build_ftp_url(lan_remote_path);
+        }
     } else {
         // Cloud: the printer fetches directly from S3 over HTTPS.
         opts.file_path = remote_name;
