@@ -288,11 +288,8 @@ bool json_peek_string_field(const std::string& payload,
     return true;
 }
 
-// Rewrites `"key":"0"` (or `"key": "0"`) to `"key":"<value>"` *in place*.
-// Returns true if a replacement happened. Used to swap LAN print
-// `project_id`/`profile_id`/`task_id` zeros with synthetic non-zero
-// values that push Studio's MachineObject::is_sdcard_printing() off the
-// SD-card-placeholder branch and onto the cover-via-URL branch.
+// Rewrites `"key":"0"` or `"key":""` to `"key":"<value>"` in place.
+// LAN prints may emit zeros or empty strings for cloud ids.
 bool patch_string_zero_to(std::string&       payload,
                           const std::string& key,
                           const std::string& value)
@@ -302,12 +299,16 @@ bool patch_string_zero_to(std::string&       payload,
     if (pos == std::string::npos) return false;
     std::size_t i = pos + needle.size();
     while (i < payload.size() && payload[i] == ' ') ++i;
-    if (i + 3 > payload.size()) return false;
-    // Look for "0"
-    if (payload[i] != '"' || payload[i+1] != '0' || payload[i+2] != '"')
-        return false;
-    payload.replace(i, 3, "\"" + value + "\"");
-    return true;
+    if (i + 2 > payload.size() || payload[i] != '"') return false;
+    if (payload[i + 1] == '"') {
+        payload.replace(i, 2, "\"" + value + "\"");
+        return true;
+    }
+    if (i + 3 <= payload.size() && payload[i + 1] == '0' && payload[i + 2] == '"') {
+        payload.replace(i, 3, "\"" + value + "\"");
+        return true;
+    }
+    return false;
 }
 
 // FNV-1a 32-bit - deterministic across platforms and C++ runtimes, so
@@ -341,7 +342,7 @@ std::string synthetic_subtask_id(const std::string& subtask_name,
 }
 
 // LAN / Developer-Mode prints set project_id / profile_id / task_id /
-// subtask_id all to "0" in push_status.print, which makes Studio's
+// subtask_id to "0" or "" in push_status.print, which makes Studio's
 // MachineObject::is_sdcard_printing() return true and routes the
 // Device-panel thumbnail to the static SD-card placeholder bitmap. We
 // don't want that: we have the original .3mf sitting in the printer's
