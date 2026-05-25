@@ -597,23 +597,6 @@ void tunnel_close(Tunnel* t)
     }
 }
 
-// Writes `len` bytes via SSL, handling short writes. Returns 0 on OK.
-int ssl_write_all(SSL* ssl, const void* buf, size_t len)
-{
-    const auto* p = static_cast<const uint8_t*>(buf);
-    size_t sent = 0;
-    while (sent < len) {
-        int n = SSL_write(ssl, p + sent, static_cast<int>(len - sent));
-        if (n <= 0) {
-            int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
-            return -1;
-        }
-        sent += static_cast<size_t>(n);
-    }
-    return 0;
-}
-
 // Reads exactly `len` bytes. Returns 0 on OK, 1 on EOF, -1 on error.
 //
 // The SSL object and SSL_get_error access are taken under
