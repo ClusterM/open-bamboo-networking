@@ -36,6 +36,7 @@ if [[ -z "$DEV_ID" || -z "$DEV_IP" || -z "$ACCESS" ]]; then
 fi
 
 WORKDIR=$(mktemp -d /tmp/obn-naming-probe-XXXXXX)
+trap '[[ "${OBN_KEEP:-0}" == 1 ]] || rm -rf "$WORKDIR"' EXIT
 PAYLOAD="${WORKDIR}/payload.bin"
 echo -n 'X' > "$PAYLOAD"
 G3MF="${WORKDIR}/job.gcode.3mf"
@@ -50,7 +51,7 @@ run_case() {
     if ! "$RUNNER" --abi "$ABI" \
         ${OBN_PLUGIN_PATH:+--plugin-path "$OBN_PLUGIN_PATH"} \
         --data-dir "${OBN_DATA_DIR:-$HOME/.config/BambuStudio}" \
-        --cert-file "${OBN_CERT_FILE:-$HOME/Important/Projects/C/BambuStudio/resources/cert/slicer_base64.cer}" \
+        ${OBN_CERT_FILE:+--cert-file "$OBN_CERT_FILE"} \
         --params-json "$params_json" \
         --action "$ACTION" \
         --gcode-3mf "$G3MF" \
@@ -131,6 +132,3 @@ fi
 
 echo
 echo "Logs in $WORKDIR (set OBN_KEEP=1 to preserve; default rm on exit)"
-if [[ "${OBN_KEEP:-0}" != "1" ]]; then
-    rm -rf "$WORKDIR"
-fi

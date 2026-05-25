@@ -414,8 +414,9 @@ class LocalCtrlSession:
                 break
             with self._rx_cv:
                 sync_active = self._sync_depth > 0
-                self._rx_buf.extend(data)
-                self._rx_cv.notify_all()
+                if sync_active:
+                    self._rx_buf.extend(data)
+                    self._rx_cv.notify_all()
             if not sync_active:
                 print(format_recv(data, self._recv_hex_limit), flush=True)
 
