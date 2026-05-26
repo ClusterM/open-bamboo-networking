@@ -6,6 +6,7 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/auth.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
@@ -100,11 +101,18 @@ std::string remap_bind_payload(const std::string& raw_body,
         const auto dev_id = d.find("dev_id").as_string();
         if (out_dev_ids && !dev_id.empty()) out_dev_ids->push_back(dev_id);
         out << "\"dev_id\":"          << obn::json::escape(dev_id) << ',';
-        out << "\"dev_name\":"        << obn::json::escape(d.find("dev_name").as_string()) << ',';
-        out << "\"dev_online\":"      << (d.find("dev_online").as_bool() ? "true" : "false") << ',';
+        {
+            auto dn = d.find("dev_name");
+            out << "\"dev_name\":" << obn::json::escape(
+                !dn.is_null() ? dn.as_string() : d.find("name").as_string()) << ',';
+        }
+        {
+            auto on = d.find("dev_online");
+            const bool online = !on.is_null() ? on.as_bool() : d.find("online").as_bool();
+            out << "\"dev_online\":" << (online ? "true" : "false");
+        }
+        out << ',';
         out << "\"dev_model_name\":"  << obn::json::escape(d.find("dev_model_name").as_string()) << ',';
-        // task_status is the Studio-native name; fall back to print_status for
-        // compatibility with any older API responses that still use the old name.
         {
             auto ts = d.find("task_status");
             out << "\"task_status\":" << obn::json::escape(
@@ -127,6 +135,41 @@ std::string remap_bind_payload(const std::string& raw_body,
     return out.str();
 }
 
+// Count devices in a /print or /bind response envelope.
+size_t count_devices(const std::string& raw_body)
+{
+    std::string perr;
+    auto root = obn::json::parse(raw_body, &perr);
+    if (!root) return 0;
+    return root->find("devices").as_array().size();
+}
+
+} // namespace
+
+namespace {
+
+bool fetch_user_print_info(obn::Agent* a,
+                           const obn::auth::Session& s,
+                           const std::string& path,
+                           obn::http::Response* out_resp,
+                           std::string* out_mapped,
+                           std::vector<std::string>* out_dev_ids)
+{
+    const std::string url = obn::cloud::api_host(a->cloud_region()) + path;
+    std::map<std::string, std::string> hdrs{
+        {"Authorization", "Bearer " + s.access_token},
+    };
+    auto resp = obn::http::get_json(url, hdrs);
+    if (out_resp) *out_resp = resp;
+    if (resp.status_code != 200 || resp.body.empty()) return false;
+
+    std::string mapped = remap_bind_payload(resp.body, out_dev_ids);
+    if (count_devices(resp.body) == 0) return false;
+
+    if (out_mapped) *out_mapped = std::move(mapped);
+    return true;
+}
+
 } // namespace
 
 OBN_ABI int bambu_network_get_user_print_info(void* agent,
@@ -143,13 +186,19 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
         return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     }
 
-    const std::string url = obn::cloud::api_host(a->cloud_region())
-                          + "/v1/iot-service/api/user/print?force=true";
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + s.access_token},
-    };
+    const std::string print_path = "/v1/iot-service/api/user/print?force=true";
+    const std::string bind_path  = "/v1/iot-service/api/user/bind";
 
-    auto resp = obn::http::get_json(url, hdrs);
+    obn::http::Response resp;
+    std::vector<std::string> dev_ids;
+    std::string mapped;
+    bool ok = fetch_user_print_info(a, s, print_path, &resp, &mapped, &dev_ids);
+    if (!ok) {
+        OBN_INFO("get_user_print_info: /user/print empty or failed, trying /user/bind");
+        dev_ids.clear();
+        ok = fetch_user_print_info(a, s, bind_path, &resp, &mapped, &dev_ids);
+    }
+
     if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
 
     if (!resp.error.empty()) {
@@ -163,9 +212,11 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
         if (http_body) *http_body = resp.body;
         return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     }
+    if (!ok) {
+        OBN_WARN("get_user_print_info: both endpoints returned no devices");
+        mapped = R"({"message":"success","devices":[]})";
+    }
 
-    std::vector<std::string> dev_ids;
-    std::string mapped = remap_bind_payload(resp.body, &dev_ids);
     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
              resp.body.size(), mapped.size(), dev_ids.size());
 
@@ -193,6 +244,48 @@ OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,
     if (http_body) http_body->clear();
     return BAMBU_NETWORK_SUCCESS;
 }
+
+namespace {
+
+// Emit a firmware[] array omitting entries with status=="beta".
+void emit_filtered_firmware(std::ostringstream& out, const obn::json::Value& fw_v)
+{
+    out << "[";
+    const auto& fw = fw_v.as_array();
+    bool first_fw = true;
+    for (const auto& entry : fw) {
+        if (entry.find("status").as_string() == "beta") continue;
+        if (!first_fw) out << ',';
+        first_fw = false;
+        out << entry.dump();
+    }
+    out << "]";
+}
+
+// Emit an ams[] array, filtering beta entries inside each ams[].firmware[].
+void emit_filtered_ams(std::ostringstream& out, const obn::json::Value& ams_v)
+{
+    out << "[";
+    if (ams_v.is_null()) {
+        out << "]";
+        return;
+    }
+    const auto& ams_arr = ams_v.as_array();
+    bool first_ams = true;
+    for (const auto& ams : ams_arr) {
+        if (!first_ams) out << ',';
+        first_ams = false;
+        out << '{';
+        if (auto v = ams.find("ams_id"); !v.is_null())
+            out << "\"ams_id\":" << dump_or_null(v) << ',';
+        out << "\"firmware\":";
+        emit_filtered_firmware(out, ams.find("firmware"));
+        out << '}';
+    }
+    out << "]";
+}
+
+} // namespace
 
 OBN_ABI int bambu_network_get_printer_firmware(void* agent,
                                                std::string dev_id,
@@ -248,23 +341,10 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
                                 if (!first_dev) out << ',';
                                 first_dev = false;
                                 out << "{\"dev_id\":" << obn::json::escape(dev.find("dev_id").as_string());
-                                out << ",\"firmware\":[";
-                                auto fw_v = dev.find("firmware");
-                                const auto& fw = fw_v.as_array();
-                                bool first_fw = true;
-                                for (const auto& entry : fw) {
-                                    if (entry.find("status").as_string() == "beta") continue;
-                                    if (!first_fw) out << ',';
-                                    first_fw = false;
-                                    out << entry.dump();
-                                }
-                                out << "]";
-                                // Preserve the ams array so Studio's AMS firmware
-                                // display continues to work. Beta filtering of
-                                // ams[].firmware entries is not applied (rare in
-                                // practice; ams firmware seldom has a beta track).
-                                auto ams_v = dev.find("ams");
-                                out << ",\"ams\":" << (ams_v.is_null() ? "[]" : ams_v.dump());
+                                out << ",\"firmware\":";
+                                emit_filtered_firmware(out, dev.find("firmware"));
+                                out << ",\"ams\":";
+                                emit_filtered_ams(out, dev.find("ams"));
                                 out << "}";
                             }
                             out << "]}";

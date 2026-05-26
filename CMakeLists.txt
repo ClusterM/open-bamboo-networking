@@ -665,7 +665,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(ftps_parse_test PRIVATE include src)
     add_test(NAME ftps_parse COMMAND ftps_parse_test)
 
-<<<<<<< HEAD
     add_executable(remote_name_test tests/remote_name_test.cpp
         src/print_job_naming.cpp)
     target_include_directories(remote_name_test PRIVATE include)
@@ -690,7 +689,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(tunnel_local_test PRIVATE include stubs)
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME tunnel_local COMMAND tunnel_local_test)
-=======
+
     # Hermetic unit test for obn::auth::Store persistence, specifically
     # the firmware_beta_open field (profile setting.isFirmwareBetaOpen)
     # and backwards compatibility loading old JSON files without that field.
@@ -701,7 +700,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/os_compat.cpp)
     target_include_directories(auth_persist_test PRIVATE include)
     add_test(NAME auth_persist COMMAND auth_persist_test)
->>>>>>> 44f8715 (More notes on API usage and endpoint setup)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp

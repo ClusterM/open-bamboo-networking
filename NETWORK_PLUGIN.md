@@ -576,11 +576,26 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_enable_multi_machine` | `void(void*, bool)` |
 | `bambu_network_send_message` | `int(void*, std::string dev_id, std::string json_str, int qos, int flag)` — MQTT-style call |
 
-#### 6.3.1. Cloud MQTT authentication: mutual TLS (mTLS)
+#### 6.3.1. Cloud MQTT authentication
 
-Cloud MQTT does **not** use username/password authentication. The stock plugin authenticates with client certificates obtained from the Bambu cloud REST API immediately before connecting to the broker. The following was confirmed via SSLKEYLOGFILE TLS decryption of the stock plugin's HTTPS traffic.
+Two distinct mechanisms exist on the production broker. **This open plugin uses the simpler one**; the stock closed-source plugin uses the other.
 
-**Certificate retrieval endpoint:**
+**Open plugin (implemented — `src/cloud_session.cpp`)**
+
+| Field | Value |
+|-------|-------|
+| Host | `us.mqtt.bambulab.com:8883` (or `cn.mqtt.bambulab.com` for CN) |
+| TLS | Server cert verified (system CA store; Windows MVP skips chain verify — see `Agent::connect_cloud()`) |
+| Username | `u_<user_id>` |
+| Password | OAuth access token from `POST /v1/user-service/user/ticket/<T>` |
+
+This matches what Home Assistant's `pybambu` integration uses. No client certificate is required for the open plugin path; cloud auth rides on the bearer token in the MQTT password field.
+
+**Stock plugin (reverse-engineered — not implemented here)**
+
+The stock `libbambu_networking.so` obtains a **client certificate chain** from the cloud REST API immediately before connecting and presents it during the MQTT TLS handshake (mutual TLS). The HTTPS call that fetches the cert was confirmed via SSLKEYLOGFILE decryption of the stock plugin's **REST** traffic (not by decrypting the MQTT session itself).
+
+**Certificate retrieval endpoint (stock only):**
 
 ```
 GET /v1/iot-service/api/user/applications/{application_token}/cert?aes256={base64url-key}&ver=1
@@ -613,6 +628,10 @@ The `cert` field contains a **3-certificate chain** (PEM-concatenated):
 **`key` field:** the private key is AES-256 encrypted and base64-encoded. The `aes256` query parameter in the request URL is the decryption key.
 
 **`crl` field:** a fresh CRL issued at request time, not a cached value.
+
+`fetch_device_cert()` in `include/obn/cloud_auth.hpp` documents this stock-only path; the implementation is gated with `#if 0` and intentionally not wired to `CloudSession`.
+
+**Do not confuse with:** the LAN `project_file` RSA signing certificate (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from cloud MQTT broker authentication.
 
 ### 6.4. Local printer connection (LAN)
 
