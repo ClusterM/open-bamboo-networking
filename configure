@@ -339,9 +339,9 @@ fi
 set -- -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 [ -n "$PREFIX" ]              && set -- "$@" -DCMAKE_INSTALL_PREFIX="$PREFIX"
 [ -n "$OBN_VERSION" ]         && set -- "$@" -DOBN_VERSION="$OBN_VERSION"
-[ -n "$CLOUD_API_URL" ]       && set -- "$@" -DOBN_CLOUD_API_URL="$CLOUD_API_URL"
-[ -n "$CLOUD_WEB_URL" ]       && set -- "$@" -DOBN_CLOUD_WEB_URL="$CLOUD_WEB_URL"
-[ -n "$CLOUD_MQTT_HOSTNAME" ] && set -- "$@" -DOBN_CLOUD_MQTT_HOSTNAME="$CLOUD_MQTT_HOSTNAME"
+set -- "$@" -DOBN_CLOUD_API_URL="$CLOUD_API_URL"
+set -- "$@" -DOBN_CLOUD_WEB_URL="$CLOUD_WEB_URL"
+set -- "$@" -DOBN_CLOUD_MQTT_HOSTNAME="$CLOUD_MQTT_HOSTNAME"
 set -- "$@" \
     -DOBN_CLIENT_TYPE="$CLIENT_TYPE" \
     -DOBN_ENABLE_WORKAROUNDS="$WORKAROUNDS" \

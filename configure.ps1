@@ -307,9 +307,9 @@ $cmakeArgs += @(
     "-DOBN_PATCH_CLIENT_CONF=$patchConfVal",
     "-DOBN_REGISTER_DSHOW_FILTER=$registerDshowVal"
 )
-if (-not [string]::IsNullOrWhiteSpace($CloudApiUrl))      { $cmakeArgs += "-DOBN_CLOUD_API_URL=$CloudApiUrl" }
-if (-not [string]::IsNullOrWhiteSpace($CloudWebUrl))      { $cmakeArgs += "-DOBN_CLOUD_WEB_URL=$CloudWebUrl" }
-if (-not [string]::IsNullOrWhiteSpace($CloudMqttHostname)) { $cmakeArgs += "-DOBN_CLOUD_MQTT_HOSTNAME=$CloudMqttHostname" }
+$cmakeArgs += "-DOBN_CLOUD_API_URL=$CloudApiUrl"
+$cmakeArgs += "-DOBN_CLOUD_WEB_URL=$CloudWebUrl"
+$cmakeArgs += "-DOBN_CLOUD_MQTT_HOSTNAME=$CloudMqttHostname"
 if ($CMakeArg.Count -gt 0) { $cmakeArgs += $CMakeArg }
 
 Write-Note ("cmake " + ($cmakeArgs -join " "))
