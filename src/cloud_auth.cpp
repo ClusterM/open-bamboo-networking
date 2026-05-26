@@ -54,10 +54,10 @@ std::string api_host(const std::string& region)
 std::string web_host(const std::string& region)
 {
     if (auto o = config::resolve_override("OBN_CLOUD_WEB_URL", OBN_CLOUD_WEB_URL_DEFAULT)) return *o;
-    // No trailing slash: Studio appends "/sign-in" (WebUserLoginDialog)
-    // and "api/sign-in/ticket?..." (bind flow) to this value.
-    if (region == "CN" || region == "cn") return "https://bambulab.cn";
-    return "https://bambulab.com";
+    // Trailing slash required: Studio appends some suffixes with a
+    // leading slash ("/sign-in") and others without ("api/sign-in/..."),
+    if (region == "CN" || region == "cn") return "https://bambulab.cn/";
+    return "https://bambulab.com/";
 }
 
 AuthResult login_with_ticket(const std::string& region,

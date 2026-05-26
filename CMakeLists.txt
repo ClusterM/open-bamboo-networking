@@ -42,7 +42,7 @@ if(NOT OBN_VERSION)
 endif()
 
 set(OBN_CLOUD_API_URL      "" CACHE STRING "Override cloud REST API base URL (e.g. https://api.example.com).")
-set(OBN_CLOUD_WEB_URL      "" CACHE STRING "Override cloud web portal base URL (e.g. https://example.com).")
+set(OBN_CLOUD_WEB_URL      "" CACHE STRING "Override cloud web portal base URL, trailing slash required (e.g. https://example.com/).")
 set(OBN_CLOUD_MQTT_HOSTNAME "" CACHE STRING "Override cloud MQTT broker hostname (no scheme, no port).")
 if(OBN_CLOUD_API_URL OR OBN_CLOUD_WEB_URL OR OBN_CLOUD_MQTT_HOSTNAME)
     message(STATUS "obn: cloud endpoint overrides")

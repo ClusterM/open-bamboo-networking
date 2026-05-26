@@ -92,9 +92,9 @@ Cloud endpoint overrides:
                              e.g. https://api.example.com. Replaces
                              https://api.bambulab.com / .bambulab.cn.
                              Runtime env: OBN_CLOUD_API_URL.
-  --cloud-web-url=URL        Cloud web portal base URL (no trailing slash),
-                             e.g. https://example.com. Replaces
-                             https://bambulab.com / .bambulab.cn.
+  --cloud-web-url=URL        Cloud web portal base URL (trailing slash
+                             required), e.g. https://example.com/.
+                             Replaces https://bambulab.com / .bambulab.cn.
                              Runtime env: OBN_CLOUD_WEB_URL.
   --cloud-mqtt-hostname=HOST Cloud MQTT broker hostname (no scheme, no port),
                              e.g. mqtt.example.com. Replaces
