@@ -3,6 +3,7 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/config.hpp"
 #include "obn/log.hpp"
 
 using obn::Agent;
@@ -15,8 +16,10 @@ std::string g_log_start_time;
 
 OBN_ABI void* bambu_network_create_agent(std::string log_dir)
 {
-    // Optional file sink: set OBN_LOG_TO_FILE=1 so logs also go to
-    // <log_dir>/obn.log (same folder as Studio's logs). Default is stderr only.
+    const auto cfg = obn::config::load_or_create(log_dir);
+    obn::log::apply_config(cfg);
+    // Optional file sink: OBN_LOG_TO_FILE=1 or log_to_file=1 in obn.conf
+    // appends to <log_dir>/obn.log (same folder as Studio's logs).
     // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
 

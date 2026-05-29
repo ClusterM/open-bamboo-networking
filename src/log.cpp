@@ -1,6 +1,7 @@
 #include "obn/log.hpp"
 
 #include "obn/build_identity.hpp"
+#include "obn/config.hpp"
 #include "obn/os_compat.hpp"
 
 #include <atomic>
@@ -22,8 +23,10 @@ struct State {
     FILE*      fp          = nullptr;
     bool       echo_stderr = true;
     bool       explicit_path = false; // OBN_LOG_FILE set by user
+    bool       want_data_dir_file = false; // OBN_LOG_TO_FILE or log_to_file
     Level      level       = LVL_INFO;
     bool       initialized = false;
+    bool       config_applied = false;
 };
 
 State& state()
@@ -32,7 +35,7 @@ State& state()
     return s;
 }
 
-// Non-empty OBN_LOG_TO_FILE enables <log_dir>/obn.log unless explicitly false.
+// Non-empty truthy value enables <log_dir>/obn.log unless explicitly false.
 static bool env_wants_default_file(const char* v)
 {
     if (!v || !*v) return false;
@@ -93,6 +96,9 @@ void ensure_initialized_locked(State& s)
     if (const char* e = std::getenv("OBN_LOG_STDERR"))
         s.echo_stderr = !(e[0] == '0' && e[1] == '\0');
 
+    if (const char* tf = std::getenv("OBN_LOG_TO_FILE"))
+        s.want_data_dir_file = env_wants_default_file(tf);
+
     if (const char* p = std::getenv("OBN_LOG_FILE")) {
         s.explicit_path = true;
         if (*p) open_file_locked(s, p);
@@ -100,7 +106,8 @@ void ensure_initialized_locked(State& s)
         // enables OBN_LOG_TO_FILE from configure_from_log_dir (blocked below).
     }
     // No default file: logs go to stderr only unless OBN_LOG_FILE,
-    // OBN_LOG_TO_FILE (see configure_from_log_dir), or tests set a path.
+    // OBN_LOG_TO_FILE / log_to_file (see configure_from_log_dir), or tests
+    // set a path.
 }
 
 // Must be called with State::mu held, and only outside the dynamic loader lock.
@@ -135,13 +142,35 @@ void format_timestamp(char* buf, std::size_t n)
 
 } // namespace
 
+void apply_config(const obn::config::Settings& cfg)
+{
+    auto& s = state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    if (s.config_applied) return;
+    s.config_applied = true;
+
+    if (!std::getenv("OBN_LOG_LEVEL") && !cfg.log_level.empty())
+        s.level = parse_level(cfg.log_level.c_str());
+
+    if (!std::getenv("OBN_LOG_STDERR") && !cfg.log_stderr.empty())
+        s.echo_stderr = env_wants_default_file(cfg.log_stderr.c_str());
+
+    if (!std::getenv("OBN_LOG_TO_FILE") && !cfg.log_to_file.empty())
+        s.want_data_dir_file = env_wants_default_file(cfg.log_to_file.c_str());
+
+    if (!std::getenv("OBN_LOG_FILE") && !cfg.log_file.empty()) {
+        s.explicit_path = true;
+        open_file_locked(s, cfg.log_file);
+    }
+}
+
 void configure_from_log_dir(const std::string& log_dir)
 {
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
     ensure_initialized_locked(s);
     if (s.explicit_path || log_dir.empty()) return;
-    if (!env_wants_default_file(std::getenv("OBN_LOG_TO_FILE"))) return;
+    if (!s.want_data_dir_file) return;
     std::string path = log_dir;
     // Tolerate either separator: log_dir comes from Studio (Windows uses
     // backslashes), and trailing-slash policy is left to the caller.

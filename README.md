@@ -503,6 +503,46 @@ Then edit the configuration file.
   - set `"network_plugin_remind_later"` to `"true"` to suppress “newer plugin available” prompts
   - remove your plugin version from `"network_plugin_skipped_versions"` if it appears there
 
+## Configuration file
+
+Persistent plugin settings live in **`<data_dir>/obn.conf`**, in the same
+directory as `obn.log` and `obn.auth.json`. The slicer passes `data_dir` to
+`bambu_network_create_agent(log_dir)`; on first launch, if the file is missing,
+the plugin creates a commented template with safe defaults.
+
+**Format:** INI-like `key = value` lines. Lines starting with `#` are comments.
+Spaces around `=` are optional.
+
+**Priority:** for each setting, **environment variables override `obn.conf`,
+which overrides built-in defaults**. Logging env vars (`OBN_LOG_*`) still win
+over the file when set.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `log_level` | `info` | Log threshold: `trace`, `debug`, `info`, `warn`, `error`, `off`. Overridden by `OBN_LOG_LEVEL`. |
+| `log_stderr` | `1` | When `1`, copy every line to stderr with an `[obn]` prefix. Overridden by `OBN_LOG_STDERR`. |
+| `log_to_file` | `0` | When `1`, append to `<data_dir>/obn.log`. Overridden by `OBN_LOG_TO_FILE`. |
+| `log_file` | *(unset)* | Absolute path to a log file. Overridden by `OBN_LOG_FILE`. |
+| `cloud_api_host` | *(unset)* | REST API base URL, e.g. `https://api.bambulab.com`. Empty = US/CN production host from `country_code`. |
+| `cloud_web_host` | *(unset)* | Web portal base for sign-in / bind UI, e.g. `https://bambulab.com`. Empty = regional default. |
+| `cloud_mqtt_host` | *(unset)* | Cloud MQTT broker hostname, e.g. `us.mqtt.bambulab.com` (port 8883 unchanged). Empty = regional default. |
+
+Example — enable a persistent log file without env vars:
+
+```ini
+log_to_file = 1
+log_level = debug
+```
+
+Example — point cloud REST at a dev host (MQTT/web must be set separately if needed):
+
+```ini
+cloud_api_host = https://api-dev.bambulab.net
+```
+
+Typical paths: `~/.config/BambuStudio/obn.conf`, `~/.config/OrcaSlicer/obn.conf`,
+`%APPDATA%\BambuStudio\obn.conf`, `%APPDATA%\OrcaSlicer\obn.conf`.
+
 ## Logging
 
 The plugin writes a printf-style log of ABI calls and MQTT / FTPS /
@@ -510,13 +550,18 @@ HTTP activity. **Defaults:** severity **info**, output **only to stderr**
 (the terminal that launched Bambu Studio). No log file is opened unless
 you opt in — this keeps disk noise down for everyday use.
 
+Most logging options can also be set in [`obn.conf`](#configuration-file)
+(`log_level`, `log_stderr`, `log_to_file`, `log_file`); env vars override
+the file when both are present.
+
 **Where it goes.**
 
 - **Default:** stderr only (`OBN_LOG_STDERR=1`), each line prefixed with
 `[obn]` so it is easy to grep apart from Bambu Studio’s own stderr.
-- **File next to the slicer's data directory:** set `OBN_LOG_TO_FILE=1`
-to append to `<data_dir>/obn.log`, where `data_dir` is the path the
-slicer passes to `bambu_network_create_agent`. Typical paths:
+- **File next to the slicer's data directory:** set `OBN_LOG_TO_FILE=1` or
+`log_to_file = 1` in `obn.conf` to append to `<data_dir>/obn.log`, where
+`data_dir` is the path the slicer passes to `bambu_network_create_agent`.
+Typical paths:
 `~/.config/BambuStudio/obn.log` (Linux Studio),
 `~/.config/OrcaSlicer/obn.log` (Linux Orca),
 `%APPDATA%\BambuStudio\obn.log` (Windows Studio),
@@ -533,8 +578,9 @@ Studio and Orca never share a log file.
 is **info**. Use `debug` or `trace` when diagnosing issues (`trace` adds
 per-MQTT-frame and per-FTPS-command noise).
 
-**Configuration via environment variables** (read once, on first log
-call — export them *before* launching Studio):
+**Configuration via environment variables** (read once at plugin init;
+export them *before* launching Studio. Same keys exist in `obn.conf`; env
+wins when both are set):
 
 | Variable          | Default   | Effect                                                                                                                                       |
 | ----------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------- |

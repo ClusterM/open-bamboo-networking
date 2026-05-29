@@ -1,6 +1,7 @@
 #include "obn/cloud_session.hpp"
 
 #include "obn/bambu_networking.hpp"
+#include "obn/config.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -64,6 +65,7 @@ void CloudSession::configure(std::string region,
 
 std::string CloudSession::mqtt_host_() const
 {
+    if (const auto& h = obn::config::current().cloud_mqtt_host; !h.empty()) return h;
     if (region_ == "CN" || region_ == "cn") return "cn.mqtt.bambulab.com";
     return "us.mqtt.bambulab.com";
 }

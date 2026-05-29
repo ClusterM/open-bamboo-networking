@@ -1,5 +1,6 @@
 #include "obn/cloud_auth.hpp"
 
+#include "obn/config.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -45,12 +46,14 @@ std::string api_error(const obn::json::Value& root, long status)
 
 std::string api_host(const std::string& region)
 {
+    if (const auto& h = obn::config::current().cloud_api_host; !h.empty()) return h;
     if (region == "CN" || region == "cn") return "https://api.bambulab.cn";
     return "https://api.bambulab.com";
 }
 
 std::string web_host(const std::string& region)
 {
+    if (const auto& h = obn::config::current().cloud_web_host; !h.empty()) return h;
     // No trailing slash: Studio appends "/sign-in" (WebUserLoginDialog)
     // and "api/sign-in/ticket?..." (bind flow) to this value.
     if (region == "CN" || region == "cn") return "https://bambulab.cn";

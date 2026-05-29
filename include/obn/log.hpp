@@ -4,6 +4,10 @@
 #include <cstdio>
 #include <string>
 
+namespace obn::config {
+struct Settings;
+} // namespace obn::config
+
 // Minimal printf-style logger shared by all ABI implementations. Goals:
 //   * zero runtime dependencies beyond libc;
 //   * always-on (no macro stripping in release) so a deployed plugin can be
@@ -11,9 +15,11 @@
 //   * thread-safe - mosquitto calls us on a background thread, Studio calls
 //     us on the main thread, and they often interleave.
 //
-// Configuration happens at first use through environment variables:
+// Configuration happens at first use through environment variables (highest
+// priority), then obn.conf (see obn/config.hpp), then built-in defaults:
 //   OBN_LOG_FILE      optional absolute path to a log file. If unset, no file
-//                     sink is opened unless OBN_LOG_TO_FILE=1 (see below).
+//                     sink is opened unless OBN_LOG_TO_FILE=1 or log_to_file
+//                     in obn.conf (see below).
 //   OBN_LOG_TO_FILE   set to 1 to also write to <log_dir>/obn.log (log_dir is
 //                     passed from Studio to create_agent). Ignored if
 //                     OBN_LOG_FILE is set (including empty: console-only).
@@ -37,9 +43,13 @@ enum Level : int {
 };
 
 // Called from bambu_network_create_agent once Studio gives us a log directory.
-// Opens <log_dir>/obn.log only when OBN_LOG_TO_FILE=1. Safe to call multiple
-// times; skipped if OBN_LOG_FILE was set explicitly via env.
+// Opens <log_dir>/obn.log when OBN_LOG_TO_FILE=1 or log_to_file in obn.conf.
+// Safe to call multiple times; skipped if OBN_LOG_FILE was set explicitly via env.
 void configure_from_log_dir(const std::string& log_dir);
+
+// Apply obn.conf logging keys for any OBN_LOG_* env vars that are not set.
+// Must run before the first OBN_* line (create_agent calls this after load_or_create).
+void apply_config(const obn::config::Settings& cfg);
 
 // Low-level emitter. Use the OBN_* macros below instead of calling directly.
 // `__attribute__((format(printf,...)))` is GCC/Clang-only; MSVC accepts the

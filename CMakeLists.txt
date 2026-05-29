@@ -266,6 +266,7 @@ add_library(bambu_networking SHARED
     src/agent.cpp
     src/auth.cpp
     src/cert_store.cpp
+    src/config.cpp
     src/cloud_auth.cpp
     src/bind_cloud.cpp
     src/cloud_filament.cpp
@@ -626,6 +627,13 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/os_compat.cpp)
     target_include_directories(ftps_parse_test PRIVATE include src)
     add_test(NAME ftps_parse COMMAND ftps_parse_test)
+
+    add_executable(config_test tests/config_test.cpp
+        src/config.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(config_test PRIVATE include)
+    add_test(NAME config COMMAND config_test)
 
     add_executable(remote_name_test tests/remote_name_test.cpp
         src/print_job_naming.cpp)
