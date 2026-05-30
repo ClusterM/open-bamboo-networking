@@ -240,6 +240,12 @@ public:
     // path when the user explicitly picks a non-advertised version.
     std::string render_firmware_json(const std::string& dev_id) const;
 
+    // Returns true if at least one MQTT firmware frame has been received
+    // for this device (info.get_version or upgrade_state.new_ver_list).
+    // Used by bambu_network_get_printer_firmware to decide whether to fall
+    // back to the cloud firmware catalogue endpoint.
+    bool has_firmware_data(const std::string& dev_id) const;
+
     // Public so parse helpers inside agent.cpp can reach them; nobody
     // outside the library has reason to touch these directly.
     struct ModuleFw {

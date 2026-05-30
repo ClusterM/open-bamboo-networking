@@ -576,6 +576,14 @@ static void emit_fw_entry(std::string*       dst,
     dst->push_back('}');
 }
 
+bool Agent::has_firmware_data(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = device_fw_.find(dev_id);
+    if (it == device_fw_.end()) return false;
+    return !it->second.modules.empty();
+}
+
 std::string Agent::render_firmware_json(const std::string& dev_id) const
 {
     // Pull a snapshot under the lock; build the JSON text outside it.
@@ -853,10 +861,19 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     // keep the UI responsive we offload that to a detached worker and
     // back off on failure.
     if (!lan_only) {
-        // Cloud / hybrid mode: Bambu's own plugin fetches the device-
-        // specific MQTT tunnel cert from MakerWorld here. We don't have
-        // cloud auth plumbed in yet (phases 4-5), so log and bail cleanly.
-        OBN_DEBUG("install_device_cert dev=%s lan_only=0, cloud cert fetch deferred to phase 4", dev_id.c_str());
+        // Cloud / hybrid mode: call cloud::fetch_device_cert() to get the
+        // mTLS client cert and AES-encrypted private key. To complete the
+        // implementation:
+        //   1. Generate a random 32-byte AES key and base64url-encode it.
+        //   2. Call cloud::fetch_device_cert(region, access_token,
+        //          application_token, aes256_key).
+        //   3. AES-256-CBC decrypt DeviceCertResult::key with the raw key.
+        //   4. Write the cert and decrypted key to files in config_dir.
+        //   5. Reconfigure CloudSession with the cert+key paths via a new
+        //          CloudSession::configure_mtls(cert_path, key_path) method.
+        // `application_token` derivation is not yet confirmed; see
+        // obn::cloud::fetch_device_cert() comment in cloud_auth.hpp.
+        OBN_DEBUG("install_device_cert dev=%s lan_only=0: mTLS cert wiring pending (see cloud::fetch_device_cert)", dev_id.c_str());
         return;
     }
 
@@ -1198,9 +1215,10 @@ int Agent::apply_login_info(const std::string& login_info_json)
         if (prof.ok) {
             auth_store_->update_profile(prof.user_id, prof.user_name,
                                         prof.nick_name, prof.avatar);
-            OBN_INFO("change_user: hello %s (uid=%s)",
+            auth_store_->update_firmware_beta(prof.firmware_beta_open);
+            OBN_INFO("change_user: hello %s (uid=%s, beta_fw=%d)",
                      prof.user_name.empty() ? prof.nick_name.c_str() : prof.user_name.c_str(),
-                     prof.user_id.c_str());
+                     prof.user_id.c_str(), prof.firmware_beta_open ? 1 : 0);
         } else {
             OBN_WARN("change_user: profile fetch failed: %s", prof.error_message.c_str());
         }
