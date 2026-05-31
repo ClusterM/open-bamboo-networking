@@ -13,6 +13,16 @@ function Write-Info  { param([string]$msg) Write-Host "  [info]  $msg" -Foregrou
 function Write-Warn  { param([string]$msg) Write-Host "  [warn]  $msg" -ForegroundColor Yellow }
 function Write-Err   { param([string]$msg) Write-Host "  [error] $msg" -ForegroundColor Red }
 
+function Wait-And-Exit {
+    param([int]$code = 1)
+    if ($Host.Name -eq "ConsoleHost") {
+        Write-Host ""
+        Write-Host "Press any key to exit..."
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    exit $code
+}
+
 # ── Client selection ─────────────────────────────────────────────────────
 
 Write-Host ""
@@ -69,14 +79,14 @@ $Prefix = $ClientDir
 if (-not (Test-Path $Prefix)) {
     Write-Err "$ClientLabel config directory not found: $Prefix"
     Write-Err "Launch $ClientLabel at least once to create its config, then re-run this installer."
-    exit 1
+    Wait-And-Exit
 }
 
 $ConfPath = Join-Path $Prefix $ConfName
 if (-not (Test-Path $ConfPath)) {
     Write-Err "$ConfName not found at $ConfPath"
     Write-Err "Launch $ClientLabel at least once to create its config, then re-run this installer."
-    exit 1
+    Wait-And-Exit
 }
 
 # ── ABI version detection ────────────────────────────────────────────────
@@ -148,7 +158,7 @@ if (-not [string]::IsNullOrEmpty($exeVer)) {
 if ([string]::IsNullOrEmpty($detected)) {
     Write-Err "Cannot determine ABI version."
     Write-Err "Launch $ClientLabel at least once, then re-run this installer."
-    exit 1
+    Wait-And-Exit
 }
 
 # Extract major.minor.patch
@@ -156,7 +166,7 @@ if ($detected -match '^(\d+\.\d+\.\d+)') {
     $AbiPrefix = $Matches[1]
 } else {
     Write-Err "Cannot parse version: $detected"
-    exit 1
+    Wait-And-Exit
 }
 $PluginVer = "$AbiPrefix.99"
 
@@ -167,7 +177,7 @@ $LibDir = Join-Path $ScriptDir "lib"
 
 if (-not (Test-Path $LibDir)) {
     Write-Err "lib\ directory not found next to this script"
-    exit 1
+    Wait-And-Exit
 }
 
 $MatchedDir = $null
@@ -193,7 +203,7 @@ if (-not $MatchedDir -or -not (Test-Path $MatchedDir)) {
     Write-Err "No compatible ABI version for $detectedSource (need $AbiPrefix)."
     Write-Err "Available in this package: $available"
     Write-Err "You may need a newer distribution package from GitHub."
-    exit 1
+    Wait-And-Exit
 }
 
 $MatchedVer = (Split-Path -Leaf $MatchedDir) -replace '^v', ''
@@ -229,7 +239,7 @@ if ($Client -eq "bambu_studio") {
 $srcPlugin = Join-Path $MatchedDir "bambu_networking.dll"
 if (-not (Test-Path $srcPlugin)) {
     Write-Err "Plugin binary not found in $MatchedDir"
-    exit 1
+    Wait-And-Exit
 }
 Copy-Item -Path $srcPlugin -Destination (Join-Path $DestDir $PluginDestName) -Force
 Write-Info "Installed $PluginDestName"
@@ -331,7 +341,7 @@ if (Test-Path $ConfPath) {
 } else {
     Write-Err "$ConfName not found at $ConfPath"
     Write-Err "Launch $ClientLabel at least once to create it, then re-run this installer."
-    exit 1
+    Wait-And-Exit
 }
 
 # ── Register DirectShow filter ───────────────────────────────────────────
@@ -357,7 +367,7 @@ if (-not (Test-Path $ObnConf)) {
     $template = Join-Path $ScriptDir "obn.conf.in"
     if (-not (Test-Path $template)) {
         Write-Err "obn.conf.in not found next to install.ps1"
-        exit 1
+        Wait-And-Exit
     }
     Copy-Item -Path $template -Destination $ObnConf -Force
     Write-Info "Created default obn.conf"
@@ -380,7 +390,4 @@ Write-Host ""
 Write-Host "GitHub: https://github.com/ClusterM/open-bambu-networking" -ForegroundColor Cyan
 Write-Host ""
 
-if ($Host.Name -eq "ConsoleHost") {
-    Write-Host "Press any key to exit..."
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-}
+Wait-And-Exit -code 0
