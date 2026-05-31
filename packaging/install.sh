@@ -292,8 +292,8 @@ fi
 
 patch_conf() {
     if [ ! -f "$CONF_FILE" ]; then
-        warn "$CONF_NAME not found — launch $CLIENT_LABEL once, then re-run"
-        return
+        die "$CONF_NAME not found at $CONF_FILE
+  Launch $CLIENT_LABEL at least once to create it, then re-run this installer."
     fi
 
     # Python is available on virtually all Linux/macOS systems and gives us

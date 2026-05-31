@@ -310,7 +310,9 @@ if (Test-Path $ConfPath) {
         Write-Warn "Could not parse $ConfName, skipping patch: $_"
     }
 } else {
-    Write-Warn "$ConfName not found -- launch $ClientLabel once, then re-run"
+    Write-Err "$ConfName not found at $ConfPath"
+    Write-Err "Launch $ClientLabel at least once to create it, then re-run this installer."
+    exit 1
 }
 
 # ── Register DirectShow filter ───────────────────────────────────────────
