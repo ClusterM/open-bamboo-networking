@@ -84,6 +84,10 @@
   .instructions ol {
     padding-left: 1.5rem;
   }
+  .instructions ul {
+    padding-left: 1.25rem;
+    margin-top: 0.35rem;
+  }
   .instructions li {
     margin-bottom: 0.4rem;
   }
@@ -135,8 +139,13 @@
   <ol>
     <li>Download the archive for your platform</li>
     <li>Extract it anywhere</li>
-    <li><strong>Linux/macOS:</strong> run <code>./install.sh</code> (or double-click <code>install.command</code> on macOS)</li>
-    <li><strong>Windows:</strong> double-click <code>install.bat</code> (or run <code>.\install.ps1</code> in PowerShell)</li>
+    <li>Run the installer:
+      <ul>
+        <li><strong>Linux:</strong> <code>./install.sh</code></li>
+        <li><strong>macOS:</strong> <code>./install.sh</code> or double-click <code>install.command</code></li>
+        <li><strong>Windows:</strong> double-click <code>install.bat</code> or run <code>.\install.ps1</code> in PowerShell</li>
+      </ul>
+    </li>
     <li>The installer will ask which slicer to install for and handle the rest</li>
   </ol>
 </div>
