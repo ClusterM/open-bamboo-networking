@@ -495,9 +495,10 @@ Then edit the configuration file.
 Persistent plugin settings live in **`<data_dir>/obn.conf`**, in the same
 directory as `obn.log` and `obn.auth.json`. The slicer passes `data_dir` to
 `bambu_network_create_agent(log_dir)`; on first launch, if the file is missing,
-the plugin creates a commented template with safe defaults.
+the plugin creates a template with every key and its default value.
 
-**Format:** INI-like `key = value` lines. Lines starting with `#` are comments.
+**Format:** INI-like `key = value` lines. Lines starting with `#` are comments;
+`##` section headers are comments too.
 Spaces around `=` are optional.
 
 **Priority:** for each setting, **environment variables override `obn.conf`,
@@ -510,10 +511,13 @@ over the file when set.
 | `log_stderr` | `1` | When `1`, copy every line to stderr with an `[obn]` prefix. Overridden by `OBN_LOG_STDERR`. |
 | `log_to_file` | `0` | When `1`, append to `<data_dir>/obn.log`. Overridden by `OBN_LOG_TO_FILE`. |
 | `log_file` | *(unset)* | Absolute path to a log file. Overridden by `OBN_LOG_FILE`. |
-| `cloud_api_host` | *(unset)* | REST API base URL, e.g. `https://api.bambulab.com`. Empty = US/CN production host from `country_code`. |
-| `cloud_web_host` | *(unset)* | Web portal base for sign-in / bind UI, e.g. `https://bambulab.com`. Empty = regional default. |
-| `cloud_mqtt_host` | *(unset)* | Cloud MQTT broker hostname, e.g. `us.mqtt.bambulab.com`. Empty = regional default. |
-| `cloud_mqtt_port` | `8883` | Cloud MQTT broker port. |
+| `cloud_global_api_host` | `https://api.bambulab.com` | REST API base for non-CN accounts. |
+| `cloud_global_web_host` | `https://bambulab.com` | Web portal base for sign-in / bind UI (non-CN). |
+| `cloud_global_mqtt_host` | `us.mqtt.bambulab.com` | Cloud MQTT broker hostname (non-CN). |
+| `cloud_cn_api_host` | `https://api.bambulab.cn` | REST API base for CN accounts. |
+| `cloud_cn_web_host` | `https://bambulab.cn` | Web portal base for sign-in / bind UI (CN). |
+| `cloud_cn_mqtt_host` | `cn.mqtt.bambulab.com` | Cloud MQTT broker hostname (CN). |
+| `cloud_mqtt_port` | `8883` | Cloud MQTT broker port (both regions). |
 | `block_cloud` | `1` | Block background cloud MQTT/REST connections. Auth, preset sync, and bind/unbind are still allowed. |
 | `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
@@ -527,10 +531,10 @@ log_to_file = 1
 log_level = debug
 ```
 
-Example — point cloud REST at a dev host (MQTT/web must be set separately if needed):
+Example — point Global cloud REST at a dev host:
 
 ```ini
-cloud_api_host = https://api-dev.bambulab.net
+cloud_global_api_host = https://api-dev.bambulab.net
 ```
 
 Typical paths: `~/.config/BambuStudio/obn.conf`, `~/.config/OrcaSlicer/obn.conf`,

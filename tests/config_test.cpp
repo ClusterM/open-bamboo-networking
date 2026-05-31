@@ -42,11 +42,11 @@ static int test_parse_keys()
     write_conf(dir,
                "# comment\n"
                " log_level = debug \n"
-               "cloud_api_host = https://api-dev.bambulab.net\n"
+               "cloud_global_api_host = https://api-dev.bambulab.net\n"
                "unknown_key = ignored\n");
     const auto cfg = obn::config::load_or_create(dir.string());
     CHECK(cfg.log_level == "debug");
-    CHECK(cfg.cloud_api_host == "https://api-dev.bambulab.net");
+    CHECK(cfg.cloud_global_api_host == "https://api-dev.bambulab.net");
     CHECK(cfg.log_stderr.empty());
     return 0;
 }
@@ -97,9 +97,28 @@ static int test_env_overrides_config()
 static int test_cloud_api_override()
 {
     const fs::path dir = make_temp_dir();
-    write_conf(dir, "cloud_api_host = https://api-qa.bambulab.net\n");
+    write_conf(dir,
+               "cloud_global_api_host = https://api-qa.bambulab.net\n"
+               "cloud_cn_api_host = https://api-qa.bambulab.cn\n");
     (void)obn::config::load_or_create(dir.string());
-    CHECK(obn::config::current().cloud_api_host == "https://api-qa.bambulab.net");
+    CHECK(obn::config::current().cloud_global_api_host == "https://api-qa.bambulab.net");
+    CHECK(obn::config::current().cloud_cn_api_host == "https://api-qa.bambulab.cn");
+    CHECK(obn::config::cloud_api_host_for(obn::config::current(), "US")
+          == "https://api-qa.bambulab.net");
+    CHECK(obn::config::cloud_api_host_for(obn::config::current(), "CN")
+          == "https://api-qa.bambulab.cn");
+    return 0;
+}
+
+static int test_cloud_regional_defaults()
+{
+    obn::config::Settings s{};
+    CHECK(obn::config::cloud_api_host_for(s, "US") == "https://api.bambulab.com");
+    CHECK(obn::config::cloud_web_host_for(s, "US") == "https://bambulab.com");
+    CHECK(obn::config::cloud_mqtt_host_for(s, "US") == "us.mqtt.bambulab.com");
+    CHECK(obn::config::cloud_api_host_for(s, "CN") == "https://api.bambulab.cn");
+    CHECK(obn::config::cloud_web_host_for(s, "cn") == "https://bambulab.cn");
+    CHECK(obn::config::cloud_mqtt_host_for(s, "CN") == "cn.mqtt.bambulab.com");
     return 0;
 }
 
@@ -191,6 +210,7 @@ int main()
     if (test_create_template() != 0) return 1;
     if (test_env_overrides_config() != 0) return 1;
     if (test_cloud_api_override() != 0) return 1;
+    if (test_cloud_regional_defaults() != 0) return 1;
     if (test_truthy() != 0) return 1;
     if (test_new_keys() != 0) return 1;
     if (test_new_keys_defaults() != 0) return 1;

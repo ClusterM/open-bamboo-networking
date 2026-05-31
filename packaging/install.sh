@@ -378,64 +378,11 @@ patch_conf
 
 OBN_CONF="$PREFIX/obn.conf"
 if [ ! -f "$OBN_CONF" ]; then
-    cat > "$OBN_CONF" <<'OBN_CONF_EOF'
-## Open Bambu Networking — user settings
-##
-## Lines starting with ## are comments.
-## Lines starting with a single # are disabled settings;
-## remove the # to enable them.
-##
-## Log settings can also be set via OBN_LOG_* environment variables;
-## when set, they take priority over this file.
-
-## ─── Logging ────────────────────────────────────────────────
-
-log_level = info
-log_stderr = 1
-log_to_file = 0
-# log_file = /absolute/path/to/obn.log
-
-## ─── Cloud endpoints ──────────────────────────────────────
-##
-## Leave empty for production US/CN by country_code.
-##   Global:  https://api.bambulab.com / https://bambulab.com / us.mqtt.bambulab.com
-##   CN:      https://api.bambulab.cn  / https://bambulab.cn  / cn.mqtt.bambulab.com
-##   Dev/QA:  https://api-dev.bambulab.net / https://api-qa.bambulab.net / ...
-
-# cloud_api_host = https://api.bambulab.com
-# cloud_web_host = https://bambulab.com
-# cloud_mqtt_host = us.mqtt.bambulab.com
-# cloud_mqtt_port = 8883
-
-## ─── Cloud access ────────────────────────────────────────
-##
-## Block background cloud MQTT/REST connections.
-## Auth, preset sync, and bind/unbind are still allowed.
-
-# block_cloud = 1
-
-## ─── LAN TLS ─────────────────────────────────────────────
-##
-## Skip TLS certificate verification for LAN MQTT/FTPS connections.
-
-# lan_tls_skip_verify = 0
-
-## ─── Print behavior ──────────────────────────────────────
-##
-## Always save timelapse to external storage (USB/SD), ignoring the
-## Internal/External toggle in the print dialog.  Studio defaults
-## that toggle to internal storage, so this avoids switching it every time.
-
-# force_timelapse_external = 0
-
-## ─── BambuSource logging ──────────────────────────────────
-##
-## Separate log level/file for the BambuSource (video/CTRL) library.
-## Only read if BambuSource is loaded; file is never created by it.
-
-# bambusource_log_level = info
-# bambusource_log_file = /absolute/path/to/bambusource.log
-OBN_CONF_EOF
+    if [ -f "$SCRIPT_DIR/obn.conf.in" ]; then
+        cp "$SCRIPT_DIR/obn.conf.in" "$OBN_CONF"
+    else
+        die "obn.conf.in not found next to install.sh"
+    fi
     info "Created default obn.conf"
 fi
 

@@ -17,10 +17,13 @@ struct Settings {
     std::string log_to_file;
     std::string log_file;
 
-    // Cloud overrides (empty = region defaults US/CN via country_code)
-    std::string cloud_api_host;
-    std::string cloud_web_host;
-    std::string cloud_mqtt_host;
+    // Cloud endpoints (per region; empty value falls back to production default)
+    std::string cloud_global_api_host;
+    std::string cloud_global_web_host;
+    std::string cloud_global_mqtt_host;
+    std::string cloud_cn_api_host;
+    std::string cloud_cn_web_host;
+    std::string cloud_cn_mqtt_host;
 
     // LAN / cloud networking
     bool lan_tls_skip_verify      = false;
@@ -50,5 +53,11 @@ Settings load_if_exists(const std::string& config_dir);
 
 // Valid only after load_or_create(); otherwise returns default Settings.
 const Settings& current();
+
+// Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
+// Empty configured values fall back to production defaults.
+std::string cloud_api_host_for(const Settings& s, const std::string& region);
+std::string cloud_web_host_for(const Settings& s, const std::string& region);
+std::string cloud_mqtt_host_for(const Settings& s, const std::string& region);
 
 } // namespace obn::config

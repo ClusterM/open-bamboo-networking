@@ -46,18 +46,12 @@ std::string api_error(const obn::json::Value& root, long status)
 
 std::string api_host(const std::string& region)
 {
-    if (const auto& h = obn::config::current().cloud_api_host; !h.empty()) return h;
-    if (region == "CN" || region == "cn") return "https://api.bambulab.cn";
-    return "https://api.bambulab.com";
+    return obn::config::cloud_api_host_for(obn::config::current(), region);
 }
 
 std::string web_host(const std::string& region)
 {
-    if (const auto& h = obn::config::current().cloud_web_host; !h.empty()) return h;
-    // No trailing slash: Studio appends "/sign-in" (WebUserLoginDialog)
-    // and "api/sign-in/ticket?..." (bind flow) to this value.
-    if (region == "CN" || region == "cn") return "https://bambulab.cn";
-    return "https://bambulab.com";
+    return obn::config::cloud_web_host_for(obn::config::current(), region);
 }
 
 AuthResult login_with_ticket(const std::string& region,

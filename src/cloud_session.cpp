@@ -65,9 +65,7 @@ void CloudSession::configure(std::string region,
 
 std::string CloudSession::mqtt_host_() const
 {
-    if (const auto& h = obn::config::current().cloud_mqtt_host; !h.empty()) return h;
-    if (region_ == "CN" || region_ == "cn") return "cn.mqtt.bambulab.com";
-    return "us.mqtt.bambulab.com";
+    return obn::config::cloud_mqtt_host_for(obn::config::current(), region_);
 }
 
 std::string CloudSession::report_topic_(const std::string& dev_id) const

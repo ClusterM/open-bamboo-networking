@@ -14,6 +14,23 @@ namespace {
 std::mutex g_mu;
 Settings   g_current;
 
+constexpr const char* kDefaultGlobalApi  = "https://api.bambulab.com";
+constexpr const char* kDefaultGlobalWeb  = "https://bambulab.com";
+constexpr const char* kDefaultGlobalMqtt = "us.mqtt.bambulab.com";
+constexpr const char* kDefaultCnApi      = "https://api.bambulab.cn";
+constexpr const char* kDefaultCnWeb      = "https://bambulab.cn";
+constexpr const char* kDefaultCnMqtt     = "cn.mqtt.bambulab.com";
+
+bool is_cn_region(const std::string& region)
+{
+    return region == "CN" || region == "cn";
+}
+
+const char* pick_or_default(const std::string& configured, const char* fallback)
+{
+    return configured.empty() ? fallback : configured.c_str();
+}
+
 std::string trim(const std::string& s)
 {
     std::size_t b = 0;
@@ -49,9 +66,12 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "log_stderr")     out.log_stderr = val;
     else if (key == "log_to_file")    out.log_to_file = val;
     else if (key == "log_file")       out.log_file = val;
-    else if (key == "cloud_api_host") out.cloud_api_host = val;
-    else if (key == "cloud_web_host") out.cloud_web_host = val;
-    else if (key == "cloud_mqtt_host") out.cloud_mqtt_host = val;
+    else if (key == "cloud_global_api_host")  out.cloud_global_api_host = val;
+    else if (key == "cloud_global_web_host")  out.cloud_global_web_host = val;
+    else if (key == "cloud_global_mqtt_host") out.cloud_global_mqtt_host = val;
+    else if (key == "cloud_cn_api_host")      out.cloud_cn_api_host = val;
+    else if (key == "cloud_cn_web_host")      out.cloud_cn_web_host = val;
+    else if (key == "cloud_cn_mqtt_host")     out.cloud_cn_mqtt_host = val;
     else if (key == "lan_tls_skip_verify")      out.lan_tls_skip_verify = truthy(val);
     else if (key == "cloud_mqtt_port") {
         int p = std::atoi(val.c_str());
@@ -86,62 +106,65 @@ bool write_default_template(const std::filesystem::path& path)
     std::ofstream f(tmp, std::ios::binary);
     if (!f) return false;
 
-    f << "## Open Bambu Networking — user settings\n"
+    f << "## Open Bambu Networking -- user settings\n"
       << "##\n"
       << "## Lines starting with ## are comments.\n"
-      << "## Lines starting with a single # are disabled settings;\n"
-      << "## remove the # to enable them.\n"
-      << "##\n"
       << "## Log settings can also be set via OBN_LOG_* environment variables;\n"
       << "## when set, they take priority over this file.\n"
       << "\n"
-      << "## ─── Logging ────────────────────────────────────────────────\n"
+      << "## --- Logging --------------------------------------------------------\n"
       << "\n"
       << "log_level = info\n"
       << "log_stderr = 1\n"
       << "log_to_file = 0\n"
-      << "# log_file = /absolute/path/to/obn.log\n"
+      << "log_file =\n"
       << "\n"
-      << "## ─── Cloud endpoints ──────────────────────────────────────\n"
+      << "## --- Cloud endpoints (Global) --------------------------------------\n"
       << "##\n"
-      << "## Leave empty for production US/CN by country_code.\n"
-      << "##   Global:  https://api.bambulab.com / https://bambulab.com / us.mqtt.bambulab.com\n"
-      << "##   CN:      https://api.bambulab.cn  / https://bambulab.cn  / cn.mqtt.bambulab.com\n"
-      << "##   Dev/QA:  https://api-dev.bambulab.net / https://api-qa.bambulab.net / ...\n"
+      << "## Used when country_code is not CN.\n"
       << "\n"
-      << "# cloud_api_host = https://api.bambulab.com\n"
-      << "# cloud_web_host = https://bambulab.com\n"
-      << "# cloud_mqtt_host = us.mqtt.bambulab.com\n"
-      << "# cloud_mqtt_port = 8883\n"
+      << "cloud_global_api_host = https://api.bambulab.com\n"
+      << "cloud_global_web_host = https://bambulab.com\n"
+      << "cloud_global_mqtt_host = us.mqtt.bambulab.com\n"
       << "\n"
-      << "## ─── Cloud access ────────────────────────────────────────\n"
+      << "## --- Cloud endpoints (CN) ------------------------------------------\n"
+      << "##\n"
+      << "## Used when country_code is CN.\n"
+      << "\n"
+      << "cloud_cn_api_host = https://api.bambulab.cn\n"
+      << "cloud_cn_web_host = https://bambulab.cn\n"
+      << "cloud_cn_mqtt_host = cn.mqtt.bambulab.com\n"
+      << "\n"
+      << "cloud_mqtt_port = 8883\n"
+      << "\n"
+      << "## --- Cloud access ---------------------------------------------------\n"
       << "##\n"
       << "## Block background cloud MQTT/REST connections.\n"
       << "## Auth, preset sync, and bind/unbind are still allowed.\n"
       << "\n"
-      << "# block_cloud = 1\n"
+      << "block_cloud = 1\n"
       << "\n"
-      << "## ─── LAN TLS ─────────────────────────────────────────────\n"
+      << "## --- LAN TLS --------------------------------------------------------\n"
       << "##\n"
       << "## Skip TLS certificate verification for LAN MQTT/FTPS connections.\n"
       << "\n"
-      << "# lan_tls_skip_verify = 0\n"
+      << "lan_tls_skip_verify = 0\n"
       << "\n"
-      << "## ─── Print behavior ──────────────────────────────────────\n"
+      << "## --- Print behavior -------------------------------------------------\n"
       << "##\n"
       << "## Always save timelapse to external storage (USB/SD), ignoring the\n"
       << "## Internal/External toggle in the print dialog.  Studio defaults\n"
       << "## that toggle to internal storage, so this avoids switching it every time.\n"
       << "\n"
-      << "# force_timelapse_external = 0\n"
+      << "force_timelapse_external = 0\n"
       << "\n"
-      << "## ─── BambuSource logging ──────────────────────────────────\n"
+      << "## --- BambuSource logging --------------------------------------------\n"
       << "##\n"
       << "## Separate log level/file for the BambuSource (video/CTRL) library.\n"
-      << "## Only read if BambuSource is loaded; file is never created by it.\n"
+      << "## Empty = plugin defaults; file is never auto-created.\n"
       << "\n"
-      << "# bambusource_log_level = info\n"
-      << "# bambusource_log_file = /absolute/path/to/bambusource.log\n";
+      << "bambusource_log_level =\n"
+      << "bambusource_log_file =\n";
 
     if (!f) {
         f.close();
@@ -210,6 +233,27 @@ const Settings& current()
 {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_current;
+}
+
+std::string cloud_api_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_api_host, kDefaultCnApi);
+    return pick_or_default(s.cloud_global_api_host, kDefaultGlobalApi);
+}
+
+std::string cloud_web_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_web_host, kDefaultCnWeb);
+    return pick_or_default(s.cloud_global_web_host, kDefaultGlobalWeb);
+}
+
+std::string cloud_mqtt_host_for(const Settings& s, const std::string& region)
+{
+    if (is_cn_region(region))
+        return pick_or_default(s.cloud_cn_mqtt_host, kDefaultCnMqtt);
+    return pick_or_default(s.cloud_global_mqtt_host, kDefaultGlobalMqtt);
 }
 
 } // namespace obn::config
