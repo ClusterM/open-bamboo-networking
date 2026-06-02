@@ -96,6 +96,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -769,6 +770,17 @@ bool ctrl_is_cancelled(Tunnel* t, int sequence)
     return t->ctrl_cancelled.count(sequence) > 0;
 }
 
+// Removes the sequence from the cancelled set on scope exit so the set
+// does not grow unbounded during a long-lived CTRL session.
+struct CancelledGuard {
+    Tunnel* t;
+    int     seq;
+    ~CancelledGuard() {
+        std::lock_guard<std::mutex> lk(t->ctrl_mu);
+        t->ctrl_cancelled.erase(seq);
+    }
+};
+
 // Connects a fresh FTPS client on demand (first CTRL request) and probes
 // the storage mount. Kept on the tunnel so requests reuse the channel.
 std::string ensure_ftp(Tunnel* t)
@@ -964,6 +976,7 @@ void ftps_handle_list_info(Tunnel* t, int sequence, const obn::json::Value& req)
 //     instead of hanging. Thumbnails are not available over FTPS.
 void ftps_handle_sub_file(Tunnel* t, int sequence, const obn::json::Value& req)
 {
+    CancelledGuard cg{t, sequence};
     std::string err = ensure_ftp(t);
     if (!err.empty()) {
         auto env = make_reply_envelope(kCmdSubFile, sequence, kResStorUnavail,
@@ -1133,6 +1146,7 @@ void ftps_handle_sub_file(Tunnel* t, int sequence, const obn::json::Value& req)
 void ftps_handle_file_download(Tunnel* t, int sequence,
                                const obn::json::Value& req)
 {
+    CancelledGuard cg{t, sequence};
     std::string err = ensure_ftp(t);
     if (!err.empty()) {
         auto env = make_reply_envelope(kCmdFileDownload, sequence, kResStorUnavail,
