@@ -1,4 +1,5 @@
 #include "obn/config.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn_conf_default.h"
 
 #include <algorithm>
@@ -163,6 +164,7 @@ Settings load_or_create(const std::string& config_dir)
         (void)write_default_template(path);
 
     g_current = parse_file(path);
+    obn::lan_tls::propagate_cross_so_env(g_current);
     return g_current;
 }
 

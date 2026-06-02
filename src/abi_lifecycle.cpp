@@ -1,4 +1,3 @@
-#include <cstdlib>
 #include <string>
 
 #include "obn/abi_export.hpp"
@@ -6,7 +5,6 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
 #include "obn/log.hpp"
-#include "obn/os_compat.hpp"
 
 using obn::Agent;
 using obn::as_agent;
@@ -24,16 +22,8 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
     // appends to <log_dir>/obn.log (same folder as Studio's logs).
     // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
-
-    // Propagate force_ftps to the process environment so that
-    // libBambuSource.so (which compiles its own copy of config.cpp
-    // and therefore has a separate config singleton) can read it
-    // via getenv("OBN_FORCE_FTPS").
-#if defined(_WIN32)
-    ::_putenv_s("OBN_FORCE_FTPS", cfg.force_ftps ? "1" : "0");
-#else
-    ::setenv("OBN_FORCE_FTPS", cfg.force_ftps ? "1" : "0", 1);
-#endif
+    // load_or_create mirrors force_ftps / skip_verify into obn.lan_tls.env once
+    // set_config_dir provides config_dir (see Agent::set_config_dir).
 
     // MSVC's preprocessor (in /Zc:preprocessor-disabled mode, which is the
     // default for v142) refuses #ifdef directives inside macro arguments,

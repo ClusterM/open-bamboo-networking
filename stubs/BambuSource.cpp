@@ -728,12 +728,12 @@ void push_reply(Tunnel* t, CtrlReply r)
 // True when the user enabled the FTPS file-transfer workaround.
 // BambuSource compiles its own copy of config.cpp (self-contained .so),
 // so config::current() here returns defaults — the main plugin's
-// load_or_create never touches our static. Instead, the main plugin
-// propagates the setting via the OBN_FORCE_FTPS environment variable,
-// which is process-global.
+// load_or_create never touches our static. The main plugin's
+// Main plugin writes OBN_FORCE_FTPS into <config_dir>/obn.lan_tls.env;
+// env_var_get hydrates that file on miss (required on Windows across DLLs).
 bool ftps_bridge_enabled()
 {
-    const char* env = std::getenv("OBN_FORCE_FTPS");
+    const char* env = obn::lan_tls::env_var_get(obn::lan_tls::kEnvForceFtps);
     return env && env[0] == '1';
 }
 

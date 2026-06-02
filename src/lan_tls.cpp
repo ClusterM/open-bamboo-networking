@@ -39,6 +39,8 @@ std::string g_ca_file;
 std::unordered_map<std::string, std::string> g_ip_to_serial;
 std::unordered_map<std::string, std::string> g_ip_to_peer_cert;
 std::atomic<bool> g_skip_warn_logged{false};
+bool g_force_ftps{false};
+bool g_lan_tls_skip_verify{false};
 
 #if defined(_WIN32)
 bool set_env_var(const char* key, const char* value)
@@ -78,6 +80,14 @@ const char* env_var_get_os(const char* key)
 bool is_lan_tls_ipc_key(const char* key)
 {
     return key && std::strncmp(key, "OBN_LAN_TLS_", 12) == 0;
+}
+
+bool is_obn_ipc_env_key(const char* key)
+{
+    if (!key) return false;
+    if (std::strcmp(key, kEnvForceFtps) == 0) return true;
+    if (std::strcmp(key, kEnvSkipVerify) == 0) return true;
+    return is_lan_tls_ipc_key(key);
 }
 
 std::string config_dir_snapshot()
@@ -121,7 +131,7 @@ bool apply_state_line(const std::string& line)
     const std::string key = line.substr(0, eq);
     const std::string val = line.substr(eq + 1);
     if (key.empty()) return false;
-    if (key != kEnvConfigDir && !is_lan_tls_ipc_key(key.c_str())) return false;
+    if (key != kEnvConfigDir && !is_obn_ipc_env_key(key.c_str())) return false;
     return set_env_var(key.c_str(), val.c_str());
 }
 
@@ -178,6 +188,8 @@ void write_state_file_locked()
         if (path.empty()) continue;
         f << peer_env_key_for_ip(ip) << '=' << path << '\n';
     }
+    f << kEnvForceFtps << '=' << (g_force_ftps ? '1' : '0') << '\n';
+    f << kEnvSkipVerify << '=' << (g_lan_tls_skip_verify ? '1' : '0') << '\n';
     if (!f) {
         OBN_WARN("lan_tls: write failed for %s", tmp.string().c_str());
         f.close();
@@ -251,7 +263,7 @@ const char* env_var_get(const char* key)
 {
     if (!key || !*key) return nullptr;
     if (const char* v = env_var_get_os(key)) return v;
-    if (!is_lan_tls_ipc_key(key)) return nullptr;
+    if (!is_obn_ipc_env_key(key)) return nullptr;
     hydrate_env_from_state_file_once();
     return env_var_get_os(key);
 }
@@ -412,6 +424,19 @@ const char* resolve_lan_ca_file()
 const char* resolve_lan_peer_cert(const char* ip, const char* /*serial*/)
 {
     return peer_cert_path_for_ip(ip);
+}
+
+void propagate_cross_so_env(const obn::config::Settings& cfg)
+{
+    // libBambuSource has its own config.cpp; mirror flags into obn.lan_tls.env
+    // (primary IPC on Windows) and process env (best-effort within this load).
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_force_ftps            = cfg.force_ftps;
+    g_lan_tls_skip_verify   = cfg.lan_tls_skip_verify;
+    (void)set_env_var(kEnvForceFtps, cfg.force_ftps ? "1" : "0");
+    (void)set_env_var(kEnvSkipVerify, cfg.lan_tls_skip_verify ? "1" : "0");
+    if (cfg.lan_tls_skip_verify) warn_skip_once();
+    write_state_file_locked();
 }
 
 } // namespace obn::lan_tls

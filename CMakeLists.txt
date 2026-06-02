@@ -647,9 +647,11 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     add_executable(config_test tests/config_test.cpp
         src/config.cpp
+        src/lan_tls.cpp
         src/log.cpp
         src/os_compat.cpp)
     target_include_directories(config_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(config_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME config COMMAND config_test)
 
     add_executable(remote_name_test tests/remote_name_test.cpp

@@ -858,6 +858,9 @@ void Agent::set_config_dir(std::string dir)
     std::string cfg = config_dir();
     if (!cfg.empty()) {
         obn::lan_tls::registry_set_config_dir(cfg);
+        // Reload obn.conf from data_dir and rewrite obn.lan_tls.env (log_dir from
+        // create_agent may differ; BambuSource hydrates from the state file).
+        (void)obn::config::load_or_create(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
         hydrate_session();
