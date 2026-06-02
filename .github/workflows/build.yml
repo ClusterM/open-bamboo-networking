@@ -1,6 +1,6 @@
 # Build and test open-bamboo-networking on Linux x64 / aarch64,
 # Windows x64 (MSVC + vcpkg manifest), and macOS arm64.
-# Intel macOS (macos-latest-large) is optional here — see BUILD_MACOS_INTEL below.
+# Intel macOS (macos-latest-large) is optional here — see build-macos-intel job.
 # release.yml always builds both macOS architectures.
 #
 # Version strategy: the plugin must report a string whose first 8 characters
@@ -44,9 +44,8 @@ concurrency:
   cancel-in-progress: true
 
 # Intel macOS runners are expensive (~10x arm64). Interim builds skip them by
-# default; flip to 'true' when you need obn-macos-x64.tar.gz on GitHub Pages.
-env:
-  BUILD_MACOS_INTEL: 'false'
+# default; release.yml always builds both macOS architectures.
+# To enable Intel macOS in interim CI: set `if: true` on job build-macos-intel.
 
 jobs:
   build:
@@ -199,8 +198,8 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    name: v${{ matrix.abi }}.xx-macos-${{ matrix.arch }}
-    runs-on: ${{ matrix.arch == 'arm64' && 'macos-latest' || 'macos-latest-large' }}
+    name: v${{ matrix.abi }}.xx-macos-arm64
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +214,6 @@ jobs:
           - 02.06.00
           - 02.06.01
           - 02.07.00
-        arch: ${{ fromJSON(env.BUILD_MACOS_INTEL == 'true' && '["arm64","x64"]' || '["arm64"]') }}
 
     steps:
       - name: Checkout
@@ -266,13 +264,93 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: obn-macos-${{ matrix.arch }}-v${{ matrix.abi }}.xx
+          name: obn-macos-arm64-v${{ matrix.abi }}.xx
+          path: dist/
+          if-no-files-found: error
+
+  build-macos-intel:
+    name: v${{ matrix.abi }}.xx-macos-x64
+    # Flip to true to enable Intel macOS interim builds (macos-latest-large).
+    if: false
+    runs-on: macos-latest-large
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - 02.03.00
+          - 02.03.01
+          - 02.04.00
+          - 02.05.00
+          - 02.05.01
+          - 02.05.02
+          - 02.05.03
+          - 02.06.00
+          - 02.06.01
+          - 02.07.00
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          set -eu
+          for pkg in pkg-config cmake openssl@3 curl cjson zlib uthash; do
+            brew list "$pkg" &>/dev/null || brew install "$pkg"
+          done
+          {
+            echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
+            PC="$(brew --prefix openssl@3)/lib/pkgconfig"
+            PC="${PC}:$(brew --prefix curl)/lib/pkgconfig"
+            PC="${PC}:$(brew --prefix zlib)/lib/pkgconfig"
+            PC="${PC}:$(brew --prefix cjson)/lib/pkgconfig"
+            echo "PKG_CONFIG_PATH=${PC}"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          ./configure \
+            --build-type=Release \
+            --enable-tests \
+            --with-version='${{ matrix.abi }}.99' \
+            --no-conf-patch
+
+      - name: Build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Run tests
+        run: make test
+
+      - name: Verify built plugin exports every ABI symbol
+        run: tools/check_abi_compat.sh --so=build/libbambu_networking.dylib
+
+      - name: Stage artifacts
+        run: |
+          set -eu
+          mkdir -p dist
+          cp build/libbambu_networking.dylib dist/
+          cp build/libBambuSource.dylib      dist/
+          cp build/liblive555.dylib          dist/
+          cp build/network_plugins.json      dist/
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: obn-macos-x64-v${{ matrix.abi }}.xx
           path: dist/
           if-no-files-found: error
 
   package:
     name: Package distributions
-    needs: [build, build-windows, build-macos]
+    needs: [build, build-windows, build-macos, build-macos-intel]
+    if: |
+      always() &&
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-macos.result == 'success' &&
+      (needs.build-macos-intel.result == 'success' || needs.build-macos-intel.result == 'skipped')
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
