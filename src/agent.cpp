@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <thread>
@@ -11,6 +12,7 @@
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
+#include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
 #include "obn/json_lite.hpp"
@@ -172,6 +174,151 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
 
 namespace {
 
+// --- Optional MQTT push_status patches (gated by obn.conf) ----------
+//
+// These rewrite incoming LAN push_status frames in place. They are all
+// off by default and only enabled when the user opts in via obn.conf,
+// because they lie to Studio about printer capabilities. They target
+// printers (P2S, some A-series) whose firmware under-reports storage /
+// file-browser support, leaving the corresponding Studio UI greyed out
+// even though the underlying transport works.
+
+// Printers with no SD-card slot (P2S uses a USB-A stick instead, newer
+// A-series likewise) report `home_flag` with bits [8:9] == 0 (NO_SDCARD).
+// Studio's DeviceManager parses those two bits straight into
+// DevStorage::SdcardState, which gates the "Send to Printer" / "Print via
+// LAN" UIs: the storage radio button goes grey and the Device/Storage
+// pane shows a red error tile.
+//
+// Rewrite bits [8:9] from 00 (NO_SDCARD) -> 01 (HAS_SDCARD_NORMAL) in place
+// on the JSON text. Only bits [8:9] are touched; real SD error states
+// (ABNORMAL=2, READONLY=3) and printers already reporting HAS_SDCARD=1 are
+// passed through unchanged so genuine "SD card missing" errors keep working.
+//
+// Returns true if the payload was patched.
+bool try_rewrite_home_flag(std::string& payload)
+{
+    static const std::string kKey = "\"home_flag\":";
+    std::size_t pos = payload.find(kKey);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + kKey.size();
+    while (i < payload.size() && payload[i] == ' ') ++i;
+    std::size_t start = i;
+    bool        negative = false;
+    if (i < payload.size() && payload[i] == '-') { negative = true; ++i; }
+    std::size_t digits_start = i;
+    while (i < payload.size() && payload[i] >= '0' && payload[i] <= '9') ++i;
+    if (i == digits_start) return false;
+
+    long long flag = 0;
+    try { flag = std::stoll(payload.substr(digits_start, i - digits_start)); }
+    catch (...) { return false; }
+    if (negative) flag = -flag;
+
+    int sd_bits = static_cast<int>((flag >> 8) & 0x3);
+    if (sd_bits != 0) return false;  // HAS_SDCARD_NORMAL/ABNORMAL/READONLY: pass through
+
+    long long patched = flag | (1LL << 8);
+    std::string repl  = std::to_string(patched);
+    payload.replace(start, i - start, repl);
+    return true;
+}
+
+// P2S / newer A-series firmware does not expose `ipcam.file` in push_status.
+// If Studio sees no `ipcam.file` (or `file.local == "none"`) it short-circuits
+// the MediaFilePanel with "Browsing file in storage is not supported in
+// current firmware" and never opens the file tunnel.
+//
+// Inject `"file":{"local":"local","remote":"none","model_download":"enabled"}`
+// into the ipcam block of frames that lack one. If a payload already carries
+// `ipcam.file` (X1/P1S-class printers that advertise it) we pass through
+// untouched.
+//
+// Returns true if the payload was patched.
+bool try_inject_ipcam_file_local(std::string& payload)
+{
+    static const std::string kIpcam = "\"ipcam\":";
+    std::size_t pos = payload.find(kIpcam);
+    if (pos == std::string::npos) return false;
+    // Walk to the opening brace of the ipcam object.
+    std::size_t brace = payload.find('{', pos + kIpcam.size());
+    if (brace == std::string::npos) return false;
+    // Find the matching closing brace by depth counting. Strings are
+    // tracked minimally (enough for well-formed JSON; printers always
+    // emit that).
+    std::size_t i = brace + 1;
+    int depth = 1;
+    bool in_str = false;
+    bool esc = false;
+    std::size_t end = std::string::npos;
+    std::size_t file_hit = std::string::npos;
+    for (; i < payload.size(); ++i) {
+        char c = payload[i];
+        if (in_str) {
+            if (esc)          esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"')  in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            // Opportunistically spot an existing "file": at the current
+            // depth - if present, leave the payload alone.
+            if (depth == 1 && payload.compare(i, 7, "\"file\":") == 0)
+                file_hit = i;
+            continue;
+        }
+        if (c == '{')      ++depth;
+        else if (c == '}') { if (--depth == 0) { end = i; break; } }
+    }
+    if (end == std::string::npos) return false;
+    if (file_hit != std::string::npos) return false;
+    static const std::string kInject =
+        ",\"file\":{\"local\":\"local\",\"remote\":\"none\","
+        "\"model_download\":\"enabled\"}";
+    payload.insert(end, kInject);
+    return true;
+}
+
+// `print.fun2` is a hex-string capability bitmask. Bit 17 =
+// `is_support_model_internal_storage`, which makes Studio show the
+// internal-storage (eMMC) tab in the file browser. P2S supports eMMC
+// (REQUEST_MEDIA_ABILITY on :6000 returns ["emmc","udisk"]) but does not
+// advertise the bit, so Studio only shows external (USB) storage.
+//
+// Set bit 17 in place. We never inject `fun2` when it is absent, and leave
+// payloads that already have the bit untouched.
+//
+// Returns true if the payload was patched.
+bool try_patch_fun2_internal_storage(std::string& payload)
+{
+    static const std::string kKey = "\"fun2\":";
+    std::size_t pos = payload.find(kKey);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + kKey.size();
+    while (i < payload.size() && payload[i] == ' ') ++i;
+    if (i >= payload.size() || payload[i] != '"') return false;  // hex string only
+    std::size_t start = i + 1;
+    std::size_t end = start;
+    while (end < payload.size() && payload[end] != '"') ++end;
+    if (end >= payload.size()) return false;
+
+    const std::string hex = payload.substr(start, end - start);
+    if (hex.empty()) return false;
+    unsigned long long bits = 0;
+    try { bits = std::stoull(hex, nullptr, 16); }
+    catch (...) { return false; }
+
+    constexpr unsigned long long kBit17 = 1ULL << 17;
+    if (bits & kBit17) return false;  // already advertised
+
+    bits |= kBit17;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llx", bits);
+    payload.replace(start, end - start, buf);
+    return true;
+}
+
 // Extracts a JSON string-valued field from an arbitrary payload. Only
 // matches top-level flat string fields (no escaping, no nested objects)
 // because we only ever use it to read simple values like subtask_name
@@ -309,6 +456,16 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     }
 
     std::string patched = json;
+
+    // Optional capability patches (off by default; opt-in via obn.conf).
+    // These target printers that under-report storage / file-browser
+    // support, leaving the corresponding Studio UI greyed out.
+    {
+        const auto& cfg = obn::config::current();
+        if (cfg.patch_mqtt_home_flag)        try_rewrite_home_flag(patched);
+        if (cfg.patch_mqtt_ipcam_file)       try_inject_ipcam_file_local(patched);
+        if (cfg.patch_mqtt_internal_storage) try_patch_fun2_internal_storage(patched);
+    }
 
     // Per-print token used to invalidate the cover cache when the user
     // re-uploads a different .3mf under the same filename. We need a
@@ -701,6 +858,9 @@ void Agent::set_config_dir(std::string dir)
     std::string cfg = config_dir();
     if (!cfg.empty()) {
         obn::lan_tls::registry_set_config_dir(cfg);
+        // Reload obn.conf from data_dir and rewrite obn.lan_tls.env (log_dir from
+        // create_agent may differ; BambuSource hydrates from the state file).
+        (void)obn::config::load_or_create(cfg);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
         hydrate_session();

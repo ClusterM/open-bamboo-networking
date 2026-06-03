@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "obn/abi_export.hpp"
+#include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/tunnel_upload.hpp"
@@ -242,9 +243,18 @@ OBN_ABI ft_err ft_tunnel_create(const char* url, FT_TunnelHandle** out)
     OBN_INFO("ft_tunnel_create url=%s", url ? url : "(null)");
 
     if (parse_lan_url(url, t->lan)) {
-        t->is_lan = true;
-        OBN_INFO("ft_tunnel_create: lan ip=%s user=%s", t->lan.ip.c_str(),
-                 t->lan.user.c_str());
+        if (obn::config::current().force_ftps) {
+            // force_ftps: decline the native :6000 FileTransfer tunnel so
+            // Studio's SendToPrinter falls through (tcp -> tutk -> ftp) to
+            // its built-in FTPS path (start_send_gcode_to_sdcard). All ft_*
+            // entry points below already return FT_EIO when is_lan is false.
+            OBN_INFO("ft_tunnel_create: force_ftps set, declining LAN tunnel "
+                     "(ip=%s) -> Studio FTPS fallback", t->lan.ip.c_str());
+        } else {
+            t->is_lan = true;
+            OBN_INFO("ft_tunnel_create: lan ip=%s user=%s", t->lan.ip.c_str(),
+                     t->lan.user.c_str());
+        }
     } else {
         OBN_INFO("ft_tunnel_create: non-local URL, will stub");
     }

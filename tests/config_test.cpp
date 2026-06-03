@@ -154,6 +154,10 @@ static int test_new_keys()
                "cloud_mqtt_port = 1883\n"
                "block_cloud = false\n"
                "force_timelapse_external = 1\n"
+               "force_ftps = 1\n"
+               "patch_mqtt_home_flag = yes\n"
+               "patch_mqtt_ipcam_file = true\n"
+               "patch_mqtt_internal_storage = 1\n"
                "bambusource_log_level = debug\n"
                "bambusource_log_file = /tmp/bs.log\n");
     const auto cfg = obn::config::load_or_create(dir.string());
@@ -161,6 +165,10 @@ static int test_new_keys()
     CHECK(cfg.cloud_mqtt_port == 1883);
     CHECK(cfg.block_cloud == false);
     CHECK(cfg.force_timelapse_external == true);
+    CHECK(cfg.force_ftps == true);
+    CHECK(cfg.patch_mqtt_home_flag == true);
+    CHECK(cfg.patch_mqtt_ipcam_file == true);
+    CHECK(cfg.patch_mqtt_internal_storage == true);
     CHECK(cfg.bambusource_log_level == "debug");
     CHECK(cfg.bambusource_log_file == "/tmp/bs.log");
     return 0;
@@ -175,6 +183,10 @@ static int test_new_keys_defaults()
     CHECK(cfg.cloud_mqtt_port == 8883);
     CHECK(cfg.block_cloud == true);
     CHECK(cfg.force_timelapse_external == false);
+    CHECK(cfg.force_ftps == false);
+    CHECK(cfg.patch_mqtt_home_flag == false);
+    CHECK(cfg.patch_mqtt_ipcam_file == false);
+    CHECK(cfg.patch_mqtt_internal_storage == false);
     CHECK(cfg.bambusource_log_level.empty());
     CHECK(cfg.bambusource_log_file.empty());
     return 0;

@@ -22,6 +22,8 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
     // appends to <log_dir>/obn.log (same folder as Studio's logs).
     // Must run before the first OBN_* line.
     obn::log::configure_from_log_dir(log_dir);
+    // load_or_create mirrors force_ftps / skip_verify into obn.lan_tls.env once
+    // set_config_dir provides config_dir (see Agent::set_config_dir).
 
     // MSVC's preprocessor (in /Zc:preprocessor-disabled mode, which is the
     // default for v142) refuses #ifdef directives inside macro arguments,

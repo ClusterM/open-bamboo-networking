@@ -399,6 +399,7 @@ set(_obn_bambusource_sources
     stubs/rtsp_client.cpp
     stubs/rtsp_passthrough.cpp
     src/config.cpp
+    src/ftps.cpp
     src/json_lite.cpp
     src/tunnel_local.cpp
     src/tls_dial.cpp
@@ -418,7 +419,8 @@ if(WIN32)
 endif()
 
 add_library(BambuSource SHARED ${_obn_bambusource_sources})
-target_include_directories(BambuSource PRIVATE include stubs ${OBN_GENERATED_DIR})
+# `src` is on the include path for src/ftps.cpp's private ftps_parse.hpp.
+target_include_directories(BambuSource PRIVATE include src stubs ${OBN_GENERATED_DIR})
 if(WIN32)
     set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "")
     target_link_libraries(BambuSource PRIVATE
@@ -645,9 +647,11 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     add_executable(config_test tests/config_test.cpp
         src/config.cpp
+        src/lan_tls.cpp
         src/log.cpp
         src/os_compat.cpp)
     target_include_directories(config_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(config_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME config COMMAND config_test)
 
     add_executable(remote_name_test tests/remote_name_test.cpp

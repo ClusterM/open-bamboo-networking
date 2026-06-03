@@ -148,19 +148,23 @@ echo "  -> obn-macos-arm64.tar.gz"
 
 # ── macOS x64 (Intel) ────────────────────────────────────────────────────
 
-echo "Assembling obn-macos-x64..."
-STAGE="$OUTDIR/obn-macos-x64"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-collect_abi_dirs "obn-macos-x64-v*" "$STAGE"
-cp "$REPO_ROOT/packaging/install.sh" "$STAGE/"
-cp "$REPO_ROOT/packaging/install.command" "$STAGE/"
-chmod +x "$STAGE/install.sh" "$STAGE/install.command"
-write_version_file "$STAGE"
-generate_readme "macOS (Intel)" "install.command" \
-    "Double-click install.command in Finder, or run:  ./install.sh" "$STAGE/README.txt"
-(cd "$OUTDIR" && tar czf obn-macos-x64.tar.gz obn-macos-x64/)
-echo "  -> obn-macos-x64.tar.gz"
+if ls "$ARTIFACTS"/obn-macos-x64-v* 1>/dev/null 2>&1; then
+    echo "Assembling obn-macos-x64..."
+    STAGE="$OUTDIR/obn-macos-x64"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE"
+    collect_abi_dirs "obn-macos-x64-v*" "$STAGE"
+    cp "$REPO_ROOT/packaging/install.sh" "$STAGE/"
+    cp "$REPO_ROOT/packaging/install.command" "$STAGE/"
+    chmod +x "$STAGE/install.sh" "$STAGE/install.command"
+    write_version_file "$STAGE"
+    generate_readme "macOS (Intel)" "install.command" \
+        "Double-click install.command in Finder, or run:  ./install.sh" "$STAGE/README.txt"
+    (cd "$OUTDIR" && tar czf obn-macos-x64.tar.gz obn-macos-x64/)
+    echo "  -> obn-macos-x64.tar.gz"
+else
+    echo "Skipping obn-macos-x64 (no Intel macOS CI artifacts)"
+fi
 
 # ── Done ─────────────────────────────────────────────────────────────────
 

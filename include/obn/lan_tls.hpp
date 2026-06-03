@@ -5,6 +5,10 @@
 
 typedef struct ssl_ctx_st SSL_CTX;
 
+namespace obn::config {
+struct Settings;
+}
+
 namespace obn::lan_tls {
 
 // True unless OBN_SKIP_TLS_VERIFY is 1/true/yes/y/t.
@@ -37,5 +41,9 @@ const char* resolve_lan_ca_file();
 
 // Process env (OBN_LAN_TLS_PEER_<ip>) — IPC from libbambu_networking.
 const char* resolve_lan_peer_cert(const char* ip, const char* serial);
+
+// Mirror selected obn.conf flags for libBambuSource (separate dlopen): updates
+// <config_dir>/obn.lan.tls.env when config_dir is known, plus process env.
+void propagate_cross_so_env(const obn::config::Settings& cfg);
 
 } // namespace obn::lan_tls

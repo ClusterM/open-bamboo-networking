@@ -606,6 +606,19 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
 
+    // Hard stop: never push a print file through Bambu's cloud when the
+    // user has opted out. Studio normally avoids this path because the
+    // printer is never marked cloud-online under block_cloud, but a future
+    // Studio update or unexpected dispatch must not be able to upload to
+    // S3 behind the user's back. See issue #41.
+    if (obn::config::current().block_cloud) {
+        OBN_WARN("run_cloud_print_job: blocked by block_cloud");
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_INVALID_HANDLE,
+                                 "cloud print blocked by config");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
     auto session = user_session_snapshot();
     if (session.access_token.empty() || session.user_id.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,

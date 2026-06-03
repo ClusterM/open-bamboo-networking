@@ -1,12 +1,13 @@
 #pragma once
 
-// Header-only ENV IPC between libbambu_networking and libBambuSource (same
-// process, separate dlopen). Networking syncs registry -> setenv; BambuSource
-// reads via env_var_get().
+// IPC between libbambu_networking and libBambuSource (same process, separate
+// dlopen). Primary channel: <config_dir>/obn.lan_tls.env (written by the
+// plugin, hydrated once by BambuSource via env_var_get). Process env is a
+// best-effort mirror only.
 //
-// Windows: registry writes use SetEnvironmentVariableA AND _putenv_s; reads use
-// GetEnvironmentVariableA. Mixing SetEnvironmentVariable with getenv() does NOT
-// work — the CRT cache is not updated (wait_env_serial would spin forever).
+// Windows: do not rely on getenv() across DLLs — networking writes with
+// SetEnvironmentVariableA + _putenv_s; BambuSource reads GetEnvironmentVariableA
+// and, on miss, loads obn.lan_tls.env (CRT getenv alone is not enough).
 
 #include <chrono>
 #include <cstdlib>
@@ -25,6 +26,9 @@ inline constexpr const char* kEnvConfigDir    = "OBN_CONFIG_DIR";
 inline constexpr const char* kEnvIpPrefix     = "OBN_LAN_TLS_IP_";
 inline constexpr const char* kEnvPeerPrefix   = "OBN_LAN_TLS_PEER_";
 inline constexpr const char* kEnvSkipVerify   = "OBN_SKIP_TLS_VERIFY";
+// Read by libBambuSource (separate config singleton); set from obn.conf in
+// propagate_cross_so_env().
+inline constexpr const char* kEnvForceFtps    = "OBN_FORCE_FTPS";
 inline constexpr const char* kEnvSerialWaitMs = "OBN_LAN_TLS_SERIAL_WAIT_MS";
 inline constexpr const char* kLanTlsStateFile = "obn.lan_tls.env";
 

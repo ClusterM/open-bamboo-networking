@@ -63,6 +63,10 @@ OBN_ABI int bambu_network_add_subscribe(void* agent, std::vector<std::string> de
 {
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("bambu_network_add_subscribe: blocked by block_cloud");
+        return BAMBU_NETWORK_SUCCESS;
+    }
     OBN_INFO("bambu_network_add_subscribe(%zu devs)", dev_list.size());
     return a->cloud_add_subscribe(dev_list);
 }
@@ -71,6 +75,10 @@ OBN_ABI int bambu_network_del_subscribe(void* agent, std::vector<std::string> de
 {
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("bambu_network_del_subscribe: blocked by block_cloud");
+        return BAMBU_NETWORK_SUCCESS;
+    }
     OBN_INFO("bambu_network_del_subscribe(%zu devs)", dev_list.size());
     return a->cloud_del_subscribe(dev_list);
 }

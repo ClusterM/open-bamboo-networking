@@ -33,6 +33,14 @@ struct Settings {
     // Print behavior overrides
     bool force_timelapse_external = false;
 
+    // File transfer
+    bool force_ftps               = false;
+
+    // MQTT push_status patches (all off by default)
+    bool patch_mqtt_home_flag        = false;
+    bool patch_mqtt_ipcam_file       = false;
+    bool patch_mqtt_internal_storage = false;
+
     // BambuSource logging (read-only via load_if_exists)
     std::string bambusource_log_level;
     std::string bambusource_log_file;

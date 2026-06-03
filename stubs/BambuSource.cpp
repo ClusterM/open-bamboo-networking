@@ -69,6 +69,7 @@
 // from that same thread. No global locks are held.
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
 
 #include "obn/os_compat.hpp"
@@ -94,6 +95,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
@@ -101,14 +104,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
+#include "obn/config.hpp"
+#include "obn/ftps.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/lan_tls_env.hpp"
@@ -394,7 +401,24 @@ constexpr size_t kMaxFrameSize = 1u << 20;
 // --------------------------------------------------------------------
 
 constexpr int kCtrlType    = 0x3001;
-constexpr int kResContinue = 1;
+
+// PrinterFileSystem command types (req.cmdtype). Only the ones the
+// FTPS bridge serves locally are listed; everything else is forwarded
+// to firmware verbatim.
+constexpr int kCmdListInfo            = 0x0001;
+constexpr int kCmdSubFile             = 0x0002;
+constexpr int kCmdFileDel             = 0x0003;
+constexpr int kCmdFileDownload        = 0x0004;
+constexpr int kCmdRequestMediaAbility = 0x0007;
+constexpr int kCmdTaskCancel          = 0x1000;
+
+// PrinterFileSystem result codes (reply.result).
+constexpr int kResOK           = 0;
+constexpr int kResContinue     = 1;
+constexpr int kResErrCancel    = 4;
+constexpr int kResFileNoExist  = 10;
+constexpr int kResStorUnavail  = 17;
+constexpr int kResApiUnsupport = 18;
 
 struct CtrlRequest {
     int         cmdtype = 0;
@@ -474,12 +498,27 @@ struct Tunnel {
 
     std::unique_ptr<obn::tunnel_local::Session> tl_session;
 
+    // ---- FTPS bridge state (force_ftps=1) ----
+    // When force_ftps is enabled we serve LIST_INFO / FILE_DOWNLOAD /
+    // SUB_FILE / REQUEST_MEDIA_ABILITY locally over FTPS (port 990)
+    // instead of forwarding them over the native :6000 CTRL channel.
+    std::unique_ptr<obn::ftps::Client> ftp;
+    // True if the FTPS root == storage mount (P2S / USB-only printers).
+    bool             root_is_storage = false;
+    // Studio-facing label: "sdcard" (legacy SD mount) or "udisk" (USB).
+    std::string      storage_label;
+    // FTPS path prefix: "/sdcard", "/usb", or "" when root IS the storage.
+    std::string      ftp_prefix;
+
     // CTRL request inbox (Bambu_SendMessage) and reply outbox
     // (Bambu_ReadSample). Both guarded by ctrl_mu.
     std::mutex                 ctrl_mu;
     std::condition_variable    ctrl_cv;
     std::deque<CtrlRequest>    ctrl_in;
     std::deque<CtrlReply>      ctrl_out;
+    // Sequence numbers the caller asked to cancel. The FTPS handlers
+    // check this set between multi-chunk responses (long downloads).
+    std::unordered_set<int>    ctrl_cancelled;
     std::atomic<bool>          ctrl_stop{false};
     std::thread                ctrl_worker;
 
@@ -678,6 +717,674 @@ void push_reply(Tunnel* t, CtrlReply r)
     t->ctrl_cv.notify_all();
 }
 
+// --------------------------------------------------------------------
+// FTPS bridge (force_ftps=1): serve the file browser over FTPS (990)
+// instead of the native TLS :6000 CTRL protocol. Used as a workaround
+// for printers whose :6000 file browser is broken (some A1 firmware).
+// Thumbnails are NOT served in this mode (stubbed with empty blobs);
+// only file listing, download and whole-archive (zip) fetches work.
+// --------------------------------------------------------------------
+
+// True when the user enabled the FTPS file-transfer workaround.
+// BambuSource compiles its own copy of config.cpp (self-contained .so),
+// so config::current() here returns defaults — the main plugin's
+// load_or_create never touches our static. The main plugin's
+// Main plugin writes OBN_FORCE_FTPS into <config_dir>/obn.lan_tls.env;
+// env_var_get hydrates that file on miss (required on Windows across DLLs).
+bool ftps_bridge_enabled()
+{
+    const char* env = obn::lan_tls::env_var_get(obn::lan_tls::kEnvForceFtps);
+    return env && env[0] == '1';
+}
+
+// Builds the on-wire reply bytes Studio expects: the
+// `{cmdtype, sequence, result, reply}` envelope, optionally followed by
+// "\n\n" and a binary blob.
+std::string make_wire_reply(const obn::json::Value& env,
+                            const std::uint8_t*     blob,
+                            std::size_t             blob_len)
+{
+    std::string s = env.dump();
+    if (blob_len > 0) {
+        s += "\n\n";
+        s.append(reinterpret_cast<const char*>(blob), blob_len);
+    }
+    return s;
+}
+
+obn::json::Value make_reply_envelope(int cmdtype, int sequence, int result,
+                                     obn::json::Value reply)
+{
+    obn::json::Object o;
+    o["cmdtype"]  = obn::json::Value(static_cast<double>(cmdtype));
+    o["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    o["result"]   = obn::json::Value(static_cast<double>(result));
+    o["reply"]    = std::move(reply);
+    return obn::json::Value(std::move(o));
+}
+
+bool ctrl_is_cancelled(Tunnel* t, int sequence)
+{
+    std::lock_guard<std::mutex> lk(t->ctrl_mu);
+    return t->ctrl_cancelled.count(sequence) > 0;
+}
+
+// Removes the sequence from the cancelled set on scope exit so the set
+// does not grow unbounded during a long-lived CTRL session.
+struct CancelledGuard {
+    Tunnel* t;
+    int     seq;
+    ~CancelledGuard() {
+        std::lock_guard<std::mutex> lk(t->ctrl_mu);
+        t->ctrl_cancelled.erase(seq);
+    }
+};
+
+// Connects a fresh FTPS client on demand (first CTRL request) and probes
+// the storage mount. Kept on the tunnel so requests reuse the channel.
+std::string ensure_ftp(Tunnel* t)
+{
+    if (t->ftp) return {};
+    t->ftp = std::make_unique<obn::ftps::Client>();
+    obn::ftps::ConnectConfig cfg;
+    cfg.host     = t->url.host;
+    cfg.port     = 990;
+    cfg.username = t->url.user.empty() ? "bblp" : t->url.user;
+    cfg.password = t->url.passwd;
+    if (!obn::lan_tls::skip_verify_from_env()) {
+        if (const char* ca = obn::lan_tls::resolve_lan_ca_file()) {
+            cfg.ca_file = ca;
+        }
+        if (const char* serial = obn::lan_tls::wait_env_serial(
+                cfg.host.c_str(), obn::lan_tls::serial_env_wait_ms())) {
+            cfg.tls_verify_hostname = serial;
+        }
+    }
+    log_fmt(t->logger, t->log_ctx,
+            "ctrl: FTPS connect host=%s user=%s", cfg.host.c_str(),
+            cfg.username.c_str());
+    std::string err = t->ftp->connect(cfg);
+    if (!err.empty()) {
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: FTPS connect failed: %s", err.c_str());
+        t->ftp.reset();
+        return err;
+    }
+
+    // Probe storage roots to figure out our prefix. P1/X1 with an SD
+    // card exposes `/sdcard`; P2S/A-series with a USB stick exposes
+    // `/usb`. Some P2S units expose neither because the root IS storage.
+    if (t->ftp->cwd("/sdcard").empty()) {
+        t->storage_label   = "sdcard";
+        t->ftp_prefix      = "/sdcard";
+        t->root_is_storage = false;
+    } else if (t->ftp->cwd("/usb").empty()) {
+        t->storage_label   = "udisk";
+        t->ftp_prefix      = "/usb";
+        t->root_is_storage = false;
+    } else if (t->ftp->cwd("/").empty()) {
+        // USB-only printers: FTPS root is the stick; Studio expects "udisk".
+        t->storage_label   = "udisk";
+        t->ftp_prefix      = "";
+        t->root_is_storage = true;
+    } else {
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: no accessible storage mount (neither /sdcard, /usb, nor /)");
+        return "no storage mount";
+    }
+    log_fmt(t->logger, t->log_ctx,
+            "ctrl: storage=%s prefix='%s' root_is_storage=%d",
+            t->storage_label.c_str(), t->ftp_prefix.c_str(),
+            t->root_is_storage ? 1 : 0);
+    return {};
+}
+
+// Bambu firmware drops idle FTPS control connections after ~5 minutes.
+// Reconnect-once on first error masks the timeout transparently.
+std::string reconnect_ftp(Tunnel* t)
+{
+    if (t->ftp) {
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: dropping stale FTPS session");
+        t->ftp->quit();
+        t->ftp.reset();
+    }
+    return ensure_ftp(t);
+}
+
+// Subtree where Studio's `type` argument routes:
+//   timelapse -> <prefix>/timelapse, video -> <prefix>/ipcam,
+//   model / other -> <prefix>/ (root).
+std::string resolve_subtree(const Tunnel* t, const std::string& type)
+{
+    if (type == "timelapse") return t->ftp_prefix + "/timelapse";
+    if (type == "video")     return t->ftp_prefix + "/ipcam";
+    return t->ftp_prefix.empty() ? "/" : t->ftp_prefix;
+}
+
+// True when req.storage (from LIST_INFO) targets the volume we probed on
+// FTPS. Studio uses "" / absent for External, "internal" for Internal
+// timelapse tab, and on P2S also "emmc" / "udisk". The FTPS bridge only
+// serves one mount — requests for internal/emmc when we probed udisk must
+// not return the external listing (empty list instead).
+bool ftps_storage_matches_request(const Tunnel* t, const std::string& req_storage)
+{
+    if (req_storage.empty()) {
+        // External tab: match udisk/sdcard mounts, not a hypothetical emmc-only probe.
+        return t->storage_label != "emmc";
+    }
+    if (req_storage == "internal" || req_storage == "emmc")
+        return t->storage_label == "emmc";
+    if (req_storage == "udisk" || req_storage == "usb")
+        return t->storage_label == "udisk";
+    if (req_storage == "sdcard")
+        return t->storage_label == "sdcard";
+    return req_storage == t->storage_label;
+}
+
+// Extensions a listing should surface to Studio for a given file type.
+bool keep_for_type(const std::string& type, const std::string& name)
+{
+    auto ends_with = [&](const char* suf) {
+        std::size_t n = std::strlen(suf);
+        return name.size() >= n &&
+               std::equal(name.end() - n, name.end(), suf,
+                          [](char a, char b) {
+                              return std::tolower(static_cast<unsigned char>(a)) ==
+                                     std::tolower(static_cast<unsigned char>(b));
+                          });
+    };
+    if (type == "timelapse") return ends_with(".mp4") || ends_with(".avi");
+    if (type == "video")     return ends_with(".mp4");
+    if (type == "model")     return ends_with(".3mf") || ends_with(".gcode")
+                                 || ends_with(".gcode.3mf");
+    return true;
+}
+
+// Time formatter Studio expects in LIST_INFO entries.
+std::string format_time_studio(std::uint64_t epoch)
+{
+    if (epoch == 0) return "";
+    std::time_t tt = static_cast<std::time_t>(epoch);
+    std::tm tm{};
+    obn::os::gmtime_safe(tt, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%F %T", &tm);
+    return buf;
+}
+
+void ftps_handle_media_ability(Tunnel* t, int sequence,
+                               const obn::json::Value& /*req*/)
+{
+    std::string err = ensure_ftp(t);
+    obn::json::Object reply;
+    obn::json::Array  storage;
+    if (err.empty()) storage.emplace_back(t->storage_label);
+    reply["storage"] = obn::json::Value(std::move(storage));
+    auto env = make_reply_envelope(kCmdRequestMediaAbility, sequence,
+                                   err.empty() ? kResOK : kResStorUnavail,
+                                   obn::json::Value(std::move(reply)));
+    push_reply(t, {make_wire_reply(env, nullptr, 0)});
+}
+
+void ftps_handle_list_info(Tunnel* t, int sequence, const obn::json::Value& req)
+{
+    std::string type    = req.find("type").as_string();
+    std::string storage = req.find("storage").as_string();
+    std::string err     = ensure_ftp(t);
+    if (!err.empty()) {
+        auto env = make_reply_envelope(kCmdListInfo, sequence, kResStorUnavail,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    if (!ftps_storage_matches_request(t, storage)) {
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: LIST_INFO type=%s storage=%s not served by FTPS mount %s",
+                type.c_str(), storage.c_str(), t->storage_label.c_str());
+        obn::json::Object reply;
+        reply["file_lists"] = obn::json::Value(obn::json::Array{});
+        auto env = make_reply_envelope(kCmdListInfo, sequence, kResOK,
+                                       obn::json::Value(std::move(reply)));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    std::string path = resolve_subtree(t, type);
+    std::vector<obn::ftps::Entry> entries;
+    err = t->ftp->list_entries(path, &entries);
+    if (!err.empty()) {
+        // Could be a missing directory or a stale FTPS session. Retry
+        // once with a fresh session before surfacing an empty list.
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: LIST_INFO type=%s path=%s: %s -- reconnecting once",
+               type.c_str(), path.c_str(), err.c_str());
+        if (reconnect_ftp(t).empty()) {
+            path = resolve_subtree(t, type);
+            entries.clear();
+            err = t->ftp->list_entries(path, &entries);
+        }
+    }
+    if (!err.empty()) {
+        // Directory missing (e.g. no timelapses yet): return empty list.
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: LIST_INFO type=%s path=%s: %s (returning empty)",
+                type.c_str(), path.c_str(), err.c_str());
+        obn::json::Object reply;
+        reply["file_lists"] = obn::json::Value(obn::json::Array{});
+        auto env = make_reply_envelope(kCmdListInfo, sequence, kResOK,
+                                       obn::json::Value(std::move(reply)));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+
+    obn::json::Array files;
+    for (const auto& e : entries) {
+        if (e.is_dir) continue;
+        if (!keep_for_type(type, e.name)) continue;
+        obn::json::Object f;
+        f["name"] = obn::json::Value(e.name);
+        std::string full = (path == "/") ? ("/" + e.name)
+                                         : (path + "/" + e.name);
+        f["path"] = obn::json::Value(full);
+        f["size"] = obn::json::Value(static_cast<double>(e.size));
+        if (e.mtime != 0) {
+            f["time"] = obn::json::Value(static_cast<double>(e.mtime));
+            f["date"] = obn::json::Value(format_time_studio(e.mtime));
+        }
+        files.emplace_back(obn::json::Value(std::move(f)));
+    }
+    obn::json::Object reply;
+    reply["file_lists"] = obn::json::Value(std::move(files));
+    auto env = make_reply_envelope(kCmdListInfo, sequence, kResOK,
+                                   obn::json::Value(std::move(reply)));
+    push_reply(t, {make_wire_reply(env, nullptr, 0)});
+}
+
+// SUB_FILE in FTPS mode:
+//   * zip=true (FetchModel): stream the whole .3mf archive back in
+//     256 KB chunks so Studio's load_gcode_3mf_from_stream succeeds.
+//   * everything else (thumbnails / metadata): stubbed -- reply size=0
+//     for each requested entry so Studio falls back to its default icon
+//     instead of hanging. Thumbnails are not available over FTPS.
+void ftps_handle_sub_file(Tunnel* t, int sequence, const obn::json::Value& req)
+{
+    CancelledGuard cg{t, sequence};
+    std::string err = ensure_ftp(t);
+    if (!err.empty()) {
+        auto env = make_reply_envelope(kCmdSubFile, sequence, kResStorUnavail,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+
+    obn::json::Value paths_v = req.find("paths");
+    obn::json::Value files_v = req.find("files");
+    const auto& paths = paths_v.as_array();
+    const auto& files = files_v.as_array();
+    bool zip_mode = req.find("zip").as_bool(false);
+
+    auto push_chunk = [&](int result, const obn::json::Object& extra,
+                          const std::uint8_t* blob, std::size_t blen) {
+        obn::json::Object r = extra;
+        auto env = make_reply_envelope(kCmdSubFile, sequence, result,
+                                       obn::json::Value(std::move(r)));
+        push_reply(t, {make_wire_reply(env, blob, blen)});
+    };
+
+    if (!paths.empty() && zip_mode) {
+        // Studio wants a real ZIP archive (FetchModel). Hand back the
+        // source .3mf bytes unchanged, streamed in chunks. Buffer the
+        // whole archive first so the LAST non-empty chunk is reliably
+        // flagged continue=false even when the size is an exact multiple
+        // of the chunk boundary. .3mf files on the printer are typically
+        // single-digit MB; the worst case is ~50-100 MB for complex
+        // multi-plate projects, which is acceptable for a transient buffer.
+        std::vector<std::string> bases;
+        bases.reserve(paths.size());
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            std::string full = paths[i].as_string();
+            auto hash = full.find('#');
+            if (hash != std::string::npos) full = full.substr(0, hash);
+            if (std::find(bases.begin(), bases.end(), full) == bases.end())
+                bases.push_back(full);
+        }
+        constexpr std::size_t kChunkSize = 256 * 1024;
+        for (std::size_t bi = 0; bi < bases.size(); ++bi) {
+            const std::string& full = bases[bi];
+            if (ctrl_is_cancelled(t, sequence)) {
+                push_chunk(kResErrCancel, {}, nullptr, 0);
+                return;
+            }
+            std::uint64_t total_size = 0;
+            t->ftp->size(full, &total_size);
+            std::vector<std::uint8_t> archive;
+            archive.reserve(static_cast<std::size_t>(
+                total_size ? total_size : kChunkSize));
+            bool cancelled = false;
+            auto retr_into_archive = [&]() {
+                archive.clear();
+                cancelled = false;
+                return t->ftp->retr(full, [&](const void* data, std::size_t len) {
+                    if (ctrl_is_cancelled(t, sequence)) { cancelled = true; return false; }
+                    const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
+                    archive.insert(archive.end(), p, p + len);
+                    return true;
+                });
+            };
+            std::string rerr = retr_into_archive();
+            if (!rerr.empty() && !cancelled) {
+                log_at(LL_DEBUG, t->logger, t->log_ctx,
+                       "ctrl: SUB_FILE(zip) %s failed (%s) -- reconnecting once",
+                       full.c_str(), rerr.c_str());
+                if (reconnect_ftp(t).empty()) {
+                    t->ftp->size(full, &total_size);
+                    rerr = retr_into_archive();
+                }
+            }
+            if (cancelled) {
+                push_chunk(kResErrCancel, {}, nullptr, 0);
+                return;
+            }
+            if (!rerr.empty()) {
+                log_fmt(t->logger, t->log_ctx,
+                        "ctrl: SUB_FILE(zip) %s failed: %s", full.c_str(),
+                        rerr.c_str());
+                auto env = make_reply_envelope(kCmdSubFile, sequence,
+                                               kResFileNoExist,
+                                               obn::json::Value(obn::json::Object{}));
+                push_reply(t, {make_wire_reply(env, nullptr, 0)});
+                return;
+            }
+
+            const bool is_last_file = (bi + 1 == bases.size());
+            const std::size_t total = archive.size();
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: SUB_FILE(zip) seq=%d %s bytes=%zu last_file=%d",
+                    sequence, full.c_str(), total, is_last_file ? 1 : 0);
+
+            if (total == 0) {
+                obn::json::Object extra;
+                extra["path"]     = obn::json::Value(full);
+                extra["mimetype"] = obn::json::Value("application/zip");
+                extra["size"]     = obn::json::Value(static_cast<double>(0));
+                extra["offset"]   = obn::json::Value(static_cast<double>(0));
+                extra["total"]    = obn::json::Value(static_cast<double>(0));
+                extra["continue"] = obn::json::Value(false);
+                push_chunk(is_last_file ? kResOK : kResContinue, extra, nullptr, 0);
+                continue;
+            }
+
+            std::size_t offset = 0;
+            while (offset < total) {
+                std::size_t chunk = std::min(kChunkSize, total - offset);
+                bool last_chunk = (offset + chunk == total);
+                obn::json::Object extra;
+                extra["path"]     = obn::json::Value(full);
+                extra["mimetype"] = obn::json::Value("application/zip");
+                extra["size"]     = obn::json::Value(static_cast<double>(chunk));
+                extra["offset"]   = obn::json::Value(static_cast<double>(offset));
+                extra["total"]    = obn::json::Value(static_cast<double>(total));
+                extra["continue"] = obn::json::Value(!last_chunk);
+                bool is_final = last_chunk && is_last_file;
+                push_chunk(is_final ? kResOK : kResContinue, extra,
+                           archive.data() + offset, chunk);
+                offset += chunk;
+            }
+        }
+        return;
+    }
+
+    if (!paths.empty()) {
+        // Thumbnails / metadata: not available over FTPS. Reply size=0
+        // for each entry, echoing the request path so Studio matches the
+        // reply to the right File and shows its default icon.
+        std::size_t total = paths.size();
+        for (std::size_t i = 0; i < total; ++i) {
+            if (ctrl_is_cancelled(t, sequence)) {
+                push_chunk(kResErrCancel, {}, nullptr, 0);
+                return;
+            }
+            obn::json::Object extra;
+            extra["path"]     = obn::json::Value(paths[i].as_string());
+            extra["mimetype"] = obn::json::Value("application/octet-stream");
+            extra["size"]     = obn::json::Value(static_cast<double>(0));
+            extra["offset"]   = obn::json::Value(static_cast<double>(0));
+            extra["total"]    = obn::json::Value(static_cast<double>(0));
+            push_chunk((i + 1 == total) ? kResOK : kResContinue, extra, nullptr, 0);
+        }
+        return;
+    }
+
+    if (!files.empty()) {
+        // Legacy per-name thumbnail fetch: also stubbed.
+        std::size_t total = files.size();
+        for (std::size_t i = 0; i < total; ++i) {
+            if (ctrl_is_cancelled(t, sequence)) {
+                push_chunk(kResErrCancel, {}, nullptr, 0);
+                return;
+            }
+            obn::json::Object extra;
+            extra["name"]     = obn::json::Value(files[i].as_string());
+            extra["mimetype"] = obn::json::Value("image/jpeg");
+            extra["size"]     = obn::json::Value(static_cast<double>(0));
+            push_chunk((i + 1 == total) ? kResOK : kResContinue, extra, nullptr, 0);
+        }
+        return;
+    }
+
+    push_chunk(kResApiUnsupport, {}, nullptr, 0);
+}
+
+void ftps_handle_file_download(Tunnel* t, int sequence,
+                               const obn::json::Value& req)
+{
+    CancelledGuard cg{t, sequence};
+    std::string err = ensure_ftp(t);
+    if (!err.empty()) {
+        auto env = make_reply_envelope(kCmdFileDownload, sequence, kResStorUnavail,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    std::string path = req.find("path").as_string();
+    if (path.empty()) path = req.find("file").as_string();
+    if (path.empty()) {
+        auto env = make_reply_envelope(kCmdFileDownload, sequence, kResFileNoExist,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+
+    // Total size up front so Studio's progress bar can render; SIZE also
+    // probes the control connection (reconnect once if it timed out).
+    std::uint64_t total = 0;
+    {
+        std::string size_err = t->ftp->size(path, &total);
+        if (!size_err.empty()) {
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
+                   "ctrl: FILE_DOWNLOAD SIZE %s failed (%s) -- reconnecting once",
+                   path.c_str(), size_err.c_str());
+            if (reconnect_ftp(t).empty()) t->ftp->size(path, &total);
+        }
+    }
+
+    // Studio's download callback reads resp["file_md5"] once
+    // offset+size == total; a missing field aborts the recv thread.
+    std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> md_ctx(
+        EVP_MD_CTX_new(),
+        [](EVP_MD_CTX* c){ if (c) EVP_MD_CTX_free(c); });
+    if (!md_ctx || EVP_DigestInit_ex(md_ctx.get(), EVP_md5(), nullptr) != 1) {
+        auto env = make_reply_envelope(kCmdFileDownload, sequence, kResFileNoExist,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+
+    constexpr std::size_t kChunkSize = 256 * 1024;
+    std::vector<std::uint8_t> buf;
+    buf.reserve(kChunkSize);
+    std::uint64_t sent = 0;
+
+    auto finalize_md5 = [&]() -> std::string {
+        unsigned char digest[EVP_MAX_MD_SIZE] = {0};
+        unsigned      digest_len = 0;
+        EVP_DigestFinal_ex(md_ctx.get(), digest, &digest_len);
+        static const char kHex[] = "0123456789abcdef";
+        std::string hex;
+        hex.resize(digest_len * 2);
+        for (unsigned i = 0; i < digest_len; ++i) {
+            hex[2*i    ] = kHex[(digest[i] >> 4) & 0xF];
+            hex[2*i + 1] = kHex[ digest[i]       & 0xF];
+        }
+        return hex;
+    };
+
+    auto flush_chunk = [&](bool last) {
+        obn::json::Object extra;
+        extra["path"]   = obn::json::Value(path);
+        extra["offset"] = obn::json::Value(static_cast<double>(sent));
+        extra["total"]  = obn::json::Value(static_cast<double>(total));
+        extra["size"]   = obn::json::Value(static_cast<double>(buf.size()));
+        if (last) extra["file_md5"] = obn::json::Value(finalize_md5());
+        auto env = make_reply_envelope(kCmdFileDownload, sequence,
+                                       last ? kResOK : kResContinue,
+                                       obn::json::Value(std::move(extra)));
+        push_reply(t, {make_wire_reply(env, buf.data(), buf.size())});
+        sent += buf.size();
+        buf.clear();
+    };
+
+    bool cancelled = false;
+    auto run_retr = [&]() {
+        return t->ftp->retr(path, [&](const void* data, std::size_t len) {
+            if (ctrl_is_cancelled(t, sequence)) { cancelled = true; return false; }
+            EVP_DigestUpdate(md_ctx.get(), data, len);
+            const std::uint8_t* p = static_cast<const std::uint8_t*>(data);
+            while (len > 0) {
+                std::size_t take = std::min(len, kChunkSize - buf.size());
+                buf.insert(buf.end(), p, p + take);
+                p   += take;
+                len -= take;
+                if (buf.size() == kChunkSize) flush_chunk(/*last=*/false);
+            }
+            return true;
+        });
+    };
+    err = run_retr();
+    if (!err.empty() && !cancelled && sent == 0 && buf.empty()) {
+        log_at(LL_DEBUG, t->logger, t->log_ctx,
+               "ctrl: FILE_DOWNLOAD %s failed (%s) -- reconnecting once",
+               path.c_str(), err.c_str());
+        if (reconnect_ftp(t).empty()) {
+            EVP_MD_CTX_reset(md_ctx.get());
+            EVP_DigestInit_ex(md_ctx.get(), EVP_md5(), nullptr);
+            err = run_retr();
+        }
+    }
+
+    if (cancelled) {
+        auto env = make_reply_envelope(kCmdFileDownload, sequence, kResErrCancel,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    if (!err.empty()) {
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: FILE_DOWNLOAD %s failed: %s", path.c_str(), err.c_str());
+        auto env = make_reply_envelope(kCmdFileDownload, sequence, kResFileNoExist,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    // If SIZE failed (or returned 0 for a non-empty file), correct total
+    // from the actual bytes transferred so Studio's offset+size==total
+    // check fires on the final chunk and it reads file_md5.
+    std::uint64_t actual = sent + buf.size();
+    if (total == 0 || total != actual) total = actual;
+    flush_chunk(/*last=*/true);
+}
+
+void ftps_handle_file_del(Tunnel* t, int sequence, const obn::json::Value& req)
+{
+    std::string err = ensure_ftp(t);
+    if (!err.empty()) {
+        auto env = make_reply_envelope(kCmdFileDel, sequence, kResStorUnavail,
+                                       obn::json::Value(obn::json::Object{}));
+        push_reply(t, {make_wire_reply(env, nullptr, 0)});
+        return;
+    }
+    obn::json::Value paths_v = req.find("paths");
+    const auto& paths = paths_v.as_array();
+    obn::json::Array ok_names;
+    int result = kResOK;
+    bool reconnected = false;
+    for (const auto& v : paths) {
+        std::string p = v.as_string();
+        if (p.empty()) continue;
+        std::string e = t->ftp->dele(p);
+        if (!e.empty() && !reconnected) {
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
+                   "ctrl: DELE %s failed (%s) -- reconnecting once",
+                   p.c_str(), e.c_str());
+            reconnected = true;
+            if (reconnect_ftp(t).empty()) e = t->ftp->dele(p);
+        }
+        if (!e.empty()) {
+            log_fmt(t->logger, t->log_ctx, "ctrl: DELE %s failed: %s",
+                    p.c_str(), e.c_str());
+            result = kResFileNoExist;
+        } else {
+            ok_names.emplace_back(obn::json::Value(p));
+        }
+    }
+    obn::json::Object reply;
+    reply["paths"] = obn::json::Value(std::move(ok_names));
+    auto env = make_reply_envelope(kCmdFileDel, sequence, result,
+                                   obn::json::Value(std::move(reply)));
+    push_reply(t, {make_wire_reply(env, nullptr, 0)});
+}
+
+void ftps_handle_task_cancel(Tunnel* t, int sequence, const obn::json::Value& req)
+{
+    obn::json::Value tasks_v = req.find("tasks");
+    const auto& tasks = tasks_v.as_array();
+    obn::json::Array cancelled;
+    {
+        std::lock_guard<std::mutex> lk(t->ctrl_mu);
+        // Cap the set so late/stale cancels from one-shot commands
+        // (LIST_INFO, FILE_DEL, etc.) that don't use CancelledGuard
+        // cannot leak memory over a very long CTRL session.
+        if (t->ctrl_cancelled.size() > 256) t->ctrl_cancelled.clear();
+        for (const auto& v : tasks) {
+            int seq = static_cast<int>(v.as_number());
+            t->ctrl_cancelled.insert(seq);
+            cancelled.emplace_back(obn::json::Value(static_cast<double>(seq)));
+        }
+    }
+    obn::json::Object reply;
+    reply["tasks"] = obn::json::Value(std::move(cancelled));
+    auto env = make_reply_envelope(kCmdTaskCancel, sequence, kResOK,
+                                   obn::json::Value(std::move(reply)));
+    push_reply(t, {make_wire_reply(env, nullptr, 0)});
+}
+
+// Returns true if the request was served locally over FTPS (caller must
+// then skip the native :6000 forward). Only the file-browser cmdtypes
+// are intercepted; everything else falls through to native passthrough.
+bool ftps_dispatch(Tunnel* t, int cmdtype, int sequence,
+                   const obn::json::Value& body)
+{
+    switch (cmdtype) {
+    case kCmdRequestMediaAbility: ftps_handle_media_ability(t, sequence, body); return true;
+    case kCmdListInfo:            ftps_handle_list_info(t, sequence, body);     return true;
+    case kCmdSubFile:             ftps_handle_sub_file(t, sequence, body);      return true;
+    case kCmdFileDownload:        ftps_handle_file_download(t, sequence, body); return true;
+    case kCmdFileDel:             ftps_handle_file_del(t, sequence, body);      return true;
+    case kCmdTaskCancel:          ftps_handle_task_cancel(t, sequence, body);   return true;
+    default:                      return false;
+    }
+}
+
 bool parse_ctrl_request(const std::string& wire, int* cmdtype, int* sequence,
                         obn::json::Value* req)
 {
@@ -725,7 +1432,19 @@ static void native_ctrl_send_worker(Tunnel* t)
         if (!t->ssl || !t->tl_session) continue;
         int cmdtype = 0, sequence = 0;
         obn::json::Value body;
-        if (parse_ctrl_request(req.body, &cmdtype, &sequence, &body)) {
+        bool parsed = parse_ctrl_request(req.body, &cmdtype, &sequence, &body);
+        // force_ftps: serve the file browser over FTPS (990) instead of
+        // forwarding to the native :6000 CTRL channel. Only the
+        // file-browser cmdtypes are intercepted; everything else still
+        // goes to firmware verbatim.
+        if (parsed && ftps_bridge_enabled() &&
+            ftps_dispatch(t, cmdtype, sequence, body)) {
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: FTPS bridge served cmd=0x%04x seq=%d",
+                    cmdtype, sequence);
+            continue;
+        }
+        if (parsed) {
             log_fmt(t->logger, t->log_ctx,
                     "ctrl: native forward cmd=0x%04x seq=%d (%zu bytes)",
                     cmdtype, sequence, req.body.size());
@@ -814,6 +1533,11 @@ void stop_ctrl_mode(Tunnel* t)
     }
     if (t->ctrl_worker.joinable()) t->ctrl_worker.join();
     t->tl_session.reset();
+    if (t->ftp) {
+        t->ftp->quit();
+        t->ftp.reset();
+    }
+    t->ctrl_cancelled.clear();
     t->ctrl_mode = false;
 }
 

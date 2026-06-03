@@ -30,7 +30,8 @@ cloud_mqtt_port = 8883
 
 # --- Cloud access ---------------------------------------------------
 #
-# Block background cloud MQTT/REST connections.
+# Block background cloud MQTT/REST connections, cloud print upload
+# (3mf -> Bambu S3), and cloud topic subscriptions.
 # Auth, preset sync, and bind/unbind are still allowed.
 
 block_cloud = 1
@@ -48,6 +49,45 @@ lan_tls_skip_verify = 0
 # that toggle to internal storage, so this avoids switching it every time.
 
 force_timelapse_external = 0
+
+# --- File transfer --------------------------------------------------
+#
+# Force FTPS (port 990) for file listing and transfer instead of the
+# native TLS :6000 CTRL protocol.  Thumbnails are not available in
+# this mode.  Useful as a workaround when the printer's :6000 file
+# browser is broken (e.g. some A1 firmware versions).
+
+force_ftps = 0
+
+# --- MQTT push_status patches ---------------------------------------
+#
+# Patch incoming MQTT push_status fields on the fly. All disabled by
+# default. Enable only if your printer needs it.
+#
+# Rewrite home_flag SD-card bits from NO_SDCARD (0) to HAS_SDCARD (1).
+# Useful on some A-series (and similar) where Studio greys out "Send to
+# Printer" / "Print via LAN" and shows a red storage tile even though
+# USB storage works over FTPS. Many printers (e.g. P2S) do not need this.
+
+patch_mqtt_home_flag = 0
+
+# Inject ipcam.file block into push_status when the firmware omits it.
+# Without this, Studio shows "Browsing file in storage is not supported"
+# or "not supported in lan mode" and refuses to open the file browser.
+# The file browser actually works (at least on A1), the printer
+# just does not advertise the capability in its MQTT status. Only
+# affects printers that do not report ipcam.file natively (e.g. X1/P1S
+# already advertise it and are not affected).
+
+patch_mqtt_ipcam_file = 0
+
+# Set fun2 bit 17 (is_support_model_internal_storage) so Studio shows
+# the internal storage (eMMC) tab in the file browser. Without this,
+# only external storage (USB) is shown. Firmware often omits this bit
+# even when :6000/FTPS lists emmc; browsing internal memory may still
+# be slow or unreliable (e.g. on P2S) — enable only if you need the tab.
+
+patch_mqtt_internal_storage = 0
 
 # --- BambuSource logging --------------------------------------------
 #
