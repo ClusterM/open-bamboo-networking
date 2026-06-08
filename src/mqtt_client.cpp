@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
@@ -30,25 +31,27 @@ namespace obn::mqtt {
 
 namespace {
 
-std::mutex       g_init_mu;
-int              g_init_refcount = 0;
+std::once_flag g_init_once;
+
+void final_cleanup()
+{
+    ::mosquitto_lib_cleanup();
+}
 
 } // namespace
 
 void global_init()
 {
-    std::lock_guard<std::mutex> lk(g_init_mu);
-    if (g_init_refcount++ == 0) {
+    std::call_once(g_init_once, []() {
         ::mosquitto_lib_init();
-    }
+        std::atexit(&final_cleanup);
+    });
 }
 
 void global_cleanup()
 {
-    std::lock_guard<std::mutex> lk(g_init_mu);
-    if (--g_init_refcount == 0) {
-        ::mosquitto_lib_cleanup();
-    }
+    // Intentionally a no-op. The mosquitto library stays initialised for the
+    // lifetime of the loaded plugin; the matching mosquitto_lib_cleanup()
 }
 
 const char* Client::err_str(int rc)
