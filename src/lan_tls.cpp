@@ -41,6 +41,7 @@ std::unordered_map<std::string, std::string> g_ip_to_peer_cert;
 std::atomic<bool> g_skip_warn_logged{false};
 bool g_force_ftps{false};
 bool g_lan_tls_skip_verify{false};
+bool g_disable_camera_preview{false};
 
 #if defined(_WIN32)
 bool set_env_var(const char* key, const char* value)
@@ -87,6 +88,7 @@ bool is_obn_ipc_env_key(const char* key)
     if (!key) return false;
     if (std::strcmp(key, kEnvForceFtps) == 0) return true;
     if (std::strcmp(key, kEnvSkipVerify) == 0) return true;
+    if (std::strcmp(key, kEnvDisableCameraPreview) == 0) return true;
     return is_lan_tls_ipc_key(key);
 }
 
@@ -190,6 +192,8 @@ void write_state_file_locked()
     }
     f << kEnvForceFtps << '=' << (g_force_ftps ? '1' : '0') << '\n';
     f << kEnvSkipVerify << '=' << (g_lan_tls_skip_verify ? '1' : '0') << '\n';
+    f << kEnvDisableCameraPreview << '='
+      << (g_disable_camera_preview ? '1' : '0') << '\n';
     if (!f) {
         OBN_WARN("lan_tls: write failed for %s", tmp.string().c_str());
         f.close();
@@ -431,10 +435,13 @@ void propagate_cross_so_env(const obn::config::Settings& cfg)
     // libBambuSource has its own config.cpp; mirror flags into obn.lan_tls.env
     // (primary IPC on Windows) and process env (best-effort within this load).
     std::lock_guard<std::mutex> lk(g_mu);
-    g_force_ftps            = cfg.force_ftps;
-    g_lan_tls_skip_verify   = cfg.lan_tls_skip_verify;
+    g_force_ftps              = cfg.force_ftps;
+    g_lan_tls_skip_verify     = cfg.lan_tls_skip_verify;
+    g_disable_camera_preview  = cfg.disable_camera_preview;
     (void)set_env_var(kEnvForceFtps, cfg.force_ftps ? "1" : "0");
     (void)set_env_var(kEnvSkipVerify, cfg.lan_tls_skip_verify ? "1" : "0");
+    (void)set_env_var(kEnvDisableCameraPreview,
+                      cfg.disable_camera_preview ? "1" : "0");
     if (cfg.lan_tls_skip_verify) warn_skip_once();
     write_state_file_locked();
 }

@@ -433,12 +433,26 @@ void run_upload_job(FT_Tunnel* t, FT_Job* j)
     deliver_result(j, FT_EIO, outcome.wire_result >= 0 ? outcome.wire_result : 0, {});
 }
 
+bool is_mem_preview_download(const obn::tunnel_upload::DownloadRequest& req)
+{
+    if (req.is_mem_file) return true;
+    return req.path.rfind("mem:", 0) == 0;
+}
+
 void run_download_job(FT_Tunnel* t, FT_Job* j)
 {
     obn::tunnel_upload::DownloadRequest req;
     req.path        = j->download_path;
     req.is_mem_file = j->is_mem_file;
     req.target_path = j->target_path;
+
+    if (obn::config::current().disable_camera_preview &&
+        is_mem_preview_download(req)) {
+        OBN_DEBUG("ft: download: blocked mem preview (disable_camera_preview) "
+                  "path=%s", req.path.c_str());
+        deliver_result(j, FT_EIO, 0, {});
+        return;
+    }
 
     obn::tunnel_upload::DownloadCallbacks cb;
     cb.cancelled = [j] {

@@ -29,6 +29,7 @@ inline constexpr const char* kEnvSkipVerify   = "OBN_SKIP_TLS_VERIFY";
 // Read by libBambuSource (separate config singleton); set from obn.conf in
 // propagate_cross_so_env().
 inline constexpr const char* kEnvForceFtps    = "OBN_FORCE_FTPS";
+inline constexpr const char* kEnvDisableCameraPreview = "OBN_DISABLE_CAMERA_PREVIEW";
 inline constexpr const char* kEnvSerialWaitMs = "OBN_LAN_TLS_SERIAL_WAIT_MS";
 inline constexpr const char* kLanTlsStateFile = "obn.lan_tls.env";
 

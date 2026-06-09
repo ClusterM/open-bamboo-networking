@@ -737,6 +737,20 @@ bool ftps_bridge_enabled()
     return env && env[0] == '1';
 }
 
+bool camera_preview_disabled()
+{
+    const char* env =
+        obn::lan_tls::env_var_get(obn::lan_tls::kEnvDisableCameraPreview);
+    return env && env[0] == '1';
+}
+
+bool req_is_mem_download_path(const obn::json::Value& req)
+{
+    std::string path = req.find("path").as_string();
+    if (path.empty()) path = req.find("file").as_string();
+    return !path.empty() && path.rfind("mem:", 0) == 0;
+}
+
 // Builds the on-wire reply bytes Studio expects: the
 // `{cmdtype, sequence, result, reply}` envelope, optionally followed by
 // "\n\n" and a binary blob.
@@ -761,6 +775,18 @@ obn::json::Value make_reply_envelope(int cmdtype, int sequence, int result,
     o["result"]   = obn::json::Value(static_cast<double>(result));
     o["reply"]    = std::move(reply);
     return obn::json::Value(std::move(o));
+}
+
+void stub_blocked_mem_download(Tunnel* t, int sequence, const std::string& path)
+{
+    obn::json::Object extra;
+    extra["path"]   = obn::json::Value(path);
+    extra["offset"] = obn::json::Value(0.0);
+    extra["total"]  = obn::json::Value(0.0);
+    extra["size"]   = obn::json::Value(0.0);
+    auto env = make_reply_envelope(kCmdFileDownload, sequence, kResFileNoExist,
+                                   obn::json::Value(std::move(extra)));
+    push_reply(t, {make_wire_reply(env, nullptr, 0)});
 }
 
 bool ctrl_is_cancelled(Tunnel* t, int sequence)
@@ -1433,6 +1459,16 @@ static void native_ctrl_send_worker(Tunnel* t)
         int cmdtype = 0, sequence = 0;
         obn::json::Value body;
         bool parsed = parse_ctrl_request(req.body, &cmdtype, &sequence, &body);
+        if (parsed && cmdtype == kCmdFileDownload && camera_preview_disabled() &&
+            req_is_mem_download_path(body)) {
+            std::string path = body.find("path").as_string();
+            if (path.empty()) path = body.find("file").as_string();
+            log_fmt(t->logger, t->log_ctx,
+                    "ctrl: mem preview blocked (disable_camera_preview) %s",
+                    path.c_str());
+            stub_blocked_mem_download(t, sequence, path);
+            continue;
+        }
         // force_ftps: serve the file browser over FTPS (990) instead of
         // forwarding to the native :6000 CTRL channel. Only the
         // file-browser cmdtypes are intercepted; everything else still

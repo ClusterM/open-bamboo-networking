@@ -36,6 +36,9 @@ struct Settings {
     // File transfer
     bool force_ftps               = false;
 
+    // Device panel: static "Printer Preview" JPEG (mem:/N over TLS :6000)
+    bool disable_camera_preview      = false;
+
     // MQTT push_status patches (all off by default)
     bool patch_mqtt_home_flag        = false;
     bool patch_mqtt_ipcam_file       = false;
