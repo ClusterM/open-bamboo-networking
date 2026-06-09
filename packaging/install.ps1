@@ -206,7 +206,17 @@ if (-not $MatchedDir -or -not (Test-Path $MatchedDir)) {
     if (-not $available) { $available = "none" }
     Write-Err "No compatible ABI version for $detectedSource (need $AbiPrefix)."
     Write-Err "Available in this package: $available"
-    Write-Err "You may need a newer distribution package from GitHub."
+    if ($Client -eq "orca_slicer") {
+        Write-Err ""
+        Write-Err "Orca is configured for a network plug-in ABI this package does not ship"
+        Write-Err "(often the legacy 01.10.01.x entry). In Orca Slicer open:"
+        Write-Err "  Preferences -> Online -> Network plug-in -> Network plug-in version"
+        Write-Err "and select one of the supported versions listed above (e.g. 02.03.00 or"
+        Write-Err "newer — not the legacy line). Restart Orca if prompted, then re-run"
+        Write-Err "this installer."
+    } else {
+        Write-Err "You may need a newer distribution package from GitHub."
+    }
     Wait-And-Exit
 }
 

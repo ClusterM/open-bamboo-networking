@@ -219,9 +219,22 @@ fi
 
 if [ -z "$MATCHED_DIR" ] || [ ! -d "$MATCHED_DIR" ]; then
     AVAILABLE=$(ls -d "$LIB_DIR"/v*/ 2>/dev/null | xargs -I{} basename {} | sed 's/^v//' | tr '\n' ' ')
-    die "No compatible ABI version for $DETECTED_SOURCE (need ${ABI_PREFIX}).
-  Available in this package: ${AVAILABLE:-none}
+    ERR_MSG="No compatible ABI version for $DETECTED_SOURCE (need ${ABI_PREFIX}).
+  Available in this package: ${AVAILABLE:-none}"
+    if [ "$CLIENT" = "orca_slicer" ]; then
+        ERR_MSG="${ERR_MSG}
+
+  Orca is configured for a network plug-in ABI this package does not ship
+  (often the legacy 01.10.01.x entry). In Orca Slicer open:
+    Preferences -> Online -> Network plug-in -> Network plug-in version
+  and select one of the supported versions listed above (e.g. 02.03.00 or
+  newer — not the legacy line). Restart Orca if prompted, then re-run
+  this installer."
+    else
+        ERR_MSG="${ERR_MSG}
   You may need a newer distribution package from GitHub."
+    fi
+    die "$ERR_MSG"
 fi
 
 MATCHED_VER=$(basename "$MATCHED_DIR" | sed 's/^v//')
