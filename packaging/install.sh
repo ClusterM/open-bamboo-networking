@@ -200,24 +200,9 @@ if [ ! -d "$LIB_DIR" ]; then
     die "lib/ directory not found next to this script"
 fi
 
-# List available versions sorted, try exact match first
-MATCHED_DIR=""
-if [ -d "$LIB_DIR/v${ABI_PREFIX}" ]; then
-    MATCHED_DIR="$LIB_DIR/v${ABI_PREFIX}"
-fi
+MATCHED_DIR="$LIB_DIR/v${ABI_PREFIX}"
 
-if [ -z "$MATCHED_DIR" ]; then
-    # Fall back: pick the highest version <= detected
-    for d in "$LIB_DIR"/v*/; do
-        [ -d "$d" ] || continue
-        v=$(basename "$d" | sed 's/^v//')
-        if [ "$(printf '%s\n%s' "$v" "$ABI_PREFIX" | sort -V | tail -1)" = "$ABI_PREFIX" ]; then
-            MATCHED_DIR="$d"
-        fi
-    done
-fi
-
-if [ -z "$MATCHED_DIR" ] || [ ! -d "$MATCHED_DIR" ]; then
+if [ ! -d "$MATCHED_DIR" ]; then
     AVAILABLE=$(ls -d "$LIB_DIR"/v*/ 2>/dev/null | xargs -I{} basename {} | sed 's/^v//' | tr '\n' ' ')
     ERR_MSG="No compatible ABI version for $DETECTED_SOURCE (need ${ABI_PREFIX}).
   Available in this package: ${AVAILABLE:-none}"

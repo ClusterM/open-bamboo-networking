@@ -191,15 +191,6 @@ if (Test-Path $candidate) {
 }
 
 if (-not $MatchedDir) {
-    $dirs = Get-ChildItem -Path $LibDir -Directory -Filter "v*" |
-            Sort-Object Name
-    foreach ($d in $dirs) {
-        $v = $d.Name -replace '^v', ''
-        if ($v -le $AbiPrefix) { $MatchedDir = $d.FullName }
-    }
-}
-
-if (-not $MatchedDir -or -not (Test-Path $MatchedDir)) {
     $available = (Get-ChildItem -Path $LibDir -Directory -Filter "v*" |
                   Sort-Object Name |
                   ForEach-Object { $_.Name -replace '^v', '' }) -join ', '
