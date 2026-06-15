@@ -134,8 +134,11 @@ bool drive_ssl_connect(SSL* ssl, socket_t fd, int timeout_ms)
 std::string device_cert_path(const std::string& config_dir, const std::string& dev_id)
 {
     std::string base = config_dir;
-    if (!base.empty() && base.back() == '/') base.pop_back();
-    return base + "/certs/" + dev_id + ".pem";
+    if (!base.empty()) {
+        char last = base.back();
+        if (last == '/' || last == '\\') base.pop_back();
+    }
+    return (std::filesystem::path(base) / "certs" / (dev_id + ".pem")).string();
 }
 
 bool ensure_parent_dir(const std::string& file_path)
