@@ -146,9 +146,12 @@ Client::~Client()
     remove_trust_bundle_file(merged_trust_path_);
     merged_trust_path_.clear();
     if (mosq_) {
-        if (loop_started_.load(std::memory_order_acquire)) {
+        // Normally disconnect() already ran (loop_started_ == false) and this
+        // is a plain destroy. If not, shut down gracefully too so we don't
+        // leave a ghost session on the printer (see disconnect()).
+        if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
             ::mosquitto_disconnect(mosq_);
-            ::mosquitto_loop_stop(mosq_, /*force=*/true);
+            ::mosquitto_loop_stop(mosq_, /*force=*/false);
         }
         ::mosquitto_destroy(mosq_);
         mosq_ = nullptr;
@@ -286,58 +289,45 @@ int Client::connect(const ConnectConfig& cfg)
         }
     }
 
+    // Let the loop thread (started below) keep retrying with exponential
+    // backoff (2s..30s) instead of making a single attempt. A transient TCP
+    // timeout — e.g. a P1-series printer that briefly refuses :8883 while it
+    // reaps a stale MQTT session — then self-heals without Studio having to
+    // drive a manual reconnect (GitHub issues #34, #38).
+    ::mosquitto_reconnect_delay_set(mosq_, /*reconnect_delay=*/2,
+                                    /*reconnect_delay_max=*/30,
+                                    /*reconnect_exponential_backoff=*/true);
+
+    // mosquitto_connect_async only kicks off a non-blocking connect; the real
+    // work (TCP + TLS handshake + CONNECT/CONNACK) runs on the loop thread.
+    //
+    // We deliberately do NOT fall back to the synchronous mosquitto_connect:
+    // it blocks the calling Studio ABI/UI thread for the full TCP timeout
+    // (~21s on Windows) and, on failure, mosquitto runs getpeername() on the
+    // already-closed socket — which clobbers the real error with a misleading
+    // WSAENOTSOCK ("not a socket" / "Bad file descriptor"). A failed async
+    // attempt is not fatal: mosquitto_loop_forever() (run by loop_start) sees
+    // MOSQ_ERR_NO_CONN / MOSQ_ERR_ERRNO and reconnects on its own.
     int rc = ::mosquitto_connect_async(mosq_,
                                        cfg.host.c_str(),
                                        cfg.port,
                                        cfg.keepalive_s);
-#if defined(_WIN32)
-    // Snapshot WSAGetLastError() the instant connect_async returns: any
-    // logging/formatting we do on the way to OBN_ERROR can clobber it
-    // (FormatMessage, snprintf-via-CRT, syscalls in obn::os::localtime_safe,
-    // etc. each involve Winsock-adjacent state). Without this snapshot
-    // mosquitto_strerror(MOSQ_ERR_ERRNO) collapses to "No error" because
-    // it hands errno=0 to strerror.
-    int wsa_after_async = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
-#else
-    int wsa_after_async = 0;
-#endif
     if (rc != MOSQ_ERR_SUCCESS) {
-        OBN_ERROR("mqtt connect_async rc=%d (%s)",
-                  rc, detailed_err(rc, wsa_after_async).c_str());
-
+        // INVAL/NOMEM are our own programming/allocation errors and won't fix
+        // themselves, so don't spin up a loop thread for them. Anything else
+        // (notably MOSQ_ERR_ERRNO from a transient TCP failure) is handed to
+        // the loop thread's reconnect logic.
+        if (rc == MOSQ_ERR_INVAL || rc == MOSQ_ERR_NOMEM) {
 #if defined(_WIN32)
-        // Last-ditch fallback: when connect_async dies inside libmosquitto's
-        // non-blocking connect path (e.g. the well-known v2.0.x cycle where
-        // net__try_connect_tcp's WINDOWS_SET_ERRNO sees an errno value that
-        // doesn't match COMPAT_EWOULDBLOCK), the synchronous mosquitto_connect
-        // takes a different code branch (blocking connect, sets non-blocking
-        // *after*) and routinely succeeds where async did not. Try that
-        // exactly once, also still backed by mosquitto_loop_start() for the
-        // network thread.
-        if (rc == MOSQ_ERR_ERRNO) {
-            OBN_WARN("mqtt connect_async failed with WSA=%d; retrying with "
-                     "synchronous mosquitto_connect", wsa_after_async);
-            int rc_sync = ::mosquitto_connect(mosq_,
-                                              cfg.host.c_str(),
-                                              cfg.port,
-                                              cfg.keepalive_s);
-            int wsa_after_sync = (rc_sync == MOSQ_ERR_ERRNO)
-                                 ? ::WSAGetLastError() : 0;
-            if (rc_sync == MOSQ_ERR_SUCCESS) {
-                OBN_INFO("mqtt sync connect succeeded after async failure");
-                rc = MOSQ_ERR_SUCCESS;
-            } else {
-                OBN_ERROR("mqtt sync connect rc=%d (%s)",
-                          rc_sync,
-                          detailed_err(rc_sync, wsa_after_sync).c_str());
-                return rc_sync;
-            }
-        } else {
+            int wsa = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
+            OBN_ERROR("mqtt connect_async rc=%d (%s)", rc, detailed_err(rc, wsa).c_str());
+#else
+            OBN_ERROR("mqtt connect_async rc=%d (%s)", rc, err_str(rc));
+#endif
             return rc;
         }
-#else
-        return rc;
-#endif
+        OBN_INFO("mqtt connect_async rc=%d (%s); loop will reconnect in background",
+                 rc, err_str(rc));
     }
 
     rc = ::mosquitto_loop_start(mosq_);
@@ -390,13 +380,19 @@ int Client::publish(const std::string& topic, const std::string& payload, int qo
 void Client::disconnect()
 {
     if (!mosq_) return;
+    // Request a clean MQTT DISCONNECT so the broker frees the session right
+    // away. This matters on P1-series printers, which accept only a very small
+    // number of concurrent LAN MQTT sessions: a half-open ghost session (left
+    // behind when a forced thread cancel drops the DISCONNECT packet) blocks
+    // the next connect until the firmware reaps it ~1 keepalive later, which
+    // surfaces as "connection failed, works on the second try" (issues #34, #38).
     ::mosquitto_disconnect(mosq_);
     if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
-        // Must match ~Client()'s force=true path: loop_stop(false) can return
-        // before the network thread releases the TLS socket; immediate
-        // destroy() then races (Windows: connect_async -> MOSQ_ERR_ERRNO /
-        // EBADF when Orca disconnects+reconnects LAN MQTT in one UI tick).
-        ::mosquitto_loop_stop(mosq_, /*force=*/true);
+        // force=false: mosquitto_disconnect() set the request-disconnect flag,
+        // so the loop thread flushes the DISCONNECT, closes the socket and
+        // exits on its own; loop_stop then joins it. (force=true would
+        // pthread_cancel the thread mid-write and drop the DISCONNECT.)
+        ::mosquitto_loop_stop(mosq_, /*force=*/false);
     }
     remove_trust_bundle_file(merged_trust_path_);
     merged_trust_path_.clear();

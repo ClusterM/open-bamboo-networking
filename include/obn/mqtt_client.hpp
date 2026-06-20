@@ -109,7 +109,11 @@ private:
     std::string        merged_trust_path_;
 };
 
-// Refcounted mosquitto_lib_init/cleanup. Safe to call any number of times.
+// One-time mosquitto_lib_init for the lifetime of the loaded plugin. global_init
+// is idempotent (std::call_once) and registers the single mosquitto_lib_cleanup
+// for process/DLL teardown via atexit. global_cleanup is a no-op kept for call
+// symmetry: tearing the library down per-Client used to call WSACleanup()
+// mid-process and corrupt Winsock on reconnect
 void global_init();
 void global_cleanup();
 
