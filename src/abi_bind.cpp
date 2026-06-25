@@ -34,6 +34,9 @@ OBN_ABI int bambu_network_bind_detect(void*       agent,
 OBN_ABI int bambu_network_bind(void*       agent,
                                std::string dev_ip,
                                std::string dev_id,
+#if ABI_VERSION >= 0x020800
+                               std::string dev_model,
+#endif
                                std::string sec_link,
                                std::string timezone,
                                bool        improved,
@@ -41,12 +44,24 @@ OBN_ABI int bambu_network_bind(void*       agent,
 {
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_BIND_FAILED;
+#if ABI_VERSION >= 0x020800
+    OBN_INFO("bind dev_ip=%s dev_id=%s dev_model=%s sec_link=%s tz=%s improved=%d",
+             dev_ip.c_str(),
+             dev_id.c_str(),
+             dev_model.c_str(),
+             sec_link.c_str(),
+             timezone.c_str(),
+             improved);
+#else
     OBN_INFO("bind dev_ip=%s dev_id=%s sec_link=%s tz=%s improved=%d",
              dev_ip.c_str(),
              dev_id.c_str(),
              sec_link.c_str(),
              timezone.c_str(),
              improved);
+#endif
+    // TODO: dev_model (get_show_printer_type()) is required by the 02.08.00.xx ABI signature but usage is unknown for now.
+
     return obn::cloud_bind::bind_lan_to_account(
         a, dev_ip, dev_id, sec_link, timezone, improved, std::move(update_fn));
 }
