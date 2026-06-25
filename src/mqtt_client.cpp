@@ -290,12 +290,18 @@ int Client::connect(const ConnectConfig& cfg)
     }
 
     // Let the loop thread (started below) keep retrying with exponential
-    // backoff (2s..30s) instead of making a single attempt. A transient TCP
-    // timeout — e.g. a P1-series printer that briefly refuses :8883 while it
-    // reaps a stale MQTT session — then self-heals without Studio having to
-    // drive a manual reconnect (GitHub issues #34, #38).
-    ::mosquitto_reconnect_delay_set(mosq_, /*reconnect_delay=*/2,
-                                    /*reconnect_delay_max=*/30,
+    // backoff instead of making a single attempt. A transient TCP timeout —
+    // e.g. a P1-series printer that briefly refuses :8883 while it reaps a
+    // stale MQTT session — then self-heals without Studio having to drive a
+    // manual reconnect (GitHub issues #34, #38).
+    //
+    // Start at 1s (not 2s): Orca's DeviceManager does disconnect+reconnect
+    // on every print-job completion (set_selected_machine with same dev_id),
+    // and the printer typically frees its TCP listen backlog within ~1s of
+    // receiving DISCONNECT.  A 2s initial delay doubled to ~30s total via
+    // backoff, making the reconnect feel broken (#50).
+    ::mosquitto_reconnect_delay_set(mosq_, /*reconnect_delay=*/1,
+                                    /*reconnect_delay_max=*/10,
                                     /*reconnect_exponential_backoff=*/true);
 
     // mosquitto_connect_async only kicks off a non-blocking connect; the real
