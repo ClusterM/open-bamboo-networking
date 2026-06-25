@@ -104,6 +104,10 @@ void fetch_worker(obn::tunnel_upload::ConnectParams cp,
         ~ScopeRelease() { release_inflight(key); }
     } release{inflight};
 
+    // TODO: add FTPS fallback — when :6000 is unreachable (A1 Mini and
+    // other printers that don't expose the BambuTunnel port), download
+    // /cache/<subtask_name>.gcode.3mf via FTPS RETR and extract
+    // Metadata/plate_N.png from the zip archive instead.
     obn::tunnel_upload::Connection conn;
     std::string err;
     if (conn.connect(cp, &err) != 0) {
