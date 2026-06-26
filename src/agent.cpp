@@ -25,6 +25,10 @@ namespace obn {
 
 namespace {
 
+// Orca Slicer calls disconnect_printer then connect_printer again after every
+// print; if connect arrives within this window we keep the MQTT session alive.
+constexpr auto kMqttKeepReconnectGracePeriod = std::chrono::seconds(3);
+
 std::string trim_ip_string(std::string s)
 {
     while (!s.empty() &&
@@ -42,8 +46,47 @@ std::string trim_ip_string(std::string s)
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent()
 {
+    cancel_deferred_disconnect();
     if (discovery_) discovery_->stop();
     if (cloud_session_) cloud_session_->stop();
+}
+
+void Agent::schedule_deferred_disconnect()
+{
+    cancel_deferred_disconnect();
+    {
+        std::lock_guard<std::mutex> lk(deferred_dc_mu_);
+        deferred_dc_active_ = true;
+    }
+    deferred_dc_thread_ = std::thread([this]() {
+        std::unique_lock<std::mutex> lk(deferred_dc_mu_);
+        if (deferred_dc_cv_.wait_for(lk, kMqttKeepReconnectGracePeriod,
+                [this] { return !deferred_dc_active_; })) {
+            return;
+        }
+        deferred_dc_active_ = false;
+        lk.unlock();
+
+        OBN_INFO("mqtt_keep_connection: no reconnect within %ds, disconnecting",
+                 static_cast<int>(kMqttKeepReconnectGracePeriod.count()));
+        std::unique_ptr<LanSession> session;
+        {
+            std::lock_guard<std::mutex> mlk(mu_);
+            session = std::move(lan_session_);
+        }
+        if (session) session->disconnect();
+    });
+}
+
+void Agent::cancel_deferred_disconnect()
+{
+    {
+        std::lock_guard<std::mutex> lk(deferred_dc_mu_);
+        deferred_dc_active_ = false;
+        deferred_dc_cv_.notify_all();
+    }
+    if (deferred_dc_thread_.joinable())
+        deferred_dc_thread_.join();
 }
 
 int Agent::connect_printer(std::string dev_id,
@@ -52,6 +95,22 @@ int Agent::connect_printer(std::string dev_id,
                            std::string password,
                            bool        use_ssl)
 {
+    if (obn::config::current().mqtt_keep_connection) {
+        cancel_deferred_disconnect();
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_
+            && lan_session_->is_connected()
+            && lan_session_->dev_id()   == dev_id
+            && lan_session_->dev_ip()   == dev_ip
+            && lan_session_->password() == password
+            && lan_session_->use_ssl()  == use_ssl)
+        {
+            OBN_INFO("connect_printer: mqtt_keep_connection reusing session to %s",
+                     dev_ip.c_str());
+            return BAMBU_NETWORK_SUCCESS;
+        }
+    }
+
     // Studio calls connect_printer() again when the user switches to a
     // different printer or re-enters the access code. Tear down any prior
     // session cleanly so we don't leak MQTT threads.
@@ -131,6 +190,20 @@ int Agent::connect_printer(std::string dev_id,
 int Agent::disconnect_printer()
 {
     print_params_set_use_ssl_for_ftp(true);
+
+    if (obn::config::current().mqtt_keep_connection) {
+        bool have_session = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            have_session = (lan_session_ != nullptr);
+        }
+        if (have_session) {
+            OBN_INFO("disconnect_printer: mqtt_keep_connection, deferring for %ds",
+                     static_cast<int>(kMqttKeepReconnectGracePeriod.count()));
+            schedule_deferred_disconnect();
+            return BAMBU_NETWORK_SUCCESS;
+        }
+    }
 
     std::unique_ptr<LanSession> session;
     {

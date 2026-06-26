@@ -83,6 +83,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
     else if (key == "force_ftps")                out.force_ftps = truthy(val);
     else if (key == "disable_camera_preview")      out.disable_camera_preview = truthy(val);
+    else if (key == "mqtt_keep_connection")        out.mqtt_keep_connection = truthy(val);
     else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);
     else if (key == "patch_mqtt_ipcam_file")       out.patch_mqtt_ipcam_file = truthy(val);
     else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);

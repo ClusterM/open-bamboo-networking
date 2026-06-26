@@ -1,12 +1,14 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +56,8 @@ public:
     const std::string& username() const { return username_; }
     const std::string& password() const { return password_; }
     const std::string& ca_file()  const { return ca_file_; }
+    bool               use_ssl()  const { return use_ssl_; }
+    bool               is_connected() const;
 
 private:
     std::string report_topic_() const;
@@ -351,6 +355,17 @@ private:
     std::map<std::string, std::string> extra_http_headers_;
 
     std::unique_ptr<LanSession> lan_session_;
+
+    // Deferred disconnect for mqtt_keep_connection: instead of tearing down
+    // the session immediately, we wait a few seconds for a reconnect with
+    // the same credentials (Orca's typical disconnect+reconnect cycle is
+    // near-instant; see kMqttKeepReconnectGracePeriod in agent.cpp).
+    std::mutex              deferred_dc_mu_;
+    std::condition_variable deferred_dc_cv_;
+    std::thread             deferred_dc_thread_;
+    bool                    deferred_dc_active_ = false;
+    void schedule_deferred_disconnect();
+    void cancel_deferred_disconnect();
     std::unique_ptr<ssdp::Discovery> discovery_;
     std::unique_ptr<CloudSession>   cloud_session_;
     // Lazy localhost HTTP server that hands cover PNGs to Studio's

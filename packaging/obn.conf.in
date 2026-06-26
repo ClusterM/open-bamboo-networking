@@ -69,6 +69,16 @@ force_ftps = 0
 
 disable_camera_preview = 0
 
+# --- MQTT connection persistence -------------------------------------
+#
+# Keep the MQTT connection alive across the slicer's internal
+# disconnect/reconnect cycles (e.g. after sending a print job).
+# Useful for Orca Slicer, which reconnects to the printer after
+# every print, causing a 5-30s delay on printers with limited
+# MQTT session slots (A1 Mini, P1S, etc.).
+
+mqtt_keep_connection = 1
+
 # --- MQTT push_status patches ---------------------------------------
 #
 # Patch incoming MQTT push_status fields on the fly. All disabled by

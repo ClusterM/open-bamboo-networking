@@ -161,6 +161,11 @@ int LanSession::publish_json(const std::string& json_str, int qos)
     return rc == MOSQ_ERR_SUCCESS ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
 }
 
+bool LanSession::is_connected() const
+{
+    return client_ && client_->is_connected();
+}
+
 int LanSession::disconnect()
 {
     if (client_) {

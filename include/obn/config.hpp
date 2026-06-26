@@ -39,6 +39,11 @@ struct Settings {
     // Device panel: static "Printer Preview" JPEG (mem:/N over TLS :6000)
     bool disable_camera_preview      = false;
 
+    // MQTT connection persistence: Orca Slicer unconditionally tears down
+    // and re-establishes the MQTT session after every print job, causing a
+    // 5-30s reconnection delay.  Enabled by default to work around this.
+    bool mqtt_keep_connection        = true;
+
     // MQTT push_status patches (all off by default)
     bool patch_mqtt_home_flag        = false;
     bool patch_mqtt_ipcam_file       = false;
