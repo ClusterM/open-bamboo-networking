@@ -1,0 +1,3 @@
+# Placeholder so the directory is tracked before phase 3/4/7/8 lands real
+# source files (SsdpResponder, MqttBroker, FtpsServer, RtspServer). See
+# docs/bambu_bridge_plan.md.

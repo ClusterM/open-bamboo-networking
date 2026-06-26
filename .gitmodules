@@ -1,0 +1,6 @@
+[submodule "tools/bambu_extract_d/daemon/third_party/nlohmann"]
+	path = tools/bambu_extract_d/daemon/third_party/nlohmann
+	url = https://github.com/nlohmann/json.git
+[submodule "tools/bambu_extract_d/daemon/third_party/miniz"]
+	path = tools/bambu_extract_d/daemon/third_party/miniz
+	url = https://github.com/richgel999/miniz.git
