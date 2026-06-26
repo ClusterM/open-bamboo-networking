@@ -97,17 +97,24 @@ int Agent::connect_printer(std::string dev_id,
 {
     if (obn::config::current().mqtt_keep_connection) {
         cancel_deferred_disconnect();
-        std::lock_guard<std::mutex> lk(mu_);
-        if (lan_session_
-            && lan_session_->is_connected()
-            && lan_session_->dev_id()   == dev_id
-            && lan_session_->dev_ip()   == dev_ip
-            && lan_session_->password() == password
-            && lan_session_->use_ssl()  == use_ssl)
+        std::string reuse_dev_id;
         {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (lan_session_
+                && lan_session_->is_connected()
+                && lan_session_->dev_id()   == dev_id
+                && lan_session_->dev_ip()   == dev_ip
+                && lan_session_->password() == password
+                && lan_session_->use_ssl()  == use_ssl)
+            {
+                reuse_dev_id = dev_id;
+            }
+        }
+        if (!reuse_dev_id.empty()) {
             OBN_INFO("connect_printer: mqtt_keep_connection reusing session to %s",
                      dev_ip.c_str());
-            lan_session_->simulate_reconnect();
+            // Must not hold mu_: notify_local_connected locks it (Studio callback).
+            notify_local_connected(BBL::ConnectStatusOk, reuse_dev_id, {});
             return BAMBU_NETWORK_SUCCESS;
         }
     }

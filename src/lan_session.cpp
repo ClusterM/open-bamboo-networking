@@ -166,20 +166,6 @@ bool LanSession::is_connected() const
     return client_ && client_->is_connected();
 }
 
-void LanSession::simulate_reconnect()
-{
-    if (!client_ || !client_->is_connected()) {
-        OBN_WARN("LanSession simulate_reconnect: skipped (client=%p connected=%d)",
-                 static_cast<void*>(client_.get()),
-                 client_ ? client_->is_connected() : 0);
-        return;
-    }
-
-    OBN_INFO("LanSession simulate_reconnect: firing on_connect callback (mqtt_keep_connection)");
-    if (on_connected_)
-        on_connected_(BBL::ConnectStatusOk, {});
-}
-
 int LanSession::disconnect()
 {
     if (client_) {
