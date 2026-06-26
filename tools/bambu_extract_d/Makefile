@@ -64,13 +64,13 @@ daemon_embed.h: build/daemon/bambu-daemon
 	  | sed 's/^unsigned int  *build_daemon_bambu_daemon_len/static const size_t daemon_embed_bin_len/' \
 	  > $@
 
-build/watchdog_defeat_v2.so: shims/watchdog_defeat_v2.c | build
+build/watchdog_defeat.so: shims/watchdog_defeat.c | build
 	$(CC) -shared -fPIC -O2 -o $@ $< -ldl -pthread
 
-watchdog_defeat_embed.h: build/watchdog_defeat_v2.so
+watchdog_defeat_embed.h: build/watchdog_defeat.so
 	xxd -i $< \
-	  | sed 's/^unsigned char build_watchdog_defeat_v2_so/static unsigned char watchdog_defeat_embed_so/' \
-	  | sed 's/^unsigned int  *build_watchdog_defeat_v2_so_len/static unsigned int  watchdog_defeat_embed_so_len/' \
+	  | sed 's/^unsigned char build_watchdog_defeat_so/static unsigned char watchdog_defeat_embed_so/' \
+	  | sed 's/^unsigned int  *build_watchdog_defeat_so_len/static unsigned int  watchdog_defeat_embed_so_len/' \
 	  > $@
 
 build:

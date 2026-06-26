@@ -1,4 +1,4 @@
-/* watchdog_defeat_v2.c — Agent DR_DEFEAT, 2026-06-21.
+/* watchdog_defeat.c — Agent DR_DEFEAT, 2026-06-21.
  *
  * v1 (lambda2_phase22) only hooked libc open()/openat()/fopen()/read()/fread().
  * Empirical: bare PTRACE_ATTACH + CONT against shim-loaded target triggers
@@ -32,10 +32,10 @@
  *   (F) Verbose log to /tmp/wd_v2_<pid>.log when WD_V2_LOG set.
  *
  * Build:
- *   gcc -shared -fPIC -O2 -o watchdog_defeat_v2.so watchdog_defeat_v2.c -ldl -pthread
+ *   gcc -shared -fPIC -O2 -o watchdog_defeat.so watchdog_defeat.c -ldl -pthread
  *
  * Use:
- *   LD_PRELOAD=./watchdog_defeat_v2.so ./bambu-studio
+ *   LD_PRELOAD=./watchdog_defeat.so ./bambu-studio
  */
 
 #define _GNU_SOURCE
@@ -1061,7 +1061,7 @@ static void install_sigabrt_eater(void)
 }
 
 __attribute__((constructor))
-static void watchdog_defeat_v2_init(void)
+static void watchdog_defeat_init(void)
 {
     resolve_reals();
 
@@ -1073,18 +1073,18 @@ static void watchdog_defeat_v2_init(void)
         else
             snprintf(p, sizeof(p), "/tmp/wd_v2_%d.log", getpid());
         v2_log_fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
-        v2_log("=== watchdog_defeat_v2 init pid=%d ===\n", getpid());
+        v2_log("=== watchdog_defeat init pid=%d ===\n", getpid());
     }
 
     int rc = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
     fprintf(stderr,
-            "[watchdog_defeat_v2] loaded pid=%d ptrace_rc=%d log=%s\n",
+            "[watchdog_defeat] loaded pid=%d ptrace_rc=%d log=%s\n",
             getpid(), rc, log_path ? log_path : "(off)");
     fflush(stderr);
 
     if (getenv("WD_V2_EAT_SIGABRT")) {
         install_sigabrt_eater();
-        fprintf(stderr, "[watchdog_defeat_v2] SIGABRT eater installed\n");
+        fprintf(stderr, "[watchdog_defeat] SIGABRT eater installed\n");
         fflush(stderr);
     }
 
@@ -1106,11 +1106,11 @@ static void watchdog_defeat_v2_init(void)
         }
         if (is_target) {
             no_exit_armed = 1;
-            fprintf(stderr, "[watchdog_defeat_v2] exit/_exit interpose armed\n");
+            fprintf(stderr, "[watchdog_defeat] exit/_exit interpose armed\n");
             fflush(stderr);
         } else if (n > 0) {
             fprintf(stderr,
-                    "[watchdog_defeat_v2] exit/_exit interpose SKIPPED for %s\n",
+                    "[watchdog_defeat] exit/_exit interpose SKIPPED for %s\n",
                     buf);
             fflush(stderr);
         }
@@ -1119,7 +1119,7 @@ static void watchdog_defeat_v2_init(void)
     if (getenv("WD_V2_SECCOMP")) {
         int src = install_seccomp_filter();
         fprintf(stderr,
-                "[watchdog_defeat_v2] seccomp=%s\n",
+                "[watchdog_defeat] seccomp=%s\n",
                 src == 0 ? "on" : "off");
         fflush(stderr);
     }
