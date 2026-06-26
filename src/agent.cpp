@@ -104,6 +104,7 @@ int Agent::connect_printer(std::string dev_id,
                 && lan_session_->is_connected()
                 && lan_session_->dev_id()   == dev_id
                 && lan_session_->dev_ip()   == dev_ip
+                && lan_session_->username() == username
                 && lan_session_->password() == password
                 && lan_session_->use_ssl()  == use_ssl)
             {

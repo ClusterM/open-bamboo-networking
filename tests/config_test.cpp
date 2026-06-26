@@ -156,6 +156,7 @@ static int test_new_keys()
                "force_timelapse_external = 1\n"
                "force_ftps = 1\n"
                "disable_camera_preview = 1\n"
+               "mqtt_keep_connection = yes\n"
                "patch_mqtt_home_flag = yes\n"
                "patch_mqtt_ipcam_file = true\n"
                "patch_mqtt_internal_storage = 1\n"
@@ -168,6 +169,7 @@ static int test_new_keys()
     CHECK(cfg.force_timelapse_external == true);
     CHECK(cfg.force_ftps == true);
     CHECK(cfg.disable_camera_preview == true);
+    CHECK(cfg.mqtt_keep_connection == true);
     CHECK(cfg.patch_mqtt_home_flag == true);
     CHECK(cfg.patch_mqtt_ipcam_file == true);
     CHECK(cfg.patch_mqtt_internal_storage == true);
@@ -187,6 +189,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.force_timelapse_external == false);
     CHECK(cfg.force_ftps == false);
     CHECK(cfg.disable_camera_preview == false);
+    CHECK(cfg.mqtt_keep_connection == true);
     CHECK(cfg.patch_mqtt_home_flag == false);
     CHECK(cfg.patch_mqtt_ipcam_file == false);
     CHECK(cfg.patch_mqtt_internal_storage == false);
