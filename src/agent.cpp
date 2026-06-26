@@ -58,24 +58,33 @@ void Agent::schedule_deferred_disconnect()
         std::lock_guard<std::mutex> lk(deferred_dc_mu_);
         deferred_dc_active_ = true;
     }
-    deferred_dc_thread_ = std::thread([this]() {
-        std::unique_lock<std::mutex> lk(deferred_dc_mu_);
-        if (deferred_dc_cv_.wait_for(lk, kMqttKeepReconnectGracePeriod,
-                [this] { return !deferred_dc_active_; })) {
-            return;
-        }
-        deferred_dc_active_ = false;
-        lk.unlock();
+    try {
+        deferred_dc_thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lk(deferred_dc_mu_);
+            if (deferred_dc_cv_.wait_for(lk, kMqttKeepReconnectGracePeriod,
+                    [this] { return !deferred_dc_active_; })) {
+                return;
+            }
+            deferred_dc_active_ = false;
+            lk.unlock();
 
-        OBN_INFO("mqtt_keep_connection: no reconnect within %ds, disconnecting",
-                 static_cast<int>(kMqttKeepReconnectGracePeriod.count()));
-        std::unique_ptr<LanSession> session;
-        {
-            std::lock_guard<std::mutex> mlk(mu_);
-            session = std::move(lan_session_);
-        }
-        if (session) session->disconnect();
-    });
+            OBN_INFO("mqtt_keep_connection: no reconnect within %ds, disconnecting",
+                     static_cast<int>(kMqttKeepReconnectGracePeriod.count()));
+            std::unique_ptr<LanSession> session;
+            {
+                std::lock_guard<std::mutex> mlk(mu_);
+                session = std::move(lan_session_);
+            }
+            if (session) session->disconnect();
+        });
+    } catch (const std::system_error& e) {
+        OBN_WARN("schedule_deferred_disconnect: thread creation failed (%s), "
+                 "falling back to immediate disconnect", e.what());
+        std::lock_guard<std::mutex> lk(deferred_dc_mu_);
+        deferred_dc_active_ = false;
+        // Immediate disconnect will happen on next disconnect_printer() call
+        // via the normal (non-deferred) path.
+    }
 }
 
 void Agent::cancel_deferred_disconnect()
