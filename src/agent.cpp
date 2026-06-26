@@ -242,14 +242,10 @@ int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
 {
-    LanSession* session = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (lan_session_ && lan_session_->dev_id() == dev_id)
-            session = lan_session_.get();
-    }
-    if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    return session->publish_json(json_str, qos);
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!lan_session_ || lan_session_->dev_id() != dev_id)
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return lan_session_->publish_json(json_str, qos);
 }
 
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
