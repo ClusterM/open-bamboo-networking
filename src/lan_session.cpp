@@ -174,27 +174,10 @@ void LanSession::simulate_reconnect()
                  client_ ? client_->is_connected() : 0);
         return;
     }
-    const std::string topic = report_topic_();
 
-    // 1. Unsubscribe — mirrors what a real TCP drop does on the broker side
-    int rc_unsub = client_->unsubscribe(topic);
-    OBN_INFO("LanSession simulate_reconnect: unsubscribe %s rc=%d", topic.c_str(), rc_unsub);
-
-    // 2. Synthetic on_disconnect callback
-    if (on_connected_) {
-        OBN_INFO("LanSession simulate_reconnect: firing on_disconnect callback");
-        on_connected_(BBL::ConnectStatusLost,
-                      "mqtt disconnect rc=synthetic (mqtt_keep_connection)");
-    }
-
-    // 3. Re-subscribe + synthetic on_connect callback (same as the real on_connect)
-    int rc_sub = client_->subscribe(topic, 0);
-    OBN_INFO("LanSession simulate_reconnect: subscribe %s rc=%d", topic.c_str(), rc_sub);
-
-    if (on_connected_) {
-        OBN_INFO("LanSession simulate_reconnect: firing on_connect callback");
+    OBN_INFO("LanSession simulate_reconnect: firing on_connect callback (mqtt_keep_connection)");
+    if (on_connected_)
         on_connected_(BBL::ConnectStatusOk, {});
-    }
 }
 
 int LanSession::disconnect()
