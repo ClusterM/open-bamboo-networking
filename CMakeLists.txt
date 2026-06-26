@@ -301,6 +301,7 @@ add_library(bambu_networking SHARED
     src/tunnel_local.cpp
     src/tunnel_upload.cpp
     src/tls_dial.cpp
+    src/signing.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
@@ -712,7 +713,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
-        src/tunnel_upload.cpp)
+        src/tunnel_upload.cpp
+        src/signing.cpp)
     target_include_directories(lan_live_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
@@ -726,4 +728,13 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME lan_live COMMAND lan_live_test)
+
+    add_executable(signing_test tests/signing_test.cpp
+        src/signing.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME signing COMMAND signing_test)
 endif()
