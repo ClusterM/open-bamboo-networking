@@ -1,41 +1,39 @@
-/* watchdog_defeat.c — Agent DR_DEFEAT, 2026-06-21.
+/* watchdog_defeat.c — LD_PRELOAD shim that prevents VMP anti-debug from
+ * killing a ptraced bambu_networking process.
  *
- * v1 (lambda2_phase22) only hooked libc open()/openat()/fopen()/read()/fread().
- * Empirical: bare PTRACE_ATTACH + CONT against shim-loaded target triggers
- * SIGABRT after ~17 s. VMP performs a PERIODIC re-check that v1 misses.
+ * The plugin's VMProtect layer probes for a debugger by reading
+ * /proc/self/status (TracerPid), /proc/self/wchan, /proc/self/syscall,
+ * and calling ptrace(PTRACE_TRACEME) and prctl(PR_GET_DUMPABLE).
+ * This shim intercepts all those paths and returns clean values.
  *
- * v2 adds, in addition to v1's coverage:
+ * Coverage:
+ *   - open/openat/open64/openat64, fopen/fopen64 — intercept /proc/.../status
+ *     and related files and rewrite TracerPid/wchan/syscall in the read data.
+ *   - read/pread/pread64/readv/preadv, fread — rewrite data from tracked fds.
+ *   - syscall() dispatcher — catches raw glibc syscall() calls that bypass
+ *     the named wrappers above.
+ *   - prctl(PR_GET_DUMPABLE) — returns 1 to conceal ptrace attachment.
+ *   - ptrace(PTRACE_TRACEME) — opt-in intercept via WD_V2_FAKE_TRACEME=1;
+ *     off by default because VMP legitimately uses TRACEME for its watchdog.
+ *   - Seccomp BPF + SIGSYS — catches raw inline syscall instructions that
+ *     bypass every libc entry point; the SIGSYS handler serves a sanitised
+ *     memfd for /proc/self/status opens.
+ *   - abort()/exit()/_exit() interpose — opt-in via WD_V2_EAT_SIGABRT and
+ *     WD_V2_NO_EXIT; parks the calling thread instead of terminating.
  *
- *   (A) Direct libc syscall() dispatcher — catches syscall(SYS_openat, ...)
- *       and syscall(SYS_read, ...) when VMP bypasses the named wrappers.
- *
- *   (B) read64 / pread / pread64 / readv / preadv / __read_chk —
- *       glibc may dispatch through any of these depending on how the
- *       caller phrased it (FILE*, fdopen, mmap'd FILE, fortify).
- *
- *   (C) prctl(PR_GET_DUMPABLE) — VMP can probe whether the process is
- *       being attached via this side-channel (returns 0 when ptraced
- *       under prctl(PR_SET_DUMPABLE,0) interactions). Force 1.
- *
- *   (D) Seccomp BPF + SIGSYS backstop — the kernel itself traps any
- *       raw openat/read/pread/readv aimed at /proc/.../status, even
- *       when the VMP body issues a `syscall` instruction inline,
- *       bypassing every libc entry point. The SIGSYS handler emulates
- *       the call with a sanitised buffer.
- *
- *   (E) Per-thread status path coverage stays from v1 plus we also
- *       defensively rewrite Tgid / NSpid / Pid lines (in case VMP
- *       cross-checks Pid != Tgid as evidence of a tracee thread).
- *       TracerPid is the primary; other rewrites are no-ops on a
- *       healthy process.
- *
- *   (F) Verbose log to /tmp/wd_v2_<pid>.log when WD_V2_LOG set.
+ * Environment variables:
+ *   WD_V2_LOG=path       write debug log to this path
+ *   WD_V2_FAKE_TRACEME=1 intercept ptrace(PTRACE_TRACEME) -> return 0
+ *   WD_V2_EAT_SIGABRT=1  install SIGABRT handler that parks the thread
+ *   WD_V2_NO_EXIT=1      intercept exit()/_exit() in target process only
+ *   WD_V2_SECCOMP=1      install seccomp BPF backstop filter
+ *   WD_V2_OPENAT_NOTIF_PIPE=fd  write path of each opened file to this fd
  *
  * Build:
  *   gcc -shared -fPIC -O2 -o watchdog_defeat.so watchdog_defeat.c -ldl -pthread
  *
  * Use:
- *   LD_PRELOAD=./watchdog_defeat.so ./bambu-studio
+ *   LD_PRELOAD=./watchdog_defeat.so ./target-binary
  */
 
 #define _GNU_SOURCE
@@ -77,12 +75,12 @@
 /* ---------------------------------------------------------------- */
 /*  Logging                                                          */
 /* ---------------------------------------------------------------- */
-static int          v2_log_fd = -1;
+static int          wd_log_fd = -1;
 static pthread_mutex_t log_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void v2_log(const char* fmt, ...)
+static void wd_log(const char* fmt, ...)
 {
-    if (v2_log_fd < 0) return;
+    if (wd_log_fd < 0) return;
     char buf[512];
     va_list ap; va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -90,7 +88,7 @@ static void v2_log(const char* fmt, ...)
     if (n <= 0) return;
     if (n > (int)sizeof(buf)) n = sizeof(buf);
     pthread_mutex_lock(&log_mu);
-    (void)!write(v2_log_fd, buf, (size_t)n);
+    (void)!write(wd_log_fd, buf, (size_t)n);
     pthread_mutex_unlock(&log_mu);
 }
 
@@ -422,7 +420,7 @@ int open(const char* path, int flags, ...)
     int fd = real_open(path, flags, mode);
     if (fd >= 0) {
         int k = classify_proc_path(path);
-        if (k) { track_fd_k(fd, k); v2_log("open k=%d path=%s fd=%d\n", k, path, fd); }
+        if (k) { track_fd_k(fd, k); wd_log("open k=%d path=%s fd=%d\n", k, path, fd); }
     }
     return fd;
 }
@@ -440,7 +438,7 @@ int open64(const char* path, int flags, ...)
                          : real_open(path, flags, mode);
     if (fd >= 0) {
         int k = classify_proc_path(path);
-        if (k) { track_fd_k(fd, k); v2_log("open64 k=%d path=%s fd=%d\n", k, path, fd); }
+        if (k) { track_fd_k(fd, k); wd_log("open64 k=%d path=%s fd=%d\n", k, path, fd); }
     }
     return fd;
 }
@@ -457,7 +455,7 @@ int openat(int dirfd, const char* path, int flags, ...)
     int fd = real_openat(dirfd, path, flags, mode);
     if (fd >= 0) {
         int k = classify_proc_path(path);
-        if (k) { track_fd_k(fd, k); v2_log("openat k=%d path=%s fd=%d\n", k, path, fd); }
+        if (k) { track_fd_k(fd, k); wd_log("openat k=%d path=%s fd=%d\n", k, path, fd); }
     }
     return fd;
 }
@@ -475,7 +473,7 @@ int openat64(int dirfd, const char* path, int flags, ...)
                            : real_openat(dirfd, path, flags, mode);
     if (fd >= 0) {
         int k = classify_proc_path(path);
-        if (k) { track_fd_k(fd, k); v2_log("openat64 k=%d path=%s fd=%d\n", k, path, fd); }
+        if (k) { track_fd_k(fd, k); wd_log("openat64 k=%d path=%s fd=%d\n", k, path, fd); }
     }
     return fd;
 }
@@ -582,7 +580,7 @@ FILE* fopen(const char* path, const char* mode)
     FILE* fp = real_fopen(path, mode);
     if (fp) {
         int k = classify_proc_path(path);
-        if (k) { track_fp_k(fp, k); v2_log("fopen k=%d path=%s\n", k, path); }
+        if (k) { track_fp_k(fp, k); wd_log("fopen k=%d path=%s\n", k, path); }
     }
     return fp;
 }
@@ -594,7 +592,7 @@ FILE* fopen64(const char* path, const char* mode)
                             : real_fopen(path, mode);
     if (fp) {
         int k = classify_proc_path(path);
-        if (k) { track_fp_k(fp, k); v2_log("fopen64 k=%d path=%s\n", k, path); }
+        if (k) { track_fp_k(fp, k); wd_log("fopen64 k=%d path=%s\n", k, path); }
     }
     return fp;
 }
@@ -645,7 +643,7 @@ long syscall(long num, ...)
             int k = classify_proc_path(path);
             if (k) {
                 track_fd_k((int)ret, k);
-                v2_log("syscall open* k=%d path=%s fd=%ld\n", k, path, ret);
+                wd_log("syscall open* k=%d path=%s fd=%ld\n", k, path, ret);
             }
             break;
         }
@@ -696,10 +694,7 @@ long syscall(long num, ...)
  * implementations call PTRACE_TRACEME and abort on EPERM.
  *
  * Defeat: when option is PTRACE_TRACEME, return success without
- * touching the kernel. Otherwise pass through (the lift's own
- * extract_d_fast needs ptrace to work for OUR side of things — but
- * extract_d_fast doesn't preload this shim, the bambustu_main target
- * does, so blocking ptrace inside the bambustu_main is safe). */
+ * touching the kernel. Otherwise pass through. */
 typedef long (*ptrace_fn)(int, ...);
 static ptrace_fn real_ptrace = NULL;
 
@@ -714,17 +709,12 @@ long ptrace(int request, ...)
 
     /* PTRACE_TRACEME = 0. Self-probe: claim success.
      *
-     * IMPORTANT: VMP's anti-debug uses PTRACE_TRACEME legitimately to
-     * make a sibling process the tracer of its parent. extract_d_fast
-     * relies on this — it KILLS that watchdog child after init.
-     * If we intercept PTRACE_TRACEME in the watchdog child and return 0
-     * without actually establishing the tracer relationship, the watchdog
-     * goes into a divergent state that ABORTs the parent ~15 s later.
-     *
-     * So the hook is OPT-IN, only enabled with WD_V2_FAKE_TRACEME=1.
-     * Default: pass through. */
+     * The hook is OPT-IN via WD_V2_FAKE_TRACEME=1. Default is pass-through
+     * because VMP legitimately uses PTRACE_TRACEME to make a sibling process
+     * the tracer of its parent. Faking success in that sibling causes the
+     * watchdog to enter a divergent state that aborts the parent ~15 s later. */
     if (request == 0 /* PTRACE_TRACEME */ && getenv("WD_V2_FAKE_TRACEME")) {
-        v2_log("ptrace(PTRACE_TRACEME) intercepted -> 0\n");
+        wd_log("ptrace(PTRACE_TRACEME) intercepted -> 0\n");
         return 0;
     }
     if (!real_ptrace) {
@@ -733,7 +723,7 @@ long ptrace(int request, ...)
     }
     long rc = real_ptrace(request, pid, addr, data);
     if (request == 0)
-        v2_log("ptrace(PTRACE_TRACEME) pass-through rc=%ld errno=%d\n",
+        wd_log("ptrace(PTRACE_TRACEME) pass-through rc=%ld errno=%d\n",
                rc, errno);
     return rc;
 }
@@ -857,35 +847,36 @@ static void sigsys_handler(int sig, siginfo_t* info, void* uctx_v)
                  * a real fd. Track it so read()s on it via libc still
                  * get rewritten (idempotent). */
                 track_fd(mfd);
-                v2_log("SIGSYS faked open path=%s -> mfd=%d\n", path, mfd);
+                wd_log("SIGSYS faked open path=%s -> mfd=%d\n", path, mfd);
                 ret = mfd;
             } else {
                 ret = -ENOENT;
             }
         } else {
-            /* Not a status path — pass through. */
+            /* Not a status path — pass through via real syscall to avoid
+             * re-triggering the seccomp filter. */
             if (nr == SYS_open)
-                ret = syscall(SYS_openat, AT_FDCWD, a1, a2, a3);
+                ret = real_syscall(SYS_openat, AT_FDCWD, a1, a2, a3);
             else
-                ret = syscall(SYS_openat, a1, a2, a3, a4);
+                ret = real_syscall(SYS_openat, a1, a2, a3, a4);
         }
     } else if (nr == SYS_read) {
         int fd = (int)a1;
-        ret = syscall(SYS_read, a1, a2, a3);
+        ret = real_syscall(SYS_read, a1, a2, a3);
         if (ret > 0 && (is_tracked(fd) || fd_resolves_to_status(fd))) {
             rewrite_status_buf((char*)a2, (size_t)ret);
             track_fd(fd);
         }
     } else if (nr == SYS_pread64) {
         int fd = (int)a1;
-        ret = syscall(SYS_pread64, a1, a2, a3, a4);
+        ret = real_syscall(SYS_pread64, a1, a2, a3, a4);
         if (ret > 0 && (is_tracked(fd) || fd_resolves_to_status(fd))) {
             rewrite_status_buf((char*)a2, (size_t)ret);
             track_fd(fd);
         }
     } else {
         /* Should not happen with our filter. */
-        ret = syscall(nr, a1, a2, a3, a4, a5, a6);
+        ret = real_syscall(nr, a1, a2, a3, a4, a5, a6);
     }
 
     regs[REG_RET] = ret;
@@ -898,7 +889,7 @@ static int install_seccomp_filter(void)
 {
     /* Need NNP to install seccomp filter without CAP_SYS_ADMIN. */
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
-        v2_log("seccomp: PR_SET_NNP failed errno=%d\n", errno);
+        wd_log("seccomp: PR_SET_NNP failed errno=%d\n", errno);
         return -1;
     }
 
@@ -940,46 +931,27 @@ static int install_seccomp_filter(void)
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGSYS, &sa, NULL) != 0) {
-        v2_log("seccomp: sigaction(SIGSYS) failed errno=%d\n", errno);
+        wd_log("seccomp: sigaction(SIGSYS) failed errno=%d\n", errno);
         return -1;
     }
 
     if (real_syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
                      SECCOMP_FILTER_FLAG_TSYNC, &prog) != 0) {
-        v2_log("seccomp: SET_MODE_FILTER failed errno=%d\n", errno);
+        wd_log("seccomp: SET_MODE_FILTER failed errno=%d\n", errno);
         return -1;
     }
-    v2_log("seccomp: filter installed\n");
+    wd_log("seccomp: filter installed\n");
     return 0;
 }
 
 /* ---------------------------------------------------------------- */
-/*  Constructor                                                      */
+/*  SIGABRT / exit interpose                                         */
+/*                                                                   */
+/*  SIGABRT during ptrace attachment is not a VMP anti-debug         */
+/*  response — it is libstdc++ calling std::terminate() because a    */
+/*  socket/condvar operation received EINTR under ptrace stress.     */
+/*  Enable opt-in suppression with WD_V2_EAT_SIGABRT=1.             */
 /* ---------------------------------------------------------------- */
-/* ---------------------------------------------------------------- */
-/*  SIGABRT eater                                                    */
-/*                                                                   */
-/*  Empirically the "17 s SIGABRT under sustained PTRACE_ATTACH" is  */
-/*  NOT a VMP anti-debug response. It is bambu-studio's own paho/MQTT*/
-/*  + libstdc++ runtime calling std::terminate() because some        */
-/*  socket / cond_var operation got EINTR under ptrace stress and    */
-/*  propagated as an unhandled exception. The signal chain is:       */
-/*                                                                   */
-/*    std::terminate() -> __verbose_terminate_handler -> abort()     */
-/*    -> raise(SIGABRT) -> kernel default action SIGABRT -> exit 6.  */
-/*                                                                   */
-/*  Empirical confirmation: bambu-studio launched without any        */
-/*  BAMBU_BRIDGE_* env (no MQTT publish loop, no printer target)     */
-/*  survives a 200 s SEIZE attach indefinitely. With bridge env on,  */
-/*  it dies in ~13-25 s and the dr_defeat log ends with              */
-/*  "terminate called without an active exception" — that string is  */
-/*  libstdc++'s default __verbose_terminate_handler, NOT a VMP       */
-/*  signature.                                                       */
-/*                                                                   */
-/*  Optional defence: catch SIGABRT and ignore.                      */
-/*  Enable with WD_V2_EAT_SIGABRT=1. Off by default because masking  */
-/*  SIGABRT can hide real bugs; the user opts in for the attach      */
-/*  window only. */
 /* Park the calling thread forever instead of returning. Returning
  * lets glibc's abort() proceed to its second-stage SIGABRT (which is
  * delivered with SIG_DFL and unconditionally kills the process). */
@@ -996,15 +968,13 @@ static void abort_thread_park(void)
 static void sigabrt_eater(int sig, siginfo_t* si, void* uc)
 {
     (void)sig; (void)si; (void)uc;
-    v2_log("SIGABRT caught -> parking thread\n");
+    wd_log("SIGABRT caught -> parking thread\n");
     abort_thread_park();
 }
 
 /* abort() interpose. glibc's abort() is hard to derail via signal
  * handler alone (see comment in sigabrt_eater). Interpose the
- * function itself: do the same logging the C++ verbose terminate
- * handler would have done (so the user can see WHY abort fired in
- * the bambu-studio log) then park this thread forever. */
+ * function itself and park this thread forever. */
 typedef void (*abort_fn)(void) __attribute__((noreturn));
 static abort_fn real_abort = NULL;
 
@@ -1012,7 +982,7 @@ void abort(void) __attribute__((noreturn));
 void abort(void)
 {
     if (!real_abort) real_abort = (abort_fn)dlsym(RTLD_NEXT, "abort");
-    v2_log("abort() interposed -> parking thread\n");
+    wd_log("abort() interposed -> parking thread\n");
     abort_thread_park();
     /* Unreachable. */
     if (real_abort) real_abort();
@@ -1034,7 +1004,7 @@ void exit(int status)
 {
     if (!real_exit) real_exit = (exit_fn)dlsym(RTLD_NEXT, "exit");
     if (no_exit_armed) {
-        v2_log("exit(%d) interposed -> parking\n", status);
+        wd_log("exit(%d) interposed -> parking\n", status);
         abort_thread_park();
     }
     real_exit(status);
@@ -1045,7 +1015,7 @@ void _exit(int status)
 {
     if (!real__exit) real__exit = (exit_fn)dlsym(RTLD_NEXT, "_exit");
     if (no_exit_armed) {
-        v2_log("_exit(%d) interposed -> parking\n", status);
+        wd_log("_exit(%d) interposed -> parking\n", status);
         abort_thread_park();
     }
     real__exit(status);
@@ -1072,8 +1042,8 @@ static void watchdog_defeat_init(void)
             snprintf(p, sizeof(p), "%s", log_path);
         else
             snprintf(p, sizeof(p), "/tmp/wd_v2_%d.log", getpid());
-        v2_log_fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
-        v2_log("=== watchdog_defeat init pid=%d ===\n", getpid());
+        wd_log_fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        wd_log("=== watchdog_defeat init pid=%d ===\n", getpid());
     }
 
     int rc = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
