@@ -107,6 +107,7 @@ int Agent::connect_printer(std::string dev_id,
         {
             OBN_INFO("connect_printer: mqtt_keep_connection reusing session to %s",
                      dev_ip.c_str());
+            lan_session_->simulate_reconnect();
             return BAMBU_NETWORK_SUCCESS;
         }
     }

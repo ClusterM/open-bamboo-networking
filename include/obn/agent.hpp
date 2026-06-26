@@ -47,6 +47,10 @@ public:
     int start(ConnectedCb on_connected, MessageCb on_message);
 
     int publish_json(const std::string& json_str, int qos);
+    // Simulate a full disconnect/connect cycle on the live MQTT connection:
+    // unsubscribe, fire on_disconnect callback, re-subscribe, fire on_connect
+    // callback. Used by mqtt_keep_connection to make Orca see a fresh session.
+    void simulate_reconnect();
     int disconnect();
 
     const std::string& dev_id() const { return dev_id_; }
