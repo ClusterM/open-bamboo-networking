@@ -79,11 +79,17 @@ void Agent::schedule_deferred_disconnect()
         });
     } catch (const std::system_error& e) {
         OBN_WARN("schedule_deferred_disconnect: thread creation failed (%s), "
-                 "falling back to immediate disconnect", e.what());
-        std::lock_guard<std::mutex> lk(deferred_dc_mu_);
-        deferred_dc_active_ = false;
-        // Immediate disconnect will happen on next disconnect_printer() call
-        // via the normal (non-deferred) path.
+                 "disconnecting immediately", e.what());
+        {
+            std::lock_guard<std::mutex> lk(deferred_dc_mu_);
+            deferred_dc_active_ = false;
+        }
+        std::unique_ptr<LanSession> session;
+        {
+            std::lock_guard<std::mutex> mlk(mu_);
+            session = std::move(lan_session_);
+        }
+        if (session) session->disconnect();
     }
 }
 
