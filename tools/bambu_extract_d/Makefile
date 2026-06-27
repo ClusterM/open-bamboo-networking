@@ -1,8 +1,8 @@
 # Build the bambu_extract_d self-contained binary.
 #
 # Prerequisites:
-#   apt install build-essential cmake ninja-build libssl-dev libcurl4-openssl-dev \
-#               libboost-log-dev zlib1g-dev
+#   apt install build-essential cmake ninja-build xxd curl unzip \
+#               libssl-dev libcurl4-openssl-dev zlib1g-dev
 #
 # All embed headers are built from source automatically.  Build everything with:
 #   make

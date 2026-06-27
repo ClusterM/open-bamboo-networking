@@ -10,6 +10,7 @@
 #include <vector>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -65,17 +66,25 @@ std::string download_plugin_if_needed() {
     char manifest_tmp[64];
     snprintf(manifest_tmp, sizeof(manifest_tmp), "/tmp/bambu_manifest_%d.json", (int)getpid());
     {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-            "curl --silent --location --max-time 60 "
-            "-H \"X-BBL-OS-Type: linux\" "
-            "-o %s "
-            "\"https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.07.01.51\" "
-            "2>&1",
-            manifest_tmp);
-        int rc = std::system(cmd);
-        if (rc != 0) {
-            std::fprintf(stderr, "[plugin-dl] manifest fetch failed (rc=%d)\n", rc);
+        pid_t curl_pid = fork();
+        if (curl_pid == 0) {
+            execlp("curl", "curl", "--silent", "--location", "--max-time", "60",
+                   "-H", "X-BBL-OS-Type: linux",
+                   "-o", manifest_tmp,
+                   "https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.07.01.51",
+                   nullptr);
+            _exit(127);
+        }
+        if (curl_pid < 0) {
+            std::fprintf(stderr, "[plugin-dl] fork failed: %s\n", strerror(errno));
+            unlink(manifest_tmp);
+            return {};
+        }
+        int curl_st = 0;
+        waitpid(curl_pid, &curl_st, 0);
+        if (!WIFEXITED(curl_st) || WEXITSTATUS(curl_st) != 0) {
+            std::fprintf(stderr, "[plugin-dl] manifest fetch failed (curl exit=%d)\n",
+                         WIFEXITED(curl_st) ? WEXITSTATUS(curl_st) : -1);
             unlink(manifest_tmp);
             return {};
         }
@@ -188,7 +197,21 @@ std::string download_plugin_if_needed() {
 }
 
 static std::string find_slicer_cert(const std::string& plugin_path) {
-    // The cert ships alongside the plugin inside BambuStudio:
+    // Check next to the binary first (repo-bundled cert at resources/slicer_base64.cer).
+    {
+        char exe[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (len > 0) {
+            exe[len] = '\0';
+            std::string bin_dir(exe);
+            auto sl = bin_dir.rfind('/');
+            if (sl != std::string::npos) bin_dir = bin_dir.substr(0, sl);
+            std::string candidate = bin_dir + "/resources/slicer_base64.cer";
+            if (access(candidate.c_str(), R_OK) == 0) return candidate;
+        }
+    }
+
+    // The cert also ships alongside the plugin inside a BambuStudio install:
     //   <install>/plugins/libbambu_networking.so
     //   <install>/resources/cert/slicer_base64.cer
     // Walk up from the plugin directory looking for resources/cert/.
