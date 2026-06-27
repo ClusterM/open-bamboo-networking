@@ -154,14 +154,22 @@ std::string download_plugin_if_needed() {
     }
 
     {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-            "unzip -j -o %s \"*.so\" -d %s 2>&1",
-            zip_tmp, cache_dir.c_str());
-        int rc = std::system(cmd);
+        pid_t unzip_pid = fork();
+        if (unzip_pid == 0) {
+            execlp("unzip", "unzip", "-j", "-o", zip_tmp, "*.so", "-d",
+                   cache_dir.c_str(), nullptr);
+            _exit(127);
+        }
         unlink(zip_tmp);
-        if (rc != 0) {
-            std::fprintf(stderr, "[plugin-dl] unzip failed (rc=%d)\n", rc);
+        if (unzip_pid < 0) {
+            std::fprintf(stderr, "[plugin-dl] fork failed: %s\n", strerror(errno));
+            return {};
+        }
+        int unzip_st = 0;
+        waitpid(unzip_pid, &unzip_st, 0);
+        if (!WIFEXITED(unzip_st) || WEXITSTATUS(unzip_st) != 0) {
+            std::fprintf(stderr, "[plugin-dl] unzip failed (rc=%d)\n",
+                         WIFEXITED(unzip_st) ? WEXITSTATUS(unzip_st) : -1);
             return {};
         }
     }
@@ -228,11 +236,19 @@ static bool copy_file(const std::string& src, const std::string& dst) {
     if (out < 0) { close(in); return false; }
     char buf[65536];
     ssize_t n;
-    while ((n = read(in, buf, sizeof(buf))) > 0)
-        write(out, buf, (size_t)n);
+    bool ok = true;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t w = write(out, buf + written, (size_t)(n - written));
+            if (w < 0) { ok = false; break; }
+            written += w;
+        }
+        if (!ok) break;
+    }
     close(in);
     close(out);
-    return n == 0;
+    return ok && n == 0;
 }
 
 std::string write_cert_tmpdir(pid_t pid, const std::string& plugin_path,

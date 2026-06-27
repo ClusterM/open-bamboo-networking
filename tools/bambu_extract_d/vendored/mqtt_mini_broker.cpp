@@ -47,6 +47,14 @@ void MiniMqttBroker::stop() {
         }
     }
     if (accept_thread_.joinable()) accept_thread_.join();
+
+    std::vector<std::thread> to_join;
+    {
+        std::lock_guard<std::mutex> lk(threads_mu_);
+        to_join = std::move(client_threads_);
+    }
+    for (auto& t : to_join)
+        if (t.joinable()) t.join();
 }
 
 void MiniMqttBroker::accept_loop() {
@@ -58,7 +66,10 @@ void MiniMqttBroker::accept_loop() {
             if (stop_.load()) return;
             continue;
         }
-        std::thread([this, fd]() { client_loop(fd); }).detach();
+        {
+            std::lock_guard<std::mutex> lk(threads_mu_);
+            client_threads_.emplace_back([this, fd]() { client_loop(fd); });
+        }
     }
 }
 

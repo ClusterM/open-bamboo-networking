@@ -15,7 +15,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <vector>
 
 namespace Slic3r {
 namespace bambu {

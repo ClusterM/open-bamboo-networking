@@ -81,6 +81,9 @@ private:
     std::thread          accept_thread_;
     std::atomic<bool>    stop_{false};
 
+    std::mutex           threads_mu_;
+    std::vector<std::thread> client_threads_;
+
     mutable std::mutex          mu_;
     std::condition_variable     cv_;
     bool                        connected_ = false;

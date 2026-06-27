@@ -14,17 +14,16 @@ hardware breakpoint (DR0), reconstructs the full private key offline, and writes
 it as a PKCS#1 PEM file.
 
 No real printer is required. No network traffic leaves the machine. Feel free to
-run it in a VM or container, particularly if your worried about what Bambu's
+run it in a VM or container, particularly if you're worried about what Bambu's
 network plugin might be doing to your computer.
 
-Only linux is supported at this point for extraction, but using the key works on
-windows. This is one slicer key across all instances BambuStudio, I just don't
-want to distribute a key because I don't understand the legality of such a
-thing.
+Only Linux is supported for extraction, but using the key works on Windows. This
+is one slicer key across all instances of BambuStudio. The key is not
+distributed here due to uncertainty about the legality of doing so.
 
-Since this is a oppositional environment, I've only included exactly how to
-extract it, (the cheat answer at the end) not the real mechanism for
-determining how to do it. No need to give Bambu a test case to code against.
+Since this is an adversarial environment, only the extraction method is
+documented (the cheat answer at the end), not the full mechanism for
+determining it. No need to give Bambu a test case to code against.
 
 ## Output files
 

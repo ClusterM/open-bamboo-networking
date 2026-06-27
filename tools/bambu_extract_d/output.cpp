@@ -32,16 +32,31 @@ bool write_pem_output(const std::string& path,
     if (!rsa) { LOG_E("RSA_new failed"); return false; }
 
     BIGNUM* n  = bn_from_bigint(N);
-    BIGNUM* e  = BN_new(); BN_set_word(e, 65537);
+    BIGNUM* e  = BN_new();
     BIGNUM* d  = bn_from_bigint(R.d);
     BIGNUM* p  = bn_from_bigint(R.p);
     BIGNUM* q  = bn_from_bigint(R.q);
     BIGNUM* dp = bn_from_bigint(R.dp);
     BIGNUM* dq = bn_from_bigint(R.dq);
-
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM* qi  = BN_new();
-    BN_mod_inverse(qi, q, p, ctx);
+
+    if (!n || !e || !d || !p || !q || !dp || !dq || !ctx || !qi) {
+        LOG_E("OpenSSL BIGNUM allocation failed");
+        BN_free(n); BN_free(e); BN_free(d); BN_free(p); BN_free(q);
+        BN_free(dp); BN_free(dq); BN_free(qi); BN_CTX_free(ctx);
+        RSA_free(rsa);
+        return false;
+    }
+
+    BN_set_word(e, 65537);
+    if (!BN_mod_inverse(qi, q, p, ctx)) {
+        LOG_E("BN_mod_inverse failed");
+        BN_free(n); BN_free(e); BN_free(d); BN_free(p); BN_free(q);
+        BN_free(dp); BN_free(dq); BN_free(qi); BN_CTX_free(ctx);
+        RSA_free(rsa);
+        return false;
+    }
     BN_CTX_free(ctx);
 
     RSA_set0_key(rsa, n, e, d);

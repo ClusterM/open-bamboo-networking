@@ -251,8 +251,6 @@ std::string build_to_sign(const std::string& payload)
     std::string print_dump;
     if (root->find("print").kind() == obn::json::Value::Kind::Object)
         print_dump = root->find("print").dump();
-    else if (root->kind() == obn::json::Value::Kind::Object)
-        print_dump = root->dump();
     if (print_dump.empty()) return {};
     return std::string("{\"print\":") + print_dump + '}';
 }
@@ -265,13 +263,13 @@ std::string build_envelope(const std::string& to_sign,
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
     out += "{\"header\":{\"cert_id\":\"";
-    out += cert_id();
+    out += obn::json::escape(cert_id());
     out += "\",\"payload_len\":";
     out += std::to_string(to_sign.size());
     out += ",\"sign_alg\":\"";
     out += kSignAlg;
     out += "\",\"sign_string\":\"";
-    out += sig_b64;
+    out += obn::json::escape(sig_b64);
     out += "\",\"sign_ver\":\"";
     out += kSignVer;
     out += "\"},\"print\":";
