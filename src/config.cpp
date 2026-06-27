@@ -88,8 +88,10 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);
     else if (key == "patch_mqtt_ipcam_file")       out.patch_mqtt_ipcam_file = truthy(val);
     else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);
-    else if (key == "bambusource_log_level")     out.bambusource_log_level = val;
-    else if (key == "bambusource_log_file")      out.bambusource_log_file = val;
+    else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
+    else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
+    else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;
+    else if (key == "bambusource_log_file")       out.bambusource_log_file = val;
 }
 
 Settings parse_file(const std::filesystem::path& path)

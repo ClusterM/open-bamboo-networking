@@ -226,7 +226,7 @@ int dial_tls(const std::string& host, int port, int timeout_ms,
         }
         if (ca_path.empty()) {
             set_error(
-                "OBN_LAN_TLS_CA_FILE not set (check obn.lan_tls.env in config dir)");
+                "OBN_LAN_TLS_CA_FILE not set (check obn.env in config dir)");
             return -1;
         }
         if (serial_str.empty()) {

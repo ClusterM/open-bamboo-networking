@@ -127,8 +127,11 @@ patch_mqtt_internal_storage = 0
 
 # --- BambuSource logging --------------------------------------------
 #
-# Separate log level/file for the BambuSource (video/CTRL) library.
-# Empty = plugin defaults; file is never auto-created.
+# Logging for the BambuSource library (camera liveview / file browser).
+# Same pattern as the main plugin: stderr by default, file on demand.
+# Env vars (OBN_BAMBUSOURCE_LOG_*) override these when set.
 
-bambusource_log_level =
+bambusource_log_level = info
+bambusource_log_stderr = 1
+bambusource_log_to_file = 0
 bambusource_log_file =

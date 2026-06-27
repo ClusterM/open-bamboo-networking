@@ -55,8 +55,10 @@ struct Settings {
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
 
-    // BambuSource logging (read-only via load_if_exists)
+    // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
+    std::string bambusource_log_stderr;
+    std::string bambusource_log_to_file;
     std::string bambusource_log_file;
 };
 

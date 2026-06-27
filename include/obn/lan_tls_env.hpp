@@ -1,13 +1,13 @@
 #pragma once
 
 // IPC between libbambu_networking and libBambuSource (same process, separate
-// dlopen). Primary channel: <config_dir>/obn.lan_tls.env (written by the
+// dlopen). Primary channel: <config_dir>/obn.env (written by the
 // plugin, hydrated once by BambuSource via env_var_get). Process env is a
 // best-effort mirror only.
 //
 // Windows: do not rely on getenv() across DLLs — networking writes with
 // SetEnvironmentVariableA + _putenv_s; BambuSource reads GetEnvironmentVariableA
-// and, on miss, loads obn.lan_tls.env (CRT getenv alone is not enough).
+// and, on miss, loads obn.env (CRT getenv alone is not enough).
 
 #include <chrono>
 #include <cstdlib>
@@ -31,7 +31,12 @@ inline constexpr const char* kEnvSkipVerify   = "OBN_SKIP_TLS_VERIFY";
 inline constexpr const char* kEnvForceFtps    = "OBN_FORCE_FTPS";
 inline constexpr const char* kEnvDisableCameraPreview = "OBN_DISABLE_CAMERA_PREVIEW";
 inline constexpr const char* kEnvSerialWaitMs = "OBN_LAN_TLS_SERIAL_WAIT_MS";
-inline constexpr const char* kLanTlsStateFile = "obn.lan_tls.env";
+// BambuSource logging — propagated from obn.conf by the main plugin.
+inline constexpr const char* kEnvBsLogLevel   = "OBN_BAMBUSOURCE_LOG_LEVEL";
+inline constexpr const char* kEnvBsLogStderr  = "OBN_BAMBUSOURCE_LOG_STDERR";
+inline constexpr const char* kEnvBsLogToFile  = "OBN_BAMBUSOURCE_LOG_TO_FILE";
+inline constexpr const char* kEnvBsLogFile    = "OBN_BAMBUSOURCE_LOG_FILE";
+inline constexpr const char* kLanTlsStateFile = "obn.env";
 
 inline constexpr int kDefaultSerialEnvWaitMs = 5000;
 inline constexpr int kSerialEnvPollMs        = 100;

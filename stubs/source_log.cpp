@@ -1,6 +1,6 @@
 #include "source_log.hpp"
 
-#include "obn/config.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/os_compat.hpp"
 
 #include <cctype>
@@ -99,13 +99,16 @@ thread_local std::string g_last_error;
 
 LogLevel current_log_level()
 {
-    // Env var takes priority; fall back to obn.conf bambusource_log_level
-    // (available once the main plugin has called load_or_create).
-    if (const char* env = std::getenv("OBN_BAMBUSOURCE_LOG_LEVEL"))
-        return parse_log_level(env, LL_INFO);
-    const auto& lvl = obn::config::current().bambusource_log_level;
-    if (!lvl.empty()) return parse_log_level(lvl.c_str(), LL_INFO);
+    if (const char* v = obn::lan_tls::env_var_get(obn::lan_tls::kEnvBsLogLevel))
+        return parse_log_level(v, LL_INFO);
     return LL_INFO;
+}
+
+bool echo_stderr_enabled()
+{
+    const char* v = obn::lan_tls::env_var_get(obn::lan_tls::kEnvBsLogStderr);
+    if (!v || !*v) return true;
+    return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
 }
 
 #if defined(_WIN32)
@@ -154,87 +157,82 @@ std::string this_dll_data_dir()
 } // namespace
 #endif
 
-// Resolution order:
-//   1. $OBN_BAMBUSOURCE_LOG_FILE (set to "off"/"none"/empty to disable
-//      the file mirror entirely; "stderr" routes to stderr).
-//   2. Windows: <this-dll's data dir>\obn-bambusource.log
-//      POSIX:   $XDG_STATE_HOME/bambu-studio/obn-bambusource.log
-//   3. POSIX:   $HOME/.local/state/bambu-studio/obn-bambusource.log
-//      Windows: %APPDATA%\BambuStudio\obn-bambusource.log (legacy)
-//   4. Last-resort fallback (TEMP / /tmp).
+static FILE* open_log_file(const char* path)
+{
+    FILE* f = std::fopen(path, "a");
+    if (!f) return nullptr;
+    std::setvbuf(f, nullptr, _IONBF, 0);
+    std::fprintf(f, "--- obn libBambuSource opened (path=%s) ---\n", path);
+    return f;
+}
+
+// Resolve the default log file path when bambusource_log_to_file=1
+// but no explicit bambusource_log_file is set.
+static FILE* open_default_log_file()
+{
+#if defined(_WIN32)
+    std::string dd = this_dll_data_dir();
+    if (!dd.empty()) {
+        if (FILE* f = open_log_file((dd + "\\obn-bambusource.log").c_str()))
+            return f;
+    }
+#else
+    if (const char* xdg = std::getenv("XDG_STATE_HOME")) {
+        std::string p = std::string(xdg) + "/bambu-studio/obn-bambusource.log";
+        if (FILE* f = open_log_file(p.c_str())) return f;
+    }
+    if (const char* home = std::getenv("HOME")) {
+        std::string p = std::string(home) + "/.local/state/bambu-studio/obn-bambusource.log";
+        if (FILE* f = open_log_file(p.c_str())) return f;
+    }
+    if (FILE* f = open_log_file("/tmp/obn-bambusource.log")) return f;
+#endif
+    return nullptr;
+}
+
+// Resolution (matches main plugin pattern):
+//   1. bambusource_log_file (explicit path, "off"/"none" to disable, "stderr" for stderr)
+//   2. bambusource_log_to_file=1 -> auto-detect path from DLL location / $HOME
+//   3. Neither set -> no file (default, same as main plugin)
 FILE* mirror_log_fp()
 {
     static FILE* fp = []() -> FILE* {
-        // Env var takes priority; fall back to obn.conf bambusource_log_file.
-        const char* env = std::getenv("OBN_BAMBUSOURCE_LOG_FILE");
-        const auto& conf_file = obn::config::current().bambusource_log_file;
-        const char* explicit_path = env ? env : (!conf_file.empty() ? conf_file.c_str() : nullptr);
-        if (explicit_path) {
-            if (!*explicit_path || !std::strcmp(explicit_path, "off") ||
+        const char* explicit_path =
+            obn::lan_tls::env_var_get(obn::lan_tls::kEnvBsLogFile);
+        if (explicit_path && *explicit_path) {
+            if (!std::strcmp(explicit_path, "off") ||
                 !std::strcmp(explicit_path, "none") || !std::strcmp(explicit_path, "0"))
                 return nullptr;
             if (!std::strcmp(explicit_path, "stderr") || !std::strcmp(explicit_path, "-"))
                 return stderr;
-            if (FILE* f = std::fopen(explicit_path, "a")) {
-                // _IOLBF + nullptr buffer is invalid on MSVC CRT and triggers
-                // __fastfail(FAST_FAIL_INVALID_ARG); use _IONBF (no buffering)
-                // which is allowed with a NULL buffer on every supported CRT.
-                std::setvbuf(f, nullptr, _IONBF, 0);
-                std::fprintf(f, "--- obn libBambuSource opened ---\n");
+            if (FILE* f = open_log_file(explicit_path))
                 return f;
-            }
-            // Fall through to the default search if the user-supplied
-            // path could not be opened — better than dropping logs.
         }
 
-        static std::string p0, p1, p2, p3;
-        const char* paths[4] = {nullptr, nullptr, nullptr, nullptr};
-#if defined(_WIN32)
-        // Preferred: alongside the host slicer's data dir, recovered
-        // from this DLL's installed path. Works for both Studio and
-        // Orca without any compile-time switch.
-        std::string dd = this_dll_data_dir();
-        if (!dd.empty()) {
-            p0 = dd + "\\obn-bambusource.log";
-            paths[0] = p0.c_str();
-        }
-        if (const char* appdata = std::getenv("APPDATA")) {
-            p1 = std::string(appdata) + "\\BambuStudio\\obn-bambusource.log";
-            paths[1] = p1.c_str();
-        }
-        if (const char* lappdata = std::getenv("LOCALAPPDATA")) {
-            p2 = std::string(lappdata) + "\\BambuStudio\\obn-bambusource.log";
-            paths[2] = p2.c_str();
-        }
-        if (const char* tmp = std::getenv("TEMP")) {
-            p3 = std::string(tmp) + "\\obn-bambusource.log";
-            paths[3] = p3.c_str();
-        } else {
-            paths[3] = "C:\\obn-bambusource.log";
-        }
-#else
-        if (const char* xdg = std::getenv("XDG_STATE_HOME")) {
-            p0 = std::string(xdg) + "/bambu-studio/obn-bambusource.log";
-            paths[0] = p0.c_str();
-        }
-        if (const char* home = std::getenv("HOME")) {
-            p1 = std::string(home) + "/.local/state/bambu-studio/obn-bambusource.log";
-            paths[1] = p1.c_str();
-        }
-        paths[2] = "/tmp/obn-bambusource.log";
-#endif
-        for (const char* path : paths) {
-            if (!path) continue;
-            if (FILE* f = std::fopen(path, "a")) {
-                // See note above: _IOLBF + nullptr buffer crashes the MSVC CRT.
-                std::setvbuf(f, nullptr, _IONBF, 0);
-                std::fprintf(f, "--- obn libBambuSource opened (path=%s) ---\n", path);
-                return f;
-            }
-        }
+        const char* to_file =
+            obn::lan_tls::env_var_get(obn::lan_tls::kEnvBsLogToFile);
+        if (to_file && (to_file[0] == '1' || to_file[0] == 'y' ||
+                        to_file[0] == 'Y' || to_file[0] == 't' || to_file[0] == 'T'))
+            return open_default_log_file();
+
         return nullptr;
     }();
     return fp;
+}
+
+static void emit_line(LogLevel lvl, const char* buf)
+{
+    auto now = std::chrono::system_clock::now();
+    auto tt  = std::chrono::system_clock::to_time_t(now);
+    std::tm lt{};
+    obn::os::localtime_safe(tt, &lt);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%F %T", &lt);
+
+    if (FILE* fp = mirror_log_fp())
+        std::fprintf(fp, "%s [%s] %s\n", ts, level_tag(lvl), buf);
+    if (echo_stderr_enabled())
+        std::fprintf(stderr, "[obn-bs] %s [%s] %s\n", ts, level_tag(lvl), buf);
 }
 
 void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...)
@@ -247,22 +245,10 @@ void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...)
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    if (FILE* fp = mirror_log_fp()) {
-        auto now = std::chrono::system_clock::now();
-        auto tt  = std::chrono::system_clock::to_time_t(now);
-        std::tm lt{};
-        obn::os::localtime_safe(tt, &lt);
-        char ts[32];
-        std::strftime(ts, sizeof(ts), "%F %T", &lt);
-        std::fprintf(fp, "%s [%s] %s\n", ts, level_tag(lvl), buf);
-    }
+    emit_line(lvl, buf);
 
-    if (logger) {
-        // Studio expects a heap-allocated buffer that it will free via
-        // Bambu_FreeLogMsg. POSIX -> strdup; Windows -> wide-char copy
-        // via strdup_for_logger() (caller frees with free()).
+    if (logger)
         logger(ctx, /*level=*/static_cast<int>(lvl), strdup_for_logger(buf));
-    }
 }
 
 void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
@@ -275,19 +261,10 @@ void log_fmt(Logger logger, void* ctx, const char* fmt, ...)
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    if (FILE* fp = mirror_log_fp()) {
-        auto now = std::chrono::system_clock::now();
-        auto tt  = std::chrono::system_clock::to_time_t(now);
-        std::tm lt{};
-        obn::os::localtime_safe(tt, &lt);
-        char ts[32];
-        std::strftime(ts, sizeof(ts), "%F %T", &lt);
-        std::fprintf(fp, "%s [INFO] %s\n", ts, buf);
-    }
+    emit_line(LL_INFO, buf);
 
-    if (logger) {
+    if (logger)
         logger(ctx, /*level=*/static_cast<int>(LL_INFO), strdup_for_logger(buf));
-    }
 }
 
 void set_last_error(const char* msg)

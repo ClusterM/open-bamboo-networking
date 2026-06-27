@@ -729,7 +729,7 @@ void push_reply(Tunnel* t, CtrlReply r)
 // BambuSource compiles its own copy of config.cpp (self-contained .so),
 // so config::current() here returns defaults — the main plugin's
 // load_or_create never touches our static. The main plugin's
-// Main plugin writes OBN_FORCE_FTPS into <config_dir>/obn.lan_tls.env;
+// Main plugin writes OBN_FORCE_FTPS into <config_dir>/obn.env;
 // env_var_get hydrates that file on miss (required on Windows across DLLs).
 bool ftps_bridge_enabled()
 {

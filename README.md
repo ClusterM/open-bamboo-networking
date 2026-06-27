@@ -539,8 +539,10 @@ over the file when set.
 | `block_cloud` | `1` | Block background cloud MQTT/REST connections. Auth, preset sync, and bind/unbind are still allowed. |
 | `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
-| `bambusource_log_level` | *(unset)* | Log threshold for BambuSource (camera/file-browser library). Overridden by `OBN_BAMBUSOURCE_LOG_LEVEL`. |
-| `bambusource_log_file` | *(unset)* | Log file path for BambuSource. Overridden by `OBN_BAMBUSOURCE_LOG_FILE`. |
+| `bambusource_log_level` | `info` | Log threshold for BambuSource (camera/file-browser library). Overridden by `OBN_BAMBUSOURCE_LOG_LEVEL`. |
+| `bambusource_log_stderr` | `1` | Copy BambuSource log lines to stderr with `[obn-bs]` prefix. Overridden by `OBN_BAMBUSOURCE_LOG_STDERR`. |
+| `bambusource_log_to_file` | `0` | When `1`, append to `<data_dir>/obn-bambusource.log`. Overridden by `OBN_BAMBUSOURCE_LOG_TO_FILE`. |
+| `bambusource_log_file` | *(empty)* | Explicit log file path for BambuSource. Overridden by `OBN_BAMBUSOURCE_LOG_FILE`. |
 
 Example — enable a persistent log file without env vars:
 
@@ -647,18 +649,19 @@ into a proper redacting logger is on the TODO list.)
 
 ### `libBambuSource.so` logging
 
-`libBambuSource.so` is `dlopen`'d separately from the main plugin and
-runs inside the camera / file-browser code path that the slicer's media
-widget drives. It keeps its own log mirror so you can see RTSP / TLS
-failures even when the parent slicer process funnels its log somewhere
-unhelpful.
+`libBambuSource.so` is a separate library that handles the camera
+liveview and file browser. Its logging follows the same pattern as the
+main plugin: **stderr by default, file on demand**. All settings below
+can be set in `obn.conf`; environment variables override them when set.
 
-| Variable                     | Default                                                                                                                                                                                          | Effect                                                                                                                                                                |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OBN_BAMBUSOURCE_LOG_LEVEL`  | `info`                                                                                                                                                                                           | `trace` / `debug` / `info` / `warn` / `error` / `off`. Filters both the file mirror and the callback the slicer gets.                                                 |
-| `OBN_BAMBUSOURCE_LOG_FILE`   | Linux: first writable of `$XDG_STATE_HOME/bambu-studio/obn-bambusource.log`, `$HOME/.local/state/bambu-studio/obn-bambusource.log`, `/tmp/obn-bambusource.log`. Windows: first writable of `<host slicer's data dir>\obn-bambusource.log` (i.e. `%APPDATA%\BambuStudio\obn-bambusource.log` when loaded by Bambu Studio, `%APPDATA%\OrcaSlicer\obn-bambusource.log` when loaded by OrcaSlicer — auto-detected from the DLL's own install path), then `%LOCALAPPDATA%\BambuStudio\obn-bambusource.log`, then `%TEMP%\obn-bambusource.log`. | Absolute path to the file mirror, or `off` / `none` / empty / `0` to disable, or `stderr` / `-` to route to stderr instead of a file.                                 |
+| `obn.conf` key                 | Env override                     | Default   | Effect |
+| ------------------------------ | -------------------------------- | --------- | ------ |
+| `bambusource_log_level`        | `OBN_BAMBUSOURCE_LOG_LEVEL`      | `info`    | `trace` / `debug` / `info` / `warn` / `error` / `off`. |
+| `bambusource_log_stderr`       | `OBN_BAMBUSOURCE_LOG_STDERR`     | `1`       | When `1`, copy every line to stderr with an `[obn-bs]` prefix. |
+| `bambusource_log_to_file`      | `OBN_BAMBUSOURCE_LOG_TO_FILE`    | `0`       | When `1`, append to `<data_dir>/obn-bambusource.log`. |
+| `bambusource_log_file`         | `OBN_BAMBUSOURCE_LOG_FILE`       | *(empty)* | Explicit path; `off`/`none`/`0` to disable, `stderr`/`-` for stderr. |
 
-The mirror file rolls every line through `[level]` plus a timestamp.
+The log file rolls every line through `[level]` plus a timestamp.
 Lines are tagged with `rtsp:` (handshake / DESCRIBE / SETUP / PLAY),
 `rtsp_passthrough:` (the worker that hands the byte stream to
 gstbambusrc on Linux), and on Windows also `dshow:` (the DirectShow

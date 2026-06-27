@@ -162,6 +162,8 @@ static int test_new_keys()
                "patch_mqtt_ipcam_file = true\n"
                "patch_mqtt_internal_storage = 1\n"
                "bambusource_log_level = debug\n"
+               "bambusource_log_stderr = 0\n"
+               "bambusource_log_to_file = 1\n"
                "bambusource_log_file = /tmp/bs.log\n");
     const auto cfg = obn::config::load_or_create(dir.string());
     CHECK(cfg.lan_tls_skip_verify == true);
@@ -176,6 +178,8 @@ static int test_new_keys()
     CHECK(cfg.patch_mqtt_ipcam_file == true);
     CHECK(cfg.patch_mqtt_internal_storage == true);
     CHECK(cfg.bambusource_log_level == "debug");
+    CHECK(cfg.bambusource_log_stderr == "0");
+    CHECK(cfg.bambusource_log_to_file == "1");
     CHECK(cfg.bambusource_log_file == "/tmp/bs.log");
     return 0;
 }
@@ -197,6 +201,8 @@ static int test_new_keys_defaults()
     CHECK(cfg.patch_mqtt_ipcam_file == false);
     CHECK(cfg.patch_mqtt_internal_storage == false);
     CHECK(cfg.bambusource_log_level.empty());
+    CHECK(cfg.bambusource_log_stderr.empty());
+    CHECK(cfg.bambusource_log_to_file.empty());
     CHECK(cfg.bambusource_log_file.empty());
     return 0;
 }

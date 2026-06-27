@@ -47,8 +47,8 @@ Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_li
 | `bambu_network_create_agent` | ✅ | Allocates the internal agent and bootstraps logging from the supplied `log_dir`. |
 | `bambu_network_destroy_agent` | ✅ | Deletes the agent instance. |
 | `bambu_network_init_log` | ✅ | No-op here: log sinks are configured inside `create_agent`, before the first log line. |
-| `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache, device-cert snapshots, and `<config_dir>/obn.lan_tls.env` (LAN TLS IPC to `libBambuSource`). Also publishes `OBN_CONFIG_DIR` in the process environment. |
-| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder (synced to env + `obn.lan_tls.env` as `OBN_LAN_TLS_CA_FILE`); **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
+| `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache, device-cert snapshots, and `<config_dir>/obn.env` (IPC to `libBambuSource`). Also publishes `OBN_CONFIG_DIR` in the process environment. |
+| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder (synced to env + `obn.env` as `OBN_LAN_TLS_CA_FILE`); **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
 | `bambu_network_set_country_code` | ✅ | Stored; drives cloud region selection (`api_host`, `web_host`). |
 | `bambu_network_start` | ✅ | Starts worker threads. If a cached session is present the plugin also kicks off `connect_cloud()` here — the stock call chain normally goes through `EVT_USER_LOGIN_HANDLE`, but that cascade can silently stall for cached sign-ins; starting from `start()` guarantees cloud MQTT gets initiated. |
 
@@ -212,7 +212,7 @@ Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](includ
 | MQTT :8883 | ✅ (tested P2S) | Vendored libmosquitto patched for `mosquitto_tls_verify_hostname_set` when connecting to an IP. |
 | FTPS :990 | ✅ (tested P2S) | Print job, `ft_*` fastpath, BambuSource file browser (**external USB only** on P2S — see [PrinterFileSystem](#printerfilesystem-mediafilepanel)). |
 | RTSPS :322 / MJPEG :6000 | ✅ (tested P2S) | Implemented in `libBambuSource` (`stubs/tls_socket.cpp`). |
-| Cross-library IPC | ✅ | `libbambu_networking` and `libBambuSource` are separate dlopen loads. Networking syncs registry → process env + **`<config_dir>/obn.lan_tls.env`**. BambuSource reads env (Linux: `getenv`; Windows: `GetEnvironmentVariableA`) and hydrates from the state file on miss. |
+| Cross-library IPC | ✅ | `libbambu_networking` and `libBambuSource` are separate dlopen loads. Networking syncs registry → process env + **`<config_dir>/obn.env`**. BambuSource reads env (Linux: `getenv`; Windows: `GetEnvironmentVariableA`) and hydrates from the state file on miss. |
 | Bootstrap snapshot | ✅ | `cert_store.cpp` uses verify-off **once** to capture the device leaf PEM before trust anchors exist; not used for normal LAN sessions. |
 
 ---
@@ -505,7 +505,7 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
    wmp/wxMediaCtrl keeps the graph in `State_Paused` until the renderer gets the first sample (which triggers `State_Running`). A worker that gates `IMemInputPin::Receive` on `State_Running` deadlocks: renderer waits for the first sample, source waits for `Running` → black frame, endless “playing”, RTSP disconnect on back-pressure. Standard pattern: commit the allocator in `Pause()` and start streaming immediately.
 
 4. **`SetEnvironmentVariableA` (write) vs `getenv` (read) are not the same environment on MSVC.**  
-   `libbambu_networking` and `BambuSource.dll` are separate loads in one process. Networking used to publish LAN TLS state with Win32 env APIs while BambuSource read with CRT `getenv` — BambuSource never saw `OBN_LAN_TLS_CA_FILE` (RTSPS failed before TLS handshake). Fix: reads use `GetEnvironmentVariableA`; writes also mirror to `_putenv_s`; **`obn.lan_tls.env`** in `<data_dir>` is the file-backed fallback. See §6.4.1 and [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp).
+   `libbambu_networking` and `BambuSource.dll` are separate loads in one process. Networking used to publish LAN TLS state with Win32 env APIs while BambuSource read with CRT `getenv` — BambuSource never saw `OBN_LAN_TLS_CA_FILE` (RTSPS failed before TLS handshake). Fix: reads use `GetEnvironmentVariableA`; writes also mirror to `_putenv_s`; **`obn.env`** in `<data_dir>` is the file-backed fallback. See §6.4.1 and [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp).
 
 ### macOS
 
