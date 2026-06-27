@@ -255,6 +255,19 @@ std::string build_to_sign(const std::string& payload)
     return std::string("{\"print\":") + print_dump + '}';
 }
 
+// Escapes backslash and double-quote for embedding inside a JSON string
+// literal whose surrounding quotes are managed by the caller.
+static std::string json_str_escape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\\' || c == '"') out += '\\';
+        out += c;
+    }
+    return out;
+}
+
 // Builds the complete signed envelope JSON string.
 std::string build_envelope(const std::string& to_sign,
                            const std::string& sig_b64,
@@ -263,13 +276,13 @@ std::string build_envelope(const std::string& to_sign,
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
     out += "{\"header\":{\"cert_id\":\"";
-    out += obn::json::escape(cert_id());
+    out += json_str_escape(cert_id());
     out += "\",\"payload_len\":";
     out += std::to_string(to_sign.size());
     out += ",\"sign_alg\":\"";
     out += kSignAlg;
     out += "\",\"sign_string\":\"";
-    out += obn::json::escape(sig_b64);
+    out += json_str_escape(sig_b64);
     out += "\",\"sign_ver\":\"";
     out += kSignVer;
     out += "\"},\"print\":";
