@@ -171,13 +171,14 @@ std::string download_plugin_if_needed() {
                    cache_dir.c_str(), nullptr);
             _exit(127);
         }
-        unlink(zip_tmp);
         if (unzip_pid < 0) {
             std::fprintf(stderr, "[plugin-dl] fork failed: %s\n", strerror(errno));
+            unlink(zip_tmp);
             return {};
         }
         int unzip_st = 0;
         waitpid(unzip_pid, &unzip_st, 0);
+        unlink(zip_tmp);
         if (!WIFEXITED(unzip_st) || WEXITSTATUS(unzip_st) != 0) {
             std::fprintf(stderr, "[plugin-dl] unzip failed (rc=%d)\n",
                          WIFEXITED(unzip_st) ? WEXITSTATUS(unzip_st) : -1);
