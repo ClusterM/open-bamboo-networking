@@ -71,7 +71,7 @@ std::string download_plugin_if_needed() {
             execlp("curl", "curl", "--silent", "--location", "--max-time", "60",
                    "-H", "X-BBL-OS-Type: linux",
                    "-o", manifest_tmp,
-                   "https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.07.01.51",
+                   "https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/cloud=02.07.01.00",
                    nullptr);
             _exit(127);
         }
@@ -153,8 +153,10 @@ std::string download_plugin_if_needed() {
     {
         std::string parent1 = std::string(home) + "/.cache";
         std::string parent2 = std::string(home) + "/.cache/bambu_extract_d";
+        std::string parent3 = std::string(home) + "/.cache/bambu_extract_d/plugins";
         mkdir(parent1.c_str(), 0700);
         mkdir(parent2.c_str(), 0700);
+        mkdir(parent3.c_str(), 0700);
         if (mkdir(cache_dir.c_str(), 0700) != 0 && errno != EEXIST) {
             std::fprintf(stderr, "[plugin-dl] cannot create cache dir: %s\n", cache_dir.c_str());
             unlink(zip_tmp);
