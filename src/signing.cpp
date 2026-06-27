@@ -301,15 +301,9 @@ std::string maybe_sign(const std::string& payload_json,
     // to_sign has the shape: {"print":<dump>}
     const std::string print_dump = to_sign.substr(9, to_sign.size() - 10);
 
-    std::string sig_b64;
-    try {
-        sig_b64 = rsa_sha256_sign_b64(
-            pkey,
-            reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr, "signing: RSA sign failed (%s) — sending unsigned\n", ex.what());
-        return payload_json;
-    }
+    const std::string sig_b64 = rsa_sha256_sign_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
 
     return build_envelope(to_sign, sig_b64, print_dump);
 }
