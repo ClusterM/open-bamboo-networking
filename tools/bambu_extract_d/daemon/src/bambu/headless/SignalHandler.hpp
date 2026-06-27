@@ -1,5 +1,3 @@
-
-
 #ifndef SLIC3R_BAMBU_BRIDGE_HEADLESS_SIGNAL_HANDLER_HPP
 #define SLIC3R_BAMBU_BRIDGE_HEADLESS_SIGNAL_HANDLER_HPP
 
@@ -15,12 +13,6 @@ namespace headless {
 
 class SignalHandler {
 public:
-
-
-
-
-
-
 
     explicit SignalHandler(std::function<void()> on_signal);
 

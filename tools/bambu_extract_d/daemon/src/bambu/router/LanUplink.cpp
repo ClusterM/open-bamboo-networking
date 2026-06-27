@@ -1,5 +1,3 @@
-
-
 #include "LanUplink.hpp"
 
 #include "../BambuNetworkingPluginHandle.hpp"
@@ -86,9 +84,6 @@ std::string resolve_helper_path_once() {
             std::string dir = (slash == std::string::npos)
                 ? std::string(".") : exe.substr(0, slash);
 
-
-
-
             const std::vector<std::string> candidates = {
                 dir + "/../../src/bambu/router/raw_mqtt_publish.py",
                 dir + "/../../../src/bambu/router/raw_mqtt_publish.py",
@@ -164,7 +159,6 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
                           const std::string& payload_file,
                           const std::string& dev_id) {
 
-
     std::string port_s = std::to_string(printer_port);
     std::string qos_s  = std::to_string(static_cast<int>(qos));
 
@@ -192,8 +186,6 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
     }
     if (pid == 0) {
 
-
-
         int devnull = ::open("/dev/null", O_RDONLY);
         if (devnull >= 0) {
             ::dup2(devnull, STDIN_FILENO);
@@ -206,7 +198,6 @@ int spawn_raw_mqtt_helper(const std::string& helper_path,
             dev_id.c_str(), std::strerror(errno));
         std::_Exit(127);
     }
-
 
     int status = 0;
     auto deadline = std::chrono::steady_clock::now() +
@@ -243,22 +234,13 @@ struct LanUplink::Impl {
     struct DeviceState {
         LanUplinkConfig                                cfg;
 
-
-
-
-
-
         std::unordered_map<std::string, int> topic_refs;
     };
-
-
 
     struct Subscriber {
         uint64_t                            session_id;
         server::IUplink::DownstreamPublisher publisher;
     };
-
-
 
     struct RetainedMsg {
         std::string          topic;
@@ -269,41 +251,16 @@ struct LanUplink::Impl {
 
     std::shared_ptr<BambuNetworkingPluginHandle>                  handle;
 
-
-
     std::shared_ptr<EncMsgEnvelope>                               enc_msg;
     mutable std::mutex                                            mu;
     std::unordered_map<std::string, std::unique_ptr<DeviceState>> devices;
     std::unordered_map<std::string, std::vector<Subscriber>>      downstreams;
     std::unordered_map<std::string, std::vector<RetainedMsg>>     retained;
 
-
-
-
-
     std::string                                                   current_connected_dev_id;
-
-
-
-
-
-
-
-
-
 
     std::thread                                                   resign_thread;
     std::atomic<bool>                                             resign_stop{false};
-
-
-
-
-
-
-
-
-
-
 
     std::thread                                                   gcode_cmd_thread;
     std::atomic<bool>                                             gcode_cmd_stop{false};
@@ -324,10 +281,6 @@ LanUplink::~LanUplink() {
     m_impl->gcode_cmd_stop.store(true);
     if (m_impl->gcode_cmd_thread.joinable()) m_impl->gcode_cmd_thread.join();
 
-
-
-
-
     std::shared_ptr<BambuNetworkingPluginHandle> h;
     std::vector<std::string> dev_ids;
     bool we_were_connected = false;
@@ -344,7 +297,6 @@ LanUplink::~LanUplink() {
 }
 
 void LanUplink::attach_plugin(std::shared_ptr<BambuNetworkingPluginHandle> handle) {
-
 
     std::vector<std::string> dev_ids;
     std::shared_ptr<BambuNetworkingPluginHandle> old;
@@ -423,8 +375,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
 
     if (!h) return;
 
-
-
     Impl* impl = m_impl.get();
     h->register_local_message_receiver(dev_id,
         [impl, dev_id](std::string topic,
@@ -457,9 +407,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
         }
     });
 
-
-
-
     int rc = h->connect_printer(dev_id, dev_ip, "bblp", access, use_ssl);
     std::fprintf(stderr,
         "[lan-uplink] add_device dev=%s connect_printer rc=%d\n",
@@ -471,15 +418,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
             m_impl->current_connected_dev_id = dev_id;
         }
 
-
-
-
-
-
-
-
-
-
         h->set_user_selected_machine(dev_id);
         h->install_device_cert(dev_id, false);
         std::fprintf(stderr,
@@ -487,8 +425,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
             "(set_user_selected_machine + install_device_cert)\n",
             dev_id.c_str());
         std::fflush(stderr);
-
-
 
         if (const char* ms = std::getenv("BAMBU_BRIDGE_RESIGN_MS")) {
             long period = std::atol(ms);
@@ -513,18 +449,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
             }
         }
 
-
-
-
-
-
-
-
-
-
-
-
-
         if (const char* ms = std::getenv("BAMBU_BRIDGE_GCODE_CMD_MS")) {
             long period = std::atol(ms);
             if (period > 0 && !m_impl->gcode_cmd_thread.joinable()) {
@@ -538,25 +462,10 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
                         d.c_str(), period);
                     std::fflush(stderr);
 
-
-
-
-
-
-
                     unsigned long seq = 100000;
                     std::mt19937_64 rng(
                         std::chrono::steady_clock::now()
                             .time_since_epoch().count());
-
-
-
-
-
-
-
-
-
 
                     const bool diag =
                         std::getenv("BAMBU_BRIDGE_GCODE_CMD_DIAG") != nullptr;
@@ -566,9 +475,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
                         std::snprintf(namebuf, sizeof(namebuf),
                             "bridge_nonexistent_%016llx.gcode.3mf", r);
                         std::string fname = namebuf;
-
-
-
 
                         std::string gcode_file_json =
                             std::string("{\"print\":{")
@@ -599,8 +505,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
 
                         if (diag) {
 
-
-
                             std::string gcode_line_json =
                                 std::string("{\"print\":{")
                               + "\"command\":\"gcode_line\","
@@ -612,9 +516,6 @@ void LanUplink::add_device(LanUplinkConfig cfg) {
                                 "[lan-uplink] gcode-cmd DIAG dev=%s cmd=gcode_line(M105) "
                                 "send_message_to_printer rc=%d\n", d.c_str(), rc2);
                             std::fflush(stderr);
-
-
-
 
                             std::string pushall_json =
                                 std::string("{\"pushing\":{")
@@ -659,8 +560,6 @@ void LanUplink::remove_device(const std::string& dev_id) {
     if (h) {
         h->unregister_local_message_receiver(dev_id);
 
-
-
         if (was_current) h->disconnect_printer();
     }
 }
@@ -679,13 +578,6 @@ bool LanUplink::is_connected(const std::string& dev_id) const {
 }
 
 void LanUplink::on_subscribe(const std::string& dev_id, std::string topic) {
-
-
-
-
-
-
-
 
     std::shared_ptr<BambuNetworkingPluginHandle> h;
     bool need_swap = false;
@@ -746,12 +638,6 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
     }
     std::string json(payload.begin(), payload.end());
 
-
-
-
-
-
-
 #if 0
     auto publish_via_cert = [&](const std::string& label) -> bool {
         const std::string helper = resolve_helper_path_once();
@@ -796,28 +682,12 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
         return true;
     };
 
-
-
-
-
     if (is_tier2 && have_cert) {
         if (publish_via_cert("tier2-via-cert")) return;
 
     }
 
-
-
-
-
-
-
     if (is_print && have_cert && print_bypass_enabled()) {
-
-
-
-
-
-
 
         bool wrap_ok = true;
         if (enc) {
@@ -841,8 +711,6 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
         }
         if (!wrap_ok) {
 
-
-
         } else {
         const std::string helper = resolve_helper_path_once();
         if (helper.empty()) {
@@ -852,7 +720,6 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
                 dev_id.c_str());
             std::fflush(stderr);
         } else {
-
 
             const std::string tmpfile = write_tmp_payload(payload, dev_id);
             if (tmpfile.empty()) {
@@ -897,10 +764,6 @@ void LanUplink::on_publish(const std::string& dev_id, std::string topic,
         return;
     }
 
-
-
-
-
     int rc = h->send_message_to_printer(dev_id, json, static_cast<int>(qos));
     std::fprintf(stderr,
         "[lan-uplink] on_publish dev=%s bytes=%zu qos=%u send_message_to_printer rc=%d\n",
@@ -920,11 +783,6 @@ void LanUplink::on_unsubscribe(const std::string& dev_id, std::string topic) {
 }
 
 void LanUplink::on_disconnect(const std::string& dev_id) {
-
-
-
-
-
 
     (void)dev_id;
 }

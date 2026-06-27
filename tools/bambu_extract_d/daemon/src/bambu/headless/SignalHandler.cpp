@@ -1,5 +1,3 @@
-
-
 #include "SignalHandler.hpp"
 
 #include <atomic>
@@ -32,9 +30,6 @@ extern "C" void on_signal(int ) {
     const int fd = g_write_fd.load(std::memory_order_acquire);
     if (fd < 0) return;
     const char b = 1;
-
-
-
 
     ssize_t r = ::write(fd, &b, 1);
     (void) r;
@@ -71,9 +66,6 @@ SignalHandler::SignalHandler(std::function<void()> cb) {
         throw std::runtime_error("SignalHandler: pipe() failed");
     }
 
-
-
-
     int flags = ::fcntl(fds[1], F_GETFL, 0);
     ::fcntl(fds[1], F_SETFL, flags | O_NONBLOCK);
 
@@ -86,7 +78,6 @@ SignalHandler::SignalHandler(std::function<void()> cb) {
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-
 
     if (::sigaction(SIGINT,  &sa, &g_prior_sigint)  != 0 ||
         ::sigaction(SIGTERM, &sa, &g_prior_sigterm) != 0) {
@@ -107,7 +98,6 @@ SignalHandler::~SignalHandler() {
     ::sigaction(SIGTERM, &g_prior_sigterm, nullptr);
 
     g_running.store(false, std::memory_order_release);
-
 
     const int wfd = g_write_fd.exchange(-1, std::memory_order_acq_rel);
     if (wfd >= 0) ::close(wfd);

@@ -1,5 +1,3 @@
-
-
 #include "App.hpp"
 
 #include "../BambuNetworkingPluginHandle.hpp"
@@ -32,8 +30,6 @@ resolve_mtls_paths(const std::string& dev_id) {
         dir = env;
     }
 
-
-
     std::string cert_env_key = "BBL_BRIDGE_MTLS_CERT_" + dev_id;
     std::string key_env_key  = "BBL_BRIDGE_MTLS_KEY_"  + dev_id;
     const char* ec = std::getenv(cert_env_key.c_str());
@@ -44,7 +40,6 @@ resolve_mtls_paths(const std::string& dev_id) {
             return {ec, ek};
         }
     }
-
 
     DIR* d = ::opendir(dir.c_str());
     if (!d) return {{}, {}};
@@ -82,7 +77,6 @@ static std::string detect_primary_lan_ip() {
         if (!::inet_ntop(AF_INET, &in->sin_addr, buf, sizeof(buf))) continue;
         std::string ip = buf;
 
-
         const std::string ifname = ifa->ifa_name ? ifa->ifa_name : "";
         if (ifname.rfind("docker", 0) == 0)  continue;
         if (ifname.rfind("br-",    0) == 0)  continue;
@@ -100,8 +94,6 @@ static const char* const kVirtualSerialPrefix = "FFFF";
 static std::string mangle_serial(const std::string& real_sn) {
     constexpr std::size_t kPrefixLen = 4;
     if (real_sn.size() <= kPrefixLen) {
-
-
 
         return std::string(kVirtualSerialPrefix) + real_sn;
     }
@@ -140,7 +132,6 @@ static void load_port_map(const std::string& path,
 
 static bool save_port_map(const std::string& path,
                           const std::map<std::string, std::size_t>& m) {
-
 
     const std::size_t slash = path.find_last_of('/');
     if (slash != std::string::npos && slash > 0) {
@@ -203,8 +194,6 @@ void App::attach_storage_delegate(
     StorageDelegate                         delegate,
     std::function<void(const std::string&)> release_cb) {
 
-
-
     m_storage_delegate   = std::move(delegate);
     m_storage_release_cb = std::move(release_cb);
 }
@@ -219,7 +208,6 @@ uint16_t App::mqtt_port_for_dev_id(const std::string& dev_id) const {
 
     auto it = m_devices.find(dev_id);
     if (it != m_devices.end()) return it->second.mqtt_port;
-
 
     if (dev_id.size() > 4 &&
         dev_id.compare(0, 4, kVirtualSerialPrefix) == 0) {
@@ -248,8 +236,6 @@ App::lookup_real_device(const std::string& dev_id) const {
         return out;
     }
 
-
-
     if (dev_id.size() > 4 &&
         dev_id.compare(0, 4, kVirtualSerialPrefix) == 0) {
         const std::string tail = dev_id.substr(4);
@@ -270,21 +256,6 @@ App::lookup_real_device(const std::string& dev_id) const {
 bool App::initialise() {
     if (m_initialised.load()) return true;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     if (!m_plugin_injected && !m_cfg.host_drives_inventory) {
         PluginHandleConfig hcfg;
         hcfg.plugin_path        = m_cfg.plugin_path;
@@ -302,30 +273,6 @@ bool App::initialise() {
     } else {
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     m_lan_uplink = std::make_shared<router::LanUplink>();
     m_lan_uplink->attach_plugin(m_plugin);
 
@@ -335,9 +282,6 @@ bool App::initialise() {
 
 void App::teardown() {
     if (!m_initialised.load() && !m_plugin) return;
-
-
-
 
     std::vector<std::string> dev_ids;
     {
@@ -350,12 +294,7 @@ void App::teardown() {
         remove_device_locked(d);
     }
 
-
-
     m_lan_uplink.reset();
-
-
-
 
     m_plugin.reset();
 
@@ -363,9 +302,6 @@ void App::teardown() {
 }
 
 void App::reconcile_once() {
-
-
-
 
     if (m_cfg.printer_source) {
         std::vector<VirtualPrinter> printers;
@@ -379,9 +315,6 @@ void App::reconcile_once() {
         return;
     }
 
-
-
-
     expire_stale_lan_ips();
 }
 
@@ -391,8 +324,6 @@ void App::expire_stale_lan_ips() {
     for (auto& kv : m_devices) {
         auto& s = kv.second;
         if (s.lan_ip.empty()) continue;
-
-
 
         if (s.lan_ip_last_seen.time_since_epoch().count() == 0) continue;
         if (now - s.lan_ip_last_seen <= m_cfg.lan_ip_stale_after)
@@ -416,11 +347,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
         std::fflush(stderr);
     }
 
-
-
-
-
-
     if (const char* env = std::getenv("BAMBU_BRIDGE_PRINTER_ORDER"); env && *env) {
         std::vector<std::string> want;
         const std::string s = env;
@@ -439,17 +365,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
                 return ia < ib;
             });
     }
-
-
-
-
-
-
-
-
-
-
-
 
     std::vector<std::string> env_keep_order;
     if (const char* env = std::getenv("BAMBU_BRIDGE_TARGET_DEV"); env && *env) {
@@ -472,16 +387,7 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
 
     std::lock_guard<std::mutex> lk(m_devices_mu);
 
-
-
-
-
     if (!m_port_map_loaded) {
-
-
-
-
-
 
         m_port_map_path = !m_cfg.config_dir.empty()
             ? (m_cfg.config_dir + "/port-map")
@@ -495,9 +401,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
             }
             changed = true;
         } else if (!env_keep_order.empty()) {
-
-
-
 
             std::size_t max_offset = 0;
             bool any = false;
@@ -516,7 +419,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
             save_port_map(m_port_map_path, m_pinned_offset);
         }
 
-
         std::size_t max_offset = 0;
         bool any = false;
         for (const auto& kv : m_pinned_offset) {
@@ -530,18 +432,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
         m_port_map_loaded = true;
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     for (const auto& p : printers) {
         if (p.dev_id.empty()) continue;
         auto it = m_devices.find(p.dev_id);
@@ -551,14 +441,6 @@ void App::set_virtual_printers(std::vector<VirtualPrinter> printers) {
             if (!p.lan_ip.empty()) {
                 if (it->second.lan_ip != p.lan_ip)
                     update_lan_ip_locked(it->second, p.lan_ip);
-
-
-
-
-
-
-
-
 
                 it->second.lan_ip_last_seen =
                     std::chrono::steady_clock::now();
@@ -596,14 +478,9 @@ void App::add_device_locked(const VirtualPrinter& vp) {
     state.camera_url   = vp.camera_url;
     state.model        = vp.model;
 
-
-
     if (!lan_ip.empty())
         state.lan_ip_last_seen = std::chrono::steady_clock::now();
     state.access_code = access_code;
-
-
-
 
     if (auto it = m_pinned_offset.find(dev_id); it != m_pinned_offset.end()) {
         state.index = it->second;
@@ -622,18 +499,12 @@ void App::add_device_locked(const VirtualPrinter& vp) {
     state.rtsp_port   = static_cast<uint16_t>(m_cfg.rtsp_port_base + state.index);
     state.vtun_port   = static_cast<uint16_t>(m_cfg.vtun_port_base + state.index);
 
-
-
-
-
     if (m_lan_uplink) {
         if (!lan_ip.empty()) {
             router::LanUplinkConfig u;
             u.dev_id      = dev_id;
             u.printer_ip  = lan_ip;
             u.access_code = access_code;
-
-
 
             auto mtls = resolve_mtls_paths(dev_id);
             u.mtls_cert_path = mtls.first;
@@ -666,9 +537,6 @@ void App::update_lan_ip_locked(DeviceState&       state,
     state.lan_ip = lan_ip;
 
     if (!m_lan_uplink) return;
-
-
-
 
     if (!lan_ip.empty()) {
         router::LanUplinkConfig u;
@@ -718,7 +586,6 @@ int App::run() {
     m_stop.store(false);
     m_poll_thread = std::thread(&App::poll_loop, this);
 
-
     {
         std::unique_lock<std::mutex> lk(m_stop_mu);
         m_stop_cv.wait(lk, [&] { return m_stop.load(); });
@@ -762,9 +629,6 @@ bool App::mtls_info_for(const std::string& dev_id, MtlsInfo& out) const {
         out.lan_ip      = it->second.lan_ip;
         out.access_code = it->second.access_code;
     }
-
-
-
 
     auto paths = resolve_mtls_paths(dev_id);
     out.cert_path = paths.first;

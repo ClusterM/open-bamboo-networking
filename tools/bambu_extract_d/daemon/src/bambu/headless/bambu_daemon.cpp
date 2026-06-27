@@ -1,5 +1,3 @@
-
-
 #include "App.hpp"
 #include "SignalHandler.hpp"
 
@@ -95,20 +93,12 @@ bool needs_value(int argc, char** argv, int i, const char* flag) {
 int main(int argc, char** argv) {
 #if defined(__linux__)
 
-
-
-
-
-
     prctl(PR_SET_NAME, "bambustu_main", 0, 0, 0);
 #endif
 
     AppConfig cfg;
 
-
-
     cfg.host_drives_inventory = false;
-
 
     cfg.mqtt_port_base = 38883;
     cfg.ftps_port_base = 39990;
@@ -196,18 +186,10 @@ int main(int argc, char** argv) {
     }
     (void)verbose;
 
-
     if (cfg.plugin_path.empty()) {
         if (const char* env = std::getenv("BAMBU_BRIDGE_PLUGIN_PATH"))
             cfg.plugin_path = env;
     }
-
-
-
-
-
-
-
 
     if (cfg.cert_dir.empty()) {
         if (const char* env = std::getenv("BAMBU_BRIDGE_CLOUD_CERT_DIR"))
@@ -219,8 +201,6 @@ int main(int argc, char** argv) {
         else if (!cfg.cert_dir.empty())
             cfg.cert_file = "slicer_base64.cer";
     }
-
-
 
     std::vector<VirtualPrinter> seeded;
     for (auto& ip : injected) {
@@ -234,10 +214,6 @@ int main(int argc, char** argv) {
         vp.firmware    = ip.firmware;
         seeded.push_back(std::move(vp));
     }
-
-
-
-
 
     if (!seeded.empty()) {
         cfg.printer_source = [seeded]() { return seeded; };
@@ -257,18 +233,10 @@ int main(int argc, char** argv) {
         unsigned(cfg.mqtt_port_base));
     std::fflush(stderr);
 
-
-
-
-
-
-
-
     if (!std::getenv("BAMBU_BRIDGE_GCODE_CMD_MS"))
         ::setenv("BAMBU_BRIDGE_GCODE_CMD_MS", "2000", 0);
 
     App app(std::move(cfg));
-
 
     SignalHandler signals([&app] { app.shutdown(); });
 
