@@ -1,5 +1,6 @@
-// Tests for src/signing.cpp — classifier, envelope structure, H2D inversion,
-// and signature verification using a freshly generated RSA test keypair.
+// Tests for src/signing.cpp — classifier, envelope structure, and signature
+// verification using a freshly generated RSA test keypair. The key material is
+// supplied through obn::signing::init(); no environment variables are used.
 
 #include "obn/signing.hpp"
 #include "obn/json_lite.hpp"
@@ -8,14 +9,11 @@
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 
-#include <cassert>
 #include <cstdio>
-#include <cstdint>
-#include <fcntl.h>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 #define CHECK(cond) do {                                                    \
@@ -25,6 +23,8 @@
         return 1;                                                           \
     }                                                                       \
 } while (0)
+
+static constexpr const char* kTestCertId = "testcertid123CN=test.example.com";
 
 // ---------------------------------------------------------------------------
 // Global test keypair — set in main() before any test runs.
@@ -96,15 +96,15 @@ static int test_non_print_passthrough()
     // system, info, upgrade, etc. must pass through unchanged.
     const std::string sys  = R"({"system":{"command":"get_access_code"}})";
     const std::string info = R"({"info":{"command":"get_version"}})";
-    CHECK(obn::signing::maybe_sign(sys)  == sys);
-    CHECK(obn::signing::maybe_sign(info) == info);
+    CHECK(obn::signing::sign_envelope(sys)  == sys);
+    CHECK(obn::signing::sign_envelope(info) == info);
     return 0;
 }
 
 static int test_print_payload_gets_header()
 {
     const std::string payload = R"({"print":{"command":"pause","sequence_id":"1"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
+    const std::string env     = obn::signing::sign_envelope(payload);
     CHECK(env != payload);
     auto val = obn::json::parse(env);
     CHECK(val);
@@ -117,15 +117,15 @@ static int test_print_payload_gets_header()
 static int test_cert_id_constant()
 {
     const std::string payload = R"({"print":{"command":"pause","sequence_id":"2"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
-    CHECK(envelope_field(env, "cert_id") == "testcertid123CN=test.example.com");
+    const std::string env     = obn::signing::sign_envelope(payload);
+    CHECK(envelope_field(env, "cert_id") == kTestCertId);
     return 0;
 }
 
 static int test_sign_alg_and_ver()
 {
     const std::string payload = R"({"print":{"command":"stop","sequence_id":"3"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
+    const std::string env     = obn::signing::sign_envelope(payload);
     CHECK(envelope_field(env, "sign_alg") == "RSA_SHA256");
     CHECK(envelope_field(env, "sign_ver") == "v1.0");
     return 0;
@@ -135,7 +135,7 @@ static int test_payload_len_matches_to_sign()
 {
     // payload_len must equal the byte length of {"print":{...sorted...}}.
     const std::string payload = R"({"print":{"z_key":"last","a_key":"first","sequence_id":"4"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
+    const std::string env     = obn::signing::sign_envelope(payload);
     auto val = obn::json::parse(env);
     CHECK(val);
     // Reconstruct what to_sign would be: {"print":{sorted keys}}.
@@ -152,7 +152,7 @@ static int test_signature_verifies()
     // The sign_string in the envelope must verify against the sorted print
     // block using the test keypair's public component.
     const std::string payload = R"({"print":{"command":"resume","sequence_id":"5"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
+    const std::string env     = obn::signing::sign_envelope(payload);
     auto val = obn::json::parse(env);
     CHECK(val);
 
@@ -172,7 +172,7 @@ static int test_keys_sorted_in_envelope()
     // Verify that the envelope's print block has alphabetically sorted keys,
     // confirming the to_sign builder uses the sorted dump.
     const std::string payload = R"({"print":{"z_last":"Z","a_first":"A","m_mid":"M","sequence_id":"6"}})";
-    const std::string env     = obn::signing::maybe_sign(payload);
+    const std::string env     = obn::signing::sign_envelope(payload);
     auto val = obn::json::parse(env);
     CHECK(val);
 
@@ -181,6 +181,12 @@ static int test_keys_sorted_in_envelope()
     CHECK(dumped.find("\"a_first\"") < dumped.find("\"m_mid\""));
     CHECK(dumped.find("\"m_mid\"")   < dumped.find("\"sequence_id\""));
     CHECK(dumped.find("\"sequence_id\"") < dumped.find("\"z_last\""));
+    return 0;
+}
+
+static int test_enabled_reflects_init()
+{
+    CHECK(obn::signing::enabled());
     return 0;
 }
 
@@ -208,104 +214,45 @@ static int test_sign_bytes_verifies()
     return 0;
 }
 
-static int test_h2d_detection_noop_on_non_h2d()
+static int test_disabled_passthrough_after_failed_init()
 {
-    // A P2S printer should not have its payload altered.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"7",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1}]}})";
-    const std::string env_non_h2d = obn::signing::maybe_sign(payload, "3DPrinter-P2S");
-    const std::string env_no_model = obn::signing::maybe_sign(payload);
+    // A bogus key path must disable signing and make print payloads pass
+    // through unchanged. Re-init with the real key afterwards so the rest of
+    // the suite (if reordered) is unaffected.
+    CHECK(!obn::signing::init("/nonexistent/key.pem", kTestCertId));
+    CHECK(!obn::signing::enabled());
 
-    // Both should produce identical envelopes (no flip applied).
-    CHECK(env_non_h2d == env_no_model);
-    return 0;
-}
-
-static int test_h2d_nozzle_ids_flipped()
-{
-    // For an H2D printer, nozzleId 0 becomes 1 and vice versa before signing.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"8",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1},{"nozzleId":0}]}})";
-
-    const std::string env_h2d     = obn::signing::maybe_sign(payload, "3DPrinter-H2D");
-    const std::string env_no_flip = obn::signing::maybe_sign(payload);
-
-    // Envelopes must differ because the signed content differs.
-    CHECK(env_h2d != env_no_flip);
-
-    // The H2D envelope's print block should contain the flipped ids.
-    auto val = obn::json::parse(env_h2d);
-    CHECK(val);
-    const auto& arr = val->find("print.ams_mapping_info").as_array();
-    CHECK(arr.size() == 3);
-    CHECK(static_cast<int>(arr[0].find("nozzleId").as_number()) == 1);
-    CHECK(static_cast<int>(arr[1].find("nozzleId").as_number()) == 0);
-    CHECK(static_cast<int>(arr[2].find("nozzleId").as_number()) == 1);
-    return 0;
-}
-
-static int test_h2d_model_variants()
-{
-    // All three H2D model codes must trigger the inversion.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"9",)"
-        R"("ams_mapping_info":[{"nozzleId":0}]}})";
-    const std::string baseline = obn::signing::maybe_sign(payload);
-
-    for (const std::string& model : {"H2D", "O1D", "C16",
-                                      "3DPrinter-H2D-xxx",
-                                      "3DPrinter-O1D-xxx",
-                                      "printer-c16-v2"}) {
-        CHECK(obn::signing::maybe_sign(payload, model) != baseline);
-    }
-    return 0;
-}
-
-static int test_h2d_signature_verifies()
-{
-    // The H2D envelope's signature must verify against its (flipped) content.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"10",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1}]}})";
-    const std::string env = obn::signing::maybe_sign(payload, "H2D");
-    auto val = obn::json::parse(env);
-    CHECK(val);
-
-    const std::string sig_b64  = val->find("header.sign_string").as_string();
-    std::string print_dump     = val->find("print").dump();
-    std::string to_sign        = "{\"print\":" + print_dump + "}";
-
-    CHECK(verify_b64_sig(to_sign, sig_b64));
+    const std::string payload = R"({"print":{"command":"pause","sequence_id":"99"}})";
+    CHECK(obn::signing::sign_envelope(payload) == payload);
     return 0;
 }
 
 int main()
 {
-    setenv("BBL_SLICER_CERT_ID", "testcertid123CN=test.example.com", 1);
+    namespace fs = std::filesystem;
 
     // Generate fresh RSA-2048 keypair for signing tests.
     g_test_key = EVP_RSA_gen(2048);
     if (!g_test_key) { std::cerr << "EVP_RSA_gen failed\n"; return 1; }
 
-    // Write private key to temp PEM file.
-    char tmp_path[] = "/tmp/signing_test_XXXXXX";
-    int fd = mkstemp(tmp_path);
-    if (fd < 0) { std::cerr << "mkstemp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
-    close(fd);
-    std::string pem_path = std::string(tmp_path) + ".pem";
-
-    int pem_fd = open(pem_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    FILE* f = (pem_fd >= 0) ? fdopen(pem_fd, "w") : nullptr;
-    if (!f) { perror("open pem"); EVP_PKEY_free(g_test_key); return 1; }
+    // Write private key to a temp PEM file (cross-platform).
+    const fs::path pem_path =
+        fs::temp_directory_path() / "obn_signing_test_key.pem";
+    std::FILE* f = std::fopen(pem_path.string().c_str(), "wb");
+    if (!f) { std::perror("fopen pem"); EVP_PKEY_free(g_test_key); return 1; }
     PEM_write_PrivateKey(f, g_test_key, nullptr, nullptr, 0, nullptr, nullptr);
-    fclose(f);
-    unlink(tmp_path);  // remove the fd-allocated file, keep .pem
+    std::fclose(f);
 
-    setenv("BBL_SLICER_KEY_PEM", pem_path.c_str(), 1);
+    if (!obn::signing::init(pem_path.string(), kTestCertId)) {
+        std::cerr << "obn::signing::init failed\n";
+        std::error_code ec;
+        fs::remove(pem_path, ec);
+        EVP_PKEY_free(g_test_key);
+        return 1;
+    }
 
     int rc = 0;
+    if (test_enabled_reflects_init()       != 0) rc = 1;
     if (test_non_print_passthrough()       != 0) rc = 1;
     if (test_print_payload_gets_header()   != 0) rc = 1;
     if (test_cert_id_constant()            != 0) rc = 1;
@@ -316,15 +263,14 @@ int main()
     if (test_sign_bytes_length()           != 0) rc = 1;
     if (test_sign_bytes_deterministic()    != 0) rc = 1;
     if (test_sign_bytes_verifies()         != 0) rc = 1;
-    if (test_h2d_detection_noop_on_non_h2d() != 0) rc = 1;
-    if (test_h2d_nozzle_ids_flipped()     != 0) rc = 1;
-    if (test_h2d_model_variants()          != 0) rc = 1;
-    if (test_h2d_signature_verifies()      != 0) rc = 1;
+    // Must run last: it deliberately tears down the loaded key.
+    if (test_disabled_passthrough_after_failed_init() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 
     // Cleanup.
-    unlink(pem_path.c_str());
+    std::error_code ec;
+    fs::remove(pem_path, ec);
     EVP_PKEY_free(g_test_key);
     return rc;
 }

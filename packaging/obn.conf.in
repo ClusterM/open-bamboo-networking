@@ -72,6 +72,20 @@ force_timelapse_external = 0
 
 force_ftps = 0
 
+# --- MQTT signing ---------------------------------------------------
+#
+# Some firmware requires {"print":{...}} commands to be cryptographically
+# signed when Developer Mode is not enabled. The plugin signs them using
+# an RSA private key (slicer_key.pem) and a certificate ID (slicer_cert_id.txt).
+#
+# By default the plugin looks for both files in this config directory. Set
+# these only if you keep the key elsewhere or need a manual cert_id override.
+# If the key file is missing or invalid, signing stays off and an error is
+# logged; if nothing is configured and no files exist, nothing is logged.
+
+# signing_key_path =
+# signing_cert_id =
+
 # --- Device panel camera preview ------------------------------------
 #
 # When live view is off, Studio polls a static JPEG snapshot from the

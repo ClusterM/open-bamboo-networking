@@ -2,133 +2,54 @@
 // Only {"print":{...}} messages receive an envelope; all others pass through.
 // Envelope: {"header":{"cert_id":"...","payload_len":N,"sign_alg":"RSA_SHA256",
 //            "sign_string":"...","sign_ver":"v1.0"},"print":{...sorted keys...}}
+//
+// Key material is supplied explicitly via init(); this module never reads
+// environment variables or guesses filesystem locations. The caller (Agent)
+// owns key discovery and decides where the PEM and cert_id come from.
 
 #include "obn/signing.hpp"
 #include "obn/json_lite.hpp"
 
-#include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#ifdef _WIN32
-#  include <shlobj.h>
-#endif
 
 namespace obn::signing {
 
 namespace {
 
-struct BnDel   { void operator()(BIGNUM*     p) const { BN_free(p); } };
 struct PkeyDel { void operator()(EVP_PKEY*   p) const { EVP_PKEY_free(p); } };
 struct MdDel   { void operator()(EVP_MD_CTX* p) const { EVP_MD_CTX_free(p); } };
 
 static constexpr const char kSignAlg[] = "RSA_SHA256";
 static constexpr const char kSignVer[] = "v1.0";
 
-static std::string default_key_path()
-{
-#ifdef _WIN32
-    char appdata[MAX_PATH] = {};
-    if (SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appdata) != S_OK)
-        return {};
-    return std::string(appdata) + "\\BambuStudio\\slicer_key.pem";
-#else
-    const char* home = std::getenv("HOME");
-    if (!home || !home[0]) return {};
-    return std::string(home) + "/.config/BambuStudio/slicer_key.pem";
-#endif
-}
+// Mutex-guarded signing state, populated by init(). Both the key and the
+// cert_id are replaced atomically so sign_envelope()/sign_bytes() never see a
+// half-initialised pair.
+std::mutex                          g_mu;
+std::unique_ptr<EVP_PKEY, PkeyDel>  g_pkey;
+std::string                         g_cert_id;
 
-// Returns the path to the key file being used (empty if none).
-static std::string active_key_path()
+std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey(const std::string& path)
 {
-    if (const char* e = std::getenv("BBL_SLICER_KEY_PEM"))
-        if (e[0]) return e;
-    return default_key_path();
-}
-
-// Load cert_id from slicer_cert_id.txt in the same directory as the key file.
-static std::string load_cert_id_from_file()
-{
-    std::string key_path = active_key_path();
-    if (key_path.empty()) return {};
-    auto slash = key_path.rfind('/');
-#ifdef _WIN32
-    auto bslash = key_path.rfind('\\');
-    if (bslash != std::string::npos && (slash == std::string::npos || bslash > slash))
-        slash = bslash;
-#endif
-    std::string dir = (slash == std::string::npos) ? "." : key_path.substr(0, slash);
-    std::string id_path = dir +
-#ifdef _WIN32
-        "\\slicer_cert_id.txt";
-#else
-        "/slicer_cert_id.txt";
-#endif
-    std::FILE* f = std::fopen(id_path.c_str(), "r");
-    if (!f) return {};
-    char buf[256] = {};
-    if (!std::fgets(buf, sizeof(buf), f)) buf[0] = '\0';
-    std::fclose(f);
-    std::string s(buf);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-        s.pop_back();
-    return s;
-}
-
-// cert_id identifies the slicer's registered signing certificate on Bambu's
-// backend. It is fixed for the life of a given RSA key pair and is not secret.
-// Priority: BBL_SLICER_CERT_ID env > slicer_cert_id.txt alongside the key.
-static const std::string& cert_id()
-{
-    static const std::string id = []() -> std::string {
-        // 1. Environment variable override.
-        if (const char* e = std::getenv("BBL_SLICER_CERT_ID"))
-            if (e[0]) return e;
-        // 2. slicer_cert_id.txt alongside the key file.
-        std::string from_file = load_cert_id_from_file();
-        if (!from_file.empty()) return from_file;
-        // No cert found.
-        return "";
-    }();
-    return id;
-}
-
-static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
-{
-    std::string path;
-    const char* env_path = std::getenv("BBL_SLICER_KEY_PEM");
-    if (env_path && env_path[0])
-        path = env_path;
-    else
-        path = default_key_path();
-
     if (path.empty()) return nullptr;
-
-    std::FILE* f = std::fopen(path.c_str(), "r");
+    std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return nullptr;
-
     EVP_PKEY* raw = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
     std::fclose(f);
-
     return std::unique_ptr<EVP_PKEY, PkeyDel>(raw);
 }
 
-EVP_PKEY* slicer_pkey()
-{
-    static const std::unique_ptr<EVP_PKEY, PkeyDel> key = load_pkey();
-    return key.get();
-}
-
-static const char kB64Tbl[] =
+const char kB64Tbl[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::string base64_encode(const unsigned char* data, std::size_t len)
@@ -148,8 +69,9 @@ std::string base64_encode(const unsigned char* data, std::size_t len)
 }
 
 // RSA-PKCS#1 v1.5 + SHA-256 over `data`, returned as base64.
+// Throws std::runtime_error on any OpenSSL failure.
 std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
-                                 const unsigned char* data, std::size_t len)
+                                const unsigned char* data, std::size_t len)
 {
     if (!pkey) return {};
     std::unique_ptr<EVP_MD_CTX, MdDel> ctx(EVP_MD_CTX_new());
@@ -183,65 +105,6 @@ bool is_print_payload(const std::string& payload) noexcept
     return true;
 }
 
-// Returns true when `model` identifies an H2D-family printer.
-// Matches model codes H2D, O1D, and C16 case-insensitively.
-bool is_h2d_printer(const std::string& model) noexcept
-{
-    if (model.empty()) return false;
-    auto ci_has = [&](const char* tok, std::size_t tlen) noexcept {
-        for (std::size_t i = 0; i + tlen <= model.size(); ++i) {
-            bool ok = true;
-            for (std::size_t j = 0; j < tlen && ok; ++j) {
-                char a = model[i + j], b = tok[j];
-                if (a >= 'a' && a <= 'z') a = static_cast<char>(a - 32);
-                if (b >= 'a' && b <= 'z') b = static_cast<char>(b - 32);
-                ok = (a == b);
-            }
-            if (ok) return true;
-        }
-        return false;
-    };
-    return ci_has("H2D", 3) || ci_has("O1D", 3) || ci_has("C16", 3);
-}
-
-// Flips nozzleId values 0↔1 within the ams_mapping_info array region.
-// Only touches the array substring to avoid false positives elsewhere.
-std::string flip_nozzle_ids(std::string json) noexcept
-{
-    const auto region_start = json.find("\"ams_mapping_info\":[");
-    if (region_start == std::string::npos) return json;
-    const auto arr_pos = json.find('[', region_start);
-    if (arr_pos == std::string::npos) return json;
-
-    // Walk brackets to find the matching ']'.
-    int depth = 0;
-    std::size_t arr_end = std::string::npos;
-    for (std::size_t i = arr_pos; i < json.size(); ++i) {
-        if      (json[i] == '[') ++depth;
-        else if (json[i] == ']') { if (--depth == 0) { arr_end = i; break; } }
-    }
-    if (arr_end == std::string::npos) return json;
-
-    // Three-step 0↔1 swap to avoid chain-replacement bugs.
-    // Step 1: :0 → :2 (temp marker, never appears in the original)
-    // Step 2: :1 → :0
-    // Step 3: :2 → :1
-    std::string sub = json.substr(arr_pos, arr_end - arr_pos + 1);
-    struct Step { const char* from; char to; };
-    for (auto [from, to] : {Step{"\"nozzleId\":0", '2'},
-                             Step{"\"nozzleId\":1", '0'},
-                             Step{"\"nozzleId\":2", '1'}}) {
-        const std::size_t flen = std::char_traits<char>::length(from);
-        std::size_t pos = 0;
-        while ((pos = sub.find(from, pos)) != std::string::npos) {
-            sub[pos + flen - 1] = to;
-            pos += flen;
-        }
-    }
-    json.replace(arr_pos, arr_end - arr_pos + 1, sub);
-    return json;
-}
-
 // Builds the to_sign string: {"print":{...sorted keys...}}
 // Uses json_lite, whose Object type is std::map, so parse+dump already sorts.
 std::string build_to_sign(const std::string& payload)
@@ -257,7 +120,7 @@ std::string build_to_sign(const std::string& payload)
 
 // Escapes backslash and double-quote for embedding inside a JSON string
 // literal whose surrounding quotes are managed by the caller.
-static std::string json_str_escape(const std::string& s)
+std::string json_str_escape(const std::string& s)
 {
     std::string out;
     out.reserve(s.size());
@@ -269,14 +132,15 @@ static std::string json_str_escape(const std::string& s)
 }
 
 // Builds the complete signed envelope JSON string.
-std::string build_envelope(const std::string& to_sign,
+std::string build_envelope(const std::string& cert_id,
+                           const std::string& to_sign,
                            const std::string& sig_b64,
                            const std::string& print_dump)
 {
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
     out += "{\"header\":{\"cert_id\":\"";
-    out += json_str_escape(cert_id());
+    out += json_str_escape(cert_id);
     out += "\",\"payload_len\":";
     out += std::to_string(to_sign.size());
     out += ",\"sign_alg\":\"";
@@ -293,43 +157,62 @@ std::string build_envelope(const std::string& to_sign,
 
 } // namespace
 
-std::string maybe_sign(const std::string& payload_json,
-                       const std::string& printer_model)
+bool init(const std::string& key_pem_path, const std::string& cert_id)
+{
+    auto pkey = load_pkey(key_pem_path);
+
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!pkey) {
+        g_pkey.reset();
+        g_cert_id.clear();
+        return false;
+    }
+    g_pkey    = std::move(pkey);
+    g_cert_id = cert_id;
+    return true;
+}
+
+bool enabled()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_pkey != nullptr;
+}
+
+std::string sign_envelope(const std::string& payload_json)
 {
     if (!is_print_payload(payload_json)) return payload_json;
 
-    EVP_PKEY* pkey = slicer_pkey();
-    if (!pkey) return payload_json;
-
-    // Apply H2D nozzleId flip before signing so the signature covers
-    // the on-wire shape the printer will receive.
-    std::string working = printer_model.empty() || !is_h2d_printer(printer_model)
-                          ? payload_json
-                          : flip_nozzle_ids(payload_json);
-
-    const std::string to_sign = build_to_sign(working);
+    const std::string to_sign = build_to_sign(payload_json);
     if (to_sign.empty()) return payload_json; // malformed; pass through
 
     // Extract the sorted print dump from to_sign to avoid re-parsing.
     // to_sign has the shape: {"print":<dump>}
     const std::string print_dump = to_sign.substr(9, to_sign.size() - 10);
 
-    const std::string sig_b64 = rsa_sha256_sign_b64(
-        pkey,
-        reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_pkey) return payload_json;
 
-    return build_envelope(to_sign, sig_b64, print_dump);
+    try {
+        const std::string sig_b64 = rsa_sha256_sign_b64(
+            g_pkey.get(),
+            reinterpret_cast<const unsigned char*>(to_sign.data()),
+            to_sign.size());
+        return build_envelope(g_cert_id, to_sign, sig_b64, print_dump);
+    } catch (const std::exception&) {
+        // Never let a crypto failure crash the MQTT publish path; fall back
+        // to the unsigned payload so the command still goes out.
+        return payload_json;
+    }
 }
 
 std::string sign_bytes(const std::string& data)
 {
-    EVP_PKEY* pkey = slicer_pkey();
-    if (!pkey)
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_pkey)
         throw std::runtime_error(
-            "signing: no key loaded; set BBL_SLICER_KEY_PEM or place key at "
-            "~/.config/BambuStudio/slicer_key.pem");
+            "signing: no key loaded; call obn::signing::init() first");
     return rsa_sha256_sign_b64(
-        pkey,
+        g_pkey.get(),
         reinterpret_cast<const unsigned char*>(data.data()), data.size());
 }
 

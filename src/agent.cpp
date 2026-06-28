@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <thread>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
+#include "obn/signing.hpp"
 #include "obn/ssdp.hpp"
 #include "obn/lan_tls.hpp"
 
@@ -242,10 +244,13 @@ int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
 {
+    const std::string payload = obn::signing::enabled()
+        ? obn::signing::sign_envelope(json_str)
+        : json_str;
     std::lock_guard<std::mutex> lk(mu_);
     if (!lan_session_ || lan_session_->dev_id() != dev_id)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    return lan_session_->publish_json(json_str, qos);
+    return lan_session_->publish_json(payload, qos);
 }
 
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
@@ -988,6 +993,73 @@ bool Agent::lookup_synthetic_subtask(const std::string& subtask_id,
     return true;
 }
 
+namespace {
+
+// Reads the first line of a text file, trimming trailing whitespace/newlines.
+// Returns "" if the file cannot be opened or is empty.
+std::string read_first_line_trimmed(const std::filesystem::path& path)
+{
+    std::ifstream in(path);
+    if (!in) return {};
+    std::string line;
+    std::getline(in, line);
+    while (!line.empty() &&
+           (line.back() == '\n' || line.back() == '\r' ||
+            line.back() == ' '  || line.back() == '\t'))
+        line.pop_back();
+    return line;
+}
+
+// Discovers signing key material and (re)initialises obn::signing.
+//
+// Key path:  config.signing_key_path if set, else <config_dir>/slicer_key.pem.
+// Cert id:   config.signing_cert_id  if set, else <config_dir>/slicer_cert_id.txt.
+//
+// Stays silent when nothing is configured and no files are present. Logs an
+// error when key material is partially present or fails to load.
+void init_signing_from_config(const std::string& config_dir,
+                              const obn::config::Settings& cfg)
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    const bool key_overridden  = !cfg.signing_key_path.empty();
+    const bool cert_overridden = !cfg.signing_cert_id.empty();
+
+    std::string key_path = cfg.signing_key_path;
+    if (key_path.empty())
+        key_path = (fs::path(config_dir) / "slicer_key.pem").string();
+
+    std::string cert_id = cfg.signing_cert_id;
+    if (cert_id.empty())
+        cert_id = read_first_line_trimmed(fs::path(config_dir) / "slicer_cert_id.txt");
+
+    const bool key_present  = fs::is_regular_file(key_path, ec);
+    const bool cert_present = !cert_id.empty();
+
+    // Nothing configured and nothing on disk: signing simply stays off.
+    if (!key_overridden && !cert_overridden && !key_present && !cert_present)
+        return;
+
+    if (key_present && cert_present) {
+        if (obn::signing::init(key_path, cert_id))
+            OBN_INFO("signing: loaded key from %s, cert_id=%s",
+                     key_path.c_str(), cert_id.c_str());
+        else
+            OBN_ERROR("signing: failed to load key from %s", key_path.c_str());
+        return;
+    }
+
+    // Partially present: tell the user what is missing.
+    if (!key_present)
+        OBN_ERROR("signing: cert_id present but key file not found at %s",
+                  key_path.c_str());
+    else
+        OBN_ERROR("signing: key found at %s but cert_id is missing", key_path.c_str());
+}
+
+} // namespace
+
 void Agent::set_config_dir(std::string dir)
 {
     {
@@ -1002,7 +1074,8 @@ void Agent::set_config_dir(std::string dir)
         obn::lan_tls::registry_set_config_dir(cfg);
         // Reload obn.conf from data_dir and rewrite obn.env (log_dir from
         // create_agent may differ; BambuSource hydrates from the state file).
-        (void)obn::config::load_or_create(cfg);
+        const auto settings = obn::config::load_or_create(cfg);
+        init_signing_from_config(cfg, settings);
         auth_store_ = std::make_unique<obn::auth::Store>(cfg + "/obn.auth.json");
         auth_store_->load();
         hydrate_session();
@@ -1764,7 +1837,10 @@ int Agent::cloud_send_message(const std::string& dev_id,
                  dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
-    return sess->publish(dev_id, json_str, qos);
+    const std::string payload = obn::signing::enabled()
+        ? obn::signing::sign_envelope(json_str)
+        : json_str;
+    return sess->publish(dev_id, payload, qos);
 }
 
 void Agent::hydrate_session()

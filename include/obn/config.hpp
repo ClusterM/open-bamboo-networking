@@ -36,6 +36,10 @@ struct Settings {
     // File transfer
     bool force_ftps               = false;
 
+    // MQTT signing (optional overrides; empty = auto-discover in config dir)
+    std::string signing_key_path;    // path to slicer_key.pem
+    std::string signing_cert_id;     // cert_id string
+
     // Device panel: static "Printer Preview" JPEG (mem:/N over TLS :6000)
     bool disable_camera_preview      = false;
 
