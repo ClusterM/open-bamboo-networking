@@ -31,6 +31,7 @@ struct Session {
     std::string user_name;
     std::string nick_name;
     std::string avatar;
+    bool firmware_beta_open = false; // from GET /v1/user-service/my/profile setting.isFirmwareBetaOpen
 
     bool logged_in() const { return !access_token.empty() && !user_id.empty(); }
 };
@@ -57,6 +58,9 @@ public:
                         const std::string& user_name,
                         const std::string& nick_name,
                         const std::string& avatar);
+
+    // Update the firmware beta flag independently of other profile fields.
+    void update_firmware_beta(bool open);
 
     // Read a copy of the current session.
     Session snapshot() const;

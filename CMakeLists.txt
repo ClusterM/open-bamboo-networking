@@ -691,6 +691,17 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME tunnel_local COMMAND tunnel_local_test)
 
+    # Hermetic unit test for obn::auth::Store persistence, specifically
+    # the firmware_beta_open field (profile setting.isFirmwareBetaOpen)
+    # and backwards compatibility loading old JSON files without that field.
+    add_executable(auth_persist_test tests/auth_persist_test.cpp
+        src/auth.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(auth_persist_test PRIVATE include)
+    add_test(NAME auth_persist COMMAND auth_persist_test)
+
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
