@@ -16,6 +16,7 @@
 #include "obn/auth.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/mqtt_client.hpp"
+#include "obn/camera.hpp"
 
 namespace obn {
 namespace ssdp { class Discovery; }
@@ -179,6 +180,18 @@ public:
     int run_send_gcode_to_sdcard(const BBL::PrintParams& params,
                                  BBL::OnUpdateStatusFn   update_fn,
                                  BBL::WasCancelledFn     cancel_fn);
+
+    // -----------------------------
+    // Camera session management.
+    // -----------------------------
+    // Called lazily from get_camera_url() the first time the user opens the
+    // camera tab.  Looks up IP / model / access_code from internal maps.
+    // No-op if already started or if the printer model doesn't support it.
+    void maybe_setup_camera(const std::string& dev_id);
+
+    // Called on disconnect_printer() / destructor to tear down any active
+    // camera session for this dev_id.
+    void stop_camera(const std::string& dev_id);
 
     // Implements bambu_network_start_sdcard_print: the "Print" button
     // from Device -> Files. The file is already on the printer's
