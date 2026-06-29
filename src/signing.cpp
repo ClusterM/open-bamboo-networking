@@ -26,7 +26,6 @@ namespace obn::signing {
 
 namespace {
 
-struct BnDel   { void operator()(BIGNUM*     p) const { BN_free(p); } };
 struct PkeyDel { void operator()(EVP_PKEY*   p) const { EVP_PKEY_free(p); } };
 struct MdDel   { void operator()(EVP_MD_CTX* p) const { EVP_MD_CTX_free(p); } };
 
@@ -84,10 +83,12 @@ static std::string load_cert_id_from_file()
     return s;
 }
 
+} // namespace
+
 // cert_id identifies the slicer's registered signing certificate on Bambu's
 // backend. It is fixed for the life of a given RSA key pair and is not secret.
 // Priority: BBL_SLICER_CERT_ID env > slicer_cert_id.txt alongside the key.
-static const std::string& cert_id()
+const std::string& slicer_cert_id()
 {
     static const std::string id = []() -> std::string {
         // 1. Environment variable override.
@@ -101,6 +102,8 @@ static const std::string& cert_id()
     }();
     return id;
 }
+
+namespace {
 
 static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
 {
@@ -128,24 +131,6 @@ EVP_PKEY* slicer_pkey()
     return key.get();
 }
 
-static const char kB64Tbl[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string base64_encode(const unsigned char* data, std::size_t len)
-{
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (std::size_t i = 0; i < len; i += 3) {
-        std::uint32_t w = static_cast<std::uint32_t>(data[i]) << 16;
-        if (i + 1 < len) w |= static_cast<std::uint32_t>(data[i + 1]) << 8;
-        if (i + 2 < len) w |= static_cast<std::uint32_t>(data[i + 2]);
-        out.push_back(kB64Tbl[(w >> 18) & 63]);
-        out.push_back(kB64Tbl[(w >> 12) & 63]);
-        out.push_back(i + 1 < len ? kB64Tbl[(w >> 6) & 63] : '=');
-        out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
-    }
-    return out;
-}
 
 // RSA-PKCS#1 v1.5 + SHA-256 over `data`, returned as base64.
 std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
@@ -276,7 +261,7 @@ std::string build_envelope(const std::string& to_sign,
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
     out += "{\"header\":{\"cert_id\":\"";
-    out += json_str_escape(cert_id());
+    out += json_str_escape(slicer_cert_id());
     out += "\",\"payload_len\":";
     out += std::to_string(to_sign.size());
     out += ",\"sign_alg\":\"";
@@ -331,6 +316,25 @@ std::string sign_bytes(const std::string& data)
     return rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
+static constexpr char kB64Tbl[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const unsigned char* data, std::size_t len)
+{
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (std::size_t i = 0; i < len; i += 3) {
+        std::uint32_t w = static_cast<std::uint32_t>(data[i]) << 16;
+        if (i + 1 < len) w |= static_cast<std::uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) w |= static_cast<std::uint32_t>(data[i + 2]);
+        out.push_back(kB64Tbl[(w >> 18) & 63]);
+        out.push_back(kB64Tbl[(w >> 12) & 63]);
+        out.push_back(i + 1 < len ? kB64Tbl[(w >> 6) & 63] : '=');
+        out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
+    }
+    return out;
 }
 
 } // namespace obn::signing

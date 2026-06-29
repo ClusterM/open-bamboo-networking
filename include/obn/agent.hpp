@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -14,9 +15,9 @@
 
 #include "obn/auth.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/mqtt_client.hpp"
 
 namespace obn {
-namespace mqtt { class Client; }
 namespace ssdp { class Discovery; }
 namespace cover_server { class Server; }
 class CloudSession;
@@ -63,6 +64,15 @@ private:
     std::string report_topic_() const;
     std::string request_topic_() const;
 
+    // Creates a fresh client_ and wires all three callbacks. Called from
+    // start() and from reconnect_loop() before each reconnect attempt.
+    // Throws std::runtime_error if mosquitto_new fails.
+    void setup_client();
+
+    // Background thread: waits for on_disconnect to fire with rc!=0, then
+    // retries connect() with exponential backoff {1,2,5,10,30,30} seconds.
+    void reconnect_loop();
+
     std::string dev_id_;
     std::string dev_ip_;
     std::string username_;
@@ -70,9 +80,23 @@ private:
     bool        use_ssl_;
     std::string ca_file_;
 
-    std::unique_ptr<mqtt::Client> client_;
+    // Guarded by client_mu_. Shared so callers can snapshot and release the
+    // lock before invoking methods — preventing a race with reconnect_loop
+    // destroying the old handle while a publish is in flight.
+    mutable std::mutex            client_mu_;
+    std::shared_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
+
+    // Saved at start() time; reused verbatim by every reconnect attempt.
+    mqtt::ConnectConfig connect_cfg_;
+
+    std::atomic<bool>       stopped_{false};
+    std::atomic<bool>       reconnect_wanted_{false};
+    std::atomic<int>        reconnect_attempt_{0};
+    std::mutex              reconnect_mu_;
+    std::condition_variable reconnect_cv_;
+    std::thread             reconnect_thread_;
 };
 
 // The Agent object is created per Studio call to bambu_network_create_agent().
@@ -344,6 +368,15 @@ public:
     // Studio's load_user_preset().
     std::string cloud_user_id() const;
 
+    // Returns the dev_type stored by the most recent cache_ssdp_json_for_bind()
+    // call for this dev_id, or "" if unseen. Used by agent_test to verify model
+    // tracking without requiring an active MQTT session.
+    std::string test_model_for(const std::string& dev_id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = dev_model_by_id_.find(dev_id);
+        return it != dev_model_by_id_.end() ? it->second : std::string{};
+    }
+
 private:
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -429,6 +462,11 @@ private:
     // connect_printer() stores the MQTT/FTPS password (access code) here so
     // bambu_network_bind can POST it to the cloud as bind_code.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
+    std::unordered_map<std::string, std::string> lan_ip_by_dev_;
+
+    // dev_id → dev_type string populated from SSDP; used to detect multi-nozzle
+    // printers for nozzleId inversion before MQTT signing.
+    std::unordered_map<std::string, std::string> dev_model_by_id_;
 
     // Buffer populated by bambu_network_get_setting_list2 and drained
     // by bambu_network_get_user_presets. See preset_cache_* above.

@@ -25,9 +25,11 @@
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -43,6 +45,13 @@ using obn::os::kInvalidSocket;
 // so we can be sure SSL_library_init/ERR_load_crypto_strings-style state is
 // idempotent across repeat Agent lifecycles.
 std::once_flag g_ssl_init;
+
+// Per-device public-key cache.
+// Each stored EVP_PKEY* holds one reference; a ref-bump is taken on insert
+// and released on forget_printer. get_printer_pub_key hands out an additional
+// ref-bumped pointer so the caller can safely use it after unlock.
+std::mutex                       g_pubkey_mu;
+std::map<std::string, EVP_PKEY*> g_pubkey_map;
 
 void init_openssl_once()
 {
@@ -225,9 +234,25 @@ bool capture_peer_cert_pem(const std::string& host,
                 OBN_WARN("cert_store: open(%s) failed: %s",
                          out_pem_path.c_str(), std::strerror(errno));
             } else {
-                if (::PEM_write_X509(f, cert) == 1) wrote = true;
-                else OBN_WARN("cert_store: PEM_write_X509 failed for %s",
-                              out_pem_path.c_str());
+                if (::PEM_write_X509(f, cert) == 1) {
+                    wrote = true;
+                    // Populate in-memory cache while we still hold the cert.
+                    // tls_sni carries dev_id at all call sites; skip when
+                    // absent (host IP is not a stable per-device key).
+                    if (!tls_sni.empty()) {
+                        EVP_PKEY* pk = ::X509_get_pubkey(cert); // ref-bumped
+                        if (pk) {
+                            set_printer_pub_key(tls_sni, pk);
+                            ::EVP_PKEY_free(pk); // set_printer_pub_key holds its own ref
+                        } else {
+                            OBN_WARN("cert_store: X509_get_pubkey failed for dev=%s",
+                                     tls_sni.c_str());
+                        }
+                    }
+                } else {
+                    OBN_WARN("cert_store: PEM_write_X509 failed for %s",
+                             out_pem_path.c_str());
+                }
                 std::fclose(f);
             }
             ::X509_free(cert);
@@ -241,6 +266,48 @@ bool capture_peer_cert_pem(const std::string& host,
     ::SSL_CTX_free(ctx);
     obn::os::close_socket(fd);
     return wrote;
+}
+
+// ---------------------------------------------------------------------------
+// Thread-safe per-device public-key cache
+// ---------------------------------------------------------------------------
+
+EVP_PKEY* get_printer_pub_key(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    auto it = g_pubkey_map.find(dev_id);
+    if (it == g_pubkey_map.end()) return nullptr;
+    ::EVP_PKEY_up_ref(it->second); // caller must EVP_PKEY_free
+    return it->second;
+}
+
+void set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey)
+{
+    if (!pkey) return; // refuse null — malformed cert should be caught upstream
+    ::EVP_PKEY_up_ref(pkey); // take our own reference before acquiring the lock
+    std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    auto result = g_pubkey_map.emplace(dev_id, pkey);
+    if (!result.second) {
+        // Entry already present — drop the new ref and keep the existing key.
+        // The printer key is stable across reconnects; re-capture is idempotent.
+        ::EVP_PKEY_free(pkey);
+    }
+}
+
+bool has_printer_pub_key(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    return g_pubkey_map.find(dev_id) != g_pubkey_map.end();
+}
+
+void forget_printer(const std::string& dev_id)
+{
+    std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    auto it = g_pubkey_map.find(dev_id);
+    if (it != g_pubkey_map.end()) {
+        ::EVP_PKEY_free(it->second);
+        g_pubkey_map.erase(it);
+    }
 }
 
 } // namespace obn::cert_store

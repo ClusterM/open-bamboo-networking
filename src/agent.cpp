@@ -18,6 +18,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
+#include "obn/signing.hpp"
 #include "obn/ssdp.hpp"
 #include "obn/lan_tls.hpp"
 
@@ -204,9 +205,14 @@ int Agent::connect_printer(std::string dev_id,
         });
 
     if (rc == BAMBU_NETWORK_SUCCESS) {
-        std::lock_guard<std::mutex> lk(mu_);
-        lan_access_code_by_dev_[sess_dev_id] = session->password();
-        lan_session_                         = std::move(session);
+        std::string dev_ip_snap   = session->dev_ip();
+        std::string password_snap = session->password();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            lan_access_code_by_dev_[sess_dev_id] = password_snap;
+            lan_ip_by_dev_[sess_dev_id]          = dev_ip_snap;
+            lan_session_                         = std::move(session);
+        }
     }
     return rc;
 }
@@ -242,10 +248,18 @@ int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
 {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (!lan_session_ || lan_session_->dev_id() != dev_id)
-        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    return lan_session_->publish_json(json_str, qos);
+    LanSession* session = nullptr;
+    std::string model;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id) {
+            session = lan_session_.get();
+            auto it = dev_model_by_id_.find(dev_id);
+            if (it != dev_model_by_id_.end()) model = it->second;
+        }
+    }
+    if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return session->publish_json(obn::signing::maybe_sign(json_str, model), qos);
 }
 
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
@@ -1288,12 +1302,15 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     if (!root) return;
     std::string ip = trim_ip_string(root->find("dev_ip").as_string());
     if (ip.empty()) return;
-    const std::string dev_id = root->find("dev_id").as_string();
+    const std::string dev_id   = root->find("dev_id").as_string();
+    const std::string dev_type = root->find("dev_type").as_string();
     if (!dev_id.empty()) {
         obn::lan_tls::registry_put_ip_serial(ip, dev_id);
     }
     std::lock_guard<std::mutex> lk(mu_);
     ssdp_json_by_ip_[ip] = json;
+    if (!dev_id.empty() && !dev_type.empty())
+        dev_model_by_id_[dev_id] = dev_type;
 }
 
 namespace {
@@ -1755,16 +1772,19 @@ int Agent::cloud_send_message(const std::string& dev_id,
                               int qos)
 {
     CloudSession* sess = nullptr;
+    std::string model;
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = cloud_session_.get();
+        auto it = dev_model_by_id_.find(dev_id);
+        if (it != dev_model_by_id_.end()) model = it->second;
     }
     if (!sess) {
         OBN_WARN("cloud_send_message: no active cloud session for %s",
                  dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
-    return sess->publish(dev_id, json_str, qos);
+    return sess->publish(dev_id, obn::signing::maybe_sign(json_str, model), qos);
 }
 
 void Agent::hydrate_session()
