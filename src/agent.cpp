@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
+#include "obn/camera.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
@@ -276,24 +277,55 @@ int Agent::disconnect_printer()
         }
     }
 
+    std::string dev_id_snap;
     std::unique_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_) dev_id_snap = lan_session_->dev_id();
         session = std::move(lan_session_);
     }
-    if (session) {
-        session->disconnect();
-        // Release the cached RSA pubkey; it is re-learned on reconnect.
-        cert_store::forget_printer(session->dev_id());
-        std::lock_guard<std::mutex> lk(mu_);
-        app_cert_install_sent_.erase(session->dev_id());
-    }
+    if (session) session->disconnect();
+    if (!dev_id_snap.empty()) stop_camera(dev_id_snap);
     return BAMBU_NETWORK_SUCCESS;
 }
 
-bool Agent::ensure_lan_session(const std::string& dev_id,
-                               const std::string& ip_hint,
-                               const std::string& code_hint)
+void Agent::maybe_setup_camera(const std::string& dev_id)
+{
+    // Already started — idempotent.
+    if (!obn::camera::get_url(dev_id).empty()) return;
+
+    std::string ip, access_code, model;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto ip_it = lan_ip_by_dev_.find(dev_id);
+        if (ip_it == lan_ip_by_dev_.end()) return; // not a LAN printer we know
+        ip = ip_it->second;
+        auto ac_it = lan_access_code_by_dev_.find(dev_id);
+        if (ac_it != lan_access_code_by_dev_.end()) access_code = ac_it->second;
+        auto m_it = dev_model_by_id_.find(dev_id);
+        if (m_it != dev_model_by_id_.end()) model = m_it->second;
+    }
+
+    obn::camera::CameraSpec spec;
+    spec.dev_id      = dev_id;
+    spec.model       = model;
+    spec.lan_ip      = ip;
+    spec.access_code = access_code;
+    std::string url = obn::camera::start_camera(spec);
+    if (url.empty())
+        OBN_DEBUG("camera: no source for %s (model='%s')", dev_id.c_str(), model.c_str());
+    else
+        OBN_INFO("camera: %s → %s", dev_id.c_str(), url.c_str());
+}
+
+void Agent::stop_camera(const std::string& dev_id)
+{
+    obn::camera::stop_camera(dev_id);
+}
+
+int Agent::send_message_to_printer(const std::string& dev_id,
+                                   const std::string& json_str,
+                                   int                qos)
 {
     if (dev_id.empty()) return false;
 
