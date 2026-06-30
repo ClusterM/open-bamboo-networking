@@ -28,6 +28,7 @@
 #include <map>
 #include <mutex>
 
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -292,6 +293,37 @@ void set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey)
         // The printer key is stable across reconnects; re-capture is idempotent.
         ::EVP_PKEY_free(pkey);
     }
+}
+
+bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
+                                       const std::string& cert_pem)
+{
+    if (dev_id.empty() || cert_pem.empty()) return false;
+    BIO* bio = ::BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+    if (!bio) return false;
+    X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    ::BIO_free(bio);
+    if (!cert) {
+        OBN_WARN("cert_store: PEM_read_bio_X509 failed for dev=%s", dev_id.c_str());
+        return false;
+    }
+    EVP_PKEY* pk = ::X509_get_pubkey(cert); // ref-bumped; ref transferred to map below
+    ::X509_free(cert);
+    if (!pk) {
+        OBN_WARN("cert_store: X509_get_pubkey failed for dev=%s", dev_id.c_str());
+        return false;
+    }
+    // The device cert is authoritative, so replace any existing entry (e.g. a
+    // TLS-leaf TOFU fallback) rather than keeping it like set_printer_pub_key.
+    std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    auto it = g_pubkey_map.find(dev_id);
+    if (it != g_pubkey_map.end()) {
+        ::EVP_PKEY_free(it->second);
+        it->second = pk;
+    } else {
+        g_pubkey_map.emplace(dev_id, pk);
+    }
+    return true;
 }
 
 bool has_printer_pub_key(const std::string& dev_id)

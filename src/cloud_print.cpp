@@ -626,7 +626,9 @@ int create_task(const std::string& api, const std::string& token,
     req.url     = api + "/v1/user-service/my/task";
     auto hdrs = bbl_headers(token, user_id);
     hdrs["x-bbl-app-certification-id"] = obn::signing::slicer_cert_id();
-    hdrs["x-bbl-device-security-sign"] = obn::signing::sign_bytes(body);
+    // The cloud verifies this header by recovering a recent timestamp from the
+    // signature; it signs the current time in ms (raw PKCS#1 v1.5), not the body.
+    hdrs["x-bbl-device-security-sign"] = obn::signing::device_security_sign();
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;

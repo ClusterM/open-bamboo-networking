@@ -33,9 +33,19 @@ bool capture_peer_cert_pem(const std::string& host,
 // ---------------------------------------------------------------------------
 // Thread-safe per-device RSA public-key cache.
 //
-// Keys are extracted from the printer TLS leaf cert at capture time and kept
-// in process memory so concurrent multi-printer publish paths can encrypt
-// session keys without a disk read or extra TLS handshake.
+// The authoritative source for a printer's public key is its device
+// certificate, which the proprietary plugin obtains over MQTT via the
+// `app_cert_install` command (command "app_cert" on the `security` topic) and
+// stores per dev_id. Install that cert with set_printer_pub_key_from_cert_pem.
+// This works for cloud and proxy (e.g. bambuddy) connections where the TLS
+// endpoint is not the printer.
+//
+// As a fallback for LAN-direct connections (where the TLS peer *is* the
+// printer), capture_peer_cert_pem also seeds this cache from the TLS leaf via
+// set_printer_pub_key. That TOFU snapshot is NOT valid for cloud/proxy paths.
+//
+// Keys are kept in process memory so concurrent multi-printer publish paths
+// can encrypt without a disk read or extra TLS handshake.
 //
 // Ownership: `get_printer_pub_key` returns a ref-bumped EVP_PKEY*; the
 // caller is responsible for calling EVP_PKEY_free() when done.
@@ -52,6 +62,14 @@ EVP_PKEY* get_printer_pub_key(const std::string& dev_id);
 // Stores the printer's public key under dev_id. Refuses null pkey. Idempotent
 // on re-capture (existing entry is kept; the printer key is stable).
 void      set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey);
+
+// Installs the printer's public key from its device-certificate PEM (as
+// obtained over MQTT via app_cert_install). This is the authoritative source
+// and works for cloud/proxy connections. Replaces any existing entry for
+// dev_id (e.g. a TLS-leaf TOFU fallback). Returns false on empty input or a
+// PEM/cert parse failure.
+bool      set_printer_pub_key_from_cert_pem(const std::string& dev_id,
+                                            const std::string& cert_pem);
 
 // Returns true iff a key for dev_id is cached.
 bool      has_printer_pub_key(const std::string& dev_id);

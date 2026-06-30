@@ -9,7 +9,9 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,8 +28,9 @@ namespace obn::signing {
 
 namespace {
 
-struct PkeyDel { void operator()(EVP_PKEY*   p) const { EVP_PKEY_free(p); } };
-struct MdDel   { void operator()(EVP_MD_CTX* p) const { EVP_MD_CTX_free(p); } };
+struct PkeyDel { void operator()(EVP_PKEY*     p) const { EVP_PKEY_free(p); } };
+struct MdDel   { void operator()(EVP_MD_CTX*   p) const { EVP_MD_CTX_free(p); } };
+struct CtxDel  { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
 
 static constexpr const char kSignAlg[] = "RSA_SHA256";
 static constexpr const char kSignVer[] = "v1.0";
@@ -149,6 +152,29 @@ std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
     std::vector<unsigned char> sig(siglen);
     if (EVP_DigestSignFinal(ctx.get(), sig.data(), &siglen) != 1)
         throw std::runtime_error("signing: EVP_DigestSignFinal failed");
+    return base64_encode(sig.data(), siglen);
+}
+
+// Raw RSA PKCS#1 v1.5 signature over `data` — the data IS the signed message,
+// NOT its hash. Unlike rsa_sha256_sign_b64, no digest is applied and no
+// DigestInfo is prepended: the encoded block is 00 01 FF..FF 00 || data.
+// Returned as base64.
+std::string rsa_pkcs1_sign_raw_b64(EVP_PKEY* pkey,
+                                   const unsigned char* data, std::size_t len)
+{
+    if (!pkey) return {};
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(pkey, nullptr));
+    if (!ctx) throw std::runtime_error("signing: EVP_PKEY_CTX_new failed");
+    if (EVP_PKEY_sign_init(ctx.get()) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign_init failed");
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) != 1)
+        throw std::runtime_error("signing: set_rsa_padding failed");
+    std::size_t siglen = 0;
+    if (EVP_PKEY_sign(ctx.get(), nullptr, &siglen, data, len) != 1 || siglen == 0)
+        throw std::runtime_error("signing: EVP_PKEY_sign (size query) failed");
+    std::vector<unsigned char> sig(siglen);
+    if (EVP_PKEY_sign(ctx.get(), sig.data(), &siglen, data, len) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign failed");
     return base64_encode(sig.data(), siglen);
 }
 
@@ -316,6 +342,25 @@ std::string sign_bytes(const std::string& data)
     return rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
+std::string device_security_sign()
+{
+    EVP_PKEY* pkey = slicer_pkey();
+    if (!pkey)
+        throw std::runtime_error(
+            "signing: no key loaded; set BBL_SLICER_KEY_PEM or place key at "
+            "~/.config/BambuStudio/slicer_key.pem");
+    // The proprietary plugin signs the *current* time in milliseconds (as a
+    // decimal string) with a raw RSA PKCS#1 v1.5 signature — no hash. The
+    // cloud recovers the timestamp from the signature and checks it is recent
+    // (replay protection).
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string ts = std::to_string(ms);
+    return rsa_pkcs1_sign_raw_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
 }
 
 static constexpr char kB64Tbl[] =
