@@ -804,3 +804,23 @@ endif()
 if(NOT WIN32)
     add_subdirectory(tools/h2s_capture_video)
 endif()
+
+# startup_selftest is a Windows-only headless harness that LoadLibrary's the
+# built bambu_networking.dll and replays OrcaSlicer's exact startup ABI
+# sequence (create_agent -> set_config_dir -> ... -> start). Its sole purpose
+# is to reproduce the Windows agent-startup heap corruption in isolation under
+# page-heap / Application Verifier, so it MUST be built in this same CMake
+# build (same /MD runtime + MSVC STL as the DLL) for the std::string-by-value
+# ABI to match the DLL byte-for-byte. Built by default on Windows so CI ships
+# it next to the DLL.
+if(WIN32)
+    option(OBN_BUILD_STARTUP_SELFTEST
+        "Build the Windows startup_selftest.exe harness" ON)
+    if(OBN_BUILD_STARTUP_SELFTEST)
+        add_executable(startup_selftest tools/startup_selftest/startup_selftest.cpp)
+        # No special flags: inherit the project-wide /MD release runtime and
+        # MSVC STL so this exe's std::string layout matches the DLL exactly.
+        # Build it whenever the plugin builds so the artifact is always paired.
+        add_dependencies(startup_selftest bambu_networking)
+    endif()
+endif()
