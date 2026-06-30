@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(open-bamboo-networking
     VERSION 0.1.0
     DESCRIPTION "Open Bamboo Networking — open-source replacement for Bambu Studio's bambu_networking plugin"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # Vendored mosquitto pulls cJSON via FetchContent; released cJSON tags still
@@ -257,6 +257,30 @@ endif()
 # zlib is shared between BambuSource (FTPS fallback: client-side ZIP
 # extract for file-browser thumbnails) and other zlib users in the tree.
 
+# miniz submodule (third_party/miniz) — public domain, used by print_job.cpp
+# for in-place 3MF ZIP rewrite. Auto-initialised here so a plain cmake
+# configure works on a fresh clone without a manual submodule update.
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/miniz/miniz.h")
+    execute_process(
+        COMMAND git submodule update --init third_party/miniz
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    )
+endif()
+add_library(obn_miniz STATIC
+    third_party/miniz/miniz.c
+    third_party/miniz/miniz_tdef.c
+    third_party/miniz/miniz_tinfl.c
+    third_party/miniz/miniz_zip.c
+)
+target_include_directories(obn_miniz PUBLIC third_party)
+set_target_properties(obn_miniz PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Suppress warnings from vendored code.
+if(MSVC)
+    target_compile_options(obn_miniz PRIVATE /w)
+else()
+    target_compile_options(obn_miniz PRIVATE -w)
+endif()
+
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
     src/abi_lifecycle.cpp
@@ -325,6 +349,7 @@ target_compile_definitions(bambu_networking PRIVATE
 target_link_libraries(bambu_networking PRIVATE
     obn_mosquitto_iface
     obn_curl_iface
+    obn_miniz
     OpenSSL::SSL
     OpenSSL::Crypto
     ZLIB::ZLIB
@@ -721,6 +746,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/mqtt_client.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/signing.cpp
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
@@ -739,12 +765,19 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME lan_live COMMAND lan_live_test)
 
-    # Hermetic unit test for src/signing.cpp.
-    # Generates a temporary RSA key at runtime; no printer or network needed.
+    # Hermetic unit tests for obn::signing — exercises key loading, canonical
+    # JSON ordering, signature round-trip and envelope structure validation.
+    # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
     add_executable(signing_test tests/signing_test.cpp
-        src/signing.cpp
-        src/json_lite.cpp)
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/signing.cpp)
     target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(signing_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME signing COMMAND signing_test)
+
 endif()

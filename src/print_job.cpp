@@ -26,6 +26,11 @@
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/tunnel_upload.hpp"
 
+extern "C" {
+#include "miniz/miniz.h"
+#include "miniz/miniz_zip.h"
+}
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -40,6 +45,186 @@
 #include <openssl/evp.h>
 
 namespace obn::print_job {
+
+// ---------------------------------------------------------------------------
+// Plate normalisation (plate_0 → plate_1 rename + ZIP rewrite)
+// ---------------------------------------------------------------------------
+
+std::string to_print_basename(std::string fname)
+{
+    {
+        auto slash = fname.find_last_of("/\\");
+        if (slash != std::string::npos)
+            fname = fname.substr(slash + 1);
+    }
+    if (fname.empty()) return "print.gcode.3mf";
+    {
+        const std::string needle = "plate_0";
+        auto pos = fname.find(needle);
+        if (pos != std::string::npos)
+            fname.replace(pos, needle.size(), "plate_1");
+    }
+    auto ends_with_ci = [](const std::string& s, const char* suf) {
+        std::size_t n = std::strlen(suf);
+        if (s.size() < n) return false;
+        for (std::size_t i = 0; i < n; ++i) {
+            char a = s[s.size() - n + i];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+            if (a != suf[i]) return false;
+        }
+        return true;
+    };
+    if (ends_with_ci(fname, ".gcode.3mf")) return fname;
+    if (ends_with_ci(fname, ".3mf"))
+        fname.erase(fname.size() - 4);
+    return fname + ".gcode.3mf";
+}
+
+namespace {
+
+// Increments the last _N decimal suffix in a ZIP entry name.
+// "Metadata/plate_0.gcode" → "Metadata/plate_1.gcode"
+// Returns nm unchanged when no such suffix is found.
+static std::string bump_plate_index(const std::string& nm)
+{
+    auto under = nm.rfind('_');
+    if (under == std::string::npos) return nm;
+    std::size_t di = under + 1, de = di;
+    while (de < nm.size() && std::isdigit(static_cast<unsigned char>(nm[de]))) ++de;
+    if (de == di) return nm;
+    int n;
+    try {
+        n = std::stoi(nm.substr(di, de - di));
+    } catch (const std::exception&) {
+        return nm; // out_of_range / invalid_argument: leave name untouched
+    }
+    return nm.substr(0, di) + std::to_string(n + 1) + nm.substr(de);
+}
+
+// Applies bump_plate_index to every Metadata/ path found in the config body,
+// and increments numeric plater_id attribute values.
+static std::string bump_config_body(std::string body)
+{
+    std::string out;
+    out.reserve(body.size() + 32);
+    for (std::size_t i = 0; i < body.size(); ) {
+        auto pos = body.find("Metadata/", i);
+        if (pos == std::string::npos) { out.append(body, i, std::string::npos); break; }
+        out.append(body, i, pos - i);
+        std::size_t end = pos + 9;
+        while (end < body.size() && body[end] != '"' && body[end] != '<' &&
+               body[end] != '>' && body[end] != '\n' && body[end] != ' ')
+            ++end;
+        out += bump_plate_index(body.substr(pos, end - pos));
+        i = end;
+    }
+    const std::string kPV = "key=\"plater_id\" value=\"";
+    for (std::size_t i = 0; (i = out.find(kPV, i)) != std::string::npos; ) {
+        std::size_t vi = i + kPV.size(), ve = vi;
+        while (ve < out.size() && std::isdigit(static_cast<unsigned char>(out[ve]))) ++ve;
+        if (ve > vi) {
+            try {
+                int n = std::stoi(out.substr(vi, ve - vi));
+                out.replace(vi, ve - vi, std::to_string(n + 1));
+            } catch (const std::exception&) {
+                // out_of_range / invalid_argument: leave value untouched
+            }
+        }
+        i = ve;
+    }
+    return out;
+}
+
+} // namespace
+
+bool normalise_to_plate_one(const std::string& in_path)
+{
+    mz_zip_archive in{};
+    if (!mz_zip_reader_init_file(&in, in_path.c_str(), 0)) {
+        OBN_ERROR("plate_norm: open failed: %s", in_path.c_str());
+        return false;
+    }
+
+    bool has_plate_0 = false;
+    bool has_plate_1 = false;
+    const mz_uint n_in = mz_zip_reader_get_num_files(&in);
+    char name[512];
+    for (mz_uint i = 0; i < n_in && !(has_plate_0 && has_plate_1); ++i) {
+        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
+        const std::string nm(name);
+        if (nm.rfind("Metadata/plate_0", 0) == 0) has_plate_0 = true;
+        if (nm.rfind("Metadata/plate_1", 0) == 0) has_plate_1 = true;
+    }
+    if (!has_plate_0) {
+        mz_zip_reader_end(&in);
+        return true;
+    }
+    if (has_plate_1) {
+        mz_zip_reader_end(&in);
+        return true;
+    }
+
+    const std::string out_path = in_path + ".normalised";
+    std::error_code ec;
+    std::filesystem::remove(out_path, ec);
+    mz_zip_archive out{};
+    if (!mz_zip_writer_init_file(&out, out_path.c_str(), 0)) {
+        OBN_ERROR("plate_norm: create temp failed: %s", out_path.c_str());
+        mz_zip_reader_end(&in);
+        return false;
+    }
+
+    bool ok = true;
+    int  n_renamed = 0;
+    for (mz_uint i = 0; i < n_in && ok; ++i) {
+        if (mz_zip_reader_get_filename(&in, i, name, sizeof(name)) == 0) continue;
+        const std::string in_name(name);
+        if (in_name == "Metadata/model_settings.config") {
+            std::size_t sz = 0;
+            void* data = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+            if (!data) { ok = false; break; }
+            std::string body = bump_config_body(
+                std::string(static_cast<const char*>(data), sz));
+            mz_free(data);
+            if (!mz_zip_writer_add_mem(&out, in_name.c_str(), body.data(), body.size(),
+                                       MZ_DEFAULT_COMPRESSION)) {
+                ok = false; break;
+            }
+        } else {
+            const std::string out_name = bump_plate_index(in_name);
+            if (out_name != in_name) {
+                std::size_t sz = 0;
+                void* data = mz_zip_reader_extract_to_heap(&in, i, &sz, 0);
+                if (!data) { ok = false; break; }
+                bool added = mz_zip_writer_add_mem(&out, out_name.c_str(), data, sz,
+                                                   MZ_DEFAULT_COMPRESSION);
+                mz_free(data);
+                if (!added) { ok = false; break; }
+                ++n_renamed;
+            } else {
+                if (!mz_zip_writer_add_from_zip_reader(&out, &in, i)) { ok = false; break; }
+            }
+        }
+    }
+
+    if (ok && !mz_zip_writer_finalize_archive(&out)) ok = false;
+    if (!mz_zip_writer_end(&out))                    ok = false;
+    mz_zip_reader_end(&in);
+
+    if (!ok) {
+        std::filesystem::remove(out_path, ec);
+        OBN_ERROR("plate_norm: rewrite failed: %s", in_path.c_str());
+        return false;
+    }
+    std::filesystem::rename(out_path, in_path, ec);
+    if (ec) {
+        OBN_ERROR("plate_norm: rename failed (%s): %s", ec.message().c_str(), in_path.c_str());
+        std::filesystem::remove(out_path, ec);
+        return false;
+    }
+    OBN_INFO("plate_norm: rewrote %s (entries renamed=%d)", in_path.c_str(), n_renamed);
+    return true;
+}
 
 namespace {
 
@@ -300,12 +485,24 @@ int ftp_upload(const BBL::PrintParams&    p,
     return 0;
 }
 
-std::string build_project_file_json(const BBL::PrintParams& p,
-                                    const ProjectFileOpts&  opts)
+namespace {
+
+// Shared body for both the LAN (`build_project_file_json`) and cloud
+// (`build_cloud_project_file_json`) variants of the `project_file` MQTT
+// command. The two variants differ only in two slots:
+//   * the "param"/"param_enc" field (plaintext plate path vs RSA-encrypted)
+//   * the "url"/"url_enc"     field (plaintext fetch URL vs RSA-encrypted)
+// The caller passes those two slots fully formed (key + value, including the
+// leading comma) so the rest of the payload — and its exact field ordering —
+// stays byte-identical between the two. `Opts` is duck-typed: both
+// ProjectFileOpts and CloudProjectFileOpts expose project_id / profile_id /
+// task_id / subtask_id / file_path / md5.
+template <typename Opts>
+std::string build_project_file_json_impl(const BBL::PrintParams& p,
+                                         const Opts&             opts,
+                                         const std::string&      param_field,
+                                         const std::string&      url_field)
 {
-    std::string plate_param = "Metadata/plate_" +
-                              std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
-                              ".gcode";
     std::string subtask     = p.project_name.empty() ? p.task_name : p.project_name;
     std::string bed_type    = p.task_bed_type.empty() ? "auto" : p.task_bed_type;
     std::string ams_mapping = format_ams_mapping(p.ams_mapping, p.task_use_ams);
@@ -314,14 +511,14 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     os << "{\"print\":{";
     os << "\"sequence_id\":" << json_escape(now_seq_id());
     os << ",\"command\":\"project_file\"";
-    os << ",\"param\":" << json_escape(plate_param);
+    os << param_field;
     os << ",\"project_id\":" << json_escape(opts.project_id);
     os << ",\"profile_id\":" << json_escape(opts.profile_id);
     os << ",\"task_id\":"    << json_escape(opts.task_id);
     os << ",\"subtask_id\":" << json_escape(opts.subtask_id);
     os << ",\"subtask_name\":" << json_escape(subtask);
     os << ",\"file\":" << json_escape(strip_leading_slash(opts.file_path));
-    os << ",\"url\":"  << json_escape(opts.url);
+    os << url_field;
     os << ",\"md5\":"  << json_escape(opts.md5);
     os << ",\"bed_type\":" << json_escape(bed_type);
     os << ",\"bed_leveling\":"      << to_bool(p.task_bed_leveling);
@@ -401,6 +598,41 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     return os.str();
 }
 
+} // namespace
+
+std::string build_project_file_json(const BBL::PrintParams& p,
+                                    const ProjectFileOpts&  opts)
+{
+    std::string plate_param = "Metadata/plate_" +
+                              std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
+                              ".gcode";
+    return build_project_file_json_impl(
+        p, opts,
+        ",\"param\":" + json_escape(plate_param),
+        ",\"url\":"   + json_escape(opts.url));
+}
+
+// Cloud-print variant of build_project_file_json.
+//
+// Identical to the LAN variant except:
+//   * "param" is replaced by "param_enc" (RSA-PKCS#1 v1.5 encrypted,
+//     base64-encoded).  The plaintext would be "Metadata/plate_N.gcode".
+//   * "url"   is replaced by "url_enc"   (RSA-PKCS#1 v1.5 encrypted,
+//     base64-encoded).  The plaintext is the raw fetch URL (ftp:///, brtc://,
+//     or presigned HTTPS).
+//
+// Both encrypted values must be pre-computed by the caller (see
+// rsa_pkcs1v15_encrypt_b64 in cloud_print.cpp) using the printer's RSA
+// public key extracted from its TLS leaf certificate.
+std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
+                                          const CloudProjectFileOpts& opts)
+{
+    return build_project_file_json_impl(
+        p, opts,
+        ",\"param_enc\":" + json_escape(opts.param_enc),
+        ",\"url_enc\":"   + json_escape(opts.url_enc));
+}
+
 } // namespace obn::print_job
 
 namespace obn {
@@ -432,6 +664,17 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
+    // Plate normalisation: rewrite plate_0 → plate_1 inside the 3MF ZIP
+    // in-place BEFORE upload so the printer receives a correct archive.
+    // Fail-closed: if the rewrite errors, refuse the print rather than
+    // pushing a half-written archive. BBS-style spools are unchanged (no-op).
+    if (!print_job::normalise_to_plate_one(params.filename)) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
+                                 "plate normalisation failed");
+        return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
+    }
+
     // Stock plugin parity: when `ftp_folder` is empty (which it always
     // is — Studio never assigns m_ftp_folder anywhere in the public
     // tree, see `3rd_party/BambuStudio/src/slic3r/GUI/Jobs/PrintJob.cpp`)
@@ -448,7 +691,11 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     std::string remote_folder = params.ftp_folder;
     if (!remote_folder.empty() && remote_folder.back() != '/') remote_folder += '/';
     if (!remote_folder.empty() && remote_folder.front() == '/') remote_folder.erase(0, 1);
-    std::string remote_name = print_job::pick_remote_name(params);
+    // Normalise plate_0→plate_1 in the remote filename so the STOR target
+    // and the project_file url= field reference plate_1, matching the
+    // rewritten archive entries.
+    std::string remote_name = print_job::to_print_basename(
+                                  print_job::pick_remote_name(params));
     std::string remote_path = "/" + remote_folder + remote_name;
 
     std::string ca_file = bambu_ca_bundle_path();
@@ -632,6 +879,15 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
     }
 
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
+
+    // Plate normalisation before upload (no-op on BBS-style spools).
+    if (!params.filename.empty() &&
+        !print_job::normalise_to_plate_one(params.filename)) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
+                                 "plate normalisation failed");
+        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    }
 
     std::string remote_name = print_job::dest_name_for_send_gcode(params);
     if (remote_name.empty()) {
