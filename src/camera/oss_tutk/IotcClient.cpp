@@ -43,6 +43,7 @@
 //   [ ] Confirm MSG_P2P_ALIVE_C2D bytes via pcap if NAT P2P path is ever used
 
 #include "obn/net_compat.hpp"
+#include "obn/endian_compat.hpp"   // htole32/le32toh etc. — <endian.h> is POSIX-only
 
 #ifndef SHUT_RDWR
 #  define SHUT_RDWR SD_BOTH
@@ -74,14 +75,152 @@ namespace bambu_net {
 namespace oss_tutk {
 
 // ==========================================================================
+// Windows / MSVC portability shim
+// ==========================================================================
+//
+// This translation unit was written against POSIX sockets (ssize_t,
+// read()/write() on fds, struct-timeval SO_RCVTIMEO, errno-based EAGAIN
+// checks).  obn/net_compat.hpp already pulls in winsock2 and gives us
+// socket_t / close_socket / kInvalid, but the raw recv/send/sendto/recvfrom
+// call sites below still assume POSIX semantics.  Rather than sprinkle
+// #ifdefs over ~40 call sites we provide a small set of in-namespace inline
+// wrappers (same names: recv/send/sendto/recvfrom/read/write) so the bare,
+// unqualified calls in this file resolve here on Windows.  On POSIX nothing
+// in this block is compiled, so the Linux output is byte-identical.
+//
+// The wrappers:
+//   * take void* / const void* buffers (Winsock wants char*; this casts),
+//   * return ssize_t,
+//   * translate WSAGetLastError() into a POSIX errno value (EWOULDBLOCK /
+//     ETIMEDOUT / EINTR / EBADF) after a failed call, so the existing
+//     `errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT`
+//     timeout checks keep working unchanged.
+#if defined(_WIN32)
+
+#if defined(_MSC_VER) && !defined(__MINGW32__)
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
+
+#ifndef EWOULDBLOCK
+#  define EWOULDBLOCK WSAEWOULDBLOCK
+#endif
+#ifndef ETIMEDOUT
+#  define ETIMEDOUT WSAETIMEDOUT
+#endif
+
+namespace win_compat {
+
+// Map the last WinSock error onto errno so POSIX-style `errno == EAGAIN`
+// checks in this file behave correctly.  Called only on the error path.
+inline void set_errno_from_wsa()
+{
+    int e = ::WSAGetLastError();
+    switch (e) {
+        case WSAEWOULDBLOCK: errno = EAGAIN;     break;
+        case WSAETIMEDOUT:   errno = ETIMEDOUT;  break;
+        case WSAEINTR:       errno = EINTR;      break;
+        case WSAENOTSOCK:
+        case WSAEBADF:       errno = EBADF;      break;
+        default:             errno = e;          break;
+    }
+}
+
+} // namespace win_compat
+
+inline ssize_t sendto(obn::net::socket_t s, const void* buf, size_t len, int flags,
+                      const struct sockaddr* to, int tolen)
+{
+    int r = ::sendto(s, static_cast<const char*>(buf), static_cast<int>(len),
+                     flags, to, tolen);
+    if (r < 0) win_compat::set_errno_from_wsa();
+    return r;
+}
+
+inline ssize_t recvfrom(obn::net::socket_t s, void* buf, size_t len, int flags,
+                        struct sockaddr* from, int* fromlen)
+{
+    int r = ::recvfrom(s, static_cast<char*>(buf), static_cast<int>(len),
+                       flags, from, fromlen);
+    if (r < 0) win_compat::set_errno_from_wsa();
+    return r;
+}
+
+inline ssize_t recv(obn::net::socket_t s, void* buf, size_t len, int flags)
+{
+    int r = ::recv(s, static_cast<char*>(buf), static_cast<int>(len), flags);
+    if (r < 0) win_compat::set_errno_from_wsa();
+    return r;
+}
+
+inline ssize_t send(obn::net::socket_t s, const void* buf, size_t len, int flags)
+{
+    int r = ::send(s, static_cast<const char*>(buf), static_cast<int>(len), flags);
+    if (r < 0) win_compat::set_errno_from_wsa();
+    return r;
+}
+
+// POSIX read()/write() on a connected stream socket map to recv()/send().
+inline ssize_t read(obn::net::socket_t s, void* buf, size_t len)
+{
+    return recv(s, buf, len, 0);
+}
+
+inline ssize_t write(obn::net::socket_t s, const void* buf, size_t len)
+{
+    return send(s, buf, len, 0);
+}
+
+// Winsock's setsockopt() takes the option blob as `const char*`; POSIX takes
+// `const void*`.  This wrapper lets the bare setsockopt() call sites in this
+// file pass int* / sockaddr-ish pointers unchanged.  NOTE: SO_RCVTIMEO /
+// SO_SNDTIMEO are handled separately (DWORD-ms vs struct timeval) and must NOT
+// go through this path with a timeval.
+inline int setsockopt(obn::net::socket_t s, int level, int optname,
+                      const void* optval, int optlen)
+{
+    return ::setsockopt(s, level, optname,
+                        static_cast<const char*>(optval), optlen);
+}
+
+#endif // _WIN32
+
+// getaddrinfo error string: on Windows `gai_strerror` is a UNICODE-aware
+// macro that can resolve to gai_strerrorW (wchar_t*).  Force the ANSI variant
+// so the result is always a `const char*` printable with %s.
+#if defined(_WIN32)
+inline const char* gai_strerror_portable(int rc) { return ::gai_strerrorA(rc); }
+#else
+inline const char* gai_strerror_portable(int rc) { return ::gai_strerror(rc); }
+#endif
+
+// Portable receive timeout: POSIX uses struct timeval, Winsock uses a DWORD
+// of milliseconds for SO_RCVTIMEO/SO_SNDTIMEO.
+inline void set_socket_recv_timeout(obn::net::socket_t fd, int ms)
+{
+#if defined(_WIN32)
+    DWORD tv = static_cast<DWORD>(ms < 0 ? 0 : ms);
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+    struct timeval tv;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+// ==========================================================================
 // Internal utilities
 // ==========================================================================
 
-__attribute__((unused)) static uint32_t now_sec()
+[[maybe_unused]] static uint32_t now_sec()
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)ts.tv_sec;
+    // Portable monotonic seconds (POSIX clock_gettime(CLOCK_MONOTONIC) is not
+    // available on MSVC; std::chrono::steady_clock is the cross-platform path).
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now).count());
 }
 
 static uint32_t rand32()
@@ -173,7 +312,7 @@ static bool resolve_master(const std::string& hostname, uint16_t port,
 
     int rc = getaddrinfo(hostname.c_str(), port_str, &hints, &res);
     if (rc != 0 || !res) {
-        OBN_ERROR("[oss-iotc] DNS failed for %s: %s", hostname.c_str(), gai_strerror(rc));
+        OBN_ERROR("[oss-iotc] DNS failed for %s: %s", hostname.c_str(), gai_strerror_portable(rc));
         return false;
     }
     *out = *reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
@@ -210,10 +349,7 @@ static obn::net::socket_t open_udp_socket(uint16_t* bound_port_out)
 
 static void set_recv_timeout(obn::net::socket_t fd, int ms)
 {
-    struct timeval tv;
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    set_socket_recv_timeout(fd, ms);
 }
 
 // ==========================================================================
@@ -1347,9 +1483,19 @@ static bool query_master_for_device(const std::string& uid_lc,
             obn::net::socket_t tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
             if (tcp_fd == obn::net::kInvalid) continue;
 
-            struct timeval tv{ 3, 0 };  // 3-second connect timeout
-            setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            // 3-second send/recv timeout (portable: timeval on POSIX,
+            // DWORD-ms on Winsock).
+#if defined(_WIN32)
+            DWORD tv = 3000;
+            ::setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO,
+                         reinterpret_cast<const char*>(&tv), sizeof(tv));
+            ::setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+            struct timeval tv{ 3, 0 };
+            ::setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            ::setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
 
             if (connect(tcp_fd, (struct sockaddr*)&master_addr,
                         sizeof(master_addr)) != 0) {
@@ -2019,7 +2165,7 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     snprintf(port_str, sizeof(port_str), "%u", 10240);
     int rc = getaddrinfo(hostname, port_str, &hints, &res);
     if (rc != 0 || !res) {
-        OBN_ERROR("[relay] DNS failed for %s: %s", hostname, gai_strerror(rc));
+        OBN_ERROR("[relay] DNS failed for %s: %s", hostname, gai_strerror_portable(rc));
         return -1;
     }
     struct sockaddr_in relay_addr{};
