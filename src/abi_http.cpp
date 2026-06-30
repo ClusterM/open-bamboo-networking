@@ -6,6 +6,7 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/auth.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
 #include "obn/http_client.hpp"
@@ -57,24 +58,24 @@ std::string dump_or_null(const obn::json::Value& v)
     return v.is_null() ? std::string{"null"} : v.dump();
 }
 
-// The Bambu cloud returns device-bind info at
-//   GET /v1/iot-service/api/user/bind
-// with body shape:
+// The Bambu cloud returns device print info at
+//   GET /v1/iot-service/api/user/print?force=true
+// with Studio-native field names already in place:
 //   { "devices":[{
 //       "dev_id":"22E8BJ610801473",
-//       "name":"3Д принтерик",
-//       "online":true,
-//       "print_status":"SUCCESS",
+//       "dev_name":"My Printer",
+//       "dev_online":true,
+//       "task_status":"SUCCESS",
 //       "dev_model_name":"N7-V2",
 //       "dev_product_name":"P2S",
 //       "dev_access_code":"03f06755",
 //       ... }]}
-// Studio's DeviceManager::parse_user_print_info however reads slightly
-// different field names - {dev_name, dev_online, task_status}. We
-// translate here so Studio's parser finds everything. Pass-through
-// fields that Studio doesn't care about (print_job, nozzle_diameter,
-// dev_structure...) are preserved verbatim in case anything else on
-// the Studio side picks them up.
+// Studio's DeviceManager::parse_user_print_info reads exactly these
+// field names; unlike the older /bind endpoint no translation is needed
+// for the primary fields. Pass-through extras are preserved verbatim.
+//
+// Security note: dev_access_code is the LAN MQTT password (also shown
+// on the printer display). It is returned in plaintext from this endpoint.
 std::string remap_bind_payload(const std::string& raw_body,
                                std::vector<std::string>* out_dev_ids)
 {
@@ -101,10 +102,24 @@ std::string remap_bind_payload(const std::string& raw_body,
         const auto dev_id = d.find("dev_id").as_string();
         if (out_dev_ids && !dev_id.empty()) out_dev_ids->push_back(dev_id);
         out << "\"dev_id\":"          << obn::json::escape(dev_id) << ',';
-        out << "\"dev_name\":"        << obn::json::escape(d.find("name").as_string()) << ',';
-        out << "\"dev_online\":"      << (d.find("online").as_bool() ? "true" : "false") << ',';
+        {
+            auto dn = d.find("dev_name");
+            out << "\"dev_name\":" << obn::json::escape(
+                !dn.is_null() ? dn.as_string() : d.find("name").as_string()) << ',';
+        }
+        {
+            auto on = d.find("dev_online");
+            const bool online = !on.is_null() ? on.as_bool() : d.find("online").as_bool();
+            out << "\"dev_online\":" << (online ? "true" : "false");
+        }
+        out << ',';
         out << "\"dev_model_name\":"  << obn::json::escape(d.find("dev_model_name").as_string()) << ',';
-        out << "\"task_status\":"     << obn::json::escape(d.find("print_status").as_string()) << ',';
+        {
+            auto ts = d.find("task_status");
+            out << "\"task_status\":" << obn::json::escape(
+                !ts.is_null() ? ts.as_string() : d.find("print_status").as_string());
+        }
+        out << ',';
         out << "\"dev_access_code\":" << obn::json::escape(d.find("dev_access_code").as_string());
         // Pass-through extras; Studio code paths occasionally look them up.
         if (auto v = d.find("dev_product_name"); !v.is_null())
@@ -119,6 +134,41 @@ std::string remap_bind_payload(const std::string& raw_body,
     }
     out << "]}";
     return out.str();
+}
+
+// Count devices in a /print or /bind response envelope.
+size_t count_devices(const std::string& raw_body)
+{
+    std::string perr;
+    auto root = obn::json::parse(raw_body, &perr);
+    if (!root) return 0;
+    return root->find("devices").as_array().size();
+}
+
+} // namespace
+
+namespace {
+
+bool fetch_user_print_info(obn::Agent* a,
+                           const obn::auth::Session& s,
+                           const std::string& path,
+                           obn::http::Response* out_resp,
+                           std::string* out_mapped,
+                           std::vector<std::string>* out_dev_ids)
+{
+    const std::string url = obn::cloud::api_host(a->cloud_region()) + path;
+    std::map<std::string, std::string> hdrs{
+        {"Authorization", "Bearer " + s.access_token},
+    };
+    auto resp = obn::http::get_json(url, hdrs);
+    if (out_resp) *out_resp = resp;
+    if (resp.status_code != 200 || resp.body.empty()) return false;
+
+    std::string mapped = remap_bind_payload(resp.body, out_dev_ids);
+    if (count_devices(resp.body) == 0) return false;
+
+    if (out_mapped) *out_mapped = std::move(mapped);
+    return true;
 }
 
 } // namespace
@@ -137,13 +187,19 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
         return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     }
 
-    const std::string url = obn::cloud::api_host(a->cloud_region())
-                          + "/v1/iot-service/api/user/bind";
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + s.access_token},
-    };
+    const std::string print_path = "/v1/iot-service/api/user/print?force=true";
+    const std::string bind_path  = "/v1/iot-service/api/user/bind";
 
-    auto resp = obn::http::get_json(url, hdrs);
+    obn::http::Response resp;
+    std::vector<std::string> dev_ids;
+    std::string mapped;
+    bool ok = fetch_user_print_info(a, s, print_path, &resp, &mapped, &dev_ids);
+    if (!ok) {
+        OBN_INFO("get_user_print_info: /user/print empty or failed, trying /user/bind");
+        dev_ids.clear();
+        ok = fetch_user_print_info(a, s, bind_path, &resp, &mapped, &dev_ids);
+    }
+
     if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
 
     if (!resp.error.empty()) {
@@ -157,9 +213,11 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
         if (http_body) *http_body = resp.body;
         return BAMBU_NETWORK_ERR_GET_USER_PRINTINFO_FAILED;
     }
+    if (!ok) {
+        OBN_WARN("get_user_print_info: both endpoints returned no devices");
+        mapped = R"({"message":"success","devices":[]})";
+    }
 
-    std::vector<std::string> dev_ids;
-    std::string mapped = remap_bind_payload(resp.body, &dev_ids);
     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
              resp.body.size(), mapped.size(), dev_ids.size());
 
@@ -188,25 +246,119 @@ OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,
     return BAMBU_NETWORK_SUCCESS;
 }
 
+namespace {
+
+// Emit a firmware[] array omitting entries with status=="beta".
+void emit_filtered_firmware(std::ostringstream& out, const obn::json::Value& fw_v)
+{
+    out << "[";
+    const auto& fw = fw_v.as_array();
+    bool first_fw = true;
+    for (const auto& entry : fw) {
+        if (entry.find("status").as_string() == "beta") continue;
+        if (!first_fw) out << ',';
+        first_fw = false;
+        out << entry.dump();
+    }
+    out << "]";
+}
+
+// Emit an ams[] array, filtering beta entries inside each ams[].firmware[].
+void emit_filtered_ams(std::ostringstream& out, const obn::json::Value& ams_v)
+{
+    out << "[";
+    if (ams_v.is_null()) {
+        out << "]";
+        return;
+    }
+    const auto& ams_arr = ams_v.as_array();
+    bool first_ams = true;
+    for (const auto& ams : ams_arr) {
+        if (!first_ams) out << ',';
+        first_ams = false;
+        out << '{';
+        if (auto v = ams.find("ams_id"); !v.is_null())
+            out << "\"ams_id\":" << dump_or_null(v) << ',';
+        out << "\"firmware\":";
+        emit_filtered_firmware(out, ams.find("firmware"));
+        out << '}';
+    }
+    out << "]";
+}
+
+} // namespace
+
 OBN_ABI int bambu_network_get_printer_firmware(void* agent,
                                                std::string dev_id,
                                                unsigned* http_code, std::string* http_body)
 {
-    // The stock plugin fetches this from Bambu Lab's cloud firmware
-    // catalogue. We don't have cloud auth plumbed in, so we rebuild
-    // the subset Studio actually reads from the MQTT frames the
-    // printer already pushes through us: current versions come from
-    // info.command=get_version, advertised-new versions come from
-    // push_status.upgrade_state.new_ver_list. See Agent::render_
-    // firmware_json for details.
+    // Primary source: MQTT frames (info.command=get_version and
+    // push_status.upgrade_state.new_ver_list) harvested by notify_local_message.
+    // See Agent::render_firmware_json for details.
     //
-    // The Update tab stays blank until this call returns a JSON that
-    // parses successfully AND whose devices[0].dev_id matches; an
-    // empty body (the previous stub) made json::parse("") throw and
-    // left m_firmware_valid=false forever.
+    // Cloud fallback: when no MQTT firmware data has arrived yet (e.g. on
+    // first launch or before a get_version reply), try the cloud catalogue:
+    //   GET /v1/iot-service/api/user/device/version?dev_id={serial}
+    // The response contains real OTA download URLs and stable version strings
+    // independent of the printer's push cycle.
     std::string body;
-    if (auto* a = as_agent(agent)) {
+    auto* a = as_agent(agent);
+    if (a) {
         body = a->render_firmware_json(dev_id);
+
+        if (!a->has_firmware_data(dev_id)) {
+            auto s = a->user_session_snapshot();
+            if (!s.access_token.empty() && !s.user_id.empty()) {
+                const std::string url = obn::cloud::api_host(a->cloud_region())
+                    + "/v1/iot-service/api/user/device/version?dev_id=" + dev_id;
+                // X-BBL-Client-ID format confirmed from MITM: slicer:{user_id}:{4-char-hex}.
+                // The 4-character suffix derivation from the stock plugin binary
+                // is not yet confirmed; "0000" is a placeholder.
+                std::map<std::string, std::string> hdrs{
+                    {"Authorization",    "Bearer " + s.access_token},
+                    {"X-BBL-Client-ID",  "slicer:" + s.user_id + ":0000"},
+                };
+                auto resp = obn::http::get_json(url, hdrs);
+                if (resp.status_code == 200 && !resp.body.empty()) {
+                    std::string perr;
+                    auto root = obn::json::parse(resp.body, &perr);
+                    if (root && !root->find("devices").is_null()) {
+                        // Filter out beta firmware entries unless the user has
+                        // opted into beta firmware via their account settings.
+                        // When firmware_beta_open is false, only release entries
+                        // are shown so Studio doesn't offer unsolicited beta updates.
+                        if (!s.firmware_beta_open) {
+                            // Rebuild the JSON omitting any entry whose "status"
+                            // field is "beta". We do a full parse-and-emit since
+                            // the cloud body is already structured JSON; the
+                            // parse cost here is negligible (called once per
+                            // device per Studio launch).
+                            auto devs_v = root->find("devices");
+                            const auto& devs = devs_v.as_array();
+                            std::ostringstream out;
+                            out << "{\"devices\":[";
+                            bool first_dev = true;
+                            for (const auto& dev : devs) {
+                                if (!first_dev) out << ',';
+                                first_dev = false;
+                                out << "{\"dev_id\":" << obn::json::escape(dev.find("dev_id").as_string());
+                                out << ",\"firmware\":";
+                                emit_filtered_firmware(out, dev.find("firmware"));
+                                out << ",\"ams\":";
+                                emit_filtered_ams(out, dev.find("ams"));
+                                out << "}";
+                            }
+                            out << "]}";
+                            body = out.str();
+                        } else {
+                            body = resp.body;
+                        }
+                        OBN_INFO("get_printer_firmware dev=%s: cloud fallback %zu bytes (beta=%d)",
+                                 dev_id.c_str(), body.size(), s.firmware_beta_open ? 1 : 0);
+                    }
+                }
+            }
+        }
     } else {
         // No agent context yet - emit the minimal valid envelope so
         // Studio's json::parse doesn't throw. This path is only hit

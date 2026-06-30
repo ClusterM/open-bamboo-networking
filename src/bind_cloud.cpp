@@ -244,7 +244,7 @@ int modify_printer_name(Agent* agent, const std::string& dev_id, const std::stri
     std::ostringstream body;
     body << '{'
          << "\"dev_id\":" << obn::json::escape(dev_id) << ','
-         << "\"name\":" << obn::json::escape(dev_name) << '}';
+         << "\"dev_name\":" << obn::json::escape(dev_name) << '}';
 
     const std::string url =
         api_base(agent) + "/v1/iot-service/api/user/device/info";
