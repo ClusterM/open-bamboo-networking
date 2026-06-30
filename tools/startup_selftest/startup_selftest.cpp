@@ -65,6 +65,12 @@ typedef int (*func_set_user_selected_machine)(void* agent, std::string dev_id);
 typedef int (*func_start_subscribe)(void* agent, std::string module);
 typedef int (*func_add_subscribe)(void* agent, std::vector<std::string> dev_list);
 
+// Telemetry hooks OrcaSlicer calls at startup (GUI_App::on_init_network BBL
+// section + check_track_enable): track_enable(false) then track_remove_files().
+// Signatures copied verbatim from BBLNetworkPlugin.hpp:109-110.
+typedef int (*func_track_enable)(void* agent, bool enable);
+typedef int (*func_track_remove_files)(void* agent);
+
 // ---------------------------------------------------------------------------
 // Callback std::function typedefs — copied verbatim from the host header
 // OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp so the std::function-by-value
@@ -149,6 +155,8 @@ struct PluginApi {
     func_set_user_selected_machine set_user_selected_machine{};
     func_start_subscribe           start_subscribe{};
     func_add_subscribe             add_subscribe{};
+    func_track_enable              track_enable{};
+    func_track_remove_files        track_remove_files{};
 
     func_set_server_callback         set_server_callback{};
     func_set_on_server_connected_fn  set_on_server_connected{};
@@ -181,6 +189,8 @@ PluginApi resolve_all(HMODULE mod)
     a.set_user_selected_machine = resolve<func_set_user_selected_machine>(mod, "bambu_network_set_user_selected_machine");
     a.start_subscribe           = resolve<func_start_subscribe>          (mod, "bambu_network_start_subscribe");
     a.add_subscribe             = resolve<func_add_subscribe>            (mod, "bambu_network_add_subscribe");
+    a.track_enable              = resolve<func_track_enable>             (mod, "bambu_network_track_enable");
+    a.track_remove_files        = resolve<func_track_remove_files>       (mod, "bambu_network_track_remove_files");
 
     a.set_server_callback       = resolve<func_set_server_callback>        (mod, "bambu_network_set_server_callback");
     a.set_on_server_connected   = resolve<func_set_on_server_connected_fn> (mod, "bambu_network_set_on_server_connected_fn");
@@ -334,6 +344,17 @@ void* bring_up_agent(const PluginApi& api, const char* tag,
     log_line(">> [%s] set_country_code(\"US\")", tag);
     rc = api.set_country_code(agent, std::string("US"));
     log_line("<< [%s] set_country_code() = %d", tag, rc);
+
+    // Telemetry hooks, in OrcaSlicer's on_init_network order (GUI_App.cpp
+    // ~3491 BBL section + check_track_enable): track_enable(false) then
+    // track_remove_files(), before start().
+    log_line(">> [%s] track_enable(false)", tag);
+    rc = api.track_enable(agent, false);
+    log_line("<< [%s] track_enable() = %d", tag, rc);
+
+    log_line(">> [%s] track_remove_files()", tag);
+    rc = api.track_remove_files(agent);
+    log_line("<< [%s] track_remove_files() = %d", tag, rc);
 
     log_line(">> [%s] start()", tag);
     rc = api.start(agent);
