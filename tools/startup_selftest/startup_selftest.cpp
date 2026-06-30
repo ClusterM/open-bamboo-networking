@@ -45,6 +45,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <functional>
+#include <map>
 #include <string>
 
 // ---------------------------------------------------------------------------
@@ -60,6 +62,47 @@ typedef int   (*func_set_config_dir)(void* agent, std::string config_dir);
 typedef int   (*func_set_cert_file)(void* agent, std::string folder, std::string filename);
 typedef int   (*func_set_country_code)(void* agent, std::string country_code);
 typedef int   (*func_start)(void* agent);
+
+// ---------------------------------------------------------------------------
+// Callback std::function typedefs — copied verbatim from the host header
+// OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp so the std::function-by-value
+// ABI matches exactly what OrcaSlicer hands the plugin. These are the second
+// (and now prime) suspect for the startup heap corruption: OrcaSlicer registers
+// ~13 of them via init_networking_callbacks BEFORE start(), and connect_cloud()
+// INVOKES some (on_server_connected, etc.) on the network thread.
+//
+// NOTE: these names/signatures are also defined identically in the plugin's own
+// include/obn/bambu_networking.hpp — verified to match the host header.
+namespace BBL {
+typedef std::function<void(int online_login, bool login)>                    OnUserLoginFn;
+typedef std::function<void(std::string topic_str)>                           OnPrinterConnectedFn;
+typedef std::function<void(int status, std::string dev_id, std::string msg)> OnLocalConnectedFn;
+typedef std::function<void(int return_code, int reason_code)>                OnServerConnectedFn;
+typedef std::function<void(std::string dev_id, std::string msg)>             OnMessageFn;
+typedef std::function<void(unsigned http_code, std::string http_body)>       OnHttpErrorFn;
+typedef std::function<std::string()>                                         GetCountryCodeFn;
+typedef std::function<void(std::string topic)>                               GetSubscribeFailureFn;
+typedef std::function<void(std::string dev_info_json_str)>                    OnMsgArrivedFn;
+typedef std::function<void(std::function<void()>)>                           QueueOnMainFn;
+typedef std::function<void(std::string url, int status)>                     OnServerErrFn;
+} // namespace BBL
+
+// Callback-registration export typedefs (mirror the plugin's OBN_CB_EXPORT
+// signatures in src/abi_callbacks.cpp: int(void* agent, BBL::<Fn> fn), the
+// std::function passed BY VALUE).
+typedef int (*func_set_on_ssdp_msg_fn)         (void*, BBL::OnMsgArrivedFn);
+typedef int (*func_set_on_user_login_fn)       (void*, BBL::OnUserLoginFn);
+typedef int (*func_set_on_printer_connected_fn)(void*, BBL::OnPrinterConnectedFn);
+typedef int (*func_set_on_server_connected_fn) (void*, BBL::OnServerConnectedFn);
+typedef int (*func_set_on_http_error_fn)       (void*, BBL::OnHttpErrorFn);
+typedef int (*func_set_get_country_code_fn)    (void*, BBL::GetCountryCodeFn);
+typedef int (*func_set_on_subscribe_failure_fn)(void*, BBL::GetSubscribeFailureFn);
+typedef int (*func_set_on_message_fn)          (void*, BBL::OnMessageFn);
+typedef int (*func_set_on_user_message_fn)     (void*, BBL::OnMessageFn);
+typedef int (*func_set_on_local_connect_fn)    (void*, BBL::OnLocalConnectedFn);
+typedef int (*func_set_on_local_message_fn)    (void*, BBL::OnMessageFn);
+typedef int (*func_set_queue_on_main_fn)       (void*, BBL::QueueOnMainFn);
+typedef int (*func_set_server_callback)        (void*, BBL::OnServerErrFn);
 
 namespace {
 
@@ -156,6 +199,112 @@ int main(int argc, char** argv)
     log_line(">> set_cert_file(\"%s\", \"slicer_base64.cer\")", cert_folder.c_str());
     rc = set_cert_file(agent, cert_folder, std::string("slicer_base64.cer"));
     log_line("<< set_cert_file() = %d", rc);
+
+    // ------------------------------------------------------------------
+    // init_networking_callbacks(): register EVERY callback the plugin
+    // exports, with real (non-empty) lambdas using the exact host
+    // std::function signatures. OrcaSlicer does this BEFORE set_country_code
+    // /start (GUI_App::init_networking_callbacks, ~lines 1887-2030), and
+    // connect_cloud() later INVOKES some of these on the network thread —
+    // exactly the std::function-by-value traffic we now suspect. Order
+    // mirrors OrcaSlicer's registration sequence; the remaining setters
+    // (which Studio also wires through NetworkAgent) follow.
+    // ------------------------------------------------------------------
+    auto set_server_callback     = resolve<func_set_server_callback>        (mod, "bambu_network_set_server_callback");
+    auto set_on_server_connected = resolve<func_set_on_server_connected_fn> (mod, "bambu_network_set_on_server_connected_fn");
+    auto set_on_printer_conn     = resolve<func_set_on_printer_connected_fn>(mod, "bambu_network_set_on_printer_connected_fn");
+    auto set_get_country_code    = resolve<func_set_get_country_code_fn>    (mod, "bambu_network_set_get_country_code_fn");
+    auto set_on_subscribe_fail   = resolve<func_set_on_subscribe_failure_fn>(mod, "bambu_network_set_on_subscribe_failure_fn");
+    auto set_on_local_connect    = resolve<func_set_on_local_connect_fn>    (mod, "bambu_network_set_on_local_connect_fn");
+    auto set_on_message          = resolve<func_set_on_message_fn>          (mod, "bambu_network_set_on_message_fn");
+    auto set_on_user_message     = resolve<func_set_on_user_message_fn>     (mod, "bambu_network_set_on_user_message_fn");
+    auto set_on_local_message    = resolve<func_set_on_local_message_fn>    (mod, "bambu_network_set_on_local_message_fn");
+    auto set_on_http_error       = resolve<func_set_on_http_error_fn>       (mod, "bambu_network_set_on_http_error_fn");
+    auto set_on_ssdp_msg         = resolve<func_set_on_ssdp_msg_fn>         (mod, "bambu_network_set_on_ssdp_msg_fn");
+    auto set_on_user_login       = resolve<func_set_on_user_login_fn>       (mod, "bambu_network_set_on_user_login_fn");
+    auto set_queue_on_main       = resolve<func_set_queue_on_main_fn>       (mod, "bambu_network_set_queue_on_main_fn");
+
+    log_line(">> set_server_callback");
+    rc = set_server_callback(agent, [](std::string url, int status) {
+        log_line("   [cb] server_callback url=%s status=%d", url.c_str(), status);
+    });
+    log_line("<< set_server_callback() = %d", rc);
+
+    log_line(">> set_on_server_connected_fn");
+    rc = set_on_server_connected(agent, [](int return_code, int reason_code) {
+        log_line("   [cb] on_server_connected rc=%d reason=%d", return_code, reason_code);
+    });
+    log_line("<< set_on_server_connected_fn() = %d", rc);
+
+    log_line(">> set_on_printer_connected_fn");
+    rc = set_on_printer_conn(agent, [](std::string topic) {
+        log_line("   [cb] on_printer_connected topic=%s", topic.c_str());
+    });
+    log_line("<< set_on_printer_connected_fn() = %d", rc);
+
+    log_line(">> set_get_country_code_fn");
+    rc = set_get_country_code(agent, []() -> std::string {
+        log_line("   [cb] get_country_code -> US");
+        return std::string("US");
+    });
+    log_line("<< set_get_country_code_fn() = %d", rc);
+
+    log_line(">> set_on_subscribe_failure_fn");
+    rc = set_on_subscribe_fail(agent, [](std::string topic) {
+        log_line("   [cb] on_subscribe_failure topic=%s", topic.c_str());
+    });
+    log_line("<< set_on_subscribe_failure_fn() = %d", rc);
+
+    log_line(">> set_on_local_connect_fn");
+    rc = set_on_local_connect(agent, [](int status, std::string dev_id, std::string msg) {
+        log_line("   [cb] on_local_connect status=%d dev=%s msg=%s",
+                 status, dev_id.c_str(), msg.c_str());
+    });
+    log_line("<< set_on_local_connect_fn() = %d", rc);
+
+    log_line(">> set_on_message_fn");
+    rc = set_on_message(agent, [](std::string dev_id, std::string msg) {
+        log_line("   [cb] on_message dev=%s len=%zu", dev_id.c_str(), msg.size());
+    });
+    log_line("<< set_on_message_fn() = %d", rc);
+
+    log_line(">> set_on_user_message_fn");
+    rc = set_on_user_message(agent, [](std::string dev_id, std::string msg) {
+        log_line("   [cb] on_user_message dev=%s len=%zu", dev_id.c_str(), msg.size());
+    });
+    log_line("<< set_on_user_message_fn() = %d", rc);
+
+    log_line(">> set_on_local_message_fn");
+    rc = set_on_local_message(agent, [](std::string dev_id, std::string msg) {
+        log_line("   [cb] on_local_message dev=%s len=%zu", dev_id.c_str(), msg.size());
+    });
+    log_line("<< set_on_local_message_fn() = %d", rc);
+
+    log_line(">> set_on_http_error_fn");
+    rc = set_on_http_error(agent, [](unsigned http_code, std::string body) {
+        log_line("   [cb] on_http_error code=%u len=%zu", http_code, body.size());
+    });
+    log_line("<< set_on_http_error_fn() = %d", rc);
+
+    log_line(">> set_on_ssdp_msg_fn");
+    rc = set_on_ssdp_msg(agent, [](std::string dev_info_json) {
+        log_line("   [cb] on_ssdp_msg len=%zu", dev_info_json.size());
+    });
+    log_line("<< set_on_ssdp_msg_fn() = %d", rc);
+
+    log_line(">> set_on_user_login_fn");
+    rc = set_on_user_login(agent, [](int online_login, bool login) {
+        log_line("   [cb] on_user_login online=%d login=%d", online_login, (int)login);
+    });
+    log_line("<< set_on_user_login_fn() = %d", rc);
+
+    log_line(">> set_queue_on_main_fn");
+    rc = set_queue_on_main(agent, [](std::function<void()> task) {
+        // Studio marshals onto the UI thread; here we just run it inline.
+        log_line("   [cb] queue_on_main (running task inline)");
+        if (task) task();
+    });
+    log_line("<< set_queue_on_main_fn() = %d", rc);
 
     log_line(">> set_country_code(\"US\")");
     rc = set_country_code(agent, std::string("US"));
