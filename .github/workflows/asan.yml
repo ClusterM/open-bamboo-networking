@@ -95,28 +95,62 @@ jobs:
           "dll=$($dll.FullName)"                | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "exe=$($exe.FullName)"                | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Run startup_selftest under ASAN (EMPTY config)
+      - name: Run startup_selftest under ASAN (empty + cached-login)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $cfg  = Join-Path $env:GITHUB_WORKSPACE 'empty_cfg'
+          # A real (self-signed) PEM so mosquitto_tls_set() actually accepts it
+          # on Windows and the suspect OpenSSL/mosquitto TLS setup + handshake
+          # code runs (an empty/garbage cert makes the plugin bail before the
+          # handshake). Generated with the runner's openssl.
           $cert = Join-Path $env:GITHUB_WORKSPACE 'cert'
-          New-Item -ItemType Directory -Force -Path $cfg  | Out-Null
           New-Item -ItemType Directory -Force -Path $cert | Out-Null
-          # Minimal cert file so set_cert_file's bundle path resolves.
-          Set-Content -Path (Join-Path $cert 'slicer_base64.cer') `
-            -Value "-----BEGIN CERTIFICATE-----`nMIIBfake`n-----END CERTIFICATE-----"
+          $pem = Join-Path $cert 'slicer_base64.cer'
+          & openssl req -x509 -newkey rsa:2048 -nodes -keyout (Join-Path $cert 'k.pem') `
+            -out $pem -days 3650 -subj "/CN=selftest" 2>$null
+          if (-not (Test-Path $pem)) { Write-Error "failed to generate test cert" }
+          Write-Host "test cert at $pem"
 
-          $env:ASAN_OPTIONS = 'abort_on_error=1:print_stats=0:windows_hook_legacy_allocators=true'
+          # windows_hook_rtl_allocators: also intercept Win32 HeapAlloc/
+          # RtlAllocateHeap (CRT new/malloc are intercepted by default).
+          # exitcode=99 so a non-abort ASAN error path is still distinguishable.
+          $env:ASAN_OPTIONS = 'windows_hook_rtl_allocators=true:abort_on_error=1:exitcode=99:print_stats=0'
           # ASAN runtime is next to the exe (copied above); also add its dir to PATH.
           $env:PATH = "${{ steps.locate.outputs.asan_dir }};$env:PATH"
 
-          Write-Host "=== running: startup_selftest <dll> <empty_cfg> <cert> ==="
-          & "${{ steps.locate.outputs.exe }}" "${{ steps.locate.outputs.dll }}" $cfg $cert
-          $code = $LASTEXITCODE
-          Write-Host "=== startup_selftest exit code: $code ==="
-          if ($code -ne 0) {
-            Write-Error "startup_selftest exited non-zero ($code) — see ASAN report above"
+          $dll = "${{ steps.locate.outputs.dll }}"
+          $exe = "${{ steps.locate.outputs.exe }}"
+
+          # ---- Run 1: EMPTY config (Windows-only basic startup, no cloud) ----
+          $empty = Join-Path $env:GITHUB_WORKSPACE 'empty_cfg'
+          New-Item -ItemType Directory -Force -Path $empty | Out-Null
+          Write-Host "=== RUN 1: EMPTY config (no creds, no cloud) ==="
+          & $exe $dll $empty $cert
+          $code1 = $LASTEXITCODE
+          Write-Host "=== RUN 1 exit code: $code1 ==="
+
+          # ---- Run 2: cached-login config (forces start()->connect_cloud->
+          #      Windows TLS setup in cloud_session.cpp + mqtt_client). A DUMMY
+          #      token is enough: user_logged_in() only needs a non-empty token
+          #      + future expiry; the Windows TLS SETUP + handshake run before
+          #      the MQTT CONNECT is auth-rejected. No real credentials needed.
+          $login = Join-Path $env:GITHUB_WORKSPACE 'login_cfg'
+          New-Item -ItemType Directory -Force -Path $login | Out-Null
+          # Single-quoted PS string: the JSON's double-quotes pass through
+          # verbatim (avoids a here-string, whose closing '@ must sit at
+          # column 0 and would break the YAML block-scalar indentation).
+          $auth = '{"region":"GLOBAL","account":"test@example.com","access_token":"DUMMYTOKENDUMMYTOKENDUMMYTOKEN0123456789","refresh_token":"","expires_at":"2027-12-31T00:00:00Z","user_id":"1468414750","user_name":"t","nick_name":"t","avatar":""}'
+          Set-Content -Path (Join-Path $login 'obn.auth.json') -Value $auth -NoNewline
+          Set-Content -Path (Join-Path $login 'obn.conf')      -Value "block_cloud=0" -NoNewline
+          Write-Host "=== RUN 2: cached-login config (start->connect_cloud TLS path) ==="
+          & $exe $dll $login $cert
+          $code2 = $LASTEXITCODE
+          Write-Host "=== RUN 2 exit code: $code2 ==="
+
+          if ($code1 -ne 0 -or $code2 -ne 0) {
+            Write-Error "startup_selftest fired ASAN (empty=$code1 login=$code2) — see report(s) above"
+          } else {
+            Write-Host "BOTH runs clean under ASAN (RTL allocator hooking enabled)."
           }
 
       - name: Upload ASAN-instrumented binaries (for offline debugging)
