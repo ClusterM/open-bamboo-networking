@@ -347,10 +347,10 @@ std::string sign_bytes(const std::string& data)
 std::string device_security_sign()
 {
     EVP_PKEY* pkey = slicer_pkey();
-    if (!pkey)
-        throw std::runtime_error(
-            "signing: no key loaded; set BBL_SLICER_KEY_PEM or place key at "
-            "~/.config/BambuStudio/slicer_key.pem");
+    // Degrade gracefully when no slicer key is configured (same as maybe_sign):
+    // return empty so the caller omits the header rather than crashing the
+    // cloud-connect/print path. The header is only enforced on signed writes.
+    if (!pkey) return {};
     // The proprietary plugin signs the *current* time in milliseconds (as a
     // decimal string) with a raw RSA PKCS#1 v1.5 signature — no hash. The
     // cloud recovers the timestamp from the signature and checks it is recent

@@ -19,6 +19,8 @@ std::string sign_bytes(const std::string& data);
 // requests: a raw RSA PKCS#1 v1.5 signature (no hash) over the current Unix
 // time in milliseconds, base64-encoded. Matches the proprietary plugin, which
 // signs a fresh timestamp (not the request body) for replay protection.
+// Returns "" when no slicer key is configured (the caller should omit the
+// header rather than fail — it is only enforced on signed writes).
 std::string device_security_sign();
 
 // Standard base64 encoding (RFC 4648, with padding).

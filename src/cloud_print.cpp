@@ -625,10 +625,15 @@ int create_task(const std::string& api, const std::string& token,
     req.method  = obn::http::Method::POST;
     req.url     = api + "/v1/user-service/my/task";
     auto hdrs = bbl_headers(token, user_id);
-    hdrs["x-bbl-app-certification-id"] = obn::signing::slicer_cert_id();
-    // The cloud verifies this header by recovering a recent timestamp from the
-    // signature; it signs the current time in ms (raw PKCS#1 v1.5), not the body.
-    hdrs["x-bbl-device-security-sign"] = obn::signing::device_security_sign();
+    // Signing headers are best-effort: when no slicer key/cert is configured
+    // these come back empty, and we omit them rather than send blanks. The
+    // cloud verifies x-bbl-device-security-sign by recovering a recent
+    // timestamp from the signature (current time in ms, raw PKCS#1 v1.5, not
+    // the body); it is only enforced on signed writes.
+    const std::string cert_id  = obn::signing::slicer_cert_id();
+    const std::string sec_sign = obn::signing::device_security_sign();
+    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
+    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
