@@ -5,42 +5,38 @@
 // WHY THIS EXISTS
 //   The plugin loads + creates the agent fine, but Studio crashes with a heap
 //   corruption around set_config_dir()/set_cert_file()/start(). The Bambu
-//   plugin ABI passes std::string BY VALUE across the DLL boundary (the host
-//   allocates the string, the plugin's CRT destroys it), so the failing call
-//   MUST be reproduced with an MSVC-built exe that uses the EXACT same
-//   std::string ABI as the DLL. A C-only LoadLibrary harness would not.
+//   plugin ABI passes std::string / std::function / std::vector BY VALUE across
+//   the DLL boundary (the host allocates, the plugin's CRT destroys), so the
+//   failing path MUST be reproduced with an MSVC-built exe that uses the EXACT
+//   same STL ABI as the DLL. This file is therefore built in the SAME CMake
+//   build as bambu_networking.dll (/MD, same MSVC STL).
 //
-//   This file is therefore deliberately tiny and self-contained, and is built
-//   in the SAME CMake/preset/toolchain as bambu_networking.dll (/MD, same
-//   MSVC STL) so its std::string layout matches the DLL byte-for-byte.
+// WHAT IT NOW DOES (mirrors GUI_App::on_init_network as closely as possible)
+//   1. LoadLibraryW the DLL, GetProcAddress every export, as Studio does.
+//   2. Bring up agent #1: create_agent -> set_config_dir -> init_log ->
+//      set_cert_file -> register ALL 13 callbacks -> set_user_selected_machine
+//      -> set_country_code -> start. The on_server_connected callback is
+//      RE-ENTRANT: from the MQTT network thread it calls back into the agent
+//      (set_user_selected_machine(get_user_selected_machine())), exactly like
+//      GUI_App.cpp:55,60.
+//   3. Bring up agent #2 the same way (mirrors GUI_App::on_init_network ~3476:
+//      a SECOND plugin agent for the "bbl" cloud service, same config dir).
+//      Both agents stay alive together — both touch the plugin's GLOBAL state
+//      (lan_tls g_config_dir, config::current(), mosquitto / OpenSSL global
+//      init), the prime suspect for the heap corruption.
+//   4. Sleep(4000) so both cloud threads run and invoke callbacks, then
+//      destroy both agents.
 //
-// WHAT IT DOES
-//   LoadLibraryW(argv[1]) the plugin DLL, GetProcAddress every startup symbol
-//   exactly as src/slic3r/Utils/BBLNetworkPlugin.cpp does, then replay
-//   OrcaSlicer's exact GUI_App startup sequence
-//   (see GUI_App::on_init_network_done / load_networking_plugin):
-//
-//     get_version()
-//     create_agent(log_dir)
-//     set_config_dir(config_dir)
-//     init_log(agent)
-//     set_cert_file(cert_folder, "slicer_base64.cer")
-//     set_country_code("US")
-//     start(agent)
-//     Sleep(4000)            // let any background startup threads run/crash
-//     destroy_agent(agent)
-//
-//   A flushed printf is emitted BEFORE and AFTER every ABI call, so when the
-//   process dies the last ">>" line printed names the call that corrupted the
-//   heap (or the call after which the corruption was detected). Under Wine +
-//   page-heap / Application Verifier this faults at the exact instruction.
+//   A flushed printf ">>"/"<<" wraps every ABI call; the last line printed
+//   before the process dies names the corrupting call. Under Wine + page-heap
+//   / Application Verifier this faults at the exact instruction.
 //
 // USAGE
 //   startup_selftest.exe <path-to-bambu_networking.dll> <config_dir> [cert_folder]
 //
-//   The typedefs below are copied verbatim from the host header
-//   src/slic3r/Utils/BBLNetworkPlugin.hpp so the std::string-by-value contract
-//   is identical to what OrcaSlicer compiles against.
+//   All typedefs below are copied verbatim from the host headers
+//   src/slic3r/Utils/BBLNetworkPlugin.hpp and bambu_networking.hpp so the
+//   by-value ABI is identical to what OrcaSlicer compiles against.
 
 #include <windows.h>
 
@@ -48,11 +44,12 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Host ABI typedefs — copied verbatim from
-// OrcaSlicer/src/slic3r/Utils/BBLNetworkPlugin.hpp (lines 24-31). std::string
-// is passed BY VALUE on purpose: that is the boundary we are stress-testing.
+// OrcaSlicer/src/slic3r/Utils/BBLNetworkPlugin.hpp. std::string / std::vector
+// are passed BY VALUE on purpose: that is the boundary we are stress-testing.
 // ---------------------------------------------------------------------------
 typedef std::string (*func_get_version)(void);
 typedef void* (*func_create_agent)(std::string log_dir);
@@ -63,16 +60,16 @@ typedef int   (*func_set_cert_file)(void* agent, std::string folder, std::string
 typedef int   (*func_set_country_code)(void* agent, std::string country_code);
 typedef int   (*func_start)(void* agent);
 
+typedef std::string (*func_get_user_selected_machine)(void* agent);
+typedef int (*func_set_user_selected_machine)(void* agent, std::string dev_id);
+typedef int (*func_start_subscribe)(void* agent, std::string module);
+typedef int (*func_add_subscribe)(void* agent, std::vector<std::string> dev_list);
+
 // ---------------------------------------------------------------------------
 // Callback std::function typedefs — copied verbatim from the host header
 // OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp so the std::function-by-value
-// ABI matches exactly what OrcaSlicer hands the plugin. These are the second
-// (and now prime) suspect for the startup heap corruption: OrcaSlicer registers
-// ~13 of them via init_networking_callbacks BEFORE start(), and connect_cloud()
-// INVOKES some (on_server_connected, etc.) on the network thread.
-//
-// NOTE: these names/signatures are also defined identically in the plugin's own
-// include/obn/bambu_networking.hpp — verified to match the host header.
+// ABI matches exactly what OrcaSlicer hands the plugin. Also defined identically
+// in the plugin's include/obn/bambu_networking.hpp.
 namespace BBL {
 typedef std::function<void(int online_login, bool login)>                    OnUserLoginFn;
 typedef std::function<void(std::string topic_str)>                           OnPrinterConnectedFn;
@@ -129,14 +126,234 @@ T resolve(HMODULE mod, const char* name)
     return reinterpret_cast<T>(p);
 }
 
-// Convert a narrow argv path to wide for LoadLibraryW. ASCII paths only
-// (test harness; the CI passes simple build-dir paths).
 std::wstring widen(const char* s)
 {
     std::wstring w;
     for (const char* p = s; p && *p; ++p)
         w.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
     return w;
+}
+
+// All plugin exports we drive, resolved once.
+struct PluginApi {
+    func_get_version               get_version{};
+    func_create_agent              create_agent{};
+    func_destroy_agent             destroy_agent{};
+    func_init_log                  init_log{};
+    func_set_config_dir            set_config_dir{};
+    func_set_cert_file             set_cert_file{};
+    func_set_country_code          set_country_code{};
+    func_start                     start{};
+
+    func_get_user_selected_machine get_user_selected_machine{};
+    func_set_user_selected_machine set_user_selected_machine{};
+    func_start_subscribe           start_subscribe{};
+    func_add_subscribe             add_subscribe{};
+
+    func_set_server_callback         set_server_callback{};
+    func_set_on_server_connected_fn  set_on_server_connected{};
+    func_set_on_printer_connected_fn set_on_printer_connected{};
+    func_set_get_country_code_fn     set_get_country_code{};
+    func_set_on_subscribe_failure_fn set_on_subscribe_failure{};
+    func_set_on_local_connect_fn     set_on_local_connect{};
+    func_set_on_message_fn           set_on_message{};
+    func_set_on_user_message_fn      set_on_user_message{};
+    func_set_on_local_message_fn     set_on_local_message{};
+    func_set_on_http_error_fn        set_on_http_error{};
+    func_set_on_ssdp_msg_fn          set_on_ssdp_msg{};
+    func_set_on_user_login_fn        set_on_user_login{};
+    func_set_queue_on_main_fn        set_queue_on_main{};
+};
+
+PluginApi resolve_all(HMODULE mod)
+{
+    PluginApi a;
+    a.get_version               = resolve<func_get_version>              (mod, "bambu_network_get_version");
+    a.create_agent              = resolve<func_create_agent>             (mod, "bambu_network_create_agent");
+    a.destroy_agent             = resolve<func_destroy_agent>            (mod, "bambu_network_destroy_agent");
+    a.init_log                  = resolve<func_init_log>                 (mod, "bambu_network_init_log");
+    a.set_config_dir            = resolve<func_set_config_dir>           (mod, "bambu_network_set_config_dir");
+    a.set_cert_file             = resolve<func_set_cert_file>            (mod, "bambu_network_set_cert_file");
+    a.set_country_code          = resolve<func_set_country_code>         (mod, "bambu_network_set_country_code");
+    a.start                     = resolve<func_start>                    (mod, "bambu_network_start");
+
+    a.get_user_selected_machine = resolve<func_get_user_selected_machine>(mod, "bambu_network_get_user_selected_machine");
+    a.set_user_selected_machine = resolve<func_set_user_selected_machine>(mod, "bambu_network_set_user_selected_machine");
+    a.start_subscribe           = resolve<func_start_subscribe>          (mod, "bambu_network_start_subscribe");
+    a.add_subscribe             = resolve<func_add_subscribe>            (mod, "bambu_network_add_subscribe");
+
+    a.set_server_callback       = resolve<func_set_server_callback>        (mod, "bambu_network_set_server_callback");
+    a.set_on_server_connected   = resolve<func_set_on_server_connected_fn> (mod, "bambu_network_set_on_server_connected_fn");
+    a.set_on_printer_connected  = resolve<func_set_on_printer_connected_fn>(mod, "bambu_network_set_on_printer_connected_fn");
+    a.set_get_country_code      = resolve<func_set_get_country_code_fn>    (mod, "bambu_network_set_get_country_code_fn");
+    a.set_on_subscribe_failure  = resolve<func_set_on_subscribe_failure_fn>(mod, "bambu_network_set_on_subscribe_failure_fn");
+    a.set_on_local_connect      = resolve<func_set_on_local_connect_fn>    (mod, "bambu_network_set_on_local_connect_fn");
+    a.set_on_message            = resolve<func_set_on_message_fn>          (mod, "bambu_network_set_on_message_fn");
+    a.set_on_user_message       = resolve<func_set_on_user_message_fn>     (mod, "bambu_network_set_on_user_message_fn");
+    a.set_on_local_message      = resolve<func_set_on_local_message_fn>    (mod, "bambu_network_set_on_local_message_fn");
+    a.set_on_http_error         = resolve<func_set_on_http_error_fn>       (mod, "bambu_network_set_on_http_error_fn");
+    a.set_on_ssdp_msg           = resolve<func_set_on_ssdp_msg_fn>         (mod, "bambu_network_set_on_ssdp_msg_fn");
+    a.set_on_user_login         = resolve<func_set_on_user_login_fn>       (mod, "bambu_network_set_on_user_login_fn");
+    a.set_queue_on_main         = resolve<func_set_queue_on_main_fn>       (mod, "bambu_network_set_queue_on_main_fn");
+    return a;
+}
+
+// Bring one agent through OrcaSlicer's full configure+callbacks+start sequence.
+// Returns the agent handle (already started), or nullptr on failure.
+void* bring_up_agent(const PluginApi& api, const char* tag,
+                     const std::string& log_dir, const std::string& config_dir,
+                     const std::string& cert_folder, const std::string& dev_id)
+{
+    log_line(">> [%s] create_agent(\"%s\")", tag, log_dir.c_str());
+    void* agent = api.create_agent(log_dir);
+    log_line("<< [%s] create_agent() = %p", tag, agent);
+    if (!agent) {
+        log_line("FATAL: [%s] create_agent returned null", tag);
+        return nullptr;
+    }
+
+    log_line(">> [%s] set_config_dir(\"%s\")", tag, config_dir.c_str());
+    int rc = api.set_config_dir(agent, config_dir);
+    log_line("<< [%s] set_config_dir() = %d", tag, rc);
+
+    log_line(">> [%s] init_log()", tag);
+    rc = api.init_log(agent);
+    log_line("<< [%s] init_log() = %d", tag, rc);
+
+    log_line(">> [%s] set_cert_file(\"%s\", \"slicer_base64.cer\")", tag, cert_folder.c_str());
+    rc = api.set_cert_file(agent, cert_folder, std::string("slicer_base64.cer"));
+    log_line("<< [%s] set_cert_file() = %d", tag, rc);
+
+    // ------------------------------------------------------------------
+    // init_networking_callbacks(): register EVERY callback with real
+    // lambdas. on_server_connected is RE-ENTRANT — from the MQTT network
+    // thread it calls back into the agent exactly like GUI_App.cpp:55,60.
+    // ------------------------------------------------------------------
+    log_line(">> [%s] set_server_callback", tag);
+    rc = api.set_server_callback(agent, [tag](std::string url, int status) {
+        log_line("   [%s cb] server_callback url=%s status=%d", tag, url.c_str(), status);
+    });
+    log_line("<< [%s] set_server_callback() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_server_connected_fn", tag);
+    // Capture the agent + the get/set_user_selected_machine func ptrs so the
+    // callback can re-enter the agent from the network thread (the exact
+    // GUI_App pattern: set_user_selected_machine(get_user_selected_machine())).
+    void* agent_for_cb              = agent;
+    auto  get_sel                   = api.get_user_selected_machine;
+    auto  set_sel                   = api.set_user_selected_machine;
+    rc = api.set_on_server_connected(agent,
+        [tag, agent_for_cb, get_sel, set_sel](int return_code, int reason_code) {
+            log_line("   [%s cb] on_server_connected rc=%d reason=%d (re-entering agent)",
+                     tag, return_code, reason_code);
+            // get_user_selected_machine returns std::string BY VALUE (plugin
+            // allocates, this callback's CRT frees); then hand it straight
+            // back by value. Same cross-boundary ownership transfer Studio does.
+            std::string sel = get_sel(agent_for_cb);
+            log_line("   [%s cb] get_user_selected_machine = \"%s\"", tag, sel.c_str());
+            set_sel(agent_for_cb, sel);
+            log_line("   [%s cb] set_user_selected_machine done", tag);
+        });
+    log_line("<< [%s] set_on_server_connected_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_printer_connected_fn", tag);
+    rc = api.set_on_printer_connected(agent, [tag](std::string topic) {
+        log_line("   [%s cb] on_printer_connected topic=%s", tag, topic.c_str());
+    });
+    log_line("<< [%s] set_on_printer_connected_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_get_country_code_fn", tag);
+    rc = api.set_get_country_code(agent, [tag]() -> std::string {
+        log_line("   [%s cb] get_country_code -> US", tag);
+        return std::string("US");
+    });
+    log_line("<< [%s] set_get_country_code_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_subscribe_failure_fn", tag);
+    rc = api.set_on_subscribe_failure(agent, [tag](std::string topic) {
+        log_line("   [%s cb] on_subscribe_failure topic=%s", tag, topic.c_str());
+    });
+    log_line("<< [%s] set_on_subscribe_failure_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_local_connect_fn", tag);
+    rc = api.set_on_local_connect(agent, [tag](int status, std::string dev_id_, std::string msg) {
+        log_line("   [%s cb] on_local_connect status=%d dev=%s msg=%s",
+                 tag, status, dev_id_.c_str(), msg.c_str());
+    });
+    log_line("<< [%s] set_on_local_connect_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_message_fn", tag);
+    rc = api.set_on_message(agent, [tag](std::string dev_id_, std::string msg) {
+        log_line("   [%s cb] on_message dev=%s len=%zu", tag, dev_id_.c_str(), msg.size());
+    });
+    log_line("<< [%s] set_on_message_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_user_message_fn", tag);
+    rc = api.set_on_user_message(agent, [tag](std::string dev_id_, std::string msg) {
+        log_line("   [%s cb] on_user_message dev=%s len=%zu", tag, dev_id_.c_str(), msg.size());
+    });
+    log_line("<< [%s] set_on_user_message_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_local_message_fn", tag);
+    rc = api.set_on_local_message(agent, [tag](std::string dev_id_, std::string msg) {
+        log_line("   [%s cb] on_local_message dev=%s len=%zu", tag, dev_id_.c_str(), msg.size());
+    });
+    log_line("<< [%s] set_on_local_message_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_http_error_fn", tag);
+    rc = api.set_on_http_error(agent, [tag](unsigned http_code, std::string body) {
+        log_line("   [%s cb] on_http_error code=%u len=%zu", tag, http_code, body.size());
+    });
+    log_line("<< [%s] set_on_http_error_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_ssdp_msg_fn", tag);
+    rc = api.set_on_ssdp_msg(agent, [tag](std::string dev_info_json) {
+        log_line("   [%s cb] on_ssdp_msg len=%zu", tag, dev_info_json.size());
+    });
+    log_line("<< [%s] set_on_ssdp_msg_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_on_user_login_fn", tag);
+    rc = api.set_on_user_login(agent, [tag](int online_login, bool login) {
+        log_line("   [%s cb] on_user_login online=%d login=%d", tag, online_login, (int)login);
+    });
+    log_line("<< [%s] set_on_user_login_fn() = %d", tag, rc);
+
+    log_line(">> [%s] set_queue_on_main_fn", tag);
+    rc = api.set_queue_on_main(agent, [tag](std::function<void()> task) {
+        log_line("   [%s cb] queue_on_main (running task inline)", tag);
+        if (task) task();
+    });
+    log_line("<< [%s] set_queue_on_main_fn() = %d", tag, rc);
+
+    // Device selection, mirroring Studio: set the selected machine before
+    // start so connect_cloud has a device to subscribe to.
+    log_line(">> [%s] set_user_selected_machine(\"%s\")", tag, dev_id.c_str());
+    rc = api.set_user_selected_machine(agent, dev_id);
+    log_line("<< [%s] set_user_selected_machine() = %d", tag, rc);
+
+    log_line(">> [%s] set_country_code(\"US\")", tag);
+    rc = api.set_country_code(agent, std::string("US"));
+    log_line("<< [%s] set_country_code() = %d", tag, rc);
+
+    log_line(">> [%s] start()", tag);
+    rc = api.start(agent);
+    log_line("<< [%s] start() = %d", tag, rc);
+
+    // Mirror device subscription: start_subscribe(std::string) + add_subscribe
+    // (std::vector<std::string> BY VALUE — another container ABI surface).
+    log_line(">> [%s] start_subscribe(\"app\")", tag);
+    rc = api.start_subscribe(agent, std::string("app"));
+    log_line("<< [%s] start_subscribe() = %d", tag, rc);
+
+    if (!dev_id.empty()) {
+        std::vector<std::string> dev_list;
+        dev_list.push_back(dev_id);
+        log_line(">> [%s] add_subscribe([1 dev])", tag);
+        rc = api.add_subscribe(agent, dev_list);
+        log_line("<< [%s] add_subscribe() = %d", tag, rc);
+    }
+
+    return agent;
 }
 
 } // namespace
@@ -155,6 +372,8 @@ int main(int argc, char** argv)
     // OrcaSlicer hands create_agent() the data-dir; reuse config_dir as the
     // log dir here so we exercise the same long-path std::string traffic.
     const std::string log_dir     = config_dir;
+    // A plausible Bambu device id for set_user_selected_machine / add_subscribe.
+    const std::string dev_id      = "00M00A1234567890";
 
     log_line(">> LoadLibraryW(%s)", dll_path.c_str());
     HMODULE mod = ::LoadLibraryW(widen(dll_path.c_str()).c_str());
@@ -164,166 +383,44 @@ int main(int argc, char** argv)
     }
     log_line("<< LoadLibraryW ok");
 
-    auto get_version      = resolve<func_get_version>     (mod, "bambu_network_get_version");
-    auto create_agent     = resolve<func_create_agent>    (mod, "bambu_network_create_agent");
-    auto set_config_dir   = resolve<func_set_config_dir>  (mod, "bambu_network_set_config_dir");
-    auto init_log         = resolve<func_init_log>        (mod, "bambu_network_init_log");
-    auto set_cert_file    = resolve<func_set_cert_file>   (mod, "bambu_network_set_cert_file");
-    auto set_country_code = resolve<func_set_country_code>(mod, "bambu_network_set_country_code");
-    auto start            = resolve<func_start>           (mod, "bambu_network_start");
-    auto destroy_agent    = resolve<func_destroy_agent>   (mod, "bambu_network_destroy_agent");
+    const PluginApi api = resolve_all(mod);
 
     // get_version() returns std::string BY VALUE (plugin allocates, host frees).
     log_line(">> get_version()");
     {
-        std::string ver = get_version();
+        std::string ver = api.get_version();
         log_line("<< get_version() = \"%s\"", ver.c_str());
     }
 
-    log_line(">> create_agent(\"%s\")", log_dir.c_str());
-    void* agent = create_agent(log_dir);
-    log_line("<< create_agent() = %p", agent);
-    if (!agent) {
-        log_line("FATAL: create_agent returned null");
-        return 3;
-    }
+    // ---- Agent #1 (mirrors GUI_App m_agent / Orca cloud agent) ------------
+    void* agent1 = bring_up_agent(api, "A1", log_dir, config_dir, cert_folder, dev_id);
+    if (!agent1) { ::FreeLibrary(mod); return 3; }
 
-    log_line(">> set_config_dir(\"%s\")", config_dir.c_str());
-    int rc = set_config_dir(agent, config_dir);
-    log_line("<< set_config_dir() = %d", rc);
+    // ---- Agent #2 (mirrors GUI_App::on_init_network ~3476: a SECOND plugin
+    //      agent created for the "bbl" cloud service, SAME config dir, kept
+    //      alive concurrently). Both agents now share the plugin's GLOBAL
+    //      state (lan_tls g_config_dir, config::current(), mosquitto/OpenSSL
+    //      global init) — the prime suspect for the heap corruption.
+    void* agent2 = bring_up_agent(api, "A2", log_dir, config_dir, cert_folder, dev_id);
+    // Not fatal if the second agent fails to come up — keep going so we can
+    // still observe / clean up agent1.
 
-    log_line(">> init_log()");
-    rc = init_log(agent);
-    log_line("<< init_log() = %d", rc);
-
-    log_line(">> set_cert_file(\"%s\", \"slicer_base64.cer\")", cert_folder.c_str());
-    rc = set_cert_file(agent, cert_folder, std::string("slicer_base64.cer"));
-    log_line("<< set_cert_file() = %d", rc);
-
-    // ------------------------------------------------------------------
-    // init_networking_callbacks(): register EVERY callback the plugin
-    // exports, with real (non-empty) lambdas using the exact host
-    // std::function signatures. OrcaSlicer does this BEFORE set_country_code
-    // /start (GUI_App::init_networking_callbacks, ~lines 1887-2030), and
-    // connect_cloud() later INVOKES some of these on the network thread —
-    // exactly the std::function-by-value traffic we now suspect. Order
-    // mirrors OrcaSlicer's registration sequence; the remaining setters
-    // (which Studio also wires through NetworkAgent) follow.
-    // ------------------------------------------------------------------
-    auto set_server_callback     = resolve<func_set_server_callback>        (mod, "bambu_network_set_server_callback");
-    auto set_on_server_connected = resolve<func_set_on_server_connected_fn> (mod, "bambu_network_set_on_server_connected_fn");
-    auto set_on_printer_conn     = resolve<func_set_on_printer_connected_fn>(mod, "bambu_network_set_on_printer_connected_fn");
-    auto set_get_country_code    = resolve<func_set_get_country_code_fn>    (mod, "bambu_network_set_get_country_code_fn");
-    auto set_on_subscribe_fail   = resolve<func_set_on_subscribe_failure_fn>(mod, "bambu_network_set_on_subscribe_failure_fn");
-    auto set_on_local_connect    = resolve<func_set_on_local_connect_fn>    (mod, "bambu_network_set_on_local_connect_fn");
-    auto set_on_message          = resolve<func_set_on_message_fn>          (mod, "bambu_network_set_on_message_fn");
-    auto set_on_user_message     = resolve<func_set_on_user_message_fn>     (mod, "bambu_network_set_on_user_message_fn");
-    auto set_on_local_message    = resolve<func_set_on_local_message_fn>    (mod, "bambu_network_set_on_local_message_fn");
-    auto set_on_http_error       = resolve<func_set_on_http_error_fn>       (mod, "bambu_network_set_on_http_error_fn");
-    auto set_on_ssdp_msg         = resolve<func_set_on_ssdp_msg_fn>         (mod, "bambu_network_set_on_ssdp_msg_fn");
-    auto set_on_user_login       = resolve<func_set_on_user_login_fn>       (mod, "bambu_network_set_on_user_login_fn");
-    auto set_queue_on_main       = resolve<func_set_queue_on_main_fn>       (mod, "bambu_network_set_queue_on_main_fn");
-
-    log_line(">> set_server_callback");
-    rc = set_server_callback(agent, [](std::string url, int status) {
-        log_line("   [cb] server_callback url=%s status=%d", url.c_str(), status);
-    });
-    log_line("<< set_server_callback() = %d", rc);
-
-    log_line(">> set_on_server_connected_fn");
-    rc = set_on_server_connected(agent, [](int return_code, int reason_code) {
-        log_line("   [cb] on_server_connected rc=%d reason=%d", return_code, reason_code);
-    });
-    log_line("<< set_on_server_connected_fn() = %d", rc);
-
-    log_line(">> set_on_printer_connected_fn");
-    rc = set_on_printer_conn(agent, [](std::string topic) {
-        log_line("   [cb] on_printer_connected topic=%s", topic.c_str());
-    });
-    log_line("<< set_on_printer_connected_fn() = %d", rc);
-
-    log_line(">> set_get_country_code_fn");
-    rc = set_get_country_code(agent, []() -> std::string {
-        log_line("   [cb] get_country_code -> US");
-        return std::string("US");
-    });
-    log_line("<< set_get_country_code_fn() = %d", rc);
-
-    log_line(">> set_on_subscribe_failure_fn");
-    rc = set_on_subscribe_fail(agent, [](std::string topic) {
-        log_line("   [cb] on_subscribe_failure topic=%s", topic.c_str());
-    });
-    log_line("<< set_on_subscribe_failure_fn() = %d", rc);
-
-    log_line(">> set_on_local_connect_fn");
-    rc = set_on_local_connect(agent, [](int status, std::string dev_id, std::string msg) {
-        log_line("   [cb] on_local_connect status=%d dev=%s msg=%s",
-                 status, dev_id.c_str(), msg.c_str());
-    });
-    log_line("<< set_on_local_connect_fn() = %d", rc);
-
-    log_line(">> set_on_message_fn");
-    rc = set_on_message(agent, [](std::string dev_id, std::string msg) {
-        log_line("   [cb] on_message dev=%s len=%zu", dev_id.c_str(), msg.size());
-    });
-    log_line("<< set_on_message_fn() = %d", rc);
-
-    log_line(">> set_on_user_message_fn");
-    rc = set_on_user_message(agent, [](std::string dev_id, std::string msg) {
-        log_line("   [cb] on_user_message dev=%s len=%zu", dev_id.c_str(), msg.size());
-    });
-    log_line("<< set_on_user_message_fn() = %d", rc);
-
-    log_line(">> set_on_local_message_fn");
-    rc = set_on_local_message(agent, [](std::string dev_id, std::string msg) {
-        log_line("   [cb] on_local_message dev=%s len=%zu", dev_id.c_str(), msg.size());
-    });
-    log_line("<< set_on_local_message_fn() = %d", rc);
-
-    log_line(">> set_on_http_error_fn");
-    rc = set_on_http_error(agent, [](unsigned http_code, std::string body) {
-        log_line("   [cb] on_http_error code=%u len=%zu", http_code, body.size());
-    });
-    log_line("<< set_on_http_error_fn() = %d", rc);
-
-    log_line(">> set_on_ssdp_msg_fn");
-    rc = set_on_ssdp_msg(agent, [](std::string dev_info_json) {
-        log_line("   [cb] on_ssdp_msg len=%zu", dev_info_json.size());
-    });
-    log_line("<< set_on_ssdp_msg_fn() = %d", rc);
-
-    log_line(">> set_on_user_login_fn");
-    rc = set_on_user_login(agent, [](int online_login, bool login) {
-        log_line("   [cb] on_user_login online=%d login=%d", online_login, (int)login);
-    });
-    log_line("<< set_on_user_login_fn() = %d", rc);
-
-    log_line(">> set_queue_on_main_fn");
-    rc = set_queue_on_main(agent, [](std::function<void()> task) {
-        // Studio marshals onto the UI thread; here we just run it inline.
-        log_line("   [cb] queue_on_main (running task inline)");
-        if (task) task();
-    });
-    log_line("<< set_queue_on_main_fn() = %d", rc);
-
-    log_line(">> set_country_code(\"US\")");
-    rc = set_country_code(agent, std::string("US"));
-    log_line("<< set_country_code() = %d", rc);
-
-    log_line(">> start()");
-    rc = start(agent);
-    log_line("<< start() = %d", rc);
-
-    // Give any background startup threads (cloud MQTT, discovery) time to run
-    // and trip a heap check, mirroring how the Studio crash surfaces shortly
+    // Both agents alive together: let both cloud threads run and invoke the
+    // (re-entrant) callbacks, mirroring how Studio's crash surfaces shortly
     // after start() rather than synchronously inside it.
-    log_line(">> Sleep(4000)");
+    log_line(">> Sleep(4000) with both agents alive");
     ::Sleep(4000);
     log_line("<< Sleep done");
 
-    log_line(">> destroy_agent(%p)", agent);
-    destroy_agent(agent);
-    log_line("<< destroy_agent done");
+    if (agent2) {
+        log_line(">> [A2] destroy_agent(%p)", agent2);
+        api.destroy_agent(agent2);
+        log_line("<< [A2] destroy_agent done");
+    }
+
+    log_line(">> [A1] destroy_agent(%p)", agent1);
+    api.destroy_agent(agent1);
+    log_line("<< [A1] destroy_agent done");
 
     log_line(">> FreeLibrary");
     ::FreeLibrary(mod);
