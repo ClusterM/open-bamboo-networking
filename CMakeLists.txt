@@ -798,4 +798,9 @@ endif()
 # tools
 # --------------------------------------------------------------------------
 
-add_subdirectory(tools/h2s_capture_video)
+# h2s_capture_video is a POSIX-only standalone diagnostic tool (uses
+# <sys/wait.h>, <unistd.h>, fork/exec, etc.) and is not part of the
+# orca_slicer / Windows plugin build. Exclude it on Windows.
+if(NOT WIN32)
+    add_subdirectory(tools/h2s_capture_video)
+endif()
