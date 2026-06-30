@@ -71,6 +71,13 @@ typedef int (*func_add_subscribe)(void* agent, std::vector<std::string> dev_list
 typedef int (*func_track_enable)(void* agent, bool enable);
 typedef int (*func_track_remove_files)(void* agent);
 
+// BBLCloudServiceAgent::start() calls set_extra_http_header() FIRST (before the
+// plugin start()), passing a std::map<std::string,std::string> BY VALUE across
+// the ABI — the most layout-sensitive STL container at the boundary, and a
+// startup call the harness had never exercised. Signature from
+// BBLNetworkPlugin.hpp:87.
+typedef int (*func_set_extra_http_header)(void* agent, std::map<std::string, std::string> extra_headers);
+
 // ---------------------------------------------------------------------------
 // Callback std::function typedefs — copied verbatim from the host header
 // OrcaSlicer/src/slic3r/Utils/bambu_networking.hpp so the std::function-by-value
@@ -157,6 +164,7 @@ struct PluginApi {
     func_add_subscribe             add_subscribe{};
     func_track_enable              track_enable{};
     func_track_remove_files        track_remove_files{};
+    func_set_extra_http_header     set_extra_http_header{};
 
     func_set_server_callback         set_server_callback{};
     func_set_on_server_connected_fn  set_on_server_connected{};
@@ -191,6 +199,7 @@ PluginApi resolve_all(HMODULE mod)
     a.add_subscribe             = resolve<func_add_subscribe>            (mod, "bambu_network_add_subscribe");
     a.track_enable              = resolve<func_track_enable>             (mod, "bambu_network_track_enable");
     a.track_remove_files        = resolve<func_track_remove_files>       (mod, "bambu_network_track_remove_files");
+    a.set_extra_http_header     = resolve<func_set_extra_http_header>    (mod, "bambu_network_set_extra_http_header");
 
     a.set_server_callback       = resolve<func_set_server_callback>        (mod, "bambu_network_set_server_callback");
     a.set_on_server_connected   = resolve<func_set_on_server_connected_fn> (mod, "bambu_network_set_on_server_connected_fn");
@@ -355,6 +364,23 @@ void* bring_up_agent(const PluginApi& api, const char* tag,
     log_line(">> [%s] track_remove_files()", tag);
     rc = api.track_remove_files(agent);
     log_line("<< [%s] track_remove_files() = %d", tag, rc);
+
+    // BBLCloudServiceAgent::start() calls set_extra_http_header() FIRST, before
+    // the plugin start(). Build the same ~6-entry header map OrcaSlicer's
+    // get_extra_header() builds and pass it BY VALUE across the ABI — the only
+    // std::map-by-value startup call, and the most layout-sensitive container.
+    {
+        std::map<std::string, std::string> extra_headers;
+        extra_headers.emplace("X-BBL-Client-Type",    "slicer");
+        extra_headers.emplace("X-BBL-Client-Name",    "BambuStudio");
+        extra_headers.emplace("X-BBL-Client-Version", "02.07.01.99");
+        extra_headers.emplace("X-BBL-OS-Type",        "windows");
+        extra_headers.emplace("X-BBL-OS-Version",     "10.0.20348");
+        extra_headers.emplace("X-BBL-Device-ID",      "selftestdevice");
+        log_line(">> [%s] set_extra_http_header(%zu headers)", tag, extra_headers.size());
+        rc = api.set_extra_http_header(agent, extra_headers);
+        log_line("<< [%s] set_extra_http_header() = %d", tag, rc);
+    }
 
     log_line(">> [%s] start()", tag);
     rc = api.start(agent);
