@@ -576,6 +576,63 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_enable_multi_machine` | `void(void*, bool)` |
 | `bambu_network_send_message` | `int(void*, std::string dev_id, std::string json_str, int qos, int flag)` — MQTT-style call |
 
+#### 6.3.1. Cloud MQTT authentication
+
+Two distinct mechanisms exist on the production broker. **This open plugin uses the simpler one**; the stock closed-source plugin uses the other.
+
+**Open plugin (implemented — `src/cloud_session.cpp`)**
+
+| Field | Value |
+|-------|-------|
+| Host | `us.mqtt.bambulab.com:8883` (or `cn.mqtt.bambulab.com` for CN) |
+| TLS | Server cert verified (system CA store; Windows MVP skips chain verify — see `Agent::connect_cloud()`) |
+| Username | `u_<user_id>` |
+| Password | OAuth access token from `POST /v1/user-service/user/ticket/<T>` |
+
+This matches what Home Assistant's `pybambu` integration uses. No client certificate is required for the open plugin path; cloud auth rides on the bearer token in the MQTT password field.
+
+**Stock plugin (reverse-engineered — not implemented here)**
+
+The stock `libbambu_networking.so` obtains a **client certificate chain** from the cloud REST API immediately before connecting and presents it during the MQTT TLS handshake (mutual TLS). The HTTPS call that fetches the cert was confirmed via SSLKEYLOGFILE decryption of the stock plugin's **REST** traffic (not by decrypting the MQTT session itself).
+
+**Certificate retrieval endpoint (stock only):**
+
+```
+GET /v1/iot-service/api/user/applications/{application_token}/cert?aes256={base64url-key}&ver=1
+Authorization: Bearer {access_token}
+```
+
+`application_token` is an opaque token from the user's account (distinct from the MQTT bearer token). `aes256` is a base64url-encoded key used to decrypt the returned private key. `ver=1` is the API version.
+
+**Response (200 OK):**
+
+```json
+{
+  "message": "success",
+  "code": 0,
+  "error": null,
+  "cert": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+  "crl": ["-----BEGIN X509 CRL-----\n...\n-----END X509 CRL-----\n"],
+  "key": "{base64-encoded-encrypted-private-key}"
+}
+```
+
+The `cert` field contains a **3-certificate chain** (PEM-concatenated):
+
+1. **Device leaf cert** — subject: `GLOF{dev_id}-{hex}`, issuer: `GLOF{dev_id}.bambulab.com`
+2. **Per-device intermediate CA** — subject: `GLOF{dev_id}.bambulab.com`, issuer: `application_root.bambulab.com`
+3. **Root CA** — subject: `application_root.bambulab.com`, issuer: `BBL CA`
+
+**Per-device CA architecture:** each device has its own intermediate CA named `{dev_uid}.bambulab.com`. Client certs are issued under this per-device CA, so the MQTT broker can verify which device a connection belongs to from the certificate alone. Revocation is per-device via the device-specific CRL returned in the `crl` field. Observed CRL validity: 30 days from issue date.
+
+**`key` field:** the private key is AES-256 encrypted and base64-encoded. The `aes256` query parameter in the request URL is the decryption key.
+
+**`crl` field:** a fresh CRL issued at request time, not a cached value.
+
+`fetch_device_cert()` in `include/obn/cloud_auth.hpp` documents this stock-only path; the implementation is gated with `#if 0` and intentionally not wired to `CloudSession`.
+
+**Do not confuse with:** the LAN `project_file` RSA signing certificate (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from cloud MQTT broker authentication.
+
 ### 6.4. Local printer connection (LAN)
 
 | Symbol | Signature |
@@ -606,6 +663,71 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_get_user_info`  | `int(void*, int* identifier)` |
 
 > Known Studio bug (`src/slic3r/Utils/NetworkAgent.cpp:368`): the `get_my_token_ptr` pointer is mistakenly resolved via the string `"bambu_network_get_my_profile"` instead of `"bambu_network_get_my_token"`. Studio still tries to read the `bambu_network_get_my_token` symbol as well, so a compatible plugin must export **both**. Through that pointer Studio will in practice execute the `get_my_profile` body — the two functions must therefore share identical signatures, and any real token-fetching logic ends up running from `get_my_profile`.
+
+#### 6.5.1. Ticket login — confirmed response shape
+
+`POST /v1/user-service/user/ticket/<T>` with body `{"ticket":"<T>"}`. Confirmed from SSLKEYLOGFILE capture. The `ticket` is a short alphanumeric code (~6 chars) produced by a separate browser-based OAuth flow outside this library.
+
+Response (200 OK):
+```json
+{
+  "accessToken":    "AQB...",
+  "refreshToken":   "AQB...",
+  "expiresIn":      31536000,
+  "refreshExpiresIn": 31536000,
+  "tfaKey":         "",
+  "accessMethod":   "ticket",
+  "loginType":      "",
+  "firstAppLogin":  false
+}
+```
+
+`expiresIn` and `refreshExpiresIn` are both 1 year (31 536 000 seconds) from issue in observed data. `accessToken` and `refreshToken` are the same value on initial issue — they may diverge after a token refresh cycle. `accessMethod` is `"ticket"` for this flow. Token format: `AQA…` / `AQB…` prefix, base64url-encoded opaque token (~100+ chars).
+
+#### 6.5.2. User profile — confirmed response shape
+
+`GET /v1/user-service/my/profile` with `Authorization: Bearer <access_token>`. Confirmed from SSLKEYLOGFILE capture. The fields Studio and the plugin actually consume are `uid`/`uidStr`, `name`, `nickname`, `avatar`, and `account`. The full response shape includes additional social/content fields:
+
+```json
+{
+  "uid":          12345678,
+  "uidStr":       "12345678",
+  "account":      "<email>",
+  "name":         "<username>",
+  "avatar":       "<url>",
+  "fanCount":     0,
+  "followCount":  0,
+  "identifier":   1,
+  "productModels": [],
+  "personal": {
+    "bio": "",
+    "links": [],
+    "taskWeightSum":  <int>,
+    "taskLengthSum":  <int>,
+    "taskTimeSum":    <int>,
+    "backgroundUrl":  "<url>",
+    "designsInfo":    [],
+    "userLevel": { "level": <int>, "gradeType": <int> }
+  },
+  "isNSFWShown":    0,
+  "favoritesCount": <int>,
+  "defaultLicense": "",
+  "point":          0,
+  "tpModelAccounts": [],
+  "bannedPermission": { "whole": false, "comment": false, "upload": false, "redeem": false },
+  "MWCount": { "myDesignDownloadCount": 0 },
+  "certificated": false,
+  "setting": {
+    "isLikeOpen":          0,
+    "isFollowOpen":        0,
+    "isFanOpen":           0,
+    "isFirmwareBetaOpen":  false,
+    "recommendStatus":     0
+  }
+}
+```
+
+`setting.isFirmwareBetaOpen` controls whether the firmware endpoint returns beta-channel builds in the `firmware[]` array (see §6.7). `personal.taskWeightSum` / `taskLengthSum` / `taskTimeSum` are cumulative print statistics.
 
 ### 6.6. Binding / bind
 
@@ -642,21 +764,26 @@ struct detectResult {
 {
   "devices": [{
     "dev_id": "<printer serial>",
+    "version": "<currently installed firmware version>",
     "firmware": [
       {
         "version": "01.08.02.00",
-        "url": "https://public-cdn.bblmw.com/upgrade/.../ota.zip",
-        "description": "optional release notes text (plain/markdown)"
+        "force_update": false,
+        "url": "https://public-cdn.bblmw.com/upgrade/device/<model>/<version>/product/<hash>/ota-<filename>.json.sig",
+        "description": "optional release notes text (plain/markdown)",
+        "status": "release"
       }
     ],
     "ams": [{
       "firmware": [
-        { "version": "00.00.07.89", "url": "https://.../ams.bin", "description": "..." }
+        { "version": "00.00.07.89", "force_update": false, "url": "https://.../ams.bin", "description": "...", "status": "release" }
       ]
     }]
   }]
 }
 ```
+
+OTA URL format: `https://public-cdn.bblmw.com/upgrade/device/<model-id>/<version>/product/<hash>/ota-<model>_v<version>-<timestamp>.json.sig`. `force_update: true` indicates the printer should refuse to operate until this firmware is applied — Studio greys out all controls and shows only the Update button. `status` is `"release"` for GA firmware or `"beta"` for beta-channel builds (controlled by the `isFirmwareBetaOpen` flag in `GET /v1/user-service/my/profile` → `setting.isFirmwareBetaOpen`). The `version` field at the device level is the currently installed version, not present in the pre-capture schema — Studio derives installed version from MQTT `info.command=get_version` regardless.
 
 Studio creates a `FirmwareInfo item` per entry in `firmware[]` / `ams[].firmware[]` and derives the file name from the tail of `url` (`item.name = url.substr(url.find_last_of('/') + 1)`). If the name cannot be extracted, the entry is skipped. The `description` field is the text displayed in the **Release Notes** dialog.
 
@@ -2029,7 +2156,33 @@ All authenticated endpoints require exactly one mandatory header:
 Authorization: Bearer <access_token>
 ```
 
-MITM dumps of the stock plugin show it also sending the full Studio fingerprint on every request — `User-Agent: bambu_network_agent/<ver>`, plus `X-BBL-Client-ID`, `X-BBL-Client-Name`, `X-BBL-Client-Type`, `X-BBL-Client-Version`, `X-BBL-Device-ID`, `X-BBL-Language`, `X-BBL-OS-Type`, `X-BBL-OS-Version`, `X-BBL-Agent-Version`, `X-BBL-Executable-info`, `X-BBL-Agent-OS-Type`, and anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for the API to accept the call. They influence analytics only.
+MITM/SSLKEYLOGFILE captures of the stock plugin show the full fingerprint header set on every request:
+
+```
+User-Agent: bambu_network_agent/<agent-ver>
+X-BBL-Client-Name: BambuStudio
+X-BBL-Client-Type: slicer
+X-BBL-Client-Version: <slicer-ver>
+X-BBL-Device-ID: <slicer-machine-uuid>
+X-BBL-Language: en-US
+X-BBL-OS-Type: linux
+X-BBL-OS-Version: <os-build, e.g. 10.0.26200>
+X-BBL-Agent-Version: <agent-ver>
+X-BBL-Executable-info: {}
+X-BBL-Agent-OS-Type: linux
+```
+
+`X-BBL-Client-Version` is the slicer version; `X-BBL-Agent-Version` is the networking plugin version. `X-BBL-OS-Type` and `X-BBL-Agent-OS-Type` both report `linux` when running through pjarczak's WSL2 bridge; native Linux builds send `linux` directly. `X-BBL-OS-Version` carries the OS build string (Windows build number when relayed through pjarczak). `X-BBL-Executable-info` is always the literal string `{}`. `X-BBL-Device-ID` is a machine-local UUID, not the printer serial.
+
+Plus anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for the API to accept the call. They influence analytics only.
+
+An additional header `X-BBL-Client-ID` appears on **device-scoped endpoints** (e.g. firmware version query, device metadata) but not on account-scoped endpoints (auth, profile, presets):
+
+```
+X-BBL-Client-ID: slicer:{user_id}:{4-char-suffix}
+```
+
+`user_id` is the numeric user ID (same as `uidStr` in the profile response). The 4-character suffix appears to be a random or session-derived nonce; its exact derivation is unconfirmed. This header is not required for the API to accept the call.
 
 Most JSON responses share a common envelope:
 
@@ -2054,7 +2207,10 @@ All paths below are relative to the regional API host from §6.10.1. The "eviden
 - **`set_extra_http_header`** — pure state update. Studio calls it during startup and on region/language switches to attach fingerprint headers to every subsequent request. The stock plugin stores the map and folds it into outgoing header sets; the server ignores the contents. *Evidence: source.*
 - **`get_my_message`** — the Message Centre bell polls this for `(type, after, limit)`. Studio parses `http_body` as JSON and expects an envelope with a `messages[]` array. The exact URL was not captured in available MITM dumps (the stock plugin only emits it when there is something in the cloud inbox for the user); the most likely candidate from community traces is `GET /v1/user-service/my/messages?type=<t>&after=<unix>&limit=<n>`. Returning an empty body with `http_code = 0` makes Studio's parser treat the response as "no messages" and the bell stays clear. *Evidence: source; URL unconfirmed.*
 - **`check_user_task_report`** — polled after every print to decide whether to show the "rate this print" prompt. The output contract is `*task_id` (zero means "nothing to report") and `*printable`. Stock endpoint was not captured; returning `0 / false` is the documented way to suppress the popup. *Evidence: source; URL unconfirmed.*
-- **`get_user_print_info`** — `GET /v1/iot-service/api/user/bind`. This is the single source for the cloud side of the Devices tab. Response shape (from MITM plus direct probes): `{"devices":[{ "dev_id", "name", "online", "print_status", "dev_model_name", "dev_product_name", "dev_access_code", ... }]}`. Studio's `DeviceManager::parse_user_print_info` reads slightly different field names — `dev_name`, `dev_online`, `task_status` — so a clean implementation has to remap on the way out. *Evidence: MITM + probe.*
+- **`get_user_print_info`** — Two confirmed endpoints serve this data:
+  - `GET /v1/iot-service/api/user/bind` — returns `{ "devices":[{ "dev_id", "name", "online", "print_status", "dev_model_name", "dev_product_name", "dev_access_code", "print_job", "nozzle_diameter", "dev_structure", ... }]}`. Uses `name`/`online`/`print_status` — requires remapping to Studio's expected `dev_name`/`dev_online`/`task_status`. *Evidence: MITM + probe.*
+  - `GET /v1/iot-service/api/user/print?force=true` — returns `{ "devices":[{ "dev_id", "dev_name", "dev_model_name", "dev_product_name", "dev_online", "dev_access_code" }]}`. Field names match Studio's parser directly; no remapping needed. Also polled repeatedly by the stock plugin as a cloud print-job queue check (returns `{"message":"success","code":0,"error":null}` with no `devices` key when the queue is empty). *Evidence: SSLKEYLOGFILE capture.*
+  - **Security note:** `dev_access_code` is returned in plaintext by both endpoints. This is the same 8-hex-character code shown on the printer display and used as the LAN MQTT password (`bblp` / access code). Any bearer token holder can retrieve LAN access codes for all cloud-bound devices.
 - **`get_user_tasks`** — the Cloud Task / History grid. Studio passes the whole `http_body` through to its JSON parser. The stock endpoint is not captured. *Evidence: source; URL unconfirmed.*
 - **`get_task_plate_index`** — looks up which plate a given cloud `task_id` ran on. Studio falls back to plate `0` on failure. *Evidence: source; URL unconfirmed.*
 - **`get_subtask_info`** — MakerWorld subtask detail fetch; Studio pulls the printer-card hero image from `context.plates[<plate_idx>].thumbnail.url` in the response. `content` is a JSON *string* holding an inner `{info:{plate_idx}}` envelope — both shapes are in `DeviceManager.cpp`. The stock cloud URL is unconfirmed. *Evidence: source; cloud URL unconfirmed.*
@@ -2067,7 +2223,7 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 |---------|-------------|---------|----------|
 | Bearer-token login / refresh / profile | `POST /v1/user-service/user/ticket/<T>`, `POST /v1/user-service/user/refreshtoken`, `GET /v1/user-service/my/profile` | §6.5 | MITM + probe |
 | Device bind / unbind / rename | `POST /v1/iot-service/api/user/bind`, `GET /v1/iot-service/api/user/bind`, `PATCH /v1/iot-service/api/user/device/info`, `DELETE /v1/iot-service/api/user/bind?dev_id=<id>` | §6.6 | MITM + probe |
-| Printer firmware catalogue | stock: unknown cloud catalogue call; ours: synthesised from MQTT state | §6.7 | source only (stock) |
+| Printer firmware catalogue | stock: `GET /v1/iot-service/api/user/device/version?dev_id=<serial>` (add `X-BBL-Client-ID: slicer:<uid>:<4-char-suffix>`); ours: synthesised from MQTT state | §6.7 | SSLKEYLOGFILE (stock); synthesised (ours) |
 | Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, `PUT /v1/iot-service/api/user/notification`, `GET /v1/iot-service/api/user/notification?action=upload&ticket=<t>`, `PATCH /v1/iot-service/api/user/project/<pid>`, `GET /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf`, `POST /v1/user-service/my/task` | §6.8 | MITM |
 | User presets sync | `<m> /v1/iot-service/api/slicer/setting[/<id>]?public=false&version=<bundle>` | §6.9 | MITM + probe |
 | Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |

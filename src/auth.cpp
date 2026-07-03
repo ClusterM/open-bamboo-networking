@@ -96,6 +96,7 @@ void Store::load_locked()
     s_.user_name     = root->find("user_name").as_string();
     s_.nick_name     = root->find("nick_name").as_string();
     s_.avatar        = root->find("avatar").as_string();
+    s_.firmware_beta_open = root->find("firmware_beta_open").as_bool();
     OBN_INFO("auth: loaded session for %s (user_id=%s, expires=%s)",
              s_.account.c_str(), s_.user_id.c_str(),
              to_iso8601(s_.expires_at).c_str());
@@ -144,7 +145,10 @@ void Store::persist_locked() const
         add("user_id",       s_.user_id);
         add("user_name",     s_.user_name);
         add("nick_name",     s_.nick_name);
-        add("avatar",        s_.avatar, /*last=*/true);
+        add("avatar",        s_.avatar);
+        body += "  \"firmware_beta_open\": ";
+        body += s_.firmware_beta_open ? "true" : "false";
+        body += "\n";
         body += "}\n";
         out.write(body.data(), static_cast<std::streamsize>(body.size()));
         out.flush();
@@ -208,6 +212,13 @@ void Store::update_profile(const std::string& user_id,
     if (!user_name.empty()) s_.user_name = user_name;
     if (!nick_name.empty()) s_.nick_name = nick_name;
     if (!avatar.empty())    s_.avatar    = avatar;
+    persist_locked();
+}
+
+void Store::update_firmware_beta(bool open)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    s_.firmware_beta_open = open;
     persist_locked();
 }
 
