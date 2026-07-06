@@ -208,6 +208,56 @@ static int test_sign_bytes_verifies()
     return 0;
 }
 
+static int test_device_security_sign_is_raw_timestamp()
+{
+    // device_security_sign() must reproduce the proprietary plugin's scheme: a
+    // RAW RSA PKCS#1 v1.5 signature over the current epoch-ms decimal string
+    // (no SHA-256, no DigestInfo). Recovering it must yield exactly that
+    // string — matching the real observed POST /my/task signature, which
+    // recovered to the bare ms timestamp "1782788656000".
+    const std::string sig_b64 = obn::signing::device_security_sign();
+    CHECK(sig_b64.size() == 344);  // RSA-2048 -> 256 bytes -> 344 base64 chars
+
+    std::vector<unsigned char> sig;
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    for (std::size_t i = 0; i + 4 <= sig_b64.size(); i += 4) {
+        int v0 = val(sig_b64[i]),   v1 = val(sig_b64[i+1]);
+        int v2 = val(sig_b64[i+2]), v3 = val(sig_b64[i+3]);
+        if (v0 < 0 || v1 < 0) break;
+        sig.push_back(static_cast<unsigned char>((v0 << 2) | (v1 >> 4)));
+        if (v2 >= 0) sig.push_back(static_cast<unsigned char>((v1 << 4) | (v2 >> 2)));
+        if (v3 >= 0) sig.push_back(static_cast<unsigned char>((v2 << 6) | v3));
+    }
+    CHECK(sig.size() == 256);
+
+    // Raw PKCS#1 recover (no digest) with the test key's public component.
+    struct CtxDel { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(g_test_key, nullptr));
+    CHECK(ctx != nullptr);
+    CHECK(EVP_PKEY_verify_recover_init(ctx.get()) == 1);
+    CHECK(EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) == 1);
+    std::size_t rlen = 0;
+    CHECK(EVP_PKEY_verify_recover(ctx.get(), nullptr, &rlen, sig.data(), sig.size()) == 1);
+    std::vector<unsigned char> rec(rlen);
+    CHECK(EVP_PKEY_verify_recover(ctx.get(), rec.data(), &rlen, sig.data(), sig.size()) == 1);
+    rec.resize(rlen);
+    const std::string msg(rec.begin(), rec.end());
+
+    // The recovered message is the bare ms-timestamp string (same shape as the
+    // real example), NOT a SHA-256 DigestInfo block.
+    CHECK(msg.size() >= 12 && msg.size() <= 14);
+    for (char c : msg) CHECK(c >= '0' && c <= '9');
+    CHECK(std::stoll(msg) > 1700000000000LL);  // plausible recent epoch-ms
+    return 0;
+}
+
 static int test_h2d_detection_noop_on_non_h2d()
 {
     // A P2S printer should not have its payload altered.
@@ -316,6 +366,7 @@ int main()
     if (test_sign_bytes_length()           != 0) rc = 1;
     if (test_sign_bytes_deterministic()    != 0) rc = 1;
     if (test_sign_bytes_verifies()         != 0) rc = 1;
+    if (test_device_security_sign_is_raw_timestamp() != 0) rc = 1;
     if (test_h2d_detection_noop_on_non_h2d() != 0) rc = 1;
     if (test_h2d_nozzle_ids_flipped()     != 0) rc = 1;
     if (test_h2d_model_variants()          != 0) rc = 1;

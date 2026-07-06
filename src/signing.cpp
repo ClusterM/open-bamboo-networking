@@ -9,7 +9,9 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,9 +28,9 @@ namespace obn::signing {
 
 namespace {
 
-struct BnDel   { void operator()(BIGNUM*     p) const { BN_free(p); } };
-struct PkeyDel { void operator()(EVP_PKEY*   p) const { EVP_PKEY_free(p); } };
-struct MdDel   { void operator()(EVP_MD_CTX* p) const { EVP_MD_CTX_free(p); } };
+struct PkeyDel { void operator()(EVP_PKEY*     p) const { EVP_PKEY_free(p); } };
+struct MdDel   { void operator()(EVP_MD_CTX*   p) const { EVP_MD_CTX_free(p); } };
+struct CtxDel  { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
 
 static constexpr const char kSignAlg[] = "RSA_SHA256";
 static constexpr const char kSignVer[] = "v1.0";
@@ -84,10 +86,12 @@ static std::string load_cert_id_from_file()
     return s;
 }
 
+} // namespace
+
 // cert_id identifies the slicer's registered signing certificate on Bambu's
 // backend. It is fixed for the life of a given RSA key pair and is not secret.
 // Priority: BBL_SLICER_CERT_ID env > slicer_cert_id.txt alongside the key.
-static const std::string& cert_id()
+const std::string& slicer_cert_id()
 {
     static const std::string id = []() -> std::string {
         // 1. Environment variable override.
@@ -101,6 +105,8 @@ static const std::string& cert_id()
     }();
     return id;
 }
+
+namespace {
 
 static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
 {
@@ -128,24 +134,6 @@ EVP_PKEY* slicer_pkey()
     return key.get();
 }
 
-static const char kB64Tbl[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string base64_encode(const unsigned char* data, std::size_t len)
-{
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (std::size_t i = 0; i < len; i += 3) {
-        std::uint32_t w = static_cast<std::uint32_t>(data[i]) << 16;
-        if (i + 1 < len) w |= static_cast<std::uint32_t>(data[i + 1]) << 8;
-        if (i + 2 < len) w |= static_cast<std::uint32_t>(data[i + 2]);
-        out.push_back(kB64Tbl[(w >> 18) & 63]);
-        out.push_back(kB64Tbl[(w >> 12) & 63]);
-        out.push_back(i + 1 < len ? kB64Tbl[(w >> 6) & 63] : '=');
-        out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
-    }
-    return out;
-}
 
 // RSA-PKCS#1 v1.5 + SHA-256 over `data`, returned as base64.
 std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
@@ -164,6 +152,29 @@ std::string rsa_sha256_sign_b64(EVP_PKEY* pkey,
     std::vector<unsigned char> sig(siglen);
     if (EVP_DigestSignFinal(ctx.get(), sig.data(), &siglen) != 1)
         throw std::runtime_error("signing: EVP_DigestSignFinal failed");
+    return base64_encode(sig.data(), siglen);
+}
+
+// Raw RSA PKCS#1 v1.5 signature over `data` — the data IS the signed message,
+// NOT its hash. Unlike rsa_sha256_sign_b64, no digest is applied and no
+// DigestInfo is prepended: the encoded block is 00 01 FF..FF 00 || data.
+// Returned as base64.
+std::string rsa_pkcs1_sign_raw_b64(EVP_PKEY* pkey,
+                                   const unsigned char* data, std::size_t len)
+{
+    if (!pkey) return {};
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(pkey, nullptr));
+    if (!ctx) throw std::runtime_error("signing: EVP_PKEY_CTX_new failed");
+    if (EVP_PKEY_sign_init(ctx.get()) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign_init failed");
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) != 1)
+        throw std::runtime_error("signing: set_rsa_padding failed");
+    std::size_t siglen = 0;
+    if (EVP_PKEY_sign(ctx.get(), nullptr, &siglen, data, len) != 1 || siglen == 0)
+        throw std::runtime_error("signing: EVP_PKEY_sign (size query) failed");
+    std::vector<unsigned char> sig(siglen);
+    if (EVP_PKEY_sign(ctx.get(), sig.data(), &siglen, data, len) != 1)
+        throw std::runtime_error("signing: EVP_PKEY_sign failed");
     return base64_encode(sig.data(), siglen);
 }
 
@@ -276,7 +287,7 @@ std::string build_envelope(const std::string& to_sign,
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
     out += "{\"header\":{\"cert_id\":\"";
-    out += json_str_escape(cert_id());
+    out += json_str_escape(slicer_cert_id());
     out += "\",\"payload_len\":";
     out += std::to_string(to_sign.size());
     out += ",\"sign_alg\":\"";
@@ -331,6 +342,44 @@ std::string sign_bytes(const std::string& data)
     return rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(data.data()), data.size());
+}
+
+std::string device_security_sign()
+{
+    EVP_PKEY* pkey = slicer_pkey();
+    // Degrade gracefully when no slicer key is configured (same as maybe_sign):
+    // return empty so the caller omits the header rather than crashing the
+    // cloud-connect/print path. The header is only enforced on signed writes.
+    if (!pkey) return {};
+    // The proprietary plugin signs the *current* time in milliseconds (as a
+    // decimal string) with a raw RSA PKCS#1 v1.5 signature — no hash. The
+    // cloud recovers the timestamp from the signature and checks it is recent
+    // (replay protection).
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::string ts = std::to_string(ms);
+    return rsa_pkcs1_sign_raw_b64(
+        pkey,
+        reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
+}
+
+static constexpr char kB64Tbl[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string base64_encode(const unsigned char* data, std::size_t len)
+{
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (std::size_t i = 0; i < len; i += 3) {
+        std::uint32_t w = static_cast<std::uint32_t>(data[i]) << 16;
+        if (i + 1 < len) w |= static_cast<std::uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) w |= static_cast<std::uint32_t>(data[i + 2]);
+        out.push_back(kB64Tbl[(w >> 18) & 63]);
+        out.push_back(kB64Tbl[(w >> 12) & 63]);
+        out.push_back(i + 1 < len ? kB64Tbl[(w >> 6) & 63] : '=');
+        out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
+    }
+    return out;
 }
 
 } // namespace obn::signing

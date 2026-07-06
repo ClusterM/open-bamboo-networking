@@ -263,6 +263,16 @@ int CloudSession::del_subscribe(const std::vector<std::string>& dev_ids)
     return BAMBU_NETWORK_SUCCESS;
 }
 
+int CloudSession::subscribe_device(const std::string& dev_id)
+{
+    return add_subscribe({dev_id});
+}
+
+int CloudSession::unsubscribe_device(const std::string& dev_id)
+{
+    return del_subscribe({dev_id});
+}
+
 void CloudSession::apply_subscriptions_locked_()
 {
     if (!client_) return;
