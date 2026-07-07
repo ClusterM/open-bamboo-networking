@@ -14,8 +14,8 @@
 //
 // Token persistence:
 //   SessionData holds tokens with absolute expiry timestamps.
-//   save_session() writes atomically (write-temp + rename) with mode 0600
-//   to $XDG_CONFIG_HOME/BambuStudio/session.json (or ~/.config/BambuStudio/).
+//   save_session() writes atomically (write-temp + rename) with mode 0600.
+//   Path priority: obn.conf session_path > config_dir/session.json.
 //   load_and_refresh_if_needed() is the one-call startup helper: reads the
 //   file, refreshes the access token if it is within slack_seconds of
 //   expiry, and saves the updated tokens back before returning.
@@ -112,9 +112,8 @@ struct SessionData {
 };
 
 // Default file path used by save_session() / load_session() when no
-// explicit path is supplied:
-//   $XDG_CONFIG_HOME/BambuStudio/session.json
-//   or ~/.config/BambuStudio/session.json
+// explicit path is supplied: obn.conf session_path, or
+// config_dir/session.json when empty.
 std::string default_session_path();
 
 // Promote a login / refresh AuthResult into a SessionData, computing
@@ -144,7 +143,6 @@ SessionData load_session(const std::string& path = {});
 //   4. Otherwise → return SessionData{} with empty tokens.
 SessionData load_and_refresh_if_needed(const std::string& path = {},
                                        int slack_seconds = 60);
-
 // NOT YET WIRED - the following struct and function document the cloud MQTT
 // mTLS certificate endpoint. The implementation in cloud_auth.cpp is gated
 // with #if 0. See agent.cpp install_device_cert for the integration plan.

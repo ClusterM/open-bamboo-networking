@@ -837,6 +837,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     # JSON ordering, signature round-trip and envelope structure validation.
     # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
     add_executable(signing_test tests/signing_test.cpp
+        tests/config_stub.cpp
         src/json_lite.cpp
         src/log.cpp
         src/os_compat.cpp

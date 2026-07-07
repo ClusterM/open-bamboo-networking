@@ -4,6 +4,7 @@
 //            "sign_string":"...","sign_ver":"v1.0"},"print":{...sorted keys...}}
 
 #include "obn/signing.hpp"
+#include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 
 #include <openssl/bio.h>
@@ -14,15 +15,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#ifdef _WIN32
-#  include <shlobj.h>
-#endif
 
 namespace obn::signing {
 
@@ -35,47 +31,24 @@ struct CtxDel  { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); 
 static constexpr const char kSignAlg[] = "RSA_SHA256";
 static constexpr const char kSignVer[] = "v1.0";
 
-static std::string default_key_path()
+// Resolve the key file path: obn.conf slicer_key_pem, or
+// config_dir/slicer_key.pem when empty.
+static std::string resolve_key_path()
 {
-#ifdef _WIN32
-    char appdata[MAX_PATH] = {};
-    if (SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appdata) != S_OK)
-        return {};
-    return std::string(appdata) + "\\BambuStudio\\slicer_key.pem";
-#else
-    const char* home = std::getenv("HOME");
-    if (!home || !home[0]) return {};
-    return std::string(home) + "/.config/BambuStudio/slicer_key.pem";
-#endif
+    const auto& cfg = obn::config::current().slicer_key_pem;
+    if (!cfg.empty()) return cfg;
+    const auto& dir = obn::config::dir();
+    if (dir.empty()) return {};
+    return dir + "/slicer_key.pem";
 }
 
-// Returns the path to the key file being used (empty if none).
-static std::string active_key_path()
-{
-    if (const char* e = std::getenv("BBL_SLICER_KEY_PEM"))
-        if (e[0]) return e;
-    return default_key_path();
-}
-
-// Load cert_id from slicer_cert_id.txt in the same directory as the key file.
+// Read cert_id from slicer_cert_id.txt in config_dir.
 static std::string load_cert_id_from_file()
 {
-    std::string key_path = active_key_path();
-    if (key_path.empty()) return {};
-    auto slash = key_path.rfind('/');
-#ifdef _WIN32
-    auto bslash = key_path.rfind('\\');
-    if (bslash != std::string::npos && (slash == std::string::npos || bslash > slash))
-        slash = bslash;
-#endif
-    std::string dir = (slash == std::string::npos) ? "." : key_path.substr(0, slash);
-    std::string id_path = dir +
-#ifdef _WIN32
-        "\\slicer_cert_id.txt";
-#else
-        "/slicer_cert_id.txt";
-#endif
-    std::FILE* f = std::fopen(id_path.c_str(), "r");
+    const auto& dir = obn::config::dir();
+    if (dir.empty()) return {};
+    std::string path = dir + "/slicer_cert_id.txt";
+    std::FILE* f = std::fopen(path.c_str(), "r");
     if (!f) return {};
     char buf[256] = {};
     if (!std::fgets(buf, sizeof(buf), f)) buf[0] = '\0';
@@ -90,17 +63,14 @@ static std::string load_cert_id_from_file()
 
 // cert_id identifies the slicer's registered signing certificate on Bambu's
 // backend. It is fixed for the life of a given RSA key pair and is not secret.
-// Priority: BBL_SLICER_CERT_ID env > slicer_cert_id.txt alongside the key.
+// Priority: obn.conf slicer_cert_id > config_dir/slicer_cert_id.txt
 const std::string& slicer_cert_id()
 {
     static const std::string id = []() -> std::string {
-        // 1. Environment variable override.
-        if (const char* e = std::getenv("BBL_SLICER_CERT_ID"))
-            if (e[0]) return e;
-        // 2. slicer_cert_id.txt alongside the key file.
+        const auto& cfg = obn::config::current().slicer_cert_id;
+        if (!cfg.empty()) return cfg;
         std::string from_file = load_cert_id_from_file();
         if (!from_file.empty()) return from_file;
-        // No cert found.
         return "";
     }();
     return id;
@@ -110,13 +80,7 @@ namespace {
 
 static std::unique_ptr<EVP_PKEY, PkeyDel> load_pkey()
 {
-    std::string path;
-    const char* env_path = std::getenv("BBL_SLICER_KEY_PEM");
-    if (env_path && env_path[0])
-        path = env_path;
-    else
-        path = default_key_path();
-
+    std::string path = resolve_key_path();
     if (path.empty()) return nullptr;
 
     std::FILE* f = std::fopen(path.c_str(), "r");
@@ -335,10 +299,13 @@ std::string maybe_sign(const std::string& payload_json,
 std::string sign_bytes(const std::string& data)
 {
     EVP_PKEY* pkey = slicer_pkey();
-    if (!pkey)
+    if (!pkey) {
+        const auto& d = obn::config::dir();
         throw std::runtime_error(
-            "signing: no key loaded; set BBL_SLICER_KEY_PEM or place key at "
-            "~/.config/BambuStudio/slicer_key.pem");
+            "signing: no key loaded; set slicer_key_pem in obn.conf "
+            "or place slicer_key.pem in the config directory ("
+            + (d.empty() ? "<not set>" : d) + ")");
+    }
     return rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(data.data()), data.size());

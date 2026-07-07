@@ -32,24 +32,6 @@ int64_t now_epoch_seconds()
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-// ---------------------------------------------------------------------------
-// Path helpers
-// ---------------------------------------------------------------------------
-
-std::string getenv_str_(const char* key)
-{
-    const char* v = std::getenv(key);
-    return (v && *v) ? std::string(v) : std::string{};
-}
-
-std::string xdg_config_root_()
-{
-    auto x = getenv_str_("XDG_CONFIG_HOME");
-    if (!x.empty()) return x;
-    auto h = getenv_str_("HOME");
-    return (!h.empty() ? h : ".") + "/.config";
-}
-
 // Create the directory tree up to (not including) the filename in `path`.
 void mkdirs_for_file_(const std::string& path)
 {
@@ -111,7 +93,11 @@ bool SessionData::refresh_valid(int slack_seconds) const noexcept
 
 std::string default_session_path()
 {
-    return xdg_config_root_() + "/BambuStudio/session.json";
+    const auto& cfg = obn::config::current().session_path;
+    if (!cfg.empty()) return cfg;
+    const auto& dir = obn::config::dir();
+    if (!dir.empty()) return dir + "/session.json";
+    return {};
 }
 
 SessionData session_from_auth(const AuthResult& r,

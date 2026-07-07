@@ -93,6 +93,24 @@ disable_camera_preview = 0
 
 mqtt_keep_connection = 1
 
+# --- Signing / cloud auth -------------------------------------------
+#
+# Path to the slicer RSA private key (PEM) used for MQTT payload signing
+# and cloud REST request authentication.
+# If empty, looks for slicer_key.pem in this config directory.
+
+slicer_key_pem =
+
+# Slicer certificate ID registered on the Bambu backend.
+# If empty, reads slicer_cert_id.txt from this config directory.
+
+slicer_cert_id =
+
+# Path to the login session persistence file.
+# If empty, uses session.json in this config directory.
+
+session_path =
+
 # --- MQTT push_status patches ---------------------------------------
 #
 # Replace the printer's self-reported LAN IP in MQTT push_status with the

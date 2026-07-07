@@ -2,6 +2,7 @@
 // and signature verification using a freshly generated RSA test keypair.
 
 #include "obn/signing.hpp"
+#include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 
 #include <openssl/evp.h>
@@ -331,15 +332,18 @@ static int test_h2d_signature_verifies()
     return 0;
 }
 
+namespace obn::config {
+    Settings& test_settings();
+    std::string& test_dir();
+}
+
 int main()
 {
-    setenv("BBL_SLICER_CERT_ID", "testcertid123CN=test.example.com", 1);
-
     // Generate fresh RSA-2048 keypair for signing tests.
     g_test_key = EVP_RSA_gen(2048);
     if (!g_test_key) { std::cerr << "EVP_RSA_gen failed\n"; return 1; }
 
-    // Write private key to temp PEM file.
+    // Write private key to a temp PEM file and point the config at it.
     char tmp_path[] = "/tmp/signing_test_XXXXXX";
     int fd = mkstemp(tmp_path);
     if (fd < 0) { std::cerr << "mkstemp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
@@ -351,9 +355,10 @@ int main()
     if (!f) { perror("open pem"); EVP_PKEY_free(g_test_key); return 1; }
     PEM_write_PrivateKey(f, g_test_key, nullptr, nullptr, 0, nullptr, nullptr);
     fclose(f);
-    unlink(tmp_path);  // remove the fd-allocated file, keep .pem
+    unlink(tmp_path);
 
-    setenv("BBL_SLICER_KEY_PEM", pem_path.c_str(), 1);
+    obn::config::test_settings().slicer_key_pem = pem_path;
+    obn::config::test_settings().slicer_cert_id = "testcertid123CN=test.example.com";
 
     int rc = 0;
     if (test_non_print_passthrough()       != 0) rc = 1;

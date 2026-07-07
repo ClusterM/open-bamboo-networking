@@ -80,43 +80,18 @@ std::string json_escape(const std::string& in)
 // RSA field encryption helpers (cloud project_file url_enc / param_enc).
 // ---------------------------------------------------------------------------
 
-// Encrypts `plaintext` with RSA-PKCS#1 v1.5 using the public key embedded in
-// the PEM X.509 certificate at `pem_path`. Returns the base64-encoded
-// ciphertext, or an empty string on failure (with a message in `*err`).
-//
-// Uses the EVP_PKEY_* API exclusively (deprecated RSA_* functions avoided).
-// PKCS#1 v1.5 padding is mandatory: the printer firmware uses RSA encryption
-// (not signing), and empirical captures confirm PKCS#1 v1.5, NOT OAEP.
-static std::string rsa_pkcs1v15_encrypt_b64(const std::string& pem_path,
+// Encrypts `plaintext` with RSA-PKCS#1 v1.5 using `pkey`. The caller retains
+// ownership of `pkey`. Returns base64-encoded ciphertext, or "" on failure.
+static std::string rsa_pkcs1v15_encrypt_b64(EVP_PKEY*          pkey,
                                              const std::string& plaintext,
                                              std::string*       err)
 {
-    // Load the X.509 certificate.
-    FILE* f = std::fopen(pem_path.c_str(), "r");
-    if (!f) {
-        if (err) *err = "cannot open cert PEM: " + pem_path;
-        return {};
-    }
-    X509* cert = ::PEM_read_X509(f, nullptr, nullptr, nullptr);
-    std::fclose(f);
-    if (!cert) {
-        unsigned long ecode = ::ERR_peek_last_error();
-        char ebuf[256];
-        ::ERR_error_string_n(ecode, ebuf, sizeof(ebuf));
-        if (err) *err = std::string("PEM_read_X509 failed (") + ebuf + "): " + pem_path;
-        return {};
-    }
-
-    // Extract the public key from the certificate.
-    EVP_PKEY* pkey = ::X509_get_pubkey(cert);
-    ::X509_free(cert);
     if (!pkey) {
-        if (err) *err = "X509_get_pubkey failed for: " + pem_path;
+        if (err) *err = "null public key";
         return {};
     }
 
     EVP_PKEY_CTX* ctx = ::EVP_PKEY_CTX_new(pkey, nullptr);
-    ::EVP_PKEY_free(pkey);
     if (!ctx) {
         if (err) *err = "EVP_PKEY_CTX_new failed";
         return {};
@@ -136,7 +111,6 @@ static std::string rsa_pkcs1v15_encrypt_b64(const std::string& pem_path,
     const auto* pt    = reinterpret_cast<const unsigned char*>(plaintext.data());
     std::size_t ptlen = plaintext.size();
 
-    // Query required output buffer size.
     std::size_t outlen = 0;
     if (::EVP_PKEY_encrypt(ctx, nullptr, &outlen, pt, ptlen) <= 0) {
         ::EVP_PKEY_CTX_free(ctx);
@@ -159,6 +133,20 @@ static std::string rsa_pkcs1v15_encrypt_b64(const std::string& pem_path,
     ::EVP_PKEY_CTX_free(ctx);
 
     return obn::signing::base64_encode(ct.data(), outlen);
+}
+
+// Loads the printer's public key from its PEM certificate on disk.
+// Returns a ref-bumped EVP_PKEY* (caller must free), or nullptr on failure.
+static EVP_PKEY* load_printer_pub_key_from_pem(const std::string& pem_path)
+{
+    FILE* f = std::fopen(pem_path.c_str(), "r");
+    if (!f) return nullptr;
+    X509* cert = ::PEM_read_X509(f, nullptr, nullptr, nullptr);
+    std::fclose(f);
+    if (!cert) return nullptr;
+    EVP_PKEY* pk = ::X509_get_pubkey(cert);
+    ::X509_free(cert);
+    return pk;
 }
 
 // Reads the whole file into memory. The print-ready 3mf is typically
@@ -639,31 +627,45 @@ int create_task(const std::string& api, const std::string& token,
     req.timeout_s = 60;
 
     auto resp = obn::http::perform(req);
+
+    // Soft-fail: the /my/task endpoint records the print in MakerWorld but is
+    // not required for the actual print to start (the printer is triggered by
+    // the MQTT project_file command). If the HTTP request fails (network error,
+    // non-2xx, missing signing key, etc.) we log and continue with task_id "0".
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
+        OBN_WARN("cloud_print: create_task soft-fail (http %ld, err=%s); "
+                 "continuing with task_id=0",
+                 resp.status_code, resp.error.c_str());
+        *out_task_id = "0";
+        return 0;
+    }
+
     auto root = obn::json::parse(resp.body);
-    if (!root) return fail_stage(update_fn,
-                                 BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED,
-                                 "create_task bad JSON", resp);
+    if (!root) {
+        OBN_WARN("cloud_print: create_task bad JSON; continuing with task_id=0");
+        *out_task_id = "0";
+        return 0;
+    }
     *out_task_id = root->find("id").as_string();
     if (out_task_id->empty()) {
         // Some builds return id as an integer; json_lite as_string()
-        // returns empty for numeric values. Fall back to parsing the
-        // raw body for the number.
-        const auto& body = resp.body;
-        auto pos = body.find("\"id\"");
+        // returns empty for numeric values.
+        const auto& rbody = resp.body;
+        auto pos = rbody.find("\"id\"");
         if (pos != std::string::npos) {
-            pos = body.find_first_of("0123456789", pos);
+            pos = rbody.find_first_of("0123456789", pos);
             if (pos != std::string::npos) {
-                auto end = body.find_first_not_of("0123456789", pos);
-                *out_task_id = body.substr(pos, end == std::string::npos
-                                                ? std::string::npos
-                                                : end - pos);
+                auto end = rbody.find_first_not_of("0123456789", pos);
+                *out_task_id = rbody.substr(pos, end == std::string::npos
+                                                 ? std::string::npos
+                                                 : end - pos);
             }
         }
     }
-    if (out_task_id->empty())
-        return fail_stage(update_fn,
-                          BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED,
-                          "create_task missing task_id", resp);
+    if (out_task_id->empty()) {
+        OBN_WARN("cloud_print: create_task missing task_id; continuing with task_id=0");
+        *out_task_id = "0";
+    }
     OBN_INFO("cloud_print: task_id=%s", out_task_id->c_str());
     return 0;
 }
@@ -920,28 +922,38 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // cloud-channel) require url_enc / param_enc — RSA-PKCS#1 v1.5 encrypted
     // to the printer's public key — instead of plaintext url / param. Without
     // this the firmware rejects the command with "mqtt message verify failed".
-    //
-    // The printer's RSA public key is extracted from the TLS leaf certificate
-    // captured by install_device_cert() and stored at
-    // <config_dir>/certs/<dev_id>.pem.  If the cert hasn't been captured yet
-    // (e.g. the printer was never connected on LAN), we fail early rather than
-    // sending a plaintext payload the firmware will reject anyway.
     std::string mqtt_json;
     {
-        std::string pem_path = cert_store::device_cert_path(config_dir(), p.dev_id);
+        // Obtain the printer's RSA public key: prefer the in-memory cache
+        // (populated by install_device_cert / capture_peer_cert_pem), fall
+        // back to reading the PEM from disk if the cache is empty.
+        EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+        if (!printer_pk) {
+            std::string pem_path = cert_store::device_cert_path(config_dir(), p.dev_id);
+            printer_pk = load_printer_pub_key_from_pem(pem_path);
+            if (printer_pk) {
+                cert_store::set_printer_pub_key(p.dev_id, printer_pk);
+            }
+        }
+        if (!printer_pk) {
+            OBN_ERROR("cloud_print: no public key for dev=%s; "
+                      "ensure install_device_cert() has run", p.dev_id.c_str());
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "no printer public key for RSA encryption");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
 
-        // The `param` plaintext is the plate-gcode entrypoint inside the 3mf.
         std::string plate_param = "Metadata/plate_" +
             std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) + ".gcode";
 
         std::string enc_err;
-        std::string url_enc   = rsa_pkcs1v15_encrypt_b64(pem_path, opts.url,   &enc_err);
-        std::string param_enc = rsa_pkcs1v15_encrypt_b64(pem_path, plate_param, &enc_err);
+        std::string url_enc   = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url,   &enc_err);
+        std::string param_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, plate_param, &enc_err);
+        ::EVP_PKEY_free(printer_pk);
 
         if (url_enc.empty() || param_enc.empty()) {
-            OBN_ERROR("cloud_print: RSA field encryption failed (%s); "
-                      "cert=%s  Ensure install_device_cert() has run for dev=%s",
-                      enc_err.c_str(), pem_path.c_str(), p.dev_id.c_str());
+            OBN_ERROR("cloud_print: RSA field encryption failed: %s", enc_err.c_str());
             if (update_fn) update_fn(BBL::PrintingStageERROR,
                                      BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
                                      "RSA field encryption failed: " + enc_err);

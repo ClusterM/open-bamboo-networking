@@ -55,6 +55,15 @@ struct Settings {
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
 
+    // Slicer signing key and certificate id.
+    // Empty = config_dir/slicer_key.pem and config_dir/slicer_cert_id.txt
+    std::string slicer_key_pem;
+    std::string slicer_cert_id;
+
+    // Cloud login session persistence file.
+    // Empty = config_dir/session.json
+    std::string session_path;
+
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
     std::string bambusource_log_stderr;
@@ -77,6 +86,10 @@ Settings load_if_exists(const std::string& config_dir);
 
 // Valid only after load_or_create(); otherwise returns default Settings.
 const Settings& current();
+
+// The config_dir passed to the most recent load_or_create() call.
+// All default file paths (key, cert_id, session) are relative to this.
+const std::string& dir();
 
 // Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
 // Empty configured values fall back to production defaults.

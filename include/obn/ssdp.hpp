@@ -73,6 +73,7 @@ private:
     std::uintptr_t       fd_{static_cast<std::uintptr_t>(-1)};
     std::thread          worker_;
     std::atomic<bool>    running_{false};
+    std::mutex           start_mu_;
     std::mutex           cb_mu_;
     OnMessage            cb_;
     int                  port_{2021};

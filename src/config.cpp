@@ -13,8 +13,9 @@
 namespace obn::config {
 namespace {
 
-std::mutex g_mu;
-Settings   g_current;
+std::mutex  g_mu;
+Settings    g_current;
+std::string g_config_dir;
 
 constexpr const char* kDefaultGlobalApi  = "https://api.bambulab.com";
 constexpr const char* kDefaultGlobalWeb  = "https://bambulab.com";
@@ -88,6 +89,9 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);
     else if (key == "patch_mqtt_ipcam_file")       out.patch_mqtt_ipcam_file = truthy(val);
     else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);
+    else if (key == "slicer_key_pem")               out.slicer_key_pem = val;
+    else if (key == "slicer_cert_id")              out.slicer_cert_id = val;
+    else if (key == "session_path")                out.session_path = val;
     else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
     else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
     else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;
@@ -168,6 +172,7 @@ Settings load_or_create(const std::string& config_dir)
     if (!std::filesystem::is_regular_file(path, ec))
         (void)write_default_template(path);
 
+    g_config_dir = config_dir;
     g_current = parse_file(path);
     obn::lan_tls::propagate_cross_so_env(g_current);
     return g_current;
@@ -187,6 +192,12 @@ const Settings& current()
 {
     std::lock_guard<std::mutex> lk(g_mu);
     return g_current;
+}
+
+const std::string& dir()
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_config_dir;
 }
 
 std::string cloud_api_host_for(const Settings& s, const std::string& region)

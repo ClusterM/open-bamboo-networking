@@ -27,7 +27,7 @@ std::string device_security_sign();
 std::string base64_encode(const unsigned char* data, std::size_t len);
 
 // Returns the cert_id string used in envelope headers and REST auth headers.
-// Priority: BBL_SLICER_CERT_ID env > slicer_cert_id.txt alongside the key file.
+// Priority: obn.conf slicer_cert_id > config_dir/slicer_cert_id.txt.
 // Returns empty string if neither is configured.
 const std::string& slicer_cert_id();
 

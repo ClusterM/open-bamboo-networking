@@ -139,6 +139,16 @@ static std::string bump_config_body(std::string body)
 
 bool normalise_to_plate_one(const std::string& in_path)
 {
+    // Only process .3mf archives; other file types (e.g. check_access_code.txt
+    // sent by Studio to verify access codes) pass through unchanged.
+    {
+        auto dot = in_path.rfind('.');
+        if (dot == std::string::npos) return true;
+        std::string ext = in_path.substr(dot);
+        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ext != ".3mf") return true;
+    }
+
     mz_zip_archive in{};
     if (!mz_zip_reader_init_file(&in, in_path.c_str(), 0)) {
         OBN_ERROR("plate_norm: open failed: %s", in_path.c_str());
@@ -664,16 +674,37 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
-    // Plate normalisation: rewrite plate_0 → plate_1 inside the 3MF ZIP
-    // in-place BEFORE upload so the printer receives a correct archive.
-    // Fail-closed: if the rewrite errors, refuse the print rather than
-    // pushing a half-written archive. BBS-style spools are unchanged (no-op).
-    if (!print_job::normalise_to_plate_one(params.filename)) {
+    // Protect the original .3mf: normalise a temporary copy, upload it,
+    // then delete the copy. The original file is never modified.
+    const std::string upload_path = params.filename + ".upload";
+    {
+        std::error_code cec;
+        std::filesystem::copy_file(params.filename, upload_path,
+                                   std::filesystem::copy_options::overwrite_existing, cec);
+        if (cec) {
+            OBN_ERROR("local_print: copy %s -> %s failed: %s",
+                      params.filename.c_str(), upload_path.c_str(), cec.message().c_str());
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
+                                     "failed to create upload copy");
+            return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
+        }
+    }
+    auto upload_copy_guard = [&upload_path]() {
+        std::error_code ec;
+        std::filesystem::remove(upload_path, ec);
+    };
+
+    if (!print_job::normalise_to_plate_one(upload_path)) {
+        upload_copy_guard();
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
                                  "plate normalisation failed");
         return BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED;
     }
+
+    BBL::PrintParams upload_params = params;
+    upload_params.filename = upload_path;
 
     // Stock plugin parity: when `ftp_folder` is empty (which it always
     // is — Studio never assigns m_ftp_folder anywhere in the public
@@ -715,7 +746,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
             obn::tunnel_upload::connect_params_from_print(
                 params.dev_ip, params.dev_id, params.password);
         obn::tunnel_upload::UploadRequest ureq;
-        ureq.local_path   = params.filename;
+        ureq.local_path   = upload_path;
         ureq.dest_storage = "emmc";
         ureq.dest_name    = remote_name;
 
@@ -731,17 +762,19 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         rc = obn::tunnel_upload::upload_file(
             cp, ureq, cb, &outcome,
             BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED);
-        if (rc != 0) return rc;
+        if (rc != 0) { upload_copy_guard(); return rc; }
         total = outcome.bytes;
         stored_path = remote_name;
         OBN_INFO("local_print: brtc upload %llu bytes to emmc/%s",
                  static_cast<unsigned long long>(total), remote_name.c_str());
     } else {
-        rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
+        rc = print_job::ftp_upload(upload_params, remote_path, ca_file, update_fn, cancel_fn,
                                    BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED, total,
                                    &stored_path);
-        if (rc != 0) return rc;
+        if (rc != 0) { upload_copy_guard(); return rc; }
     }
+
+    upload_copy_guard();
 
     if (cancel_fn && cancel_fn()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "cancelled");
@@ -880,17 +913,43 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
 
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
 
-    // Plate normalisation before upload (no-op on BBS-style spools).
-    if (!params.filename.empty() &&
-        !print_job::normalise_to_plate_one(params.filename)) {
-        if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                 BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
-                                 "plate normalisation failed");
-        return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+    // Protect the original file: normalise a temporary copy, upload it,
+    // then delete the copy.
+    const std::string upload_path = params.filename.empty()
+                                    ? std::string{} : params.filename + ".upload";
+    auto sg_upload_guard = [&upload_path]() {
+        if (upload_path.empty()) return;
+        std::error_code ec;
+        std::filesystem::remove(upload_path, ec);
+    };
+
+    if (!params.filename.empty()) {
+        std::error_code cec;
+        std::filesystem::copy_file(params.filename, upload_path,
+                                   std::filesystem::copy_options::overwrite_existing, cec);
+        if (cec) {
+            OBN_ERROR("send_gcode: copy %s -> %s failed: %s",
+                      params.filename.c_str(), upload_path.c_str(), cec.message().c_str());
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
+                                     "failed to create upload copy");
+            return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+        }
+        if (!print_job::normalise_to_plate_one(upload_path)) {
+            sg_upload_guard();
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
+                                     "plate normalisation failed");
+            return BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED;
+        }
     }
+
+    BBL::PrintParams upload_params = params;
+    if (!upload_path.empty()) upload_params.filename = upload_path;
 
     std::string remote_name = print_job::dest_name_for_send_gcode(params);
     if (remote_name.empty()) {
+        sg_upload_guard();
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED,
                                  "empty project_name");
@@ -904,8 +963,9 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
 
     std::string ca_file = bambu_ca_bundle_path();
     std::uint64_t total = 0;
-    int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
+    int rc = print_job::ftp_upload(upload_params, remote_path, ca_file, update_fn, cancel_fn,
                                    BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED, total);
+    sg_upload_guard();
     if (rc != 0) return rc;
     if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
     return 0;
