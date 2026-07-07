@@ -1466,14 +1466,141 @@ Multi-extruder / new-auto-calibration paths carry:
 
 Studio uses the `extrusion_cali_*` family for **pressure advance (K factor)** calibration and for managing PA profiles persisted on the printer. Related flow-ratio calibration uses the parallel `flowrate_*` commands (see end of this section).
 
-**Terminology (Studio is inconsistent here):** the same `PACalibResult` struct appears in two different lifecycles:
+###### What K and N are
+
+The printer's firmware uses two coefficients for pressure advance compensation:
+
+| Coefficient | Meaning | Typical range |
+|-------------|---------|---------------|
+| **K** (`k_value`) | Pressure advance factor — how aggressively the extruder motor compensates for filament compressibility in the Bowden tube / hotend. Higher K = more compensation. | 0.01 – 0.10 (direct drive), 0.20 – 1.00+ (Bowden) |
+| **N** (`n_coef`) | Non-linearity coefficient — models the pressure/flow relationship when it deviates from linear. Used only by auto-calibration; manual calibration sets this to `0.0`. | 0.0 – 2.0 |
+
+Both coefficients are stored **on the printer**, not in Studio. Studio is purely a viewer/editor — it reads, writes, and selects profiles via MQTT commands, but the authoritative copy always lives in printer firmware storage.
+
+###### K-value storage model on the printer
+
+The printer maintains a **profile table** keyed by `(filament_id, nozzle_id, nozzle_diameter)`. Each key can have **multiple profile slots**, identified by `cali_idx`:
+
+```
+Profile table (printer-side):
+┌──────────────────────────────────────────────────────────────────┐
+│ Key: filament_id="GFA00", nozzle_id="HS00-0.4", diameter="0.4" │
+│                                                                  │
+│  cali_idx=-1  k=0.040  n=1.400  name="Default"     ← default    │
+│  cali_idx= 0  k=0.035  n=0.000  name="My PLA 210"  ← manual    │
+│  cali_idx= 1  k=0.042  n=1.350  name="Auto result"  ← auto     │
+│  cali_idx= 2  k=0.038  n=0.000  name="Low speed"               │
+│                                                                  │
+│  Active for tray 5: cali_idx=1  (set via extrusion_cali_sel)    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- `cali_idx = -1` is the default (factory / firmware-provided) profile; it cannot be deleted.
+- Each AMS tray can have **one active profile** selected via `extrusion_cali_sel`.
+- Entries with `k_value` outside `[0, 10]` are discarded by Studio during parsing (`DevCalib.cpp:~64`).
+- `confidence` field marks quality: `0` = success, `1` = uncertain, `2` = failed.
+
+###### Capability gates
+
+Before any PA calibration UI is shown, Studio checks:
+
+| Flag | Source | Effect |
+|------|--------|--------|
+| `is_support_pa_calibration` | `fun` bit 7 / `home_flag` bit 16 / JSON `support_flow_calibration` (**naming error** — see §6.8.0) | Master gate for all `extrusion_cali_*` commands |
+| `m_calib.support_new_auto_calib` | `fun` bit 40 | Enables the multi-filament wizard path (batch `filaments[]` commands) |
+| `is_support_pa_mode` | `fun2` bit 3 | PA tuning mode toggle |
+
+**Series-specific overrides** (hardcoded in Studio, ignoring firmware):
+- **P-series**: `is_support_pa_calibration` is **force-disabled** — PA calibration UI is hidden entirely.
+- **O-series (H2D)**: `is_support_flow_calibration` is force-disabled (but PA calibration remains available).
+
+###### Two data lifecycles — run output vs stored profiles
+
+The same `PACalibResult` struct (`src/libslic3r/Calib.hpp:114-140`) appears in two different contexts:
 
 | Concept | MQTT command | Studio API | Meaning |
 |---------|--------------|------------|---------|
-| **Run output** | `extrusion_cali_get_result` | `GetPAResult()`, `m_pa_calib_results` | Fresh K/N values from the calibration job that just finished; not yet committed to printer storage until `extrusion_cali_set`. |
-| **Stored profiles** | `extrusion_cali_get` | `GetPAHistory()`, `m_pa_calib_tab`, UI *Calibration History* | K/N profiles already saved on the printer for a `(filament_id, nozzle, …)` key. Multiple slots per key, indexed by `cali_idx`; one is active per tray (`extrusion_cali_sel`). |
+| **Run output** (ephemeral) | `extrusion_cali_get_result` | `GetPAResult()`, `m_pa_calib_results` | Fresh K/N values from the calibration job that just finished. **Not yet committed** to printer storage — they are discarded on reboot unless saved via `extrusion_cali_set`. |
+| **Stored profiles** (persistent) | `extrusion_cali_get` | `GetPAHistory()`, `m_pa_calib_tab`, UI *Calibration History* | K/N profiles already saved on the printer for a `(filament_id, nozzle, …)` key. Multiple slots per key, indexed by `cali_idx`; one is active per tray (`extrusion_cali_sel`). |
 
 `extrusion_cali_del` removes one **stored profile slot** (`cali_idx`), not the ephemeral run output — even though Studio names the caller `delete_PA_calib_result()` (`CalibUtils.cpp:736`).
+
+###### End-to-end calibration workflows
+
+**Automatic calibration** (firmware measures K/N by printing test patterns):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali ────────────────>│  1. Start calibration run
+  │<── result: "success" ─────────────│     (printer prints test patterns,
+  │                                    │      progress via push_status)
+  │    ... wait for print to finish ...│
+  │                                    │
+  │─── extrusion_cali_get_result ────>│  2. Fetch measured K/N
+  │<── filaments[{k_value, n_coef}] ──│     (ephemeral, not saved yet)
+  │                                    │
+  │    [user reviews results in UI]    │
+  │                                    │
+  │─── extrusion_cali_set ───────────>│  3. Commit to printer storage
+  │<── tray_id, k_value, n_coef ──────│     (now persistent)
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  4. Mark as active for tray
+  │<── tray_id, cali_idx ─────────────│
+  │                                    │
+```
+
+**Manual calibration** (user prints a test pattern, visually picks the best K, enters it):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali (mode=1) ──────>│  1. Print PA test pattern
+  │<── result: "success" ─────────────│     (line pattern with varying K)
+  │                                    │
+  │    ... user inspects print ...     │
+  │    ... user enters K in UI ...     │
+  │                                    │
+  │─── extrusion_cali_set ───────────>│  2. Save user-chosen K directly
+  │    (k_value=<user>, n_coef="0.0") │     (n_coef is always 0.0 for manual)
+  │<── tray_id, k_value ──────────────│
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  3. Mark as active for tray
+  │<── tray_id, cali_idx ─────────────│
+  │                                    │
+```
+
+**Browsing / managing existing profiles** (no calibration run):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali_get ───────────>│  Read stored profiles for a
+  │    (filament_id, nozzle_id, ...)   │  filament/nozzle combination
+  │<── filaments[{k, n, cali_idx}] ───│
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  Switch active profile for a tray
+  │    (tray_id, cali_idx)             │
+  │<── ok ────────────────────────────│
+  │                                    │
+  │─── extrusion_cali_del ───────────>│  Delete a specific profile slot
+  │    (filament_id, cali_idx)         │
+  │<── ok ────────────────────────────│
+  │                                    │
+```
+
+###### Print-time PA integration
+
+When Studio submits a print job via `project_file` (§6.8.2), two fields control PA behavior:
+
+| Wire field | `PrintParams` source | Meaning |
+|------------|---------------------|---------|
+| `extrude_cali_flag` | `auto_flow_cali` (0 or 1) | Tells firmware whether to run PA calibration before printing. `1` = requested, `0` = skip. |
+| `extrude_cali_manual_mode` | `extruder_cali_manual_mode` (0 = auto, 1 = manual, -1 = omit) | If PA cali is requested, which mode to use. Omitted entirely when the value is `-1` (default sentinel). |
+
+The firmware uses the **active profile** (selected via `extrusion_cali_sel`) for the tray's `(filament_id, nozzle)` combination. If `extrude_cali_flag=1`, the printer may re-run calibration before printing rather than using the stored profile.
+
+###### Command reference
 
 **`extrusion_cali`** — start a PA calibration run
 
