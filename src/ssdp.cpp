@@ -197,6 +197,11 @@ bool Discovery::start(int port, OnMessage cb)
         return true;
     }
 
+    // A previous run_() may have exited due to a socket error and set
+    // running_ to false without being joined.  Clean up the dead thread
+    // before we proceed, so assigning worker_ below doesn't terminate().
+    if (worker_.joinable()) worker_.join();
+
     port_ = port;
     {
         std::lock_guard<std::mutex> lk(cb_mu_);
@@ -353,6 +358,17 @@ void Discovery::run_()
             cb = cb_;
         }
         if (cb) cb(json);
+    }
+
+    // If the loop exited due to an unexpected socket error (not a clean
+    // stop() shutdown), reset the flag so a subsequent start() can restart
+    // the listener instead of assuming it's still running.
+    if (running_.exchange(false, std::memory_order_acq_rel)) {
+        OBN_WARN("ssdp: listener died unexpectedly; will restart on next start()");
+        obn::os::socket_t fd = static_cast<obn::os::socket_t>(fd_);
+        fd_ = static_cast<std::uintptr_t>(obn::os::kInvalidSocket);
+        obn::os::shutdown_both(fd);
+        obn::os::close_socket(fd);
     }
 }
 
