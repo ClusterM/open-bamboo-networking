@@ -129,7 +129,12 @@ static long long download_to_fd(const char* host, const tl::Config& cfg,
     }
 
     EVP_MD_CTX* md5ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(md5ctx, EVP_md5(), nullptr);
+    if (!md5ctx || EVP_DigestInit_ex(md5ctx, EVP_md5(), nullptr) != 1) {
+        LOG_ERR("download: MD5 digest context init failed");
+        EVP_MD_CTX_free(md5ctx);           // null-safe
+        obn::tls::close_tls(&fd, &ssl);
+        return -1;
+    }
 
     long long total_written = 0;
     bool      ok            = false;
@@ -152,7 +157,19 @@ static long long download_to_fd(const char* host, const tl::Config& cfg,
 
         bool has_param_size = !root->find("reply.mem_dl_param_size").is_null();
         if (!bin.empty() && !has_param_size) {
-            if (write(out_fd, bin.data(), bin.size()) != static_cast<ssize_t>(bin.size())) {
+            // POSIX write() may do a partial write (large buffer or signal
+            // interruption); loop until the whole frame is flushed so the file
+            // and the running MD5 stay in sync with the reported byte count.
+            size_t woff = 0;
+            while (woff < bin.size()) {
+                ssize_t wn = write(out_fd, bin.data() + woff, bin.size() - woff);
+                if (wn < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                woff += static_cast<size_t>(wn);
+            }
+            if (woff != bin.size()) {
                 LOG_ERR("download: write() failed: %s", strerror(errno));
                 break;
             }

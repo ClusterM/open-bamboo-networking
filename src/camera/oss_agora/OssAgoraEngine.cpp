@@ -193,12 +193,13 @@ static int eng_queryInterface(OssEngine* self, int iid, void** out)
 {
     if (!out) return -1;
     *out = nullptr;
-    if (iid == 4) {
-        // AGORA_IID_MEDIA_ENGINE
-        auto* me = new OssMediaEngine();
-        me->vtable = kMediaEngineVtable;
-        me->engine = self;
-        *out = me;
+    if (iid == 4 && self) {
+        // AGORA_IID_MEDIA_ENGINE — hand out the engine's embedded shim. It is
+        // freed together with the engine; the Agora release() slot is a no-op,
+        // so allocating a fresh shim here (as before) would leak it.
+        self->media_engine.vtable = kMediaEngineVtable;
+        self->media_engine.engine = self;
+        *out = &self->media_engine;
         return 0;
     }
     return -1;

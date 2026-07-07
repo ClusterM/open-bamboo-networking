@@ -325,9 +325,17 @@ std::string device_security_sign()
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
     const std::string ts = std::to_string(ms);
-    return rsa_pkcs1_sign_raw_b64(
-        pkey,
-        reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
+    // rsa_pkcs1_sign_raw_b64() throws std::runtime_error on any OpenSSL failure
+    // (transient error, unusable key, etc.). Honour the graceful-degradation
+    // contract: swallow it and return empty so the caller omits the header
+    // rather than letting an exception escape into the cloud-connect/print path.
+    try {
+        return rsa_pkcs1_sign_raw_b64(
+            pkey,
+            reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
+    } catch (const std::exception&) {
+        return {};
+    }
 }
 
 static constexpr char kB64Tbl[] =

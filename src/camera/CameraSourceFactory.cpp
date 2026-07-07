@@ -121,8 +121,22 @@ CameraSourceFactory::make(const CameraSpec& spec) const
 {
     const std::string& url = spec.camera_url;
 
+    // Classify by the URL's path *resource* (bambu://<authority>/<resource>?<query>)
+    // rather than a bare substring search — a query-parameter value that happens
+    // to contain "agora?"/"tutk?" must not misclassify the URL.
+    auto url_resource = [](const std::string& u) -> std::string {
+        const auto scheme = u.find("://");
+        if (scheme == std::string::npos) return {};
+        const auto path = u.find('/', scheme + 3);   // first '/' after the authority
+        if (path == std::string::npos) return {};
+        const auto end = u.find_first_of("?#/", path + 1);
+        return u.substr(path + 1,
+                        (end == std::string::npos ? u.size() : end) - (path + 1));
+    };
+    const std::string resource = url.empty() ? std::string{} : url_resource(url);
+
     // 1. Agora cloud relay URL (bambu:///agora?...)
-    if (!url.empty() && url.find("agora?") != std::string::npos) {
+    if (resource == "agora") {
         bambu_net::camera::AgoraUrl parsed;
         std::string err;
         if (!bambu_net::camera::AgoraUrl::parse(url, parsed, err)) {
@@ -133,7 +147,7 @@ CameraSourceFactory::make(const CameraSpec& spec) const
     }
 
     // 2. TUTK direct/relay URL (bambu:///tutk?...)
-    if (!url.empty() && url.find("tutk?") != std::string::npos) {
+    if (resource == "tutk") {
         return std::make_shared<OssTutkCameraSource>(url);
     }
 

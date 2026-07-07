@@ -73,6 +73,17 @@ struct OssFrameQueue {
     }
 };
 
+struct OssEngine;  // forward decl for OssMediaEngine
+
+// IMediaEngine shim — returned by queryInterface(4). Embedded in OssEngine
+// (below) so it lives exactly as long as the engine and is freed with it: the
+// Agora release() vtable slot is a no-op, so the caller cannot free it, and
+// allocating a fresh shim on each queryInterface() call would leak.
+struct OssMediaEngine {
+    void**      vtable;
+    OssEngine*  engine;
+};
+
 // Engine state. First field MUST be the vtable pointer.
 struct OssEngine {
     void**         vtable;          // ← must be first — C++ ABI requires this
@@ -95,12 +106,10 @@ struct OssEngine {
     void* registered_observer = nullptr;
 
     std::vector<AgoraEdgeServer> edge_servers;
-};
 
-// IMediaEngine shim — returned by queryInterface(4).
-struct OssMediaEngine {
-    void**      vtable;
-    OssEngine*  engine;
+    // Sub-interface shim handed out by queryInterface(4); embedded so it is
+    // freed together with the engine (its Agora release() slot is a no-op).
+    OssMediaEngine media_engine{};
 };
 
 // IVideoFrameObserver shim — registered by libBambuSource's RegisterObserver.
