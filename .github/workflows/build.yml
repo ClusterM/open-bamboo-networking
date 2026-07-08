@@ -184,20 +184,6 @@ jobs:
           if (Test-Path $ota) {
             Copy-Item -Path $ota -Destination (Join-Path $dist 'ota') -Recurse -Force
           }
-          # Ship the startup_selftest.exe harness alongside the freshly-built
-          # bambu_networking.dll (same CMake build => identical /MD CRT + MSVC
-          # STL => faithful std::string-by-value ABI) so it can be run under
-          # Wine + page-heap to isolate the startup heap corruption. The exe is
-          # not install()ed, so copy it straight from the build dir (VS
-          # multi-config generator emits it under build\Release\).
-          $selftest = Get-ChildItem -Path (Join-Path $env:GITHUB_WORKSPACE 'build') `
-            -Recurse -Filter 'startup_selftest.exe' -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($selftest) {
-            Copy-Item -Path $selftest.FullName -Destination $dist -Force
-          } else {
-            Write-Error "startup_selftest.exe not found under build/"
-          }
           Get-ChildItem -Recurse $dist | Format-Table FullName,Length -AutoSize
 
       - name: Upload artifacts

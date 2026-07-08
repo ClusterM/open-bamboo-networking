@@ -178,47 +178,6 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# ---------------------------------------------------------------------------
-# OBN_ASAN — compile the plugin's OWN sources (and startup_selftest) with
-# AddressSanitizer to get byte-precise heap-corruption detection on the real
-# MSVC STL/CRT. We only instrument targets we build here (bambu_networking,
-# startup_selftest); the vcpkg static deps (OpenSSL/curl) stay as-is — ASAN's
-# malloc/free interceptors are process-global, so overflows in plugin code
-# touching those allocations are still caught. On MSVC, /fsanitize=address
-# requires the dynamic CRT (already our default /MD) and is incompatible with
-# incremental linking / edit-and-continue (/ZI) and RTC, so we strip those.
-# Diagnostic build only — NOT shipped.
-# ---------------------------------------------------------------------------
-option(OBN_ASAN "Instrument plugin sources with AddressSanitizer (diagnostic)" OFF)
-
-function(obn_apply_asan target)
-    if(NOT OBN_ASAN)
-        return()
-    endif()
-    if(MSVC)
-        # /Zi for symbolized ASAN stacks; /INCREMENTAL:NO is required (ASAN
-        # rejects incremental linking). RTC1/ZI are scrubbed from the global
-        # flags below so they don't conflict.
-        target_compile_options(${target} PRIVATE /fsanitize=address /Zi)
-        target_link_options(${target} PRIVATE /INCREMENTAL:NO /DEBUG)
-    else()
-        target_compile_options(${target} PRIVATE
-            -fsanitize=address -fno-omit-frame-pointer -g)
-        target_link_options(${target} PRIVATE -fsanitize=address)
-    endif()
-endfunction()
-
-# When OBN_ASAN is on under MSVC, globally strip /RTC1 and /ZI (edit-and-
-# continue) from the default flags — both are rejected with /fsanitize=address.
-if(OBN_ASAN AND MSVC)
-    foreach(_f
-        CMAKE_C_FLAGS_DEBUG CMAKE_CXX_FLAGS_DEBUG
-        CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-        string(REGEX REPLACE "/RTC[1csu]+" "" ${_f} "${${_f}}")
-        string(REPLACE "/ZI" "/Zi" ${_f} "${${_f}}")
-    endforeach()
-endif()
-
 if(MSVC)
     # Match the Bambu Studio toolchain (Visual Studio 2019, MSVC STL). The ABI
     # crosses the DLL boundary as std::string / std::map / std::function, so
@@ -432,10 +391,6 @@ else()
         PREFIX      "lib"
     )
 endif()
-
-# Instrument the plugin's own sources with AddressSanitizer when OBN_ASAN=ON
-# (diagnostic builds only).
-obn_apply_asan(bambu_networking)
 
 # --------------------------------------------------------------------------
 # libBambuSource.so  (camera tunnel + PrinterFileSystem CTRL bridge;
@@ -860,27 +815,4 @@ endif()
 # orca_slicer / Windows plugin build. Exclude it on Windows.
 if(NOT WIN32)
     add_subdirectory(tools/h2s_capture_video)
-endif()
-
-# startup_selftest is a Windows-only headless harness that LoadLibrary's the
-# built bambu_networking.dll and replays OrcaSlicer's exact startup ABI
-# sequence (create_agent -> set_config_dir -> ... -> start). Its sole purpose
-# is to reproduce the Windows agent-startup heap corruption in isolation under
-# page-heap / Application Verifier, so it MUST be built in this same CMake
-# build (same /MD runtime + MSVC STL as the DLL) for the std::string-by-value
-# ABI to match the DLL byte-for-byte. Built by default on Windows so CI ships
-# it next to the DLL.
-if(WIN32)
-    option(OBN_BUILD_STARTUP_SELFTEST
-        "Build the Windows startup_selftest.exe harness" ON)
-    if(OBN_BUILD_STARTUP_SELFTEST)
-        add_executable(startup_selftest tools/startup_selftest/startup_selftest.cpp)
-        # No special flags: inherit the project-wide /MD release runtime and
-        # MSVC STL so this exe's std::string layout matches the DLL exactly.
-        # Build it whenever the plugin builds so the artifact is always paired.
-        add_dependencies(startup_selftest bambu_networking)
-        # Instrument the harness too under OBN_ASAN so allocations it makes
-        # (the std::string/std::function args it hands the DLL) are tracked.
-        obn_apply_asan(startup_selftest)
-    endif()
 endif()
