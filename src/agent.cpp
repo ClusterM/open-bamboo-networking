@@ -264,19 +264,35 @@ int Agent::send_message_to_printer(const std::string& dev_id,
 
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
 {
-    BBL::OnLocalConnectedFn cb;
-    BBL::QueueOnMainFn      queue;
+    BBL::OnLocalConnectedFn   cb;
+    BBL::OnPrinterConnectedFn printer_cb;
+    BBL::QueueOnMainFn        queue;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        cb    = on_local_connect_;
-        queue = queue_on_main_;
+        cb         = on_local_connect_;
+        printer_cb = on_printer_connected_;
+        queue      = queue_on_main_;
     }
     OBN_DEBUG("notify_local_connected status=%d dev=%s msg=%s cb=%d queued=%d",
               status, dev_id.c_str(), msg.c_str(), cb ? 1 : 0, queue ? 1 : 0);
-    if (!cb) return;
-    auto invoke = [cb, status, dev_id, msg]() { cb(status, dev_id, msg); };
-    if (queue) queue(invoke);
-    else       invoke();
+    if (cb) {
+        auto invoke = [cb, status, dev_id, msg]() { cb(status, dev_id, msg); };
+        if (queue) queue(invoke);
+        else       invoke();
+    }
+
+    // A successful LAN CONNACK always arrives with an empty msg (disconnects
+    // carry "mqtt disconnect rc=..."). Mirror the stock plugin and fire
+    // on_printer_connected_fn as well: Studio's handler responds with
+    // command_get_access_code, and parsing that reply is the only path that
+    // persists "user_access_code" in BambuStudio.conf — which in turn is
+    // required by restore_local_machines_from_user_access_config() for the
+    // LAN auto-connect on the next startup.
+    if (status == BBL::ConnectStatusOk && msg.empty() && printer_cb) {
+        auto invoke = [printer_cb, dev_id]() { printer_cb(dev_id); };
+        if (queue) queue(invoke);
+        else       invoke();
+    }
 }
 
 namespace {
