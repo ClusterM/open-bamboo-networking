@@ -1477,13 +1477,42 @@ The printer firmware uses two coefficients for pressure advance compensation:
 
 Both coefficients are stored **on the printer**. Clients read, write, and select profiles via MQTT; the authoritative copy always lives in printer firmware storage.
 
-###### K-value storage model on the printer
+###### Two firmware generations
 
-The printer maintains a **profile table** keyed by `(filament_id, nozzle_id, nozzle_diameter)`. Each key can have **multiple custom profile slots**, identified by `cali_idx`. The default (factory) profile is **not** included in `extrusion_cali_get` responses.
+Everything in this family splits on one field: `cali_version` (`push_status` → `print.cali_version`; observed `0` on P2S). It defines two incompatible models:
 
-Each AMS tray has one **active** profile. Its `cali_idx` appears in `push_status` and is changed with `extrusion_cali_sel`.
+| | **Modern** (`cali_version >= 0`) | **Legacy** (`cali_version` absent) |
+|---|---|---|
+| Storage | Named profile table, multiple slots per `(filament_id, nozzle_id, nozzle_diameter)` key | One K/N value per tray, no table |
+| Per-tray PA fields in `push_status` | `cali_idx` only (absent on empty trays) | `k`, `n` |
+| Read active K/N | `extrusion_cali_get`, match entry by the tray's `cali_idx` | Read `k` / `n` directly from `push_status` |
+| Write | `extrusion_cali_set` batch shape (`filaments[]`) | `extrusion_cali_set` single-tray shape |
+| Activate | Separate `extrusion_cali_sel` step | No select step — writing **is** the activation |
+| Delete a profile | `extrusion_cali_del` | n/a |
 
-Response schema and a real capture: see **`extrusion_cali_get`** in Command reference below.
+The rest of this section describes the modern model unless marked otherwise; for legacy firmware the whole story is "write K/N with single-tray `extrusion_cali_set`, read them back from `push_status`".
+
+###### Storage model and reading the active profile (modern)
+
+The printer maintains a **profile table** keyed by `(filament_id, nozzle_id, nozzle_diameter)`. Each key can hold **multiple custom profile slots** identified by `cali_idx`. The default (factory) profile is not part of the table and is never returned by `extrusion_cali_get`.
+
+Each tray has one **active** profile; its `cali_idx` appears in the tray's `push_status` data and is changed with `extrusion_cali_sel`.
+
+To resolve the active profile's K/N for a tray:
+
+1. Take the tray's `cali_idx` from `push_status`.
+2. Send `extrusion_cali_get` for the tray's `(filament_id, nozzle_id, nozzle_diameter)`.
+3. Find the response entry whose `cali_idx` matches.
+4. **Match** → a custom profile is active; the entry carries its `name` and `k_value`.
+5. **No match** → the default profile is active. Its K/N are not exposed over MQTT; Bambu Studio falls back to hardcoded per-filament defaults (`CalibUtils.cpp:54-80`):
+
+| Filament | K | N |
+|----------|---|---|
+| TPU 95A (`GFU01`) | 0.25 | 1.0 |
+| TPU 90A (`GFU03`) | 0.35 | 1.0 |
+| TPU 85A (`GFU04`) | 0.65 | 1.0 |
+| PETG, PA, Support PLA (`GFG00`, `GFG01`, `GFS00`, …) | 0.04 | 1.0 |
+| Everything else (PLA, ABS, …) | 0.02 | 1.0 |
 
 AMS root-level fields in `push_status` (`print.ams`):
 
@@ -1499,13 +1528,10 @@ AMS root-level fields in `push_status` (`print.ams`):
 | `is_support_pa_calibration` | `fun` bit 7 / `home_flag` bit 16 / JSON `support_flow_calibration` (**naming error** — see §6.8.0) | Master gate for all `extrusion_cali_*` commands |
 | `m_calib.support_new_auto_calib` | `fun` bit 40 | Enables the multi-filament wizard path (batch `filaments[]` commands) |
 | `is_support_pa_mode` | `fun2` bit 3 | PA tuning mode toggle |
-| `cali_version` | `push_status` → `print.cali_version` | When present (`>= 0`), tray data in `push_status` carries only `cali_idx` — not `k`/`n`. Client must resolve K/N via `extrusion_cali_get` (see below). When absent, tray data may include `k` and `n` directly. |
 
 **Bambu Studio UI overrides** (hardcoded, ignoring firmware flags):
 - **P1P/P1S** (`series_p1p`, model_id C11/C12): PA calibration UI is hidden.
 - **H2D** (`series_o`): flow-ratio calibration UI is hidden (PA remains available).
-
-P2S (model_id N7) is classified as `series_x1` in Studio and is **not** affected by the P1P/P1S override.
 
 ###### Two data lifecycles — run output vs stored profiles
 
@@ -1513,47 +1539,6 @@ P2S (model_id N7) is classified as `series_x1` in Studio and is **not** affected
 |---------|--------------|---------|
 | **Run output** (ephemeral) | `extrusion_cali_get_result` | Fresh K/N from the calibration job that just finished. **Not yet committed** to printer storage — discarded on reboot unless saved via `extrusion_cali_set`. |
 | **Stored profiles** (persistent) | `extrusion_cali_get` | K/N profiles already saved on the printer for a `(filament_id, nozzle, …)` key. Multiple slots per key, indexed by `cali_idx`; one is active per tray (`extrusion_cali_sel`). |
-
-###### Reading the active PA profile for a tray
-
-Depends on `cali_version` (see Capability gates).
-
-**When `cali_version >= 0`** (observed on P2S with `cali_version: 0`):
-
-Each tray in `push_status` carries:
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `cali_idx` | int | Active profile index. Absent on empty trays. |
-
-Fields `k` and `n` are **not present** in tray data. To obtain K/N:
-
-1. Send `extrusion_cali_get` for the tray's `(filament_id, nozzle_id, nozzle_diameter)`.
-2. Find the entry whose `cali_idx` matches the tray's `cali_idx` from `push_status`.
-3. **Match found** → custom profile is active; entry has `name`, `k_value`, `n_coef`, `confidence`.
-4. **No match** → default (factory) profile is active; K/N are not available over MQTT (see hardcoded defaults below).
-
-**When `cali_version` is absent from `push_status`:**
-
-Tray data may additionally include:
-
-| Field | Type | Meaning |
-|-------|------|---------|
-| `k` | float | K-value the firmware is applying for this tray |
-| `n` | float | N-coefficient the firmware is applying |
-| `cali_idx` | int | Active profile index |
-
-Use `k` and `n` directly from `push_status` without querying `extrusion_cali_get`.
-
-**Default K/N when MQTT has no values** (Bambu Studio hardcoded fallbacks, `CalibUtils.cpp:54-80`):
-
-| Filament | K | N |
-|----------|---|---|
-| TPU 95A (`GFU01`) | 0.25 | 1.0 |
-| TPU 90A (`GFU03`) | 0.35 | 1.0 |
-| TPU 85A (`GFU04`) | 0.65 | 1.0 |
-| PETG, PA, Support PLA (`GFG00`, `GFG01`, `GFS00`, …) | 0.04 | 1.0 |
-| Everything else (PLA, ABS, …) | 0.02 | 1.0 |
 
 ###### End-to-end calibration workflows
 
@@ -1683,7 +1668,7 @@ Two request shapes:
 
 **`extrusion_cali_set`** — write K/N coefficients to printer storage
 
-*Legacy single-tray:*
+*Single-tray shape* (**legacy firmware**; also used by Studio when editing K without a profile table):
 
 ```json
 {
@@ -1700,13 +1685,14 @@ Two request shapes:
 }
 ```
 
-Notes on the legacy path:
-- `n_coef` is hard-coded to `1.4` regardless of the UI value.
-- `k_value` is sent as a JSON **number** (the batch path below sends it as a string).
-- `bed_temp`, `nozzle_temp`, and `max_volumetric_speed` are included **only when all three are `>= 0`**; otherwise all three are omitted.
+Notes on the single-tray shape:
+- `k_value` is the only user-controlled coefficient, sent as a JSON **number** (the batch shape sends strings). `n_coef` is hard-coded to `1.4` by Studio regardless of the UI value.
+- `bed_temp`, `nozzle_temp`, and `max_volumetric_speed` are included **only when all three are `>= 0`**; when the K value is edited from the AMS slot dialog they are omitted, leaving only `tray_id`, `k_value`, `n_coef`.
 - `setting_id` and `name` are not sent (commented out in the builder).
+- For the external spool use `tray_id` `255` (main) / `254` (deputy).
+- On legacy firmware there is no separate activation step — this write immediately becomes the tray's active K/N.
 
-*Batch save after wizard:*
+*Batch shape* (**modern firmware**; save after the calibration wizard):
 
 ```json
 {
@@ -1736,8 +1722,8 @@ Notes on the legacy path:
 }
 ```
 
-Notes on the batch path:
-- `k_value` and `n_coef` are sent as **strings** here (the legacy path sends `k_value` as a number).
+Notes on the batch shape:
+- `k_value` and `n_coef` are sent as **strings** here (the single-tray shape sends `k_value` as a number).
 - For auto-calibration saves `n_coef` carries the measured value; for manual saves it is `"0.0"`.
 - `cali_idx` is included only when `>= 0` (omit it to create a new slot; provide it to overwrite an existing one).
 - `nozzle_pos` / `nozzle_sn` are included only when a nozzle position is known.
@@ -1844,7 +1830,7 @@ When no run result exists, the printer returns a failure rather than an empty su
 }
 ```
 
-**`extrusion_cali_sel`** — set the active profile for a tray:
+**`extrusion_cali_sel`** — set the active profile for a tray (**modern firmware only**; on legacy firmware there is no profile table — write K/N via single-tray `extrusion_cali_set` instead):
 
 ```json
 {
@@ -1863,7 +1849,9 @@ When no run result exists, the printer returns a failure rather than an empty su
 }
 ```
 
-Send `cali_idx: -1` to select the default (factory) profile. After selection, the tray's `cali_idx` in `push_status` reflects the firmware's index for that profile (which may not match any custom profile returned by `extrusion_cali_get`).
+- `cali_idx: -1` selects the default (factory) profile. After selection, the tray's `cali_idx` in `push_status` reflects the firmware's index for that profile (which may not match any custom profile returned by `extrusion_cali_get`).
+- For the external spool: `ams_id` = `255` (main) / `254` (deputy), `slot_id` = `0`, and `tray_id` = the same reserved value (`255` / `254`, **not** `ams_id * 4 + slot_id`). The rest of the frame is unchanged.
+- `nozzle_pos` / `nozzle_sn` are included only when a nozzle position is known.
 
 **Response:** echoes `tray_id`, `ams_id`, `slot_id`, `cali_idx`.
 
@@ -1965,7 +1953,11 @@ Unload:
 }
 ```
 
-`tray_color` is RGBA hex without `#`. For virtual trays (`ams_id` 255/254), `tray_id` is set to `254` (`VIRTUAL_TRAY_DEPUTY_ID`).
+`tray_color` is RGBA hex without `#`.
+
+**`tray_id` semantics in this command differ from the calibration commands:**
+- For AMS trays, `tray_id` = `slot_id` (0–3), **not** the flat `ams_id * 4 + slot_id`.
+- For the external spool, `tray_id` is hardcoded to `254` (`VIRTUAL_TRAY_DEPUTY_ID`) for **both** the main (`ams_id` 255) and deputy (`ams_id` 254) spools — even `ams_id: 255` is sent with `tray_id: 254`. The actual addressing is carried by `ams_id`. Contrast with `extrusion_cali_sel`, where the external spool's `tray_id` is the real reserved id (255 main / 254 deputy).
 
 **Response:** echoes `ams_id`, `tray_id`, `tray_color`, `nozzle_temp_min`, `nozzle_temp_max`, `tray_info_idx`, `tray_type`. Studio updates its local AMS model from the ack (`DeviceManager.cpp:3459-3510`).
 
@@ -2138,7 +2130,7 @@ When `print.cali_version` is absent (legacy firmware):
 | `k` | Current PA K-value |
 | `n` | Current PA N-coefficient |
 
-See §6.8.4 "Reading the active PA profile for a tray" for how to resolve K/N from these fields.
+See §6.8.4 "Storage model and reading the active profile" for how to resolve K/N from these fields.
 
 **`ams_filament_drying`** — start or stop AMS drying (`DevFilaSystemCtrl.cpp`)
 
