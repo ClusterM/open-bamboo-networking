@@ -64,15 +64,6 @@ private:
     std::string report_topic_() const;
     std::string request_topic_() const;
 
-    // Creates a fresh client_ and wires all three callbacks. Called from
-    // start() and from reconnect_loop() before each reconnect attempt.
-    // Throws std::runtime_error if mosquitto_new fails.
-    void setup_client();
-
-    // Background thread: waits for on_disconnect to fire with rc!=0, then
-    // retries connect() with exponential backoff {1,2,5,10,30,30} seconds.
-    void reconnect_loop();
-
     std::string dev_id_;
     std::string dev_ip_;
     std::string username_;
@@ -80,23 +71,9 @@ private:
     bool        use_ssl_;
     std::string ca_file_;
 
-    // Guarded by client_mu_. Shared so callers can snapshot and release the
-    // lock before invoking methods — preventing a race with reconnect_loop
-    // destroying the old handle while a publish is in flight.
-    mutable std::mutex            client_mu_;
-    std::shared_ptr<mqtt::Client> client_;
+    std::unique_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
-
-    // Saved at start() time; reused verbatim by every reconnect attempt.
-    mqtt::ConnectConfig connect_cfg_;
-
-    std::atomic<bool>       stopped_{false};
-    std::atomic<bool>       reconnect_wanted_{false};
-    std::atomic<int>        reconnect_attempt_{0};
-    std::mutex              reconnect_mu_;
-    std::condition_variable reconnect_cv_;
-    std::thread             reconnect_thread_;
 };
 
 // The Agent object is created per Studio call to bambu_network_create_agent().
