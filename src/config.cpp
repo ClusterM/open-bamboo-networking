@@ -91,7 +91,6 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);
     else if (key == "slicer_key_pem")               out.slicer_key_pem = val;
     else if (key == "slicer_cert_id")              out.slicer_cert_id = val;
-    else if (key == "session_path")                out.session_path = val;
     else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
     else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
     else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;

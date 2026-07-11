@@ -60,10 +60,6 @@ struct Settings {
     std::string slicer_key_pem;
     std::string slicer_cert_id;
 
-    // Cloud login session persistence file.
-    // Empty = config_dir/session.json
-    std::string session_path;
-
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
     std::string bambusource_log_stderr;
