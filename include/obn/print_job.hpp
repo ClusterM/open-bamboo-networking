@@ -21,14 +21,6 @@ namespace obn::print_job {
 // Slicer wrote a plate_0 file.
 std::string to_print_basename(std::string fname);
 
-// Rewrite a 3MF ZIP archive in-place: rename Metadata/plate_0.* entries
-// to Metadata/plate_1.*, patch model_settings.config path references,
-// and bump plater_id "0"→"1". No-op when the archive already contains
-// plate_1.gcode or lacks plate_0.gcode (BBS-style spools pass through
-// unchanged). Returns false only on I/O or ZIP errors — the caller
-// should treat false as fatal and refuse the print.
-bool normalise_to_plate_one(const std::string& threemf_path);
-
 // Computes the printer-side filename we upload and later reference in
 // the project_file MQTT payload. Uses project_name/task_name when
 // possible and falls back to the basename of params.filename.
