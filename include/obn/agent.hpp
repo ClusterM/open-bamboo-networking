@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -351,15 +350,6 @@ public:
     // Studio's load_user_preset().
     std::string cloud_user_id() const;
 
-    // Returns the dev_type stored by the most recent cache_ssdp_json_for_bind()
-    // call for this dev_id, or "" if unseen. Used by agent_test to verify model
-    // tracking without requiring an active MQTT session.
-    std::string test_model_for(const std::string& dev_id) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = dev_model_by_id_.find(dev_id);
-        return it != dev_model_by_id_.end() ? it->second : std::string{};
-    }
-
 private:
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -445,10 +435,6 @@ private:
     // connect_printer() stores the MQTT/FTPS password (access code) here so
     // bambu_network_bind can POST it to the cloud as bind_code.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
-
-    // dev_id → dev_type string populated from SSDP; used to detect multi-nozzle
-    // printers for nozzleId inversion before MQTT signing.
-    std::unordered_map<std::string, std::string> dev_model_by_id_;
 
     // Buffer populated by bambu_network_get_setting_list2 and drained
     // by bambu_network_get_user_presets. See preset_cache_* above.

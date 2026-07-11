@@ -1,5 +1,5 @@
-// Tests for agent.cpp — covers SSDP model-tracking, bind-detect lookup,
-// firmware JSON rendering, and synthetic subtask id minting.
+// Tests for agent.cpp — covers SSDP bind-detect lookup, firmware JSON
+// rendering, and synthetic subtask id minting.
 // All tests run entirely in-process with no network connections.
 
 #include "obn/agent.hpp"
@@ -50,52 +50,6 @@ static std::string run_local_msg(obn::Agent& a,
     a.notify_local_message(dev_id, json);
     a.set_on_local_message_fn(nullptr);
     return out;
-}
-
-// ---------------------------------------------------------------------------
-// SSDP model-tracking (our change to cache_ssdp_json_for_bind)
-// ---------------------------------------------------------------------------
-
-static void test_ssdp_caches_model()
-{
-    obn::Agent a(".");
-    a.cache_ssdp_json_for_bind(ssdp_alive("192.168.1.10", "DEV001", "3DPrinter-H2D-AMS2"));
-    CHECK(a.test_model_for("DEV001") == "3DPrinter-H2D-AMS2");
-}
-
-static void test_ssdp_empty_dev_type_not_stored()
-{
-    obn::Agent a(".");
-    // JSON without dev_type field.
-    a.cache_ssdp_json_for_bind(R"({"dev_ip":"192.168.1.11","dev_id":"DEV002"})");
-    CHECK(a.test_model_for("DEV002") == "");
-}
-
-static void test_ssdp_empty_dev_id_not_stored()
-{
-    obn::Agent a(".");
-    // JSON without dev_id field.
-    a.cache_ssdp_json_for_bind(R"({"dev_ip":"192.168.1.12","dev_type":"3DPrinter-P2S"})");
-    // Nothing should be stored under any key.
-    CHECK(a.test_model_for("") == "");
-    CHECK(a.test_model_for("3DPrinter-P2S") == "");
-}
-
-static void test_ssdp_missing_dev_ip_is_noop()
-{
-    obn::Agent a(".");
-    // JSON without dev_ip: cache_ssdp_json_for_bind returns early.
-    a.cache_ssdp_json_for_bind(R"({"dev_id":"DEV003","dev_type":"3DPrinter-A1"})");
-    CHECK(a.test_model_for("DEV003") == "");
-}
-
-static void test_ssdp_later_packet_overwrites_model()
-{
-    obn::Agent a(".");
-    a.cache_ssdp_json_for_bind(ssdp_alive("192.168.1.13", "DEV004", "3DPrinter-P2S"));
-    CHECK(a.test_model_for("DEV004") == "3DPrinter-P2S");
-    a.cache_ssdp_json_for_bind(ssdp_alive("192.168.1.13", "DEV004", "3DPrinter-H2D"));
-    CHECK(a.test_model_for("DEV004") == "3DPrinter-H2D");
 }
 
 // ---------------------------------------------------------------------------
@@ -325,13 +279,6 @@ static void test_synthetic_subtask_id_varies_with_timestamp()
 
 int main()
 {
-    // SSDP model tracking.
-    test_ssdp_caches_model();
-    test_ssdp_empty_dev_type_not_stored();
-    test_ssdp_empty_dev_id_not_stored();
-    test_ssdp_missing_dev_ip_is_noop();
-    test_ssdp_later_packet_overwrites_model();
-
     // Bind-detect lookup.
     test_lookup_bind_detect_success();
     test_lookup_bind_detect_timeout_when_no_cache();

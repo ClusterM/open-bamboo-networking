@@ -158,65 +158,6 @@ bool is_print_payload(const std::string& payload) noexcept
     return true;
 }
 
-// Returns true when `model` identifies an H2D-family printer.
-// Matches model codes H2D, O1D, and C16 case-insensitively.
-bool is_h2d_printer(const std::string& model) noexcept
-{
-    if (model.empty()) return false;
-    auto ci_has = [&](const char* tok, std::size_t tlen) noexcept {
-        for (std::size_t i = 0; i + tlen <= model.size(); ++i) {
-            bool ok = true;
-            for (std::size_t j = 0; j < tlen && ok; ++j) {
-                char a = model[i + j], b = tok[j];
-                if (a >= 'a' && a <= 'z') a = static_cast<char>(a - 32);
-                if (b >= 'a' && b <= 'z') b = static_cast<char>(b - 32);
-                ok = (a == b);
-            }
-            if (ok) return true;
-        }
-        return false;
-    };
-    return ci_has("H2D", 3) || ci_has("O1D", 3) || ci_has("C16", 3);
-}
-
-// Flips nozzleId values 0↔1 within the ams_mapping_info array region.
-// Only touches the array substring to avoid false positives elsewhere.
-std::string flip_nozzle_ids(std::string json) noexcept
-{
-    const auto region_start = json.find("\"ams_mapping_info\":[");
-    if (region_start == std::string::npos) return json;
-    const auto arr_pos = json.find('[', region_start);
-    if (arr_pos == std::string::npos) return json;
-
-    // Walk brackets to find the matching ']'.
-    int depth = 0;
-    std::size_t arr_end = std::string::npos;
-    for (std::size_t i = arr_pos; i < json.size(); ++i) {
-        if      (json[i] == '[') ++depth;
-        else if (json[i] == ']') { if (--depth == 0) { arr_end = i; break; } }
-    }
-    if (arr_end == std::string::npos) return json;
-
-    // Three-step 0↔1 swap to avoid chain-replacement bugs.
-    // Step 1: :0 → :2 (temp marker, never appears in the original)
-    // Step 2: :1 → :0
-    // Step 3: :2 → :1
-    std::string sub = json.substr(arr_pos, arr_end - arr_pos + 1);
-    struct Step { const char* from; char to; };
-    for (auto [from, to] : {Step{"\"nozzleId\":0", '2'},
-                             Step{"\"nozzleId\":1", '0'},
-                             Step{"\"nozzleId\":2", '1'}}) {
-        const std::size_t flen = std::char_traits<char>::length(from);
-        std::size_t pos = 0;
-        while ((pos = sub.find(from, pos)) != std::string::npos) {
-            sub[pos + flen - 1] = to;
-            pos += flen;
-        }
-    }
-    json.replace(arr_pos, arr_end - arr_pos + 1, sub);
-    return json;
-}
-
 // Builds the to_sign string: {"print":{...sorted keys...}}
 // Uses json_lite, whose Object type is std::map, so parse+dump already sorts.
 std::string build_to_sign(const std::string& payload)
@@ -268,21 +209,14 @@ std::string build_envelope(const std::string& to_sign,
 
 } // namespace
 
-std::string maybe_sign(const std::string& payload_json,
-                       const std::string& printer_model)
+std::string maybe_sign(const std::string& payload_json)
 {
     if (!is_print_payload(payload_json)) return payload_json;
 
     EVP_PKEY* pkey = slicer_pkey();
     if (!pkey) return payload_json;
 
-    // Apply H2D nozzleId flip before signing so the signature covers
-    // the on-wire shape the printer will receive.
-    std::string working = printer_model.empty() || !is_h2d_printer(printer_model)
-                          ? payload_json
-                          : flip_nozzle_ids(payload_json);
-
-    const std::string to_sign = build_to_sign(working);
+    const std::string to_sign = build_to_sign(payload_json);
     if (to_sign.empty()) return payload_json; // malformed; pass through
 
     // Extract the sorted print dump from to_sign to avoid re-parsing.
