@@ -76,7 +76,10 @@ void Agent::schedule_deferred_disconnect()
                 std::lock_guard<std::mutex> mlk(mu_);
                 session = std::move(lan_session_);
             }
-            if (session) session->disconnect();
+            if (session) {
+                session->disconnect();
+                cert_store::forget_printer(session->dev_id());
+            }
         });
     } catch (const std::system_error& e) {
         OBN_WARN("schedule_deferred_disconnect: thread creation failed (%s), "
@@ -90,7 +93,10 @@ void Agent::schedule_deferred_disconnect()
             std::lock_guard<std::mutex> mlk(mu_);
             session = std::move(lan_session_);
         }
-        if (session) session->disconnect();
+        if (session) {
+            session->disconnect();
+            cert_store::forget_printer(session->dev_id());
+        }
     }
 }
 
@@ -238,7 +244,11 @@ int Agent::disconnect_printer()
         std::lock_guard<std::mutex> lk(mu_);
         session = std::move(lan_session_);
     }
-    if (session) session->disconnect();
+    if (session) {
+        session->disconnect();
+        // Release the cached RSA pubkey; it is re-learned on reconnect.
+        cert_store::forget_printer(session->dev_id());
+    }
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -606,8 +616,38 @@ bool try_rewrite_print_ids(std::string& payload,
 // and the notify_local_message caller bind to the same symbol.
 static void update_fw_state(Agent::DeviceFw* dev, const std::string& payload);
 
+void Agent::harvest_security_report(const std::string& dev_id,
+                                    const std::string& json)
+{
+    // Prefilter: security frames are rare, report frames arrive ~1 Hz.
+    if (json.find("app_cert_install") == std::string::npos) return;
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+    const auto& sec = root->find("security");
+    if (!sec.is_object()) return;
+    if (sec.find("command").as_string() != "app_cert_install") return;
+
+    const std::string result = sec.find("result").as_string();
+    const std::string printer_cert = sec.find("printer_cert").as_string();
+    if (result != "SUCCESS" || printer_cert.empty()) {
+        OBN_WARN("app_cert_install dev=%s: result=%s printer_cert=%s",
+                 dev_id.c_str(),
+                 result.empty() ? "<none>" : result.c_str(),
+                 printer_cert.empty() ? "absent" : "present");
+        return;
+    }
+    if (cert_store::set_printer_pub_key_from_cert_pem(dev_id, printer_cert)) {
+        OBN_INFO("app_cert_install dev=%s: device certificate installed, "
+                 "pubkey cached", dev_id.c_str());
+    }
+}
+
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
+    harvest_security_report(dev_id, json);
+
     BBL::OnMessageFn cb;
     std::string connect_ip;
     {
@@ -1289,6 +1329,40 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     }).detach();
 }
 
+bool Agent::request_app_cert_install(const std::string& dev_id, bool via_lan)
+{
+    const std::string app_cert = obn::signing::slicer_cert_pem();
+    if (app_cert.empty()) {
+        OBN_INFO("app_cert_install dev=%s: no slicer_cert.pem in config dir, "
+                 "skipping (TLS-leaf TOFU fallback stays in effect)",
+                 dev_id.c_str());
+        return false;
+    }
+    const std::string crl = obn::signing::slicer_crl_pem();
+
+    // Shape per reverse-networking "5. MQTT.md". The printer stores the app
+    // cert chain + CRL and replies on the report topic with its own device
+    // certificate in `printer_cert` (picked up by harvest_security_report).
+    std::string msg;
+    msg.reserve(app_cert.size() + crl.size() + 128);
+    msg += R"({"security":{"sequence_id":"0","command":"app_cert_install","app_cert":)";
+    msg += obn::json::escape(app_cert);
+    msg += ",\"crl\":[";
+    if (!crl.empty()) msg += obn::json::escape(crl);
+    msg += "]}}";
+
+    int rc = via_lan ? send_message_to_printer(dev_id, msg, /*qos=*/0)
+                     : cloud_send_message(dev_id, msg, /*qos=*/0);
+    if (rc != BAMBU_NETWORK_SUCCESS) {
+        OBN_WARN("app_cert_install dev=%s: publish failed rc=%d (via_lan=%d)",
+                 dev_id.c_str(), rc, via_lan ? 1 : 0);
+        return false;
+    }
+    OBN_INFO("app_cert_install dev=%s: request published (via_lan=%d)",
+             dev_id.c_str(), via_lan ? 1 : 0);
+    return true;
+}
+
 #define OBN_SETTER(method, field, type)                 \
     void Agent::method(type fn)                         \
     {                                                   \
@@ -1692,6 +1766,8 @@ int Agent::connect_cloud()
     auto on_msg_cb = [this, on_msg, on_printer_connected]
         (std::string dev_id, std::string json)
     {
+        harvest_security_report(dev_id, json);
+
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
         // notification so Studio moves the device from "subscribing"
@@ -1732,12 +1808,15 @@ int Agent::connect_cloud()
 int Agent::disconnect_cloud()
 {
     std::unique_ptr<CloudSession> sess;
+    std::set<std::string> devs;
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = std::move(cloud_session_);
-        cloud_connected_devs_.clear();
+        devs.swap(cloud_connected_devs_);
     }
     if (sess) sess->stop();
+    // Release cached RSA pubkeys learned during this cloud session.
+    for (const auto& d : devs) cert_store::forget_printer(d);
     return BAMBU_NETWORK_SUCCESS;
 }
 

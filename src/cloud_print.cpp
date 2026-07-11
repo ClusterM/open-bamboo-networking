@@ -924,10 +924,30 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // this the firmware rejects the command with "mqtt message verify failed".
     std::string mqtt_json;
     {
-        // Obtain the printer's RSA public key: prefer the in-memory cache
-        // (populated by install_device_cert / capture_peer_cert_pem), fall
-        // back to reading the PEM from disk if the cache is empty.
+        // Obtain the printer's RSA public key. Preference order:
+        //   1. In-memory cache — authoritative when populated by the
+        //      app_cert_install response (harvest_security_report), or a
+        //      prior TLS-leaf capture.
+        //   2. Fresh app_cert_install request over MQTT — the documented
+        //      flow; works for cloud/proxy transports where the TLS peer
+        //      is not the printer.
+        //   3. TLS-leaf PEM snapshot on disk (LAN-direct TOFU fallback).
         EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+        if (!printer_pk &&
+            request_app_cert_install(p.dev_id, use_lan_channel)) {
+            // The printer answers on the report topic; harvest_security_report
+            // fills the cache from the MQTT network thread. Poll briefly.
+            for (int i = 0; i < 20 && !printer_pk; ++i) {
+                if (cancel_fn && cancel_fn()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+            }
+            if (!printer_pk) {
+                OBN_WARN("cloud_print: no app_cert_install response for dev=%s "
+                         "within 5s; falling back to TLS-leaf snapshot",
+                         p.dev_id.c_str());
+            }
+        }
         if (!printer_pk) {
             std::string pem_path = cert_store::device_cert_path(config_dir(), p.dev_id);
             printer_pk = load_printer_pub_key_from_pem(pem_path);

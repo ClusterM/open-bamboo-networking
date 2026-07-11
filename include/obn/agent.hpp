@@ -136,6 +136,15 @@ public:
     // printer's self-signed server certificate into <config_dir>/certs/.
     void install_device_cert(const std::string& dev_id, bool lan_only);
 
+    // Publishes the security.app_cert_install MQTT command (see
+    // reverse-networking "Authorization Control/5. MQTT.md"): sends the
+    // slicer/app certificate chain + CRL (config_dir/slicer_cert.pem,
+    // slicer_crl.pem) to the printer. The printer's success report carries
+    // `printer_cert` — the authoritative device certificate — which
+    // harvest_security_report() feeds into the cert_store pubkey cache.
+    // Returns false when the app cert PEM is missing or publish fails.
+    bool request_app_cert_install(const std::string& dev_id, bool via_lan);
+
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
     // printers send NOTIFY every 5 s on UDP port 2021. Returns true if the
     // listener is running after the call.
@@ -351,6 +360,13 @@ public:
     std::string cloud_user_id() const;
 
 private:
+    // Scans an incoming MQTT report frame (LAN or cloud) for a
+    // security.app_cert_install success response and installs the returned
+    // printer_cert into the cert_store pubkey cache. Cheap substring
+    // prefilter; full JSON parse only on candidate frames.
+    void harvest_security_report(const std::string& dev_id,
+                                 const std::string& json);
+
     mutable std::mutex mu_;
     std::string        log_dir_;
     std::string        config_dir_;

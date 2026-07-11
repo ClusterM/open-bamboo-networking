@@ -28,4 +28,13 @@ std::string base64_encode(const unsigned char* data, std::size_t len);
 // Returns empty string if neither is configured.
 const std::string& slicer_cert_id();
 
+// PEM chain of the slicer (app) certificate matching slicer_key.pem, read
+// from config_dir/slicer_cert.pem. Sent to the printer in the
+// security.app_cert_install MQTT command. "" when the file is absent.
+std::string slicer_cert_pem();
+
+// PEM CRL entry accompanying the app certificate, read from
+// config_dir/slicer_crl.pem. "" when the file is absent.
+std::string slicer_crl_pem();
+
 } // namespace obn::signing

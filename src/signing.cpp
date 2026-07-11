@@ -59,6 +59,23 @@ static std::string load_cert_id_from_file()
     return s;
 }
 
+// Reads a whole file from config_dir into a string. "" on any failure.
+static std::string read_config_file(const char* basename)
+{
+    const auto& dir = obn::config::dir();
+    if (dir.empty()) return {};
+    std::string path = dir + "/" + basename;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::string out;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    std::fclose(f);
+    return out;
+}
+
 } // namespace
 
 // cert_id identifies the slicer's registered signing certificate on Bambu's
@@ -74,6 +91,16 @@ const std::string& slicer_cert_id()
         return "";
     }();
     return id;
+}
+
+std::string slicer_cert_pem()
+{
+    return read_config_file("slicer_cert.pem");
+}
+
+std::string slicer_crl_pem()
+{
+    return read_config_file("slicer_crl.pem");
 }
 
 namespace {
