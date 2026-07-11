@@ -205,12 +205,10 @@ int Agent::connect_printer(std::string dev_id,
         });
 
     if (rc == BAMBU_NETWORK_SUCCESS) {
-        std::string dev_ip_snap   = session->dev_ip();
         std::string password_snap = session->password();
         {
             std::lock_guard<std::mutex> lk(mu_);
             lan_access_code_by_dev_[sess_dev_id] = password_snap;
-            lan_ip_by_dev_[sess_dev_id]          = dev_ip_snap;
             lan_session_                         = std::move(session);
         }
     }

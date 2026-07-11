@@ -71,9 +71,6 @@ void      set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey);
 bool      set_printer_pub_key_from_cert_pem(const std::string& dev_id,
                                             const std::string& cert_pem);
 
-// Returns true iff a key for dev_id is cached.
-bool      has_printer_pub_key(const std::string& dev_id);
-
 // Removes and releases the cached key for dev_id. No-op if absent.
 void      forget_printer(const std::string& dev_id);
 

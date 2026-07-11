@@ -468,7 +468,6 @@ private:
     // connect_printer() stores the MQTT/FTPS password (access code) here so
     // bambu_network_bind can POST it to the cloud as bind_code.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
-    std::unordered_map<std::string, std::string> lan_ip_by_dev_;
 
     // dev_id → dev_type string populated from SSDP; used to detect multi-nozzle
     // printers for nozzleId inversion before MQTT signing.
