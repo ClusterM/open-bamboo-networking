@@ -69,7 +69,8 @@ static void test_ft_wire_helpers()
         obn::tunnel_local::build_media_ability_abi(3);
     CHECK(abi.find("\"cmdtype\":7") != std::string::npos);
     CHECK(abi.find("\"peer\":\"studio\"") != std::string::npos);
-    CHECK(abi.find("\"api_version\":2") != std::string::npos);
+    CHECK(abi.find("\"api_version\":3") != std::string::npos);
+    CHECK(abi.find("\"peer_t\":3") != std::string::npos);
 
     const std::string upload = obn::tunnel_local::build_file_upload_abi(
         4, "sdcard", "test.gcode.3mf", 12345, "ABCD");

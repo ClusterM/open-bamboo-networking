@@ -205,9 +205,15 @@ std::string build_media_ability_abi(std::uint32_t sequence)
 {
     // Match PrinterFileSystem::RequestMediaAbility (peer + api_version).
     // Empty req{} yields firmware result=2 (kResErrJson) on P2S.
+    // The genuine upload-lane query is {api_version:3, peer:"studio",
+    // peer_t:3}; older builds sent api_version 2 with no peer_t and P2S
+    // firmware is lenient about it, but we mirror the genuine frame.
+    // TODO(verify-on-hardware): confirm the ability reply still parses
+    // across firmware generations after the api_version bump.
     obn::json::Object req;
     req["peer"]        = obn::json::Value("studio");
-    req["api_version"] = obn::json::Value(2.0);
+    req["peer_t"]      = obn::json::Value(3.0);
+    req["api_version"] = obn::json::Value(3.0);
 
     obn::json::Object root;
     root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdMediaAbility));
