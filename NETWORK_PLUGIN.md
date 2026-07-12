@@ -1324,7 +1324,35 @@ The print-job submission ends with a single MQTT command published to the printe
 | `nozzle_offset_cali` | int | `auto_offset_cali` (**name mismatch is intentional in upstream**) | Nozzle-offset calibration option (0 = off, 2 = auto). |
 | `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it is omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01`. |
 | `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. Cross-ABI confirmation: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"`; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — a future capture showing e.g. `"1"`, `"2"` or `"5"` would identify another flag's meaning. |
-| `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**: setting `auto_flow_cali=1` flips `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+| `extrude_cali_flag` | int | derived from `auto_flow_cali` | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`** and is a **multi-valued enum, not a bool**: `0` = off, `1` = requested, and `2` (= auto) has been observed in genuine traffic ([issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)); further values may exist. OBN passes the int through verbatim, so no code change is needed. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+
+##### Cloud-start extras in `project_file` (verify on stock firmware)
+
+The **cloud** variant of `project_file` (job started through `/my/task`, not LAN) carries extra fields beyond the table above, per genuine captures cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48):
+
+- `job_id` — **int** (unlike `task_id`/`subtask_id`, which are strings), echoing the id minted by `POST /v1/user-service/my/task`;
+- `job_type: 1` — constant in observed cloud starts;
+- `design_id` — the MakerWorld design id when the print originates from a downloaded model (`0`/absent otherwise);
+- a trailing `"reason":"success","result":"success"` pair — present in the *published command* itself in some captures (not only in the printer's ack echo).
+
+OBN's cloud `project_file` builder does not emit these yet; they are documented as a **possible cloud-start gap** — whether stock firmware requires them (or silently tolerates their absence) still needs verification on hardware.
+
+##### `/my/task` body: `amsDetailMapping[]` element schema
+
+Besides `amsMapping`/`amsMapping2` (see the `ams_mapping2` row above for the camelCase/sentinel caveat), the cloud `POST /v1/user-service/my/task` body carries a **per-filament detail array** `amsDetailMapping[]` with elements of the shape ([issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)):
+
+```json
+{
+  "ams":          0,
+  "filamentId":   "GFA00",
+  "filamentType": "PLA",
+  "nozzleId":     0,
+  "sourceColor":  "#FFFFFFFF",
+  "targetColor":  "#FFFFFFFF"
+}
+```
+
+Colors are **RGBA hex strings with a leading `#`** (8 hex digits). Studio hands the plugin the source data via `PrintParams::ams_mapping_info`; the stock plugin re-serializes it into this schema for the task body.
 
 ##### URL schemes for model location (`file` / `url`)
 
@@ -1333,6 +1361,7 @@ The MQTT command is always `project_file`; there is **no** separate `storage: em
 | URL prefix | Example | Firmware behaviour (inferred) |
 |---|---|---|
 | `ftp://` | `ftp://skadis_spool-Body.gcode.3mf` | **Legacy LAN print.** Observed on classic `start_local_print` / cloud `_with_record` FTPS legs on N7-class hardware in older captures. P2S Send-to-Printer print-start in recent stock traffic uses `brtc://emmc/` instead (see row above). Current open-plugin behaviour per entry point: [STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation). |
+| `ftp:///` (three slashes) | `ftp:///skadis_spool-Body.gcode.3mf` | **Offline / pre-pushed variant of the row above, not a defect.** Genuine traffic shows both spellings and they are **scenario-dependent**: two slashes when the plugin has just FTPS-uploaded the file, three slashes (empty authority = "local", absolute path) when the file was pushed to the printer earlier and the job starts offline against the already-present copy. Firmware accepts both. Cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48). |
 | `brtc://emmc/` | `brtc://emmc/skadis_spool-Body.gcode.3mf` | **Send-to-Printer model-cache lookup.** Despite the `emmc` token in the scheme, resolution mirrors the dual-volume upload path in §6.14.2: the firmware searches the **external (udisk) model cache first**, then the **internal (emmc) cache** — first hit wins, external has priority. No absolute path is required; only the filename after the prefix matters. |
 | `file://` | `file:///media/usb0/cache/skadis_spool-Body.gcode.3mf` | **Explicit filesystem path.** No cache heuristics — open exactly that file. Typical for **Print from Device** when the `.3mf` is already on storage. Paths observed under `/media/usb0/` with or without a `/cache/` segment (e.g. `file:///media/usb0/skadis_spool-Body.gcode.3mf`). |
 | `https://` | presigned object URL | **Cloud print.** Printer downloads from Bambu object storage; unrelated to local emmc/udisk caches. |
@@ -1667,7 +1696,7 @@ When Studio submits a print job via `project_file` (§6.8.2), two fields control
 
 | Wire field | `PrintParams` source | Meaning |
 |------------|---------------------|---------|
-| `extrude_cali_flag` | `auto_flow_cali` (0 or 1) | Tells firmware whether to run PA calibration before printing. `1` = requested, `0` = skip. |
+| `extrude_cali_flag` | `auto_flow_cali` (enum, passed verbatim) | Tells firmware whether/how to run PA calibration before printing. `0` = skip, `1` = requested, `2` = auto (observed in genuine traffic, [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)); not a plain bool. |
 | `extrude_cali_manual_mode` | `extruder_cali_manual_mode` (0 = auto, 1 = manual, -1 = omit) | If PA cali is requested, which mode to use. Omitted entirely when the value is `-1` (default sentinel). |
 
 The firmware uses the **active profile** (selected via `extrusion_cali_sel`) for the tray's `(filament_id, nozzle)` combination. If `extrude_cali_flag=1`, the printer may re-run calibration before printing rather than using the stored profile.
