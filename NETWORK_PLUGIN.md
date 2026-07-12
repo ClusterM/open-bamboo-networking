@@ -1313,7 +1313,7 @@ The print-job submission ends with a single MQTT command published to the printe
 | `project_id`, `profile_id`, `task_id`, `subtask_id` | strings | cloud task IDs from `POST /v1/user-service/my/task` (cloud) or `"0"` placeholder (LAN / Developer Mode) | Sent as **strings**, not numbers. |
 | `subtask_name` | string | `project_name` (falls back to `task_name`) | Shown on the printer screen. |
 | `file` | string | `opts.file_path` | Basename or path of the `.3mf` on the printer side. Usually mirrors the trailing segment of `url` (without the scheme). See **URL schemes** below. |
-| `url` / `url_enc` | string | `opts.url` | Tells firmware **how to locate** the `.3mf`. Cleartext `url` uses one of several schemes (`ftp://`, `brtc://emmc/`, `file://`, presigned `https://…` for cloud); `url_enc` is the same URL encrypted (AES + RSA-OAEP). Non-Developer-Mode firmware requires `url_enc`; Developer Mode accepts plain `url`. Full scheme semantics: see **URL schemes** below. |
+| `url` / `url_enc` | string | `opts.url` | Tells firmware **how to locate** the `.3mf`. Cleartext `url` uses one of several schemes (`ftp://`, `brtc://emmc/`, `file://`, presigned `https://…` for cloud); `url_enc` is the same URL RSA-encrypted with the **printer's device-cert public key** using **PKCS#1 v1.5** padding (direct RSA, no AES session-key wrap — the observed ≤~245-byte ciphertext equals the RSA-2048 PKCS#1 v1.5 ceiling of `256−11=245` and rules out OAEP-SHA1, which would cap at 214; independently cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47), on-wire confirmation of the padding still pending). Non-Developer-Mode firmware requires `url_enc`; Developer Mode accepts plain `url`. Full scheme semantics: see **URL schemes** below. |
 | `md5` | string | `opts.md5` (uppercase hex) | Printer cross-checks the 3mf integrity before slicing it. |
 | `bed_type` | string | `task_bed_type` (defaults to `"auto"`) | One of the `MachineBedTypeString` values. |
 | `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams` | bool | matching `task_*` flags | Per-print toggles from the `SelectMachineDialog` checkboxes. |
@@ -1356,7 +1356,60 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 }
 ```
 
-`cert_id` identifies the device certificate used for signing (its Subject DN includes `CN=<dev_id>.bambulab.com`); `payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 signature of that exact payload computed with the per-install private key shipped inside the stock plugin's obfuscated blob; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error `84033543`). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+`payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact payload; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+
+**`cert_id` is a cloud-issued, _shared_ application certificate — not a per-install _device_ certificate** (correction cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) against a symbol-bearing `libbambu_networking.so`, a live VMProtect memory dump, and decrypted secured-printer captures). The example above, `a4e8faaa…CN=GLOF3813734089.bambulab.com`, is the **app** cert (subject/issuer under `GLOF{…}.bambulab.com`), *not* a device CN. Two distinct keys are in play, and they must not be confused:
+
+- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **fetched at runtime and shared across installs**, not statically extracted per-install: it comes from the cloud cert endpoint `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3), which returns the cert chain, the CRL, and the AES-256-encrypted private key. Only a small `bootstrap_secret` is hardcoded in the stock plugin; everything else is a cloud request after login. `cert_id` is derived from the returned cert (issuer + serial), so it need not be stored separately.
+- **Device-cert public key → encrypts.** The printer's device-certificate public key is used **only** for field encryption (`url_enc` / `param_enc`), never for signing.
+
+**HTTP half of command-security** (same app key, on secured-printer REST writes such as `POST /my/task`): the plugin adds `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` (a raw PKCS#1 v1.5 signature over the current time in milliseconds — the server recovers the timestamp and checks recency for replay protection) and `x-bbl-app-certification-id = issuer + ":" + serial.lower()`. Note this is a **different serialization** from the MQTT `cert_id` (which concatenates serial + issuer without a separator).
+
+**Provisioning surface (`security` MQTT namespace, wire-unconfirmed).** `app_cert_install` (`app_cert`, `crl`) / `app_cert_list` install and enumerate the app cert on the printer; this is the recovery path behind a `…545` rejection. Whether the `install_device_cert` ABI export maps to this provisioning flow or to a TLS-leaf TOFU snapshot (`<config>/certs/<serial>.pem`) is **not yet wire-confirmed** — flagged as a joint-capture item in issue #47.
+
+##### Command-security key & certificate flow
+
+Two independent RSA credentials drive command-security. The diagram traces where each is sourced, how it is derived, and where it is consumed:
+
+```mermaid
+flowchart TD
+    subgraph cloud["Bambu Cloud REST (after account login)"]
+        BS["bootstrap_secret<br/>(only piece hardcoded<br/>in the stock plugin)"]
+        EP["GET /v1/iot-service/api/user/<br/>applications/{enc_secret}/cert<br/>?aes256={wrapped_key}&ver=1"]
+        BS --> EP
+        EP -->|"cert (3-PEM chain)"| APPCERT["App certificate<br/>issuer GLOF{...}.bambulab.com"]
+        EP -->|"key (AES-256 encrypted)"| APPKEYENC["Encrypted app private key"]
+        EP -->|"crl"| CRL["App CRL (~30 days)"]
+    end
+
+    APPKEYENC -->|"AES-256 decrypt<br/>with aes256 key"| APPKEY["App PRIVATE key<br/>(slicer_key.pem)<br/>SHARED across installs"]
+    APPCERT -->|"issuer + serial"| CERTID["cert_id<br/>(slicer_cert_id.txt)"]
+
+    subgraph printer["Printer device certificate (two possible sources)"]
+        LAN["LAN TLS handshake to<br/>printer_ip:8883<br/>capture_peer_cert_pem"]
+        ACI["app_cert_install reply<br/>over MQTT, for cloud/proxy<br/>(wire-unconfirmed)"]
+        DEVCERT["Printer device cert<br/>CN=&lt;serial&gt;"]
+        LAN --> DEVCERT
+        ACI --> DEVCERT
+        DEVCERT --> PPUB["Printer PUBLIC key"]
+    end
+
+    APPKEY -->|"RSA-SHA256 PKCS#1 v1.5<br/>over the print object"| SIGN["MQTT header.sign_string"]
+    APPKEY -->|"RSA PKCS#1 v1.5<br/>over unix_ms string"| HSIGN["HTTP x-bbl-device-security-sign"]
+    CERTID --> MQTTHDR["MQTT header.cert_id<br/>(serial + issuer, no separator)"]
+    CERTID -->|"issuer : serial.lower()"| HCERT["HTTP x-bbl-app-certification-id"]
+
+    PPUB -->|"RSA PKCS#1 v1.5 encrypt"| ENC["url_enc / param_enc<br/>inside project_file"]
+
+    SIGN --> FW["Printer firmware verifies<br/>signature + decrypts fields"]
+    MQTTHDR --> FW
+    ENC --> FW
+    HSIGN --> CLOUDV["Bambu cloud REST<br/>verifies write"]
+    HCERT --> CLOUDV
+    DEV["Developer Mode ON"] -.->|"bypasses signature check;<br/>plain url accepted, header optional"| FW
+```
+
+Reading the diagram: the **app private key signs** (MQTT `sign_string` + HTTP `x-bbl-*`) and is the same shared credential for every install; the **printer device-cert public key encrypts** (`url_enc`/`param_enc`) and is per-printer. The only genuinely hardcoded secret is the `bootstrap_secret`; the key, cert, and CRL are all runtime cloud fetches. Developer Mode short-circuits the entire left branch (firmware skips verification), which is why LAN printing works today without ever touching the cloud cert endpoint — provided the operator has supplied the app key out-of-band.
 
 Other `PrintParams` members Studio populates but **does not put into the MQTT command** itself: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments`. They feed the cloud-side `POST /v1/user-service/my/task` body and the timelapse-storage preflight (see below), not `project_file`. (`task_timelapse_use_internal` *does* reach the MQTT command, but indirectly — see the `cfg` row in the table above.)
 
