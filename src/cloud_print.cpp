@@ -393,9 +393,11 @@ int s3_put(const std::string& url, const std::string& body,
     obn::http::Request req;
     req.method  = obn::http::Method::PUT;
     req.url     = url;
-    // S3 V2 presigned URLs include Content-Type in the canonical
-    // StringToSign. The presigner (bambulab cloud) signs with an empty
-    // Content-Type, so we MUST send the request without one. Two catches:
+    // The Bambu cloud presigner uses AWS Signature V4 query-presigning
+    // (X-Amz-Algorithm=AWS4-HMAC-SHA256, X-Amz-* query params), not the
+    // older S3 V2 scheme. It signs with an empty Content-Type, so we MUST
+    // send the PUT without one (a mismatched Content-Type would break the
+    // signed canonical request either way). Two catches:
     //   * libcurl, when doing a PUT via CUSTOMREQUEST+POSTFIELDS, silently
     //     injects `Content-Type: application/x-www-form-urlencoded`. The
     //     idiomatic way to tell libcurl to drop a header is to append

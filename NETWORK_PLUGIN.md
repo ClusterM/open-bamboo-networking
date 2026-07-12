@@ -1267,7 +1267,7 @@ Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
 Terminology note:
 
-- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs (S3-style semantics in code/comments), not a plugin-side fixed OSS endpoint.
+- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs, not a plugin-side fixed OSS endpoint. The presigned URLs are **AWS Signature V4** query-presigned (`X-Amz-Algorithm=AWS4-HMAC-SHA256`, `X-Amz-*` query params), **not** the older S3 V2 scheme (cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)). We `PUT` the body opaquely and strip `Content-Type`, which is correct for V4 query-presigning; the client never recomputes the signature, so the distinction is documentation-level for the print-upload leg. (The credential-based direct-OSS leg used by rating-picture upload does sign client-side — see §6 `get_oss_config`.)
 
 #### 6.8.2. The MQTT `project_file` command (wire format)
 
