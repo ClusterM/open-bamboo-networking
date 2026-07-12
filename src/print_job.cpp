@@ -463,12 +463,17 @@ std::string build_project_file_json(const BBL::PrintParams& p,
 
 // Cloud-print variant of build_project_file_json.
 //
-// Same payload as the LAN variant, but the RSA-PKCS#1 v1.5 encrypted
-// `param_enc` / `url_enc` fields are emitted *in addition to* the cleartext
-// `param` / `url`, not in place of them. Per the reverse-networking
-// "5. MQTT.md" middleware spec: "The cleartext value remains in the payload;
-// the encrypted value is stored in url_enc or param_enc." Both encrypted
-// values are pre-computed by the caller (see rsa_pkcs1v15_encrypt_b64 in
+// Same payload as the LAN variant, plus the RSA-PKCS#1 v1.5 encrypted
+// `url_enc` field emitted *in addition to* the cleartext `url` (per the
+// reverse-networking "5. MQTT.md" middleware spec: "The cleartext value
+// remains in the payload; the encrypted value is stored in url_enc").
+//
+// `param` is kept cleartext with no `param_enc`: the middleware spec encrypts
+// `param` only for the `gcode_line` command, not `project_file`.
+// TODO(hardware-test): verify a secured printer accepts `project_file` with a
+// cleartext `param` and no `param_enc` field.
+//
+// `url_enc` is pre-computed by the caller (see rsa_pkcs1v15_encrypt_b64 in
 // cloud_print.cpp) using the printer's device-certificate RSA public key.
 std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
                                           const CloudProjectFileOpts& opts)
@@ -478,10 +483,9 @@ std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
                               ".gcode";
     return build_project_file_json_impl(
         p, opts,
-        ",\"param\":"     + json_escape(plate_param) +
-        ",\"param_enc\":" + json_escape(opts.param_enc),
-        ",\"url\":"       + json_escape(opts.url) +
-        ",\"url_enc\":"   + json_escape(opts.url_enc));
+        ",\"param\":"   + json_escape(plate_param),
+        ",\"url\":"     + json_escape(opts.url) +
+        ",\"url_enc\":" + json_escape(opts.url_enc));
 }
 
 } // namespace obn::print_job

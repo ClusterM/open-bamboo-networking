@@ -964,15 +964,16 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
         }
 
-        std::string plate_param = "Metadata/plate_" +
-            std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) + ".gcode";
-
+        // TODO(hardware-test): the "5. MQTT.md" middleware spec encrypts only
+        // `url` -> `url_enc` for the `project_file` command; `param` -> `param_enc`
+        // is documented for `gcode_line`, not `project_file`. We therefore encrypt
+        // only the URL and leave `param` cleartext. Confirm on a secured printer
+        // that `project_file` is accepted without `param_enc` before relying on it.
         std::string enc_err;
-        std::string url_enc   = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url,   &enc_err);
-        std::string param_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, plate_param, &enc_err);
+        std::string url_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
         ::EVP_PKEY_free(printer_pk);
 
-        if (url_enc.empty() || param_enc.empty()) {
+        if (url_enc.empty()) {
             OBN_ERROR("cloud_print: RSA field encryption failed: %s", enc_err.c_str());
             if (update_fn) update_fn(BBL::PrintingStageERROR,
                                      BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
@@ -983,7 +984,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         print_job::CloudProjectFileOpts cloud_opts;
         cloud_opts.url        = opts.url;   // cleartext stays alongside url_enc
         cloud_opts.url_enc    = std::move(url_enc);
-        cloud_opts.param_enc  = std::move(param_enc);
         cloud_opts.file_path  = opts.file_path;
         cloud_opts.md5        = opts.md5;
         cloud_opts.project_id = opts.project_id;

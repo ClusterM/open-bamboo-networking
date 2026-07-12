@@ -82,16 +82,16 @@ struct ProjectFileOpts {
 std::string build_project_file_json(const BBL::PrintParams& p,
                                     const ProjectFileOpts&  opts);
 
-// Cloud-print variant: emits the RSA-PKCS#1 v1.5 encrypted `url_enc` /
-// `param_enc` fields *in addition to* the plaintext `url` / `param`, not
-// instead of them. Per the reverse-networking "5. MQTT.md" middleware spec,
-// the cleartext value stays in the payload and the encrypted value is added
-// alongside it. The caller encrypts the values before calling this function
-// (see cloud_print.cpp: rsa_pkcs1v15_encrypt_b64).
+// Cloud-print variant: emits the RSA-PKCS#1 v1.5 encrypted `url_enc` field
+// *in addition to* the plaintext `url`, not instead of it (per the
+// reverse-networking "5. MQTT.md" middleware spec: the cleartext value stays
+// in the payload, the encrypted value is added alongside). `param` is kept
+// cleartext with no `param_enc` — the spec encrypts `param` only for
+// `gcode_line`, not `project_file`. The caller encrypts `url` before calling
+// this function (see cloud_print.cpp: rsa_pkcs1v15_encrypt_b64).
 struct CloudProjectFileOpts {
     std::string url;          // cleartext fetch URL (presigned https / ftp:// / ...)
     std::string url_enc;      // base64(RSA-PKCS1v1.5-encrypt(url))
-    std::string param_enc;    // base64(RSA-PKCS1v1.5-encrypt("Metadata/plate_N.gcode"))
     std::string file_path;    // basename / absolute path on printer FS
     std::string md5;
     std::string project_id{"0"};
