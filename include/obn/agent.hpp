@@ -385,6 +385,16 @@ private:
     void harvest_security_flags(const std::string& dev_id,
                                 const std::string& json);
 
+    // Publishes the LAN-TLS peer pin for (ip -> dev_id) so the env-only
+    // consumers (:6000 FileTransfer tunnel, FTPS, camera in libBambuSource)
+    // can verify the printer's self-signed leaf even when no LAN
+    // connect_printer ran this session (e.g. cloud-only usage). No-op when
+    // the config dir is unknown or the cert is not yet on disk. The FT/TLS
+    // side never sees the config dir; the cert path only reaches it through
+    // OBN_LAN_TLS_PEER_<ip>, so every path that learns ip<->serial must call
+    // this. Safe/cheap to call repeatedly (registry dedups).
+    void publish_peer_cert_pin(const std::string& ip, const std::string& dev_id);
+
     mutable std::mutex mu_;
     std::string        log_dir_;
     std::string        config_dir_;

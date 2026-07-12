@@ -712,6 +712,11 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
 
+    // Ensure the :6000 upload leg (brtc/emmc) can verify the printer's
+    // self-signed leaf: publish the LAN-TLS peer pin from the on-disk cert
+    // even when no LAN connect_printer ran this session (cloud-only usage).
+    publish_peer_cert_pin(p.dev_ip, p.dev_id);
+
     // Hard stop: never push a print file through Bambu's cloud when the
     // user has opted out. Studio normally avoids this path because the
     // printer is never marked cloud-online under block_cloud, but a future

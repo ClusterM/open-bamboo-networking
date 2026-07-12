@@ -1470,6 +1470,19 @@ std::string Agent::cloud_region() const
     return cc == "CN" ? "CN" : "GLOBAL";
 }
 
+void Agent::publish_peer_cert_pin(const std::string& ip,
+                                  const std::string& dev_id)
+{
+    if (ip.empty() || dev_id.empty()) return;
+    const std::string cfg_dir = config_dir();
+    if (cfg_dir.empty()) return;
+    const std::string peer = cert_store::device_cert_path(cfg_dir, dev_id);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(peer, ec)) {
+        obn::lan_tls::registry_set_peer_cert(ip, peer);
+    }
+}
+
 void Agent::cache_ssdp_json_for_bind(const std::string& json)
 {
     std::string perr;
@@ -1480,6 +1493,12 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     const std::string dev_id = root->find("dev_id").as_string();
     if (!dev_id.empty()) {
         obn::lan_tls::registry_put_ip_serial(ip, dev_id);
+        // SSDP is the only place a cloud-only session learns the printer's
+        // LAN IP<->serial, so pin the cached device cert here too. Without
+        // it the :6000 FileTransfer tunnel (file browser / upload) has no
+        // peer cert to verify against and fails with certificate verify
+        // failed even though certs/<serial>.pem exists on disk.
+        publish_peer_cert_pin(ip, dev_id);
     }
     std::lock_guard<std::mutex> lk(mu_);
     ssdp_json_by_ip_[ip] = json;
