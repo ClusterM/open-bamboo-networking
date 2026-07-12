@@ -981,6 +981,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         }
 
         print_job::CloudProjectFileOpts cloud_opts;
+        cloud_opts.url        = opts.url;   // cleartext stays alongside url_enc
         cloud_opts.url_enc    = std::move(url_enc);
         cloud_opts.param_enc  = std::move(param_enc);
         cloud_opts.file_path  = opts.file_path;

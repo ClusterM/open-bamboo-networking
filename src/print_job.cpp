@@ -463,22 +463,24 @@ std::string build_project_file_json(const BBL::PrintParams& p,
 
 // Cloud-print variant of build_project_file_json.
 //
-// Identical to the LAN variant except:
-//   * "param" is replaced by "param_enc" (RSA-PKCS#1 v1.5 encrypted,
-//     base64-encoded).  The plaintext would be "Metadata/plate_N.gcode".
-//   * "url"   is replaced by "url_enc"   (RSA-PKCS#1 v1.5 encrypted,
-//     base64-encoded).  The plaintext is the raw fetch URL (ftp:///, brtc://,
-//     or presigned HTTPS).
-//
-// Both encrypted values must be pre-computed by the caller (see
-// rsa_pkcs1v15_encrypt_b64 in cloud_print.cpp) using the printer's RSA
-// public key extracted from its TLS leaf certificate.
+// Same payload as the LAN variant, but the RSA-PKCS#1 v1.5 encrypted
+// `param_enc` / `url_enc` fields are emitted *in addition to* the cleartext
+// `param` / `url`, not in place of them. Per the reverse-networking
+// "5. MQTT.md" middleware spec: "The cleartext value remains in the payload;
+// the encrypted value is stored in url_enc or param_enc." Both encrypted
+// values are pre-computed by the caller (see rsa_pkcs1v15_encrypt_b64 in
+// cloud_print.cpp) using the printer's device-certificate RSA public key.
 std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
                                           const CloudProjectFileOpts& opts)
 {
+    std::string plate_param = "Metadata/plate_" +
+                              std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
+                              ".gcode";
     return build_project_file_json_impl(
         p, opts,
+        ",\"param\":"     + json_escape(plate_param) +
         ",\"param_enc\":" + json_escape(opts.param_enc),
+        ",\"url\":"       + json_escape(opts.url) +
         ",\"url_enc\":"   + json_escape(opts.url_enc));
 }
 
