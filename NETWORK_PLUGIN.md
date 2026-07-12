@@ -2546,6 +2546,8 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 
 `PublishParams` (`bambu_networking.hpp:251-258`): `project_name`, `project_3mf_file`, `preset_name`, `project_model_id`, `design_id`, `config_filename`.
 
+**OSS credential/upload leg** (`get_oss_config` + `put_rating_picture_oss`; cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)): Studio first calls `get_oss_config`, which maps to `GET /v1/user-service/my/ossconfig?useType=1` (with `.../s3config?useType=1` as fallback) and returns the server's STS-scoped credential JSON verbatim — `{endpoint, accessKeyId, accessKeySecret, securityToken, expiration, bucketName, cdnUrl}`. Studio treats the blob as opaque and passes it back into `put_rating_picture_oss`, which signs the `PUT` **client-side** (unlike the print-upload leg in §6.8.1, where the cloud presigns the URL): AWS Signature V4 (`AWS4-HMAC-SHA256`, scope `<date>/<region>/s3/aws4_request`, signed headers `host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`) for S3-style endpoints, or Aliyun OSS V1 (`Authorization: OSS <AKID>:<base64 HMAC-SHA1 sig>` + `x-oss-security-token`) for `aliyuncs.com` endpoints (CN region). The object-key convention used for rating pictures and the exact value Studio expects back in `pic_oss_path` are not wire-confirmed yet (**verify-on-hardware**, needs a live cloud account); OBN's implementation (`src/oss_sign.cpp`, `src/abi_makerworld.cpp`) fails closed on any mismatch. *(#49, OBN)*
+
 ### 6.13. Tracking / telemetry
 
 | Symbol | Signature |

@@ -295,6 +295,7 @@ add_library(bambu_networking SHARED
     src/plugin_load_banner.cpp
     src/mqtt_client.cpp
     src/os_compat.cpp
+    src/oss_sign.cpp
     src/print_job.cpp
     src/print_job_naming.cpp
     src/signing.cpp
@@ -800,5 +801,15 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME cloud_print COMMAND cloud_print_test)
+
+    # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
+    # the AWS SigV4 signing-key derivation against the vendors' published
+    # test vectors, plus config parsing and header construction.
+    add_executable(oss_sign_test tests/oss_sign_test.cpp
+        src/json_lite.cpp
+        src/oss_sign.cpp)
+    target_include_directories(oss_sign_test PRIVATE include)
+    target_link_libraries(oss_sign_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME oss_sign COMMAND oss_sign_test)
 
 endif()

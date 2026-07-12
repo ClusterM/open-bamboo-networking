@@ -285,8 +285,8 @@ Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). MakerWorld has no open
 | `bambu_network_get_model_mall_home_url` | ❌ | Returns `https://makerworld.com/` as a safe default. |
 | `bambu_network_get_model_mall_detail_url` | ❌ | Returns `https://makerworld.com/models/<id>` as a safe default. |
 | `bambu_network_put_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`; no rating submission backend. |
-| `bambu_network_get_oss_config` | ❌ | Returns `ERR_INVALID_RESULT`; no OSS credentials are minted. |
-| `bambu_network_put_rating_picture_oss` | ❌ | Returns `ERR_INVALID_RESULT`. |
+| `bambu_network_get_oss_config` | ✅ | `GET /v1/user-service/my/ossconfig?useType=1` (fallback `.../s3config?useType=1`) with the session Bearer; the server JSON (endpoint / accessKeyId / accessKeySecret / securityToken / bucketName / cdnUrl) is returned verbatim to Studio. Needs a live cloud account to verify. |
+| `bambu_network_put_rating_picture_oss` | ✅ | Client-side signed object-storage `PUT`: AWS SigV4 (`AWS4-HMAC-SHA256`) for S3-style endpoints, Aliyun OSS V1 (`Authorization: OSS <AKID>:<sig>` + `x-oss-security-token`) for `aliyuncs.com`. Signer in `src/oss_sign.cpp`, pinned to published test vectors in `tests/oss_sign_test.cpp`. Object-key convention marked verify-on-hardware; fails closed. |
 | `bambu_network_get_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`. |
 | `bambu_network_get_mw_user_preference` | ❌ | Callback receives `{"recommendStatus":0}`. The exact field name and type are load-bearing: Studio's JSON-to-int conversion throws through a queued lambda on a `null` here and aborts the process via `wxApp::OnUnhandledException`. |
 | `bambu_network_get_mw_user_4ulist` | ❌ | Callback receives `{"list":[],"total":0}`. |
