@@ -620,33 +620,90 @@ void Agent::harvest_security_report(const std::string& dev_id,
                                     const std::string& json)
 {
     // Prefilter: security frames are rare, report frames arrive ~1 Hz.
-    if (json.find("app_cert_install") == std::string::npos) return;
+    if (json.find("app_cert") == std::string::npos) return;
 
     std::string perr;
     auto root = obn::json::parse(json, &perr);
     if (!root) return;
     const auto& sec = root->find("security");
     if (!sec.is_object()) return;
-    if (sec.find("command").as_string() != "app_cert_install") return;
+    const std::string command = sec.find("command").as_string();
 
-    const std::string result = sec.find("result").as_string();
-    const std::string printer_cert = sec.find("printer_cert").as_string();
-    if (result != "SUCCESS" || printer_cert.empty()) {
-        OBN_WARN("app_cert_install dev=%s: result=%s printer_cert=%s",
-                 dev_id.c_str(),
-                 result.empty() ? "<none>" : result.c_str(),
-                 printer_cert.empty() ? "absent" : "present");
+    if (command == "app_cert_install") {
+        const std::string result = sec.find("result").as_string();
+        const std::string printer_cert = sec.find("printer_cert").as_string();
+        if (result != "SUCCESS" || printer_cert.empty()) {
+            OBN_WARN("app_cert_install dev=%s: result=%s printer_cert=%s",
+                     dev_id.c_str(),
+                     result.empty() ? "<none>" : result.c_str(),
+                     printer_cert.empty() ? "absent" : "present");
+            return;
+        }
+        // printer_cert is a PEM chain (device leaf first, then its issuer CA);
+        // set_printer_pub_key_from_cert_pem reads the leaf, whose public key
+        // encrypts url_enc. Verified against a real P2S capture.
+        if (cert_store::set_printer_pub_key_from_cert_pem(dev_id, printer_cert)) {
+            OBN_INFO("app_cert_install dev=%s: device certificate installed, "
+                     "pubkey cached", dev_id.c_str());
+        }
         return;
     }
-    if (cert_store::set_printer_pub_key_from_cert_pem(dev_id, printer_cert)) {
-        OBN_INFO("app_cert_install dev=%s: device certificate installed, "
-                 "pubkey cached", dev_id.c_str());
+
+    if (command == "app_cert_list") {
+        // {"security":{"command":"app_cert_list","cert_ids":["<serial><issuer>", ...]}}
+        std::set<std::string> ids;
+        // Bind the Value to a named temporary: as_array() returns a reference
+        // into it, so iterating the find() rvalue directly would dangle.
+        const obn::json::Value cert_ids = sec.find("cert_ids");
+        for (const auto& e : cert_ids.as_array()) {
+            std::string id = e.as_string();
+            if (!id.empty()) ids.insert(std::move(id));
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        app_certs_by_dev_[dev_id] = std::move(ids);
+        OBN_INFO("app_cert_list dev=%s: printer trusts %zu app cert(s)",
+                 dev_id.c_str(), app_certs_by_dev_[dev_id].size());
+        return;
     }
+}
+
+void Agent::harvest_security_flags(const std::string& dev_id,
+                                   const std::string& json)
+{
+    // Prefilter: only pushall/push_status frames carry flag3.
+    if (json.find("flag3") == std::string::npos) return;
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+    const auto& f3 = root->find("print.flag3");
+    if (!f3.is_number()) return;
+
+    // Bit 16 = new authorization-control system enabled (reverse-networking
+    // "5. MQTT.md"). Latch it once true; never clear so an incremental frame
+    // that omits the bit doesn't undo a prior pushall.
+    const bool supported = ((f3.as_int() >> 16) & 1) != 0;
+    if (!supported) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    bool& latched = sec_new_auth_by_dev_[dev_id];
+    if (!latched) {
+        latched = true;
+        OBN_INFO("dev=%s advertises new authorization-control system "
+                 "(flag3 bit16)", dev_id.c_str());
+    }
+}
+
+bool Agent::printer_supports_new_auth(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = sec_new_auth_by_dev_.find(dev_id);
+    return it != sec_new_auth_by_dev_.end() && it->second;
 }
 
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
     harvest_security_report(dev_id, json);
+    harvest_security_flags(dev_id, json);
 
     BBL::OnMessageFn cb;
     std::string connect_ip;
@@ -1363,6 +1420,22 @@ bool Agent::request_app_cert_install(const std::string& dev_id, bool via_lan)
     return true;
 }
 
+bool Agent::request_app_cert_list(const std::string& dev_id, bool via_lan)
+{
+    // Shape per reverse-networking "5. MQTT.md". The printer answers on the
+    // report topic with a cert_ids array, harvested by harvest_security_report.
+    const std::string msg =
+        R"({"security":{"sequence_id":"0","command":"app_cert_list"}})";
+    int rc = via_lan ? send_message_to_printer(dev_id, msg, /*qos=*/0)
+                     : cloud_send_message(dev_id, msg, /*qos=*/0);
+    if (rc != BAMBU_NETWORK_SUCCESS) {
+        OBN_WARN("app_cert_list dev=%s: publish failed rc=%d (via_lan=%d)",
+                 dev_id.c_str(), rc, via_lan ? 1 : 0);
+        return false;
+    }
+    return true;
+}
+
 #define OBN_SETTER(method, field, type)                 \
     void Agent::method(type fn)                         \
     {                                                   \
@@ -1767,6 +1840,7 @@ int Agent::connect_cloud()
         (std::string dev_id, std::string json)
     {
         harvest_security_report(dev_id, json);
+        harvest_security_flags(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")

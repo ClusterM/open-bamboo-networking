@@ -145,6 +145,18 @@ public:
     // Returns false when the app cert PEM is missing or publish fails.
     bool request_app_cert_install(const std::string& dev_id, bool via_lan);
 
+    // Publishes the security.app_cert_list query (see reverse-networking
+    // "5. MQTT.md"): asks the printer which app certificates it already
+    // trusts. The report response is parsed by harvest_security_report into
+    // app_certs_by_dev_. Returns false on publish failure.
+    bool request_app_cert_list(const std::string& dev_id, bool via_lan);
+
+    // True once the printer has advertised the new authorization-control
+    // system (print.flag3 bit 16) in a push_status frame. Latched by
+    // harvest_security_flags(); gates app_cert_install so we don't send the
+    // command to firmware that doesn't understand it.
+    bool printer_supports_new_auth(const std::string& dev_id) const;
+
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
     // printers send NOTIFY every 5 s on UDP port 2021. Returns true if the
     // listener is running after the call.
@@ -367,6 +379,12 @@ private:
     void harvest_security_report(const std::string& dev_id,
                                  const std::string& json);
 
+    // Scans a push_status frame for print.flag3 and latches whether the
+    // printer supports the new authorization-control system (bit 16). Cheap
+    // substring prefilter; full JSON parse only on candidate frames.
+    void harvest_security_flags(const std::string& dev_id,
+                                const std::string& json);
+
     mutable std::mutex mu_;
     std::string        log_dir_;
     std::string        config_dir_;
@@ -418,6 +436,13 @@ private:
     // declared above (ModuleFw / DeviceFw) so agent.cpp helpers can
     // reach them.
     std::map<std::string, DeviceFw> device_fw_;
+
+    // Command-security capability + provisioning state, keyed by dev_id.
+    // sec_new_auth_by_dev_: latched true when print.flag3 bit 16 is seen.
+    // app_certs_by_dev_: cert_ids the printer reported as trusted via the
+    // security.app_cert_list response. Both guarded by mu_.
+    std::map<std::string, bool>                 sec_new_auth_by_dev_;
+    std::map<std::string, std::set<std::string>> app_certs_by_dev_;
 
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")

@@ -933,7 +933,18 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         //      is not the printer.
         //   3. TLS-leaf PEM snapshot on disk (LAN-direct TOFU fallback).
         EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
-        if (!printer_pk &&
+        // Only run the app_cert_install round-trip when the printer has
+        // advertised the new authorization-control system (flag3 bit 16).
+        // Otherwise the command is meaningless to the firmware; fall straight
+        // through to the TLS-leaf snapshot. (app_cert_list is best-effort
+        // observability — it tells us whether our cert is already trusted; we
+        // still install to obtain printer_cert.)
+        // TODO(hardware-test): confirm on a secured printer that gating on
+        // flag3 bit16 doesn't skip a printer that actually needs the install.
+        if (!printer_pk && printer_supports_new_auth(p.dev_id)) {
+            request_app_cert_list(p.dev_id, use_lan_channel);
+        }
+        if (!printer_pk && printer_supports_new_auth(p.dev_id) &&
             request_app_cert_install(p.dev_id, use_lan_channel)) {
             // The printer answers on the report topic; harvest_security_report
             // fills the cache from the MQTT network thread. Poll briefly.
