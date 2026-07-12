@@ -329,8 +329,12 @@ std::string build_file_upload_chunk_abi(std::uint32_t sequence,
                                         std::uint32_t size,
                                         const std::string& file_md5_lower)
 {
+    // Genuine cmdtype-5 chunk frame places `frag_id` at the frame top
+    // level (sibling of `cmdtype`/`req`), while `file_md5`/`offset`/`size`
+    // stay inside `req`. We previously nested `frag_id` under `req`.
+    // TODO(verify-on-hardware): confirm the upload still acks on firmware
+    // that reads `frag_id` at the top level (issue #48).
     obn::json::Object req;
-    req["frag_id"] = obn::json::Value(static_cast<double>(frag_id));
     req["offset"]  = obn::json::Value(static_cast<double>(offset));
     req["size"]    = obn::json::Value(static_cast<double>(size));
     if (!file_md5_lower.empty()) {
@@ -340,6 +344,7 @@ std::string build_file_upload_chunk_abi(std::uint32_t sequence,
     obn::json::Object root;
     root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileUpload));
     root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["frag_id"]  = obn::json::Value(static_cast<double>(frag_id));
     root["req"]      = obn::json::Value(std::move(req));
     return obn::json::Value(std::move(root)).dump();
 }
