@@ -55,10 +55,16 @@ struct Settings {
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
 
-    // Slicer signing key and certificate id.
-    // Empty = config_dir/slicer_key.pem and config_dir/slicer_cert_id.txt
+    // Slicer signing key, certificate id, and app-cert provisioning files.
+    // Empty = look for the corresponding file in config_dir:
+    //   slicer_key_pem  -> slicer_key.pem
+    //   slicer_cert_id  -> slicer_cert_id.txt
+    //   slicer_cert_pem -> slicer_cert.pem   (app cert chain for app_cert_install)
+    //   slicer_crl_pem  -> slicer_crl.pem    (app CRL for app_cert_install)
     std::string slicer_key_pem;
     std::string slicer_cert_id;
+    std::string slicer_cert_pem;
+    std::string slicer_crl_pem;
 
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;

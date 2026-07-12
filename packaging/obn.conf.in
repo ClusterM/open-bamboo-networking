@@ -106,6 +106,18 @@ slicer_key_pem =
 
 slicer_cert_id =
 
+# Path to the app certificate chain (PEM) sent to the printer via the
+# security.app_cert_install MQTT command (new authorization-control system).
+# If empty, looks for slicer_cert.pem in this config directory.
+
+slicer_cert_pem =
+
+# Path to the app certificate revocation list (PEM CRL) sent alongside the
+# app certificate in security.app_cert_install.
+# If empty, looks for slicer_crl.pem in this config directory.
+
+slicer_crl_pem =
+
 # Path to the login session persistence file.
 # If empty, uses session.json in this config directory.
 

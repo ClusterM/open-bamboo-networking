@@ -91,12 +91,16 @@ const std::string& slicer_cert_id()
 
 std::string slicer_cert_pem()
 {
-    return read_pem_file(obn::config::path_in_dir("slicer_cert.pem"));
+    const auto& cfg = obn::config::current().slicer_cert_pem;
+    return read_pem_file(cfg.empty() ? obn::config::path_in_dir("slicer_cert.pem")
+                                     : cfg);
 }
 
 std::string slicer_crl_pem()
 {
-    return read_pem_file(obn::config::path_in_dir("slicer_crl.pem"));
+    const auto& cfg = obn::config::current().slicer_crl_pem;
+    return read_pem_file(cfg.empty() ? obn::config::path_in_dir("slicer_crl.pem")
+                                     : cfg);
 }
 
 namespace {
