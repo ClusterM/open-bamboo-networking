@@ -37,17 +37,14 @@ static std::string resolve_key_path()
 {
     const auto& cfg = obn::config::current().slicer_key_pem;
     if (!cfg.empty()) return cfg;
-    const auto& dir = obn::config::dir();
-    if (dir.empty()) return {};
-    return dir + "/slicer_key.pem";
+    return obn::config::path_in_dir("slicer_key.pem");
 }
 
 // Read cert_id from slicer_cert_id.txt in config_dir.
 static std::string load_cert_id_from_file()
 {
-    const auto& dir = obn::config::dir();
-    if (dir.empty()) return {};
-    std::string path = dir + "/slicer_cert_id.txt";
+    std::string path = obn::config::path_in_dir("slicer_cert_id.txt");
+    if (path.empty()) return {};
     std::FILE* f = std::fopen(path.c_str(), "r");
     if (!f) return {};
     char buf[256] = {};
@@ -59,12 +56,11 @@ static std::string load_cert_id_from_file()
     return s;
 }
 
-// Reads a whole file from config_dir into a string. "" on any failure.
-static std::string read_config_file(const char* basename)
+// Reads a whole file into a string. "" on any failure. `path` is an absolute
+// or config-relative path already resolved by the caller.
+static std::string read_pem_file(const std::string& path)
 {
-    const auto& dir = obn::config::dir();
-    if (dir.empty()) return {};
-    std::string path = dir + "/" + basename;
+    if (path.empty()) return {};
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return {};
     std::string out;
@@ -95,12 +91,12 @@ const std::string& slicer_cert_id()
 
 std::string slicer_cert_pem()
 {
-    return read_config_file("slicer_cert.pem");
+    return read_pem_file(obn::config::path_in_dir("slicer_cert.pem"));
 }
 
 std::string slicer_crl_pem()
 {
-    return read_config_file("slicer_crl.pem");
+    return read_pem_file(obn::config::path_in_dir("slicer_crl.pem"));
 }
 
 namespace {

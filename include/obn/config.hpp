@@ -87,6 +87,13 @@ const Settings& current();
 // All default file paths (key, cert_id, session) are relative to this.
 const std::string& dir();
 
+// Join `basename` onto the active config_dir() using the platform's native
+// path separator (via std::filesystem). Returns "" when no config_dir has
+// been set. Always use this for files living in the config directory instead
+// of hand-concatenating "dir + \"/\" + name", which is not portable to
+// Windows.
+std::string path_in_dir(const std::string& basename);
+
 // Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
 // Empty configured values fall back to production defaults.
 std::string cloud_api_host_for(const Settings& s, const std::string& region);

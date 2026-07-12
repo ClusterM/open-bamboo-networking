@@ -199,6 +199,13 @@ const std::string& dir()
     return g_config_dir;
 }
 
+std::string path_in_dir(const std::string& basename)
+{
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_config_dir.empty()) return {};
+    return (std::filesystem::path(g_config_dir) / basename).string();
+}
+
 std::string cloud_api_host_for(const Settings& s, const std::string& region)
 {
     if (is_cn_region(region))
