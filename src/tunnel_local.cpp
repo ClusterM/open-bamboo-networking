@@ -422,13 +422,20 @@ std::string parse_ability_reply_to_ft_json(const std::string& wire_json)
         auto v = reply.find(key);
         if (v.is_array()) storages = v.as_array();
     };
-    pick_array("storage");
+    // Prefer `upload_storage` (the writable subset) over the full
+    // `storage` list: the genuine cmdtype-7 ability reply returns both,
+    // and only `upload_storage` reflects where a file may be written.
+    // They are equal on P2S, but differ on hardware with read-only mounts
+    // (issue #48). Fall back to the full list and legacy key shapes.
+    pick_array("upload_storage");
+    if (storages.empty()) pick_array("storage");
     if (storages.empty()) pick_array("storage_list");
     if (storages.empty()) pick_array("storages");
     if (storages.empty()) {
         auto ab = reply.find("ability");
         if (ab.is_object()) {
-            auto v = ab.find("storage");
+            auto v = ab.find("upload_storage");
+            if (!v.is_array()) v = ab.find("storage");
             if (v.is_array()) storages = v.as_array();
         }
     }

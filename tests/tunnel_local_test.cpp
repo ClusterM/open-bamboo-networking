@@ -120,6 +120,13 @@ static void test_ft_wire_helpers()
         obn::tunnel_local::parse_ability_reply_to_ft_json(reply);
     CHECK(ft_json == "[\"emmc\",\"usb\"]");
 
+    // upload_storage (writable subset) wins over the full storage list.
+    const std::string reply_upl =
+        R"({"cmdtype":7,"result":0,"reply":{"storage":["emmc","udisk"],)"
+        R"("upload_storage":["emmc"]}})";
+    CHECK(obn::tunnel_local::parse_ability_reply_to_ft_json(reply_upl)
+          == "[\"emmc\"]");
+
     int result = -1;
     const double pct_f = obn::tunnel_local::parse_upload_progress_value(
         R"({"result":1,"reply":{"progress":42.5}})", &result);
