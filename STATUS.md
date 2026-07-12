@@ -266,7 +266,7 @@ This `bambu_networking.so` group only covers the **cloud / TUTK** camera URL acc
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_camera_url` | 🔒 | Stock returns a `bambu:///tutk?...` URL that cannot be minted without the proprietary TUTK / Agora SDK. Callback is invoked with an empty string; Studio drives itself into its normal "connection failed" path. |
+| `bambu_network_get_camera_url` | ✅ | Stock returns a `bambu:///tutk?...` URL that cannot be minted without the proprietary TUTK / Agora SDK. Instead we return the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) when the IP (SSDP / `connect_printer`) and access code (`connect_printer` / cloud `dev_access_code`) are known. This makes the file browser, device-panel snapshot and liveview work over the local network even for cloud-paired printers (Studio only requires the reply to start with `bambu:///`). The `lv=` hint makes `libBambuSource` fetch video via RTSP(S) `:322` instead of MJPEG `:6000` on X1/P1S/P2S-class printers. Falls back to an empty string (Studio's normal "connection failed" path) when no LAN route is known. |
 | `bambu_network_get_camera_url_for_golive` | 🔒 | Same as above, for the Go-Live flow. |
 | `bambu_network_get_hms_snapshot` | 🔒 | HMS photo snapshot is cloud-only and requires the same SDK. Callback is invoked with `("", -1)`. |
 

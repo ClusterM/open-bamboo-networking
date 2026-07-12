@@ -345,6 +345,23 @@ public:
     // Last LAN access code seen in connect_printer for this dev_id (needed
     // because bambu_network_bind does not pass the code in the ABI).
     std::string lan_access_code_for(const std::string& dev_id) const;
+    // Remember the LAN access code learned outside connect_printer (the
+    // cloud /user/print endpoint returns it as dev_access_code). Lets
+    // camera_url_for() mint LAN URLs in cloud-only sessions where no LAN
+    // MQTT connect ever ran.
+    void note_device_access_code(const std::string& dev_id,
+                                 const std::string& access_code);
+    // LAN fallback for bambu_network_get_camera_url: stock plugin mints a
+    // bambu:///tutk?... URL via the proprietary TUTK/Agora SDK, which we
+    // don't ship. When the printer's LAN IP (SSDP / connect_printer) and
+    // access code (connect_printer / cloud dev_access_code) are both known
+    // we return "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>"
+    // instead, so Studio's PrinterFileSystem (file browser), the device
+    // image flow (mem:/N snapshot) and — with the lv=rtsps hint handled in
+    // libBambuSource — liveview all run over the local network even while
+    // the printer is cloud-paired. Returns "" when either piece is missing;
+    // Studio then shows its normal "connection failed" state.
+    std::string camera_url_for(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
@@ -384,6 +401,13 @@ private:
     // substring prefilter; full JSON parse only on candidate frames.
     void harvest_security_flags(const std::string& dev_id,
                                 const std::string& json);
+
+    // Scans a push_status frame for ipcam.rtsp_url and latches the LAN
+    // liveview protocol ("rtsps"/"rtsp") per device. camera_url_for()
+    // forwards it as the lv= hint so libBambuSource knows to fetch video
+    // over RTSP(S) instead of MJPEG :6000 on X1/P1S/P2S-class printers.
+    void harvest_media_caps(const std::string& dev_id,
+                            const std::string& json);
 
     // Publishes the LAN-TLS peer pin for (ip -> dev_id) so the env-only
     // consumers (:6000 FileTransfer tunnel, FTPS, camera in libBambuSource)
@@ -484,8 +508,16 @@ private:
     // ssdp::to_device_info_json). Used by lookup_bind_detect().
     std::unordered_map<std::string, std::string> ssdp_json_by_ip_;
     // connect_printer() stores the MQTT/FTPS password (access code) here so
-    // bambu_network_bind can POST it to the cloud as bind_code.
+    // bambu_network_bind can POST it to the cloud as bind_code. Also fed
+    // from the cloud /user/print dev_access_code via note_device_access_code
+    // so camera_url_for() works in cloud-only sessions.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
+    // Reverse of the lan_tls ip->serial registry: last known LAN IP per
+    // dev_id (SSDP / connect_printer). Used by camera_url_for().
+    std::unordered_map<std::string, std::string> lan_ip_by_dev_;
+    // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
+    // from push_status ipcam.rtsp_url by harvest_media_caps().
+    std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;
 
     // Buffer populated by bambu_network_get_setting_list2 and drained
     // by bambu_network_get_user_presets. See preset_cache_* above.

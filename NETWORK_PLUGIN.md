@@ -2564,6 +2564,8 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 
 > **Remote-camera URL grammar (documentation only; vendor-locked).** For the cloud/remote leg of `get_camera_url` (distinct from the LAN `bambu:///local/...` / `rtsps___` shapes in §7.6), stock mints `bambu:///tutk?uid=<ttcode>&authkey=&passwd=&region=&device=&net_ver=&dev_ver=` after `GET %1%/iot-service/api/user/ttcode`. The `get_camera_url` input key is `dev|fw|proto[|channel]`, and go-live returns a CDN `cdnUrl`. This stays out of OBN's scope: the TUTK/Agora token is single-use and gated against a live cloud account, so remote camera remains 🔒. Shape documented from [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49) for completeness only.
 
+> **OBN LAN fallback.** Studio only checks that the `get_camera_url` reply **starts with `bambu:///`** (`MediaPlayCtrl.cpp:504,523`, `MediaFilePanel.cpp:608,624`), so instead of a TUTK URL OBN returns the printer's **LAN URL** `bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]` when both the LAN IP (SSDP / `connect_printer`) and the access code (`connect_printer` / cloud `dev_access_code` from `/user/print`) are known. This routes the cloud-mode file browser (`PrinterFileSystem` CTRL over `:6000`), the device-panel snapshot (`mem:/N` via `FileTransferObject`) and liveview over the local network. The non-standard `lv=` query hint (parsed only by OBN's `libBambuSource`; Studio and firmware ignore it) redirects the **video** stream to RTSP(S) `:322` on printers whose push_status advertises `ipcam.rtsp_url` (X1/P1S/P2S-class) — the CTRL channel stays on `:6000`. [OBN]
+
 ### 6.12. MakerWorld / Mall
 
 | Symbol | Signature |

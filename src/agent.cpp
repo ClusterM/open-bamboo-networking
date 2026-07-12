@@ -212,9 +212,11 @@ int Agent::connect_printer(std::string dev_id,
 
     if (rc == BAMBU_NETWORK_SUCCESS) {
         std::string password_snap = session->password();
+        std::string ip_snap       = session->dev_ip();
         {
             std::lock_guard<std::mutex> lk(mu_);
             lan_access_code_by_dev_[sess_dev_id] = password_snap;
+            lan_ip_by_dev_[sess_dev_id]          = ip_snap;
             lan_session_                         = std::move(session);
         }
     }
@@ -700,10 +702,84 @@ bool Agent::printer_supports_new_auth(const std::string& dev_id) const
     return it != sec_new_auth_by_dev_.end() && it->second;
 }
 
+void Agent::harvest_media_caps(const std::string& dev_id,
+                               const std::string& json)
+{
+    // Prefilter: only pushall / full push_status frames carry ipcam.
+    if (json.find("rtsp_url") == std::string::npos) return;
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+    const std::string url = root->find("print.ipcam.rtsp_url").as_string();
+    // Firmware reports "disable" when LAN liveview is off and an
+    // rtsps://... URL when it is on (DeviceManager.cpp keys LVL_Rtsps
+    // off the same prefix test).
+    std::string proto;
+    if (url.rfind("rtsps", 0) == 0)     proto = "rtsps";
+    else if (url.rfind("rtsp", 0) == 0) proto = "rtsp";
+    else return;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    std::string& latched = lan_lv_proto_by_dev_[dev_id];
+    if (latched != proto) {
+        latched = proto;
+        OBN_INFO("dev=%s LAN liveview protocol: %s", dev_id.c_str(),
+                 proto.c_str());
+    }
+}
+
+void Agent::note_device_access_code(const std::string& dev_id,
+                                    const std::string& access_code)
+{
+    if (dev_id.empty() || access_code.empty()) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    lan_access_code_by_dev_[dev_id] = access_code;
+}
+
+std::string Agent::camera_url_for(const std::string& dev_id)
+{
+    std::string ip;
+    std::string code;
+    std::string lv;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto it = lan_ip_by_dev_.find(dev_id); it != lan_ip_by_dev_.end())
+            ip = it->second;
+        if (ip.empty() && lan_session_ && lan_session_->dev_id() == dev_id)
+            ip = lan_session_->dev_ip();
+        if (auto it = lan_access_code_by_dev_.find(dev_id);
+            it != lan_access_code_by_dev_.end())
+            code = it->second;
+        if (code.empty() && lan_session_ && lan_session_->dev_id() == dev_id)
+            code = lan_session_->password();
+        if (auto it = lan_lv_proto_by_dev_.find(dev_id);
+            it != lan_lv_proto_by_dev_.end())
+            lv = it->second;
+    }
+    if (ip.empty() || code.empty()) {
+        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
+                 dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
+                 code.empty() ? "unknown" : "known");
+        return {};
+    }
+
+    // The :6000 tunnel (and a possible RTSPS liveview redirect) verify the
+    // printer's self-signed leaf via OBN_LAN_TLS_PEER_<ip>; make sure the
+    // pin is published before Studio dials.
+    publish_peer_cert_pin(ip, dev_id);
+
+    std::string url = "bambu:///local/" + ip + "?port=6000&user=bblp&passwd="
+                    + code;
+    if (!lv.empty()) url += "&lv=" + lv;
+    return url;
+}
+
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
     harvest_security_report(dev_id, json);
     harvest_security_flags(dev_id, json);
+    harvest_media_caps(dev_id, json);
 
     BBL::OnMessageFn cb;
     std::string connect_ip;
@@ -1502,6 +1578,7 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     }
     std::lock_guard<std::mutex> lk(mu_);
     ssdp_json_by_ip_[ip] = json;
+    if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
 }
 
 namespace {
@@ -1861,6 +1938,7 @@ int Agent::connect_cloud()
     {
         harvest_security_report(dev_id, json);
         harvest_security_flags(dev_id, json);
+        harvest_media_caps(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
