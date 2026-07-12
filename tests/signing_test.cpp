@@ -119,7 +119,23 @@ static int test_cert_id_constant()
 {
     const std::string payload = R"({"print":{"command":"pause","sequence_id":"2"}})";
     const std::string env     = obn::signing::maybe_sign(payload);
-    CHECK(envelope_field(env, "cert_id") == "testcertid123CN=test.example.com");
+    // MQTT envelope carries the stored cert_id verbatim (serial + issuer).
+    CHECK(envelope_field(env, "cert_id")
+          == "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com");
+    return 0;
+}
+
+static int test_app_certification_id_http_format()
+{
+    // HTTP x-bbl-app-certification-id is issuer + ":" + serial.lower(),
+    // derived from the stored MQTT-form cert_id (serial + issuer).
+    // Stored: "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com"
+    //   serial = "a4e8faaa1a38e3650a0ea590d192383f" (note: ends in hex 'f'!)
+    //   issuer = "CN=GLOF3813734089.bambulab.com"
+    // Regression: walking back over ALL letters wrongly moved the serial's
+    // trailing 'f' into the issuer ("fCN=...:...192383"), which the cloud 403s.
+    CHECK(obn::signing::app_certification_id()
+          == "CN=GLOF3813734089.bambulab.com:a4e8faaa1a38e3650a0ea590d192383f");
     return 0;
 }
 
@@ -285,12 +301,14 @@ int main()
     unlink(tmp_path);
 
     obn::config::test_settings().slicer_key_pem = pem_path;
-    obn::config::test_settings().slicer_cert_id = "testcertid123CN=test.example.com";
+    obn::config::test_settings().slicer_cert_id =
+        "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com";
 
     int rc = 0;
     if (test_non_print_passthrough()       != 0) rc = 1;
     if (test_print_payload_gets_header()   != 0) rc = 1;
     if (test_cert_id_constant()            != 0) rc = 1;
+    if (test_app_certification_id_http_format() != 0) rc = 1;
     if (test_sign_alg_and_ver()            != 0) rc = 1;
     if (test_payload_len_matches_to_sign() != 0) rc = 1;
     if (test_signature_verifies()          != 0) rc = 1;

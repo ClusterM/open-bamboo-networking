@@ -118,6 +118,12 @@ slicer_cert_pem =
 
 slicer_crl_pem =
 
+# Value sent in the X-BBL-Client-Name HTTP header on cloud REST calls.
+# The MakerWorld "POST /my/task" endpoint authorizes access to uploaded
+# print content ONLY for the stock client name "BambuStudio".
+
+client_name = OpenBambooNetworking
+
 # Path to the login session persistence file.
 # If empty, uses session.json in this config directory.
 

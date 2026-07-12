@@ -76,6 +76,36 @@ std::string json_escape(const std::string& in)
     return obn::json::escape(in);
 }
 
+// Redacts a presigned URL for logging: keeps scheme://host/path and the
+// query-parameter *names* (so we can tell a SigV4 PUT-presign apart from a
+// GET-presign, spot an expiry, etc.) but drops every query *value* — the
+// AWS signature and any embedded token must never hit the log. A trailing
+// "?<k1>=…&<k2>=…" summary is appended so the shape stays diagnosable.
+std::string redact_url(const std::string& url)
+{
+    const auto q = url.find('?');
+    if (q == std::string::npos) return url;
+    std::string out = url.substr(0, q);
+    out += " ?[";
+    std::size_t i = q + 1;
+    bool first = true;
+    while (i < url.size()) {
+        std::size_t amp = url.find('&', i);
+        std::size_t end = (amp == std::string::npos) ? url.size() : amp;
+        std::size_t eq  = url.find('=', i);
+        std::string key = (eq != std::string::npos && eq < end)
+                              ? url.substr(i, eq - i)
+                              : url.substr(i, end - i);
+        if (!first) out += ',';
+        out += key;
+        first = false;
+        if (amp == std::string::npos) break;
+        i = amp + 1;
+    }
+    out += ']';
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // RSA field encryption helpers (cloud project_file url_enc / param_enc).
 // ---------------------------------------------------------------------------
@@ -280,22 +310,37 @@ std::string to_bool(bool v) { return v ? "true" : "false"; }
 // HTTP plumbing
 // ---------------------------------------------------------------
 
+// Compile-time OS identity for X-BBL-OS-Type. The MakerWorld POST /my/task
+// endpoint validates this against the OS the content was uploaded from and
+// rejects a mismatch with HTTP 403, so it must reflect the real platform
+// (an earlier hard-coded "linux" broke Windows/macOS cloud prints).
+constexpr const char* kOsType =
+#if defined(_WIN32)
+    "windows";
+#elif defined(__APPLE__)
+    "macos";
+#else
+    "linux";
+#endif
+
 // Shared X-BBL headers captured from the stock plugin. Cloudflare
 // in front of api.bambulab.com is lenient about missing X-BBL
-// fields, but a couple of endpoints (notably POST /my/task) can
-// reject calls without X-BBL-Client-ID. We always set a client id
-// derived from the user id; the rest is cosmetic telemetry.
+// fields, but POST /my/task enforces two by VALUE: X-BBL-Client-Name
+// (must be "BambuStudio" to access the uploaded content) and
+// X-BBL-OS-Type (must match the uploader's OS). See config::client_name.
 std::map<std::string, std::string> bbl_headers(const std::string& access_token,
                                                const std::string& user_id)
 {
+    const auto& cfg_client_name = obn::config::current().client_name;
     std::map<std::string, std::string> h;
     h["Authorization"]        = "Bearer " + access_token;
     h["Content-Type"]         = "application/json";
     h["Accept"]               = "application/json";
-    h["X-BBL-Client-Name"]    = "OpenBambooNetworking";
+    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
+                                                        : cfg_client_name;
     h["X-BBL-Client-Type"]    = "slicer";
-    h["X-BBL-OS-Type"]        = "linux";
-    h["X-BBL-Agent-OS-Type"]  = "linux";
+    h["X-BBL-OS-Type"]        = kOsType;
+    h["X-BBL-Agent-OS-Type"]  = kOsType;
     h["X-BBL-Language"]       = "en-US";
     h["X-BBL-Executable-info"]= "{}";
     if (!user_id.empty())
@@ -374,6 +419,7 @@ int create_project(const std::string& api, const std::string& token,
     }
     OBN_INFO("cloud_print: project pid=%s mid=%s prof=%s",
              out->project_id.c_str(), out->model_id.c_str(), out->profile_id.c_str());
+    OBN_DEBUG("cloud_print: config upload_url=%s", redact_url(out->upload_url).c_str());
     return 0;
 }
 
@@ -418,6 +464,9 @@ int s3_put(const std::string& url, const std::string& body,
     auto resp = obn::http::perform(req);
     if (!resp.error.empty() || !status_ok(resp.status_code))
         return fail_stage(update_fn, err_code, "s3 PUT", resp);
+
+    OBN_DEBUG("cloud_print: s3 PUT ok http=%ld bytes=%zu url=%s",
+              resp.status_code, body.size(), redact_url(url).c_str());
 
     if (update_fn && stage_end_pct >= 0)
         update_fn(BBL::PrintingStageUpload, stage_end_pct,
@@ -528,6 +577,9 @@ int get_upload_url(const std::string& api, const std::string& token,
     if (!resp.error.empty() || !status_ok(resp.status_code))
         return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_USER_UPLOAD_FAILED,
                           "get_upload_url", resp);
+    // Raw body holds only presigned URLs + object keys (no account secrets);
+    // kept at DEBUG for diagnosing endpoint shape changes.
+    OBN_DEBUG("cloud_print: get_upload_url raw body=%s", resp.body.c_str());
     auto root = obn::json::parse(resp.body);
     if (!root) return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_USER_UPLOAD_FAILED,
                                  "bad get_upload_url JSON", resp);
@@ -541,6 +593,7 @@ int get_upload_url(const std::string& api, const std::string& token,
     if (out_url->empty())
         return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_USER_UPLOAD_FAILED,
                           "get_upload_url missing url", resp);
+    OBN_DEBUG("cloud_print: get_upload_url -> %s", redact_url(*out_url).c_str());
     return 0;
 }
 
@@ -620,13 +673,23 @@ int create_task(const std::string& api, const std::string& token,
     req.method  = obn::http::Method::POST;
     req.url     = api + "/v1/user-service/my/task";
     auto hdrs = bbl_headers(token, user_id);
+    OBN_DEBUG("cloud_print: create_task hdr X-BBL-Client-Name=%s X-BBL-OS-Type=%s "
+              "(config client_name=%s) uid=%s",
+              hdrs["X-BBL-Client-Name"].c_str(), hdrs["X-BBL-OS-Type"].c_str(),
+              obn::config::current().client_name.c_str(), user_id.c_str());
     // Signing headers are best-effort: when no slicer key/cert is configured
     // these come back empty, and we omit them rather than send blanks. The
     // cloud verifies x-bbl-device-security-sign by recovering a recent
     // timestamp from the signature (current time in ms, raw PKCS#1 v1.5, not
     // the body); it is only enforced on signed writes.
-    const std::string cert_id  = obn::signing::slicer_cert_id();
+    // The HTTP header uses `issuer:serial.lower()`, a DIFFERENT serialization
+    // from the MQTT envelope cert_id (`serial+issuer`). Sending the MQTT form
+    // here gets the write rejected with 403.
+    const std::string cert_id  = obn::signing::app_certification_id();
     const std::string sec_sign = obn::signing::device_security_sign();
+    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) "
+              "sec_sign_len=%zu",
+              cert_id.c_str(), cert_id.size(), sec_sign.size());
     if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
     if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
     req.headers   = std::move(hdrs);
@@ -635,17 +698,20 @@ int create_task(const std::string& api, const std::string& token,
 
     auto resp = obn::http::perform(req);
 
-    // Soft-fail: the /my/task endpoint records the print in MakerWorld but is
-    // not required for the actual print to start (the printer is triggered by
-    // the MQTT project_file command). If the HTTP request fails (network error,
-    // non-2xx, missing signing key, etc.) we log and continue with task_id "0".
-    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
-        OBN_WARN("cloud_print: create_task soft-fail (http %ld, err=%s); "
-                 "continuing with task_id=0",
-                 resp.status_code, resp.error.c_str());
-        *out_task_id = "0";
-        return 0;
-    }
+    // Hard-fail on any transport error or non-2xx: POST /my/task registers the
+    // print with MakerWorld and, for cloud prints, is what actually authorizes
+    // the printer to fetch the uploaded content. Swallowing its failure led to
+    // silent breakage (the job would proceed with task_id=0 and then stall on
+    // the printer with "failed to download"), so surface it instead.
+    // The most common cause of a 403 here is X-BBL-Client-Name != "BambuStudio"
+    // (see config::client_name) or an X-BBL-OS-Type / uploader-OS mismatch.
+    // Note: this path is only reached for cloud prints (bambu_network_start_print)
+    // and "local print with record" (start_local_print_with_record); block_cloud
+    // stops run_cloud_print_job before we ever get here, and pure LAN printing
+    // (start_local_print -> run_local_print_job) never calls /my/task.
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300)
+        return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED,
+                          "create_task", resp);
 
     auto root = obn::json::parse(resp.body);
     if (!root) {
@@ -704,6 +770,29 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              p.filename.c_str(), p.config_filename.c_str(),
              p.project_name.c_str(),
              use_lan_channel ? "lan" : "cloud");
+
+    // Only cloud-connected printers reach this function; a true LAN-only
+    // printer prints through run_local_print_job instead. Studio's
+    // PrintJob::process tries start_local_print_with_record (use_lan_channel=
+    // true) FIRST and only falls back to start_print (cloud) if it returns < 0.
+    //
+    // Our "record" path still creates a cloud project + POST /my/task, which
+    // the Bambu cloud immediately dispatches to the printer as a real print.
+    // If we then also attempt the LAN MQTT project_file - which needs a
+    // LanSession that Studio never establishes for a cloud-bound printer - it
+    // fails (publish rc=-1), we return < 0, Studio falls back to start_print,
+    // and a SECOND /my/task is created. By then the printer is already printing
+    // the first job, so it rejects the duplicate with "Printing was cancelled"
+    // (err 0300_400C, reason "ERROR STATE") on its screen and via notification.
+    //
+    // Since /my/task + cloud dispatch already start the print, collapse both
+    // entry points into a single cloud print: drop the LAN upload / LAN MQTT
+    // legs so the record path succeeds (returns 0) and Studio never double-fires.
+    if (use_lan_channel) {
+        OBN_INFO("cloud_print: collapsing 'local print with record' into a single "
+                 "cloud print (skipping LAN legs) to avoid a duplicate /my/task");
+        use_lan_channel = false;
+    }
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -906,6 +995,19 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
 
+    // Cloud channel: POST /my/task hands the job to the Bambu cloud, which
+    // dispatches it to the printer itself. Publishing an MQTT project_file on
+    // top makes the printer reject the duplicate with "printer busy" (the job
+    // is already starting), so we stop here for cloud prints. The MQTT
+    // project_file path below is only for the LAN channel (local print with
+    // record), where it is the actual print trigger.
+    if (!use_lan_channel) {
+        if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+        OBN_INFO("cloud_print dev=%s: queued via /my/task (task=%s chan=cloud); "
+                 "MQTT project_file skipped", p.dev_id.c_str(), task_id.c_str());
+        return 0;
+    }
+
     // -------------------------------------------------------------
     // [J] MQTT publish the project_file command. The printer watches
     // for this on its report/request channel and starts the job the
@@ -929,6 +1031,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         opts.file_path = remote_name;
         opts.url       = main_upload_url;
     }
+    OBN_INFO("cloud_print: project_file chan=%s file=%s url=%s",
+             use_lan_channel ? "lan" : "cloud",
+             opts.file_path.c_str(), redact_url(opts.url).c_str());
 
     // Build the MQTT project_file payload. Cloud prints (both LAN-channel and
     // cloud-channel) require url_enc / param_enc — RSA-PKCS#1 v1.5 encrypted
@@ -945,6 +1050,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         //      is not the printer.
         //   3. TLS-leaf PEM snapshot on disk (LAN-direct TOFU fallback).
         EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+        const char* pk_source = printer_pk ? "cache" : "none";
         // Only run the app_cert_install round-trip when the printer has
         // advertised the new authorization-control system (flag3 bit 16).
         // Otherwise the command is meaningless to the firmware; fall straight
@@ -965,6 +1071,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 printer_pk = cert_store::get_printer_pub_key(p.dev_id);
             }
+            if (printer_pk) pk_source = "app_cert_install";
             if (!printer_pk) {
                 OBN_WARN("cloud_print: no app_cert_install response for dev=%s "
                          "within 5s; falling back to TLS-leaf snapshot",
@@ -976,6 +1083,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             printer_pk = load_printer_pub_key_from_pem(pem_path);
             if (printer_pk) {
                 cert_store::set_printer_pub_key(p.dev_id, printer_pk);
+                pk_source = "tls-leaf-pem";
+                OBN_INFO("cloud_print: printer pubkey from TLS-leaf snapshot %s",
+                         pem_path.c_str());
             }
         }
         if (!printer_pk) {
@@ -995,6 +1105,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         std::string enc_err;
         std::string url_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
         ::EVP_PKEY_free(printer_pk);
+
+        OBN_DEBUG("cloud_print: url_enc built key_source=%s url_len=%zu enc_len=%zu",
+                  pk_source, opts.url.size(), url_enc.size());
 
         if (url_enc.empty()) {
             OBN_ERROR("cloud_print: RSA field encryption failed: %s", enc_err.c_str());

@@ -104,12 +104,22 @@ OBN_ABI int bambu_network_get_subtask(void*          /*agent*/,
                                       BBLModelTask*  task,
                                       std::function<void(BBLModelTask*)> cb)
 {
-    // Cloud-only endpoint: in LAN mode there is no subtask/model-task record
-    // to fetch. Do NOT invoke the callback with a fake pointer - the caller
-    // (StatusPanel::update_model_info) dereferences subtask->task_id
-    // unconditionally and would SIGBUS/SIGSEGV on any non-mappable address.
-    OBN_DEBUG("get_subtask task=%p cb=%d (stub: no callback)", (void*)task, cb ? 1 : 0);
-    (void)cb;
+    // Studio owns `task` (a heap BBLModelTask it just new'd, with task_id
+    // pre-filled) and expects the plugin to enrich it with the cloud
+    // model/design record for that task_id, then hand it back through `cb`.
+    // The callback (StatusPanel::update_model_info -> get_subtask_fn) matches
+    // subtask->task_id against the active print and calls set_modeltask(subtask),
+    // taking ownership of the very pointer we echo back.
+    //
+    // We have no MakerWorld model/design metadata to add for user-uploaded
+    // prints (there is no published model behind them), so we echo the caller's
+    // object back unchanged. This is what completes Studio's request: skipping
+    // the callback leaves StatusPanel::request_model_info_flag latched forever
+    // and leaks the freshly-new'd BBLModelTask. It is ABI-safe precisely because
+    // we return the SAME valid pointer Studio handed us - never a fabricated one
+    // (the callback dereferences subtask->task_id, so a bad pointer would crash).
+    OBN_DEBUG("get_subtask task=%p cb=%d -> echo", (void*)task, cb ? 1 : 0);
+    if (task && cb) cb(task);
     return BAMBU_NETWORK_SUCCESS;
 }
 
