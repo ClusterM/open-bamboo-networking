@@ -576,6 +576,8 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_enable_multi_machine` | `void(void*, bool)` |
 | `bambu_network_send_message` | `int(void*, std::string dev_id, std::string json_str, int qos, int flag)` — MQTT-style call |
 
+> **DeviceSubscribeManager local↔cloud FSM (Studio-side, AGPL).** The dual-channel "LAN-first, cloud fallback" behaviour is driven by Studio's `DeviceSubscribeManager`, keyed off a `dev_id → {dev_ip, access_code}` cache: it auto-creates the **local** subscription, **defer-closes** the cloud one, and **fails back to cloud** when the local channel goes silent ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). That whole mechanism lives in Studio, not in the plugin — OBN only implements the primitive `add_subscribe`/`del_subscribe` (buffer on the plugin side, apply on the next cloud `CONNACK`). **Defensive-audit note for `block_cloud`:** when `block_cloud` is set, `bambu_network_add_subscribe` / `del_subscribe` / `connect_server` short-circuit to `SUCCESS` without ever creating a cloud subscription (`src/abi_cloud.cpp`), and `get_user_print_info` skips its implicit `cloud_add_subscribe` (`src/abi_http.cpp`). So OBN never opens a cloud subscription it then fails to tear down; any "stuck waiting for status" UI under `block_cloud` originates in Studio's FSM expecting a cloud fallback that we deliberately withhold — the printer must be reachable over LAN (LAN-Only mode + access code) for status to flow, which is the intended trade-off, not a plugin leak.
+
 #### 6.3.1. Cloud MQTT authentication
 
 Two distinct mechanisms exist on the production broker. **This open plugin uses the simpler one**; the stock closed-source plugin uses the other.
@@ -590,6 +592,8 @@ Two distinct mechanisms exist on the production broker. **This open plugin uses 
 | Password | OAuth access token from `POST /v1/user-service/user/ticket/<T>` |
 
 This matches what Home Assistant's `pybambu` integration uses. No client certificate is required for the open plugin path; cloud auth rides on the bearer token in the MQTT password field.
+
+> **Plaintext `:1883` alongside `:8883`.** Some firmware exposes an unencrypted MQTT listener on `:1883` next to the TLS `:8883` broker ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). OBN always uses the TLS port; the plaintext path is documented only so it is not mistaken for a rogue service during packet captures.
 
 **Stock plugin (reverse-engineered — not implemented here)**
 
@@ -940,7 +944,9 @@ A single integer read by three independent parsers. Reported in legacy (non-NP) 
 
 ###### NP (New Protocol) bitmask fields
 
-NP is activated when the printer sends all four hex-string fields: `cfg`, `fun`, `aux`, `stat` in `push_status.print`. When NP is active, legacy integer fields like `home_flag` and `xcam.cfg` are **not** sent; their information is encoded in the NP fields instead.
+NP is activated when the printer sends all four hex-string fields: `cfg`, `fun`, `aux`, `stat` in `push_status.print`. When NP is active, legacy integer fields like `home_flag` and `xcam.cfg` are **not** sent; their information is encoded in the NP fields instead. The hex-bitmask nature of all four fields is independently confirmed in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49) (symbol-bearing `.so` rodata + live `02.06.00.50` / `02.07` captures).
+
+> **`support_*` capability map — flow→PA mapping quirk.** Alongside the NP bitmasks, `push_status` carries a `support_*` boolean capability map plus AMS per-tray `state`, `DevInf → connection_name`, and a (usually blanked) `dev_signal`. When decoding `support_*`, note that the **flow-calibration** capability and the **pressure-advance (PA)** capability are cross-wired in at least one firmware generation (a `support_flow_*` flag actually gates PA, or vice-versa); do not assume the flag name maps 1:1 to the feature. Flagged in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49); decode against live hardware before gating UI on it. `upgrade_state.new_ver_list[]` / `sw_new_ver` are the source `get_printer_firmware` re-synthesises "available update" state from (per-entry shape confirmed in #49).
 
 **`print.cfg`** — hex string, configuration/settings state:
 
@@ -2556,6 +2562,8 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | `bambu_network_get_camera_url_for_golive` | `int(void*, std::string dev_id, std::string sdev_id, std::function<void(std::string)>)` |
 | `bambu_network_get_hms_snapshot` | `int(void*, std::string& dev_id, std::string& file_name, std::function<void(std::string, int)>)` |
 
+> **Remote-camera URL grammar (documentation only; vendor-locked).** For the cloud/remote leg of `get_camera_url` (distinct from the LAN `bambu:///local/...` / `rtsps___` shapes in §7.6), stock mints `bambu:///tutk?uid=<ttcode>&authkey=&passwd=&region=&device=&net_ver=&dev_ver=` after `GET %1%/iot-service/api/user/ttcode`. The `get_camera_url` input key is `dev|fw|proto[|channel]`, and go-live returns a CDN `cdnUrl`. This stays out of OBN's scope: the TUTK/Agora token is single-use and gated against a live cloud account, so remote camera remains 🔒. Shape documented from [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49) for completeness only.
+
 ### 6.12. MakerWorld / Mall
 
 | Symbol | Signature |
@@ -2635,6 +2643,8 @@ Result / message structs:
 struct ft_job_result { int ec; int resp_ec; const char *json; const void *bin; uint32_t bin_size; };
 struct ft_job_msg    { int kind; const char *json; };
 ```
+
+The `ft_job_result { int ec; int resp_ec; const char* json; const void* bin; uint32_t bin_size; }` layout above is independently confirmed in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49), reproduced from a disassembly of `ft_job_result_destroy` in a symbol-bearing build — the same source that recovered **79 exact demangled C++ ABI signatures** (cross-checking the whole §6 contract), the `bambu_network_create_agent` body that VMProtect hid in DLL-only efforts, and an **open-coded `PrintParams` serializer with a 6-bool block at struct offset `+0x278..+0x27d`**. These are corroboration of the ABI documented here, not new plugin work.
 
 Studio expects `ft_abi_version() == 1` (the default `abi_required` in `InitFTModule`).
 
