@@ -203,8 +203,11 @@ std::string json_or_default(const std::string& raw, const char* fallback)
 // Build a single amsMapping2 element as the server expects it:
 // `{"amsId":N,"slotId":M}` (camelCase). The convention observed in
 // the MITM dump is:
-//   -1   -> amsId=255, slotId=255 (unset / "external spool" sentinel)
+//   -1   -> amsId=255, slotId=0 (unset / "external spool" sentinel)
 //   >=0  -> amsId=i/4, slotId=i%4 (linear index over AMS slot 0..3)
+// The external-spool sentinel is `{amsId:255,slotId:0}`, NOT
+// `{...,slotId:255}`: a genuine no-AMS /my/task body carries slotId 0
+// and the endpoint 400s on the wrong shape (cross-validated in #48).
 std::string ams_slot_pair(int ams_id, int slot_id)
 {
     return "{\"amsId\":" + std::to_string(ams_id) +
@@ -234,7 +237,7 @@ std::string ams_mapping2_for_cloud(const BBL::PrintParams& p)
             if (!v.is_number()) continue;
             int idx = static_cast<int>(v.as_number());
             int ams_id, slot_id;
-            if (idx < 0) { ams_id = 255; slot_id = 255; }
+            if (idx < 0) { ams_id = 255; slot_id = 0; }
             else         { ams_id = idx / 4; slot_id = idx % 4; }
             if (!first) out.push_back(',');
             first = false;
@@ -260,7 +263,9 @@ std::string ams_mapping2_for_cloud(const BBL::PrintParams& p)
         auto slot_v = item.find("slotId");
         if (!slot_v.is_number()) slot_v = item.find("slot_id");
         int ams_id  = ams_v.is_number()  ? static_cast<int>(ams_v.as_number())  : 255;
-        int slot_id = slot_v.is_number() ? static_cast<int>(slot_v.as_number()) : 255;
+        // Missing slot defaults to 0 to match the external-spool sentinel
+        // {amsId:255,slotId:0} (see ams_slot_pair note; #48).
+        int slot_id = slot_v.is_number() ? static_cast<int>(slot_v.as_number()) : 0;
         if (!first) out.push_back(',');
         first = false;
         out += ams_slot_pair(ams_id, slot_id);

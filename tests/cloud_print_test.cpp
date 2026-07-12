@@ -68,7 +68,8 @@ static void test_ams_mapping2_sentinel_from_flat()
     p.ams_mapping  = "[-1]";
     p.ams_mapping2 = "";
     const std::string out = obn::cloud_print::test_ams_mapping2(p);
-    CHECK(out == "[{\"amsId\":255,\"slotId\":255}]");
+    // External-spool sentinel is {amsId:255,slotId:0} (not slotId:255); #48.
+    CHECK(out == "[{\"amsId\":255,\"slotId\":0}]");
 }
 
 static void test_ams_mapping2_index_from_flat()
@@ -88,7 +89,7 @@ static void test_ams_mapping2_index_from_flat()
     CHECK(static_cast<int>(arr[2].find("amsId").as_number())  == 1);
     CHECK(static_cast<int>(arr[2].find("slotId").as_number()) == 0);
     CHECK(static_cast<int>(arr[3].find("amsId").as_number())  == 255);
-    CHECK(static_cast<int>(arr[3].find("slotId").as_number()) == 255);
+    CHECK(static_cast<int>(arr[3].find("slotId").as_number()) == 0);
 }
 
 static void test_ams_mapping2_snake_case_converted_to_camel()
