@@ -871,6 +871,11 @@ UploadOutcome Connection::query_media_ability()
         return out;
     }
 
+    // Log the raw ability reply so `storage` vs `upload_storage` (the
+    // writable subset we now prefer) is inspectable without decrypting
+    // the TLS :6000 session in Wireshark.
+    OBN_DEBUG("tunnel_upload: media-ability reply: %s", wire_json.c_str());
+
     std::string body = obn::tunnel_local::parse_ability_reply_to_ft_json(wire_json);
     if (body.empty()) {
         out.error = "bad ability reply";
