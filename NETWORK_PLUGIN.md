@@ -1275,6 +1275,22 @@ Terminology note:
 
 - ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs, not a plugin-side fixed OSS endpoint. The print-upload presigned URLs are **S3 signature V2** query-auth (`?AWSAccessKeyId=…&Expires=…&Signature=…`) — **on-wire confirmed** against genuine `POST /v1/iot-service/api/user/project` traffic on a live account (`s3.us-west-2.amazonaws.com`, 2026-07). This is **not** SigV4 (no `X-Amz-Algorithm` / `X-Amz-Signature`); issue #48's SigV4 claim was **not reproduced** here and may be region- or snapshot-dependent. We `PUT` the body opaquely and strip `Content-Type` (the V2 StringToSign covers `Content-Type`, and the presigner signs with an empty one, so any `Content-Type` we add would break the signature); the client never recomputes the signature, so the scheme itself is transport-level for the print-upload leg. **Distinct leg:** the credential-based direct-OSS path used by rating-picture upload (`get_oss_config` → `put_rating_picture_oss`) *does* sign client-side, and *that* leg uses AWS SigV4 (S3) or Aliyun OSS V1 (CN) — see §6.12 `get_oss_config`.
 
+##### 6.8.1.1. Cloud print authorization (OBN findings, on hardware 2026-07)
+
+Getting a **cloud** print (or "local print with record") to actually start from OBN on a stock, non-Developer-Mode P2S required more than the upload sequence above. The findings below were established on live hardware and drive OBN's current cloud-print implementation (`src/cloud_print.cpp`, `run_cloud_print_job`); the MVP is working end-to-end.
+
+**1. `POST /my/task` is the trigger, not the MQTT `project_file`.** For a cloud-connected printer the Bambu cloud dispatches the job to the printer itself the moment `/my/task` succeeds. OBN therefore **does not** publish an MQTT `project_file` on the cloud channel — doing so makes the printer reject the second, duplicate job with **`0500_4004`** ("The printer can't receive new print jobs while printing"). The MQTT `project_file` (§6.8.2) is the print trigger **only** on the pure-LAN path (`start_local_print`).
+
+**2. Required headers on `/my/task`** (beyond the `Authorization: Bearer` token):
+- **`X-BBL-Client-Name: BambuStudio`** and a matching **`X-BBL-OS-Type`** — mandatory; a wrong/missing value 403s. See the header block in §6.10.1 for the full write-up and the `client_name` config knob.
+- **`x-bbl-app-certification-id`** and **`x-bbl-device-security-sign`** — the HTTP half of command-security for a *secured* printer, signed with the user-supplied `slicer_key.pem`. Serialization: `x-bbl-app-certification-id = issuer + ":" + serial.lower()` (a **different** serialization from the MQTT `cert_id`, which is `serial + issuer` with no separator — getting this wrong 403s), and `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` over the current time in **milliseconds** (13 digits; a nanosecond timestamp fails signature recency). Both are best-effort: absent a configured slicer key OBN omits them rather than sending blanks. See the *Command-security key & certificate flow* subsection later in §6.8 and [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47).
+
+**3. `create_task` must hard-fail.** `/my/task` is what authorizes the printer to fetch the uploaded content, so OBN treats any non-2xx as fatal (`BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED`) instead of the old soft-fail that continued with `task_id=0` and stalled the printer on "failed to download".
+
+**4. The duplicate-submission pitfall (`start_local_print_with_record` → `start_print` fallback).** Studio's `PrintJob::process()` tries **`start_local_print_with_record` first** and only falls back to **`start_print`** if it returns `< 0`. OBN's "record" path also creates a cloud task + `/my/task`; if it then tried the LAN MQTT leg (which needs a `LanSession` Studio never establishes for a cloud-bound printer) it would fail, return `< 0`, and Studio would fire `start_print` → a **second** `/my/task`. The printer, already printing the first job, then rejects the duplicate with `0500_4004` / `0300_400C` ("Printing was cancelled"). **Fix:** for a cloud-connected printer OBN collapses the "record" entry point into a single cloud print (drops the LAN legs so the record path returns `0`), so Studio never double-fires.
+
+**5. Studio-side crash caveat (not OBN).** After a print, if the printer reports **any** non-zero `print_error` (including a stale/latched one), Studio's `StatusPanel::update_error_message()` opens a `DeviceErrorDialog`, whose `RequestUserAttention → gtk_widget_get_realized` path **segfaults under GTK/Wayland** (`GLib-CRITICAL: Source ID … was not found`). This is a Studio/GTK bug, independent of the plugin; the workaround is to launch Studio with **`GDK_BACKEND=x11`**.
+
 #### 6.8.2. The MQTT `project_file` command (wire format)
 
 The print-job submission ends with a single MQTT command published to the printer's request channel (`device/<dev_id>/request` on LAN, identical envelope on the cloud forwarder). The frame the firmware actually parses lives under the `print` object. The example below was captured on a real P2S running stock firmware paired with the stock Studio + plugin; X1 / P1S share the schema with a few extra optional members.
@@ -2497,7 +2513,13 @@ X-BBL-Agent-OS-Type: linux
 
 `X-BBL-Client-Version` is the slicer version; `X-BBL-Agent-Version` is the networking plugin version. `X-BBL-OS-Type` and `X-BBL-Agent-OS-Type` both report `linux` when running through pjarczak's WSL2 bridge; native Linux builds send `linux` directly. `X-BBL-OS-Version` carries the OS build string (Windows build number when relayed through pjarczak). `X-BBL-Executable-info` is always the literal string `{}`. `X-BBL-Device-ID` is a machine-local UUID, not the printer serial.
 
-Plus anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for the API to accept the call. They influence analytics only.
+Plus anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for **most** endpoints (auth, profile, presets, bind, project/upload) — there they influence analytics only.
+
+> **Exception — `POST /v1/user-service/my/task` (cloud print / "local print with record").** On live hardware two of these headers are **hard requirements**; without them the endpoint returns **HTTP 403** ("no access rights to the content") and the cloud print never starts:
+> - **`X-BBL-Client-Name: BambuStudio`** — MakerWorld's user-service authorizes access to the just-uploaded print content only for the stock client identity. Our honest default `OpenBambooNetworking` is rejected with 403. In OBN this value is configurable via `obn.conf` `client_name` (empty ⇒ honest default ⇒ cloud print 403s; set to `BambuStudio` to make cloud printing work — see STATUS.md §6.8).
+> - **`X-BBL-OS-Type`** — must match the OS that performed the upload (`linux` / `windows` / `macos`); a mismatch also 403s. OBN sets it from a compile-time platform macro.
+>
+> Subtractive bisection against the production server (2026-07) narrowed the requirement to exactly these two `X-BBL-*` headers; the remaining fingerprint headers stay analytics-only even on `/my/task`. The signed **command-security** headers (`x-bbl-app-certification-id`, `x-bbl-device-security-sign`) are additionally needed for a *secured* printer — see §6.8.1.1 "Cloud print authorization".
 
 An additional header `X-BBL-Client-ID` appears on **device-scoped endpoints** (e.g. firmware version query, device metadata) but not on account-scoped endpoints (auth, profile, presets):
 
@@ -2586,6 +2608,20 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 `PublishParams` (`bambu_networking.hpp:251-258`): `project_name`, `project_3mf_file`, `preset_name`, `project_model_id`, `design_id`, `config_filename`.
 
 **OSS credential/upload leg** (`get_oss_config` + `put_rating_picture_oss`; cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)): Studio first calls `get_oss_config`, which maps to `GET /v1/user-service/my/ossconfig?useType=1` (with `.../s3config?useType=1` as fallback) and returns the server's STS-scoped credential JSON verbatim — `{endpoint, accessKeyId, accessKeySecret, securityToken, expiration, bucketName, cdnUrl}`. Studio treats the blob as opaque and passes it back into `put_rating_picture_oss`, which signs the `PUT` **client-side** (unlike the print-upload leg in §6.8.1, where the cloud presigns the URL): AWS Signature V4 (`AWS4-HMAC-SHA256`, scope `<date>/<region>/s3/aws4_request`, signed headers `host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`) for S3-style endpoints, or Aliyun OSS V1 (`Authorization: OSS <AKID>:<base64 HMAC-SHA1 sig>` + `x-oss-security-token`) for `aliyuncs.com` endpoints (CN region). The object-key convention used for rating pictures and the exact value Studio expects back in `pic_oss_path` are not wire-confirmed yet (**verify-on-hardware**, needs a live cloud account); OBN's implementation (`src/oss_sign.cpp`, `src/abi_makerworld.cpp`) fails closed on any mismatch. *(#49, OBN)*
+
+**`get_subtask` vs `get_subtask_info`** — two different symbols, easy to confuse:
+
+| Symbol | Input | Expected output | Studio consumer |
+|--------|-------|-----------------|-----------------|
+| `get_subtask_info` (§6.10.2) | `subtask_id` string | JSON blob; hero thumbnail from `context.plates[<plate_idx>].thumbnail.url` | `DeviceManager` → printer-card cover during print |
+| `get_subtask` (this section) | `BBLModelTask*` with only `task_id` pre-filled | Same pointer, **enriched** with MakerWorld model/design fields | `StatusPanel::update_model_info` → `set_modeltask` |
+
+Stock `get_subtask` is a cloud REST lookup keyed by `task_id`. It should populate the `BBLModelTask` members Studio cares about (`ProjectTask.hpp`):
+
+- `design_id`, `instance_id`, `profile_id`, `job_id` (ints) — `instance_id > 0` is what lets `MachineObject::update_model_task()` call `get_model_mall_rating_result` after the print finishes (post-print MakerWorld rating dialog).
+- `model_id`, `model_name`, `profile_name` (strings) — when `design_id > 0`, `StatusPanel` shows `profile_name` in the in-print task panel.
+
+The stock cloud URL is **not captured** (likely a MakerWorld/user-service endpoint). OBN's current implementation (`src/abi_makerworld.cpp`) is an **ABI-safe stub only**: it echoes the caller-owned pointer through the callback without fetching anything. That prevents Studio from leaking the freshly-`new`'d `BBLModelTask` and clears `request_model_info_flag`, but leaves all metadata fields at their zero/empty defaults — so MakerWorld-specific UI (profile label, rating prompt) stays off. For user-uploaded prints (no published MakerWorld model behind the job) a no-op may be acceptable; for prints started from a downloaded MakerWorld model the real fetch is still missing.
 
 ### 6.13. Tracking / telemetry
 

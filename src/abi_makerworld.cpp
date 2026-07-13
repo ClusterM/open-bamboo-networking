@@ -104,20 +104,12 @@ OBN_ABI int bambu_network_get_subtask(void*          /*agent*/,
                                       BBLModelTask*  task,
                                       std::function<void(BBLModelTask*)> cb)
 {
-    // Studio owns `task` (a heap BBLModelTask it just new'd, with task_id
-    // pre-filled) and expects the plugin to enrich it with the cloud
-    // model/design record for that task_id, then hand it back through `cb`.
-    // The callback (StatusPanel::update_model_info -> get_subtask_fn) matches
-    // subtask->task_id against the active print and calls set_modeltask(subtask),
-    // taking ownership of the very pointer we echo back.
-    //
-    // We have no MakerWorld model/design metadata to add for user-uploaded
-    // prints (there is no published model behind them), so we echo the caller's
-    // object back unchanged. This is what completes Studio's request: skipping
-    // the callback leaves StatusPanel::request_model_info_flag latched forever
-    // and leaks the freshly-new'd BBLModelTask. It is ABI-safe precisely because
-    // we return the SAME valid pointer Studio handed us - never a fabricated one
-    // (the callback dereferences subtask->task_id, so a bad pointer would crash).
+    // ABI-safe stub: Studio passes a heap BBLModelTask with only task_id set
+    // and expects us to cloud-fetch MakerWorld model/design metadata
+    // (design_id, instance_id, model_id, model_name, profile_name, …) then
+    // hand the enriched object back through cb. Stock does a real REST lookup;
+    // we don't — we just echo the pointer so Studio doesn't leak it and
+    // request_model_info_flag clears. MakerWorld profile/rating UI stays off.
     OBN_DEBUG("get_subtask task=%p cb=%d -> echo", (void*)task, cb ? 1 : 0);
     if (task && cb) cb(task);
     return BAMBU_NETWORK_SUCCESS;

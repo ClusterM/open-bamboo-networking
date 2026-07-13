@@ -223,8 +223,8 @@ Source: [src/abi_print.cpp](src/abi_print.cpp). **Studio-side orchestration** (w
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_start_print` | 🔒⚠️ | Pure cloud path: Studio publishes a signed MQTT command to the cloud-paired printer. The required per-install RSA signing keys are not reproducible, so the command is rejected with `84033543 "MQTT Command verification failed"`. Works only against a printer with Developer Mode enabled, where signature validation is skipped and the command arrives via LAN MQTT. |
-| `bambu_network_start_local_print_with_record` | ⚠️ | Hybrid: cloud REST/S3 + LAN upload (`:6000`+`brtc://` or FTPS); cloud `create_task` soft-fails in Dev Mode. |
+| `bambu_network_start_print` | ⚠️ | **Cloud print works end-to-end (MVP)** via the cloud REST pipeline + presigned S3 PUT + `POST /v1/user-service/my/task`; the Bambu cloud dispatches the job to the printer, so OBN **does not** publish an MQTT `project_file` on the cloud channel (that would double-fire and 0500_4004 "printer busy"). Prerequisites: user-supplied **`slicer_key.pem`** (for `x-bbl-app-certification-id` / `x-bbl-device-security-sign`) and **`client_name = BambuStudio`** in `obn.conf` (else `/my/task` 403s). We no longer use the signed **MQTT** `project_file` for cloud (which needs the non-reproducible per-install key and would fail `84033543`). See [NETWORK_PLUGIN.md §6.8.1.1](NETWORK_PLUGIN.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
+| `bambu_network_start_local_print_with_record` | ⚠️ | For a cloud-connected printer this now **collapses into the single cloud print above** (`use_lan_channel` forced false), so it returns `0` and Studio never falls back to `start_print` — which previously created a *second* `/my/task` and got the duplicate rejected with `0500_4004` / `0300_400C`. `create_task` **hard-fails** on non-2xx (was a soft-fail that stalled the printer on "failed to download"). The LAN upload leg is skipped because Studio establishes no `LanSession` for a cloud-bound printer. |
 | `bambu_network_start_send_gcode_to_sdcard` | ✅ | FTPS STOR; destination name = `project_name`. On current Studio mostly `"verify_job"` probe; P2S model upload uses `ft_*` (§6.14.2) |
 | `bambu_network_start_local_print` | ✅ | LAN-only: `:6000` emmc upload + `brtc://emmc/` MQTT when `try_emmc_print`; else FTPS + `ftp://` (N7). |
 | `bambu_network_start_sdcard_print` | ✨ | Stock hits a signed cloud REST endpoint. This plugin publishes `{"print":{"command":"project_file", "url":"file:///<path>", …}}` directly on LAN MQTT for a file already resident on the printer. No cloud task record is produced. |
@@ -237,8 +237,8 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 
 | ABI entry point | `Agent::` handler | Source | Current transport |
 | --- | --- | --- | --- |
-| `bambu_network_start_print` | `run_cloud_print_job(..., use_lan_channel=false)` | `cloud_print.cpp` | Cloud REST + presigned S3 PUT + cloud MQTT `project_file` (`url=https://…`) |
-| `bambu_network_start_local_print_with_record` | `run_cloud_print_job(..., use_lan_channel=true)` | `cloud_print.cpp` | Same cloud REST/S3 pipeline, then LAN upload (`:6000`+`brtc://` when `try_emmc_print`, else FTPS+`ftp://`) + `POST /v1/user-service/my/task` |
+| `bambu_network_start_print` | `run_cloud_print_job(..., use_lan_channel=false)` | `cloud_print.cpp` | Cloud REST + presigned S3 PUT + `POST /v1/user-service/my/task` (cloud dispatch starts the print; **no** MQTT `project_file` on the cloud channel) |
+| `bambu_network_start_local_print_with_record` | `run_cloud_print_job(..., use_lan_channel=true→false)` | `cloud_print.cpp` | **Collapsed into the cloud path** for cloud-bound printers (`use_lan_channel` forced false) to avoid a duplicate `/my/task`; the LAN upload / LAN MQTT legs are skipped. See [NETWORK_PLUGIN.md §6.8.1.1](NETWORK_PLUGIN.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
 | `bambu_network_start_local_print` | `run_local_print_job` | `print_job.cpp` | `:6000` emmc + `brtc://emmc/` when `try_emmc_print`; else FTPS + `ftp://` (N7) |
 | `bambu_network_start_send_gcode_to_sdcard` | `run_send_gcode_to_sdcard` | `print_job.cpp` | FTPS STOR only; remote name = `project_name` (probe / legacy SendJob) |
 | `bambu_network_start_sdcard_print` | `run_sdcard_print_job` | `print_job.cpp` | LAN MQTT `project_file` only (`url=file:///<path>`; file already on printer) |
@@ -249,7 +249,7 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 
 | Gap | Open plugin | Stock / notes |
 | --- | --- | --- |
-| Cloud print pipeline | Full `cloud_print.cpp` for `start_print` and `_with_record` | Dev Mode: `start_print` often stubbed; hybrid still needs cloud REST for task history |
+| Cloud print pipeline | Full `cloud_print.cpp` for `start_print` and `_with_record`; **cloud print MVP works end-to-end** given a user-supplied `slicer_key.pem` + `client_name = BambuStudio` | Stock triggers the print via a signed MQTT `project_file`; OBN instead relies on the `/my/task` cloud dispatch and skips that MQTT leg. Extra cloud-start `project_file` fields (`job_id`/`job_type`/`design_id`) still unemitted — see [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format) |
 | Cover cache after brtc print | FTPS `RETR` from `/cache/` | May need `:6000` or emmc path once prints land in model cache |
 
 Wire-format reference for `project_file` field semantics and URL schemes: [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format). Cloud REST step list observed on stock (MITM): [NETWORK_PLUGIN.md §6.8.1](NETWORK_PLUGIN.md#681-cloud-upload-flow-stock-plugin-mitm).
@@ -281,7 +281,7 @@ Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). MakerWorld has no open
 | `bambu_network_get_design_staffpick` | ❌ | Callback receives `{"list":[],"total":0}`. Studio renders an empty staff-pick carousel. |
 | `bambu_network_start_publish` | ❌ | Returns `ERR_INVALID_RESULT`; publishing to MakerWorld is not supported. |
 | `bambu_network_get_model_publish_url` | ❌ | Returns `https://makerworld.com/` as a safe default; stock serves the per-account upload endpoint. |
-| `bambu_network_get_subtask` | ❌ | Returns `SUCCESS` without invoking the callback. Invoking it with a fake `BBLModelTask*` would crash Studio — `StatusPanel::update_model_info` dereferences the pointer unconditionally. |
+| `bambu_network_get_subtask` | ❌ | **Stub only.** Stock fetches MakerWorld model/design metadata for the cloud `task_id` and fills `BBLModelTask` (`design_id`, `instance_id`, `model_id`, `model_name`, `profile_name`, …). OBN just echoes the caller-owned pointer through the callback unchanged — enough to avoid leaking the `new`'d object and to clear `request_model_info_flag`, but **no cloud fetch** happens. Without `design_id`/`instance_id` the in-print profile label and post-print MakerWorld rating UI stay disabled. See [NETWORK_PLUGIN.md §6.12](NETWORK_PLUGIN.md#612-makerworld--mall). |
 | `bambu_network_get_model_mall_home_url` | ❌ | Returns `https://makerworld.com/` as a safe default. |
 | `bambu_network_get_model_mall_detail_url` | ❌ | Returns `https://makerworld.com/models/<id>` as a safe default. |
 | `bambu_network_put_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`; no rating submission backend. |
