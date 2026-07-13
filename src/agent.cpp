@@ -481,12 +481,10 @@ void Agent::lan_watchdog_loop()
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
 {
     BBL::OnLocalConnectedFn   cb;
-    BBL::OnPrinterConnectedFn printer_cb;
     BBL::QueueOnMainFn        queue;
     {
         std::lock_guard<std::mutex> lk(mu_);
         cb         = on_local_connect_;
-        printer_cb = on_printer_connected_;
         queue      = queue_on_main_;
     }
     OBN_DEBUG("notify_local_connected status=%d dev=%s msg=%s cb=%d queued=%d",
@@ -497,18 +495,16 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
         else       invoke();
     }
 
-    // A successful LAN CONNACK always arrives with an empty msg (disconnects
-    // carry "mqtt disconnect rc=..."). Mirror the stock plugin and fire
-    // on_printer_connected_fn as well: Studio's handler responds with
-    // command_get_access_code, and parsing that reply is the only path that
-    // persists "user_access_code" in BambuStudio.conf — which in turn is
-    // required by restore_local_machines_from_user_access_config() for the
-    // LAN auto-connect on the next startup.
-    if (status == BBL::ConnectStatusOk && msg.empty() && printer_cb) {
-        auto invoke = [printer_cb, dev_id]() { printer_cb(dev_id); };
-        if (queue) queue(invoke);
-        else       invoke();
-    }
+    // NOTE: we deliberately do NOT fire on_printer_connected_fn here for LAN
+    // CONNACKs. In stock behaviour that callback is a cloud/tunnel event only
+    // (we still fire it as "tunnel/<id>" from the cloud path on the first
+    // cloud report). Studio's on_printer_connected_fn handler is written for
+    // cloud devices and calls MachineObject::erase_user_access_code(); for a
+    // LAN printer that was just paired via the "Input access code" dialog the
+    // code lives ONLY in user_access_code (access_code stays empty), so erasing
+    // it makes has_access_right() false, drops the printer out of
+    // get_my_machine_list(), and the just-connected LAN printer silently falls
+    // back to "found but not paired" until Studio is restarted.
 
     // LAN went down (lost/failed CONNACK): immediately fail the report
     // subscription back to the cloud instead of waiting out the silence
