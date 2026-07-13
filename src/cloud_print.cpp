@@ -773,28 +773,25 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              p.project_name.c_str(),
              use_lan_channel ? "lan" : "cloud");
 
-    // Only cloud-connected printers reach this function; a true LAN-only
-    // printer prints through run_local_print_job instead. Studio's
-    // PrintJob::process tries start_local_print_with_record (use_lan_channel=
-    // true) FIRST and only falls back to start_print (cloud) if it returns < 0.
+    // Studio's PrintJob::process tries start_local_print_with_record
+    // (use_lan_channel=true) FIRST and only falls back to start_print
+    // (use_lan_channel=false, cloud) if the record path returns < 0
+    // (3rd_party/BambuStudio/.../PrintJob.cpp).
     //
-    // Our "record" path still creates a cloud project + POST /my/task, which
-    // the Bambu cloud immediately dispatches to the printer as a real print.
-    // If we then also attempt the LAN MQTT project_file - which needs a
-    // LanSession that Studio never establishes for a cloud-bound printer - it
-    // fails (publish rc=-1), we return < 0, Studio falls back to start_print,
-    // and a SECOND /my/task is created. By then the printer is already printing
-    // the first job, so it rejects the duplicate with "Printing was cancelled"
-    // (err 0300_400C, reason "ERROR STATE") on its screen and via notification.
+    // LAN-first policy (mirrors the stock plugin): the "record" path uploads
+    // the 3mf straight to the printer over LAN, POSTs /my/task with
+    // mode=lan_file purely as a cloud history record (the cloud does NOT
+    // dispatch a lan_file task to the printer), and triggers the print with a
+    // plaintext LAN MQTT project_file. Only one dispatch reaches the printer,
+    // so there is no duplicate-job "printer busy" (0500_4004) / "cancelled"
+    // (0300_400C) rejection. The cloud channel (start_print) stays as the
+    // fallback: it uploads to S3 and lets the cloud dispatch the job.
     //
-    // Since /my/task + cloud dispatch already start the print, collapse both
-    // entry points into a single cloud print: drop the LAN upload / LAN MQTT
-    // legs so the record path succeeds (returns 0) and Studio never double-fires.
-    if (use_lan_channel) {
-        OBN_INFO("cloud_print: collapsing 'local print with record' into a single "
-                 "cloud print (skipping LAN legs) to avoid a duplicate /my/task");
-        use_lan_channel = false;
-    }
+    // A cloud-bound printer never gets a LanSession from Studio's
+    // connect_printer (Studio only calls that for LAN-mode printers), so the
+    // record path establishes the LAN MQTT session itself via
+    // ensure_lan_session(); if that is not possible (no IP/access code, or the
+    // session will not come up) it degrades to the cloud channel below.
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -937,6 +934,14 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             OBN_WARN("cloud_print: lan channel requested but no dev_ip/access_code "
                      "-> degrading to cloud channel");
             use_lan_channel = false;
+        } else if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
+            // Studio never opened a LanSession for this cloud-bound printer and
+            // we could not bring one up (unreachable / bad access code). Without
+            // it the LAN MQTT project_file trigger cannot be published, so fall
+            // back to the cloud channel rather than fail the print.
+            OBN_WARN("cloud_print: no LAN MQTT session for dev=%s "
+                     "-> degrading to cloud channel", p.dev_id.c_str());
+            use_lan_channel = false;
         } else if (print_job::use_brtc_cache_upload(p)) {
             OBN_INFO("cloud_print: upload path=brtc :6000 (try_emmc_print=%d, force_ftps=%d)",
                      p.try_emmc_print ? 1 : 0,
@@ -997,19 +1002,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
 
-    // Cloud channel: POST /my/task hands the job to the Bambu cloud, which
-    // dispatches it to the printer itself. Publishing an MQTT project_file on
-    // top makes the printer reject the duplicate with "printer busy" (the job
-    // is already starting), so we stop here for cloud prints. The MQTT
-    // project_file path below is only for the LAN channel (local print with
-    // record), where it is the actual print trigger.
-    if (!use_lan_channel) {
-        if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
-        OBN_INFO("cloud_print dev=%s: queued via /my/task (task=%s chan=cloud); "
-                 "MQTT project_file skipped", p.dev_id.c_str(), task_id.c_str());
-        return 0;
-    }
-
     // -------------------------------------------------------------
     // [J] MQTT publish the project_file command. The printer watches
     // for this on its report/request channel and starts the job the
@@ -1037,12 +1029,18 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              use_lan_channel ? "lan" : "cloud",
              opts.file_path.c_str(), redact_url(opts.url).c_str());
 
-    // Build the MQTT project_file payload. Cloud prints (both LAN-channel and
-    // cloud-channel) require url_enc / param_enc — RSA-PKCS#1 v1.5 encrypted
-    // to the printer's public key — instead of plaintext url / param. Without
-    // this the firmware rejects the command with "mqtt message verify failed".
     std::string mqtt_json;
-    {
+    if (use_lan_channel) {
+        // LAN channel: the printer fetches the 3mf from its own storage over a
+        // local URL (ftp:// or brtc://emmc/), so there is nothing sensitive to
+        // encrypt. This is exactly what run_local_print_job publishes; the
+        // firmware accepts plaintext `url` on the LAN report/request channel.
+        mqtt_json = print_job::build_project_file_json(p, opts);
+    } else {
+        // Cloud channel: the printer fetches from an S3 presigned https URL. The
+        // firmware requires that URL RSA-PKCS#1 v1.5 encrypted to its own public
+        // key (url_enc), emitted alongside the cleartext url. Without it the
+        // command is rejected with "mqtt message verify failed".
         // Obtain the printer's RSA public key. Preference order:
         //   1. In-memory cache — authoritative when populated by the
         //      app_cert_install response (harvest_security_report), or a
@@ -1062,10 +1060,10 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         // TODO(hardware-test): confirm on a secured printer that gating on
         // flag3 bit16 doesn't skip a printer that actually needs the install.
         if (!printer_pk && printer_supports_new_auth(p.dev_id)) {
-            request_app_cert_list(p.dev_id, use_lan_channel);
+            request_app_cert_list(p.dev_id, /*via_lan=*/false);
         }
         if (!printer_pk && printer_supports_new_auth(p.dev_id) &&
-            request_app_cert_install(p.dev_id, use_lan_channel)) {
+            request_app_cert_install(p.dev_id, /*via_lan=*/false)) {
             // The printer answers on the report topic; harvest_security_report
             // fills the cache from the MQTT network thread. Poll briefly.
             for (int i = 0; i < 20 && !printer_pk; ++i) {

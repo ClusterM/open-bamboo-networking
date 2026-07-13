@@ -130,6 +130,24 @@ public:
                                  const std::string& json_str,
                                  int                qos);
 
+    // Ensures a live LAN MQTT session to `dev_id`, opening one if needed.
+    // Studio only calls connect_printer() for LAN-mode printers; a
+    // cloud-bound printer therefore has no LanSession even though we hold its
+    // LAN IP + access code (from SSDP + the cloud /user/print dev_access_code,
+    // or passed straight from PrintParams). This lets LAN-first paths (print
+    // trigger, LAN-priority telemetry) bring the session up themselves.
+    //
+    // `ip_hint` / `code_hint` override the cached lan_ip_by_dev_ /
+    // lan_access_code_by_dev_ values when non-empty (the print path passes
+    // PrintParams::dev_ip / password directly). Returns true when a connected
+    // session to `dev_id` exists on return. Idempotent: a no-op (returns true)
+    // when the current session already targets `dev_id` and is connected.
+    // Blocks up to ~3s waiting for the MQTT CONNACK so an immediate publish
+    // succeeds.
+    bool ensure_lan_session(const std::string& dev_id,
+                            const std::string& ip_hint   = {},
+                            const std::string& code_hint = {});
+
     // Studio calls this every ~1 s from its refresh timer, plus once right
     // after on_printer_connected_fn. We only do real work the first time a
     // given `dev_id` is seen (and only in lan_only mode for now): capture the
@@ -518,6 +536,53 @@ private:
     // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
     // from push_status ipcam.rtsp_url by harvest_media_caps().
     std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;
+
+    // dev_ids for which an asynchronous LAN-autostart worker is currently
+    // running, so the ~5s SSDP / access-code hooks don't stack duplicate
+    // connect attempts. Guarded by mu_.
+    std::set<std::string> lan_autostart_inflight_;
+    // Fires ensure_lan_session(dev_id) on a detached thread when dev_id is the
+    // user-selected machine, both LAN IP and access code are known, and no
+    // live/inflight session already targets it. Non-blocking; safe to call
+    // from the SSDP dispatch / HTTP threads that already learned an IP or code.
+    void autostart_lan_if_selected(const std::string& dev_id);
+
+    // --- LAN-priority report subscription (mirrors Studio's conceptual
+    // DeviceSubscribeManager local-first behaviour, see issue #49). LAN MQTT
+    // and the cloud both carry device/<id>/report; when LAN is delivering we
+    // "defer-close" the cloud report subscription (unsubscribe, keep the cloud
+    // MQTT connected) to avoid double telemetry, and fail back to cloud if LAN
+    // goes silent. All guarded by mu_ unless noted. ---
+    // Last time a LAN report frame arrived per dev_id (steady clock).
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        last_lan_report_;
+    // Devices whose cloud report subscription is currently deferred because LAN
+    // telemetry is authoritative. cloud_add_subscribe() skips these.
+    std::set<std::string> lan_report_priority_;
+    // Called from notify_local_message on every LAN report: stamps
+    // last_lan_report_ and, on the first report for a device, defer-closes the
+    // cloud report subscription and starts the silence watchdog.
+    void maybe_prefer_lan_subscription(const std::string& dev_id);
+    // Re-subscribes the cloud report topic for dev_id (failback) and clears its
+    // LAN-priority state. Safe to call when not deferred (no-op-ish).
+    void lan_report_failback(const std::string& dev_id);
+
+    // Silence watchdog: re-subscribes cloud report for any LAN-priority device
+    // that hasn't sent a LAN report within kLanSilenceFailback.
+    std::mutex              lan_watchdog_mu_;
+    std::condition_variable lan_watchdog_cv_;
+    std::thread             lan_watchdog_thread_;
+    bool                    lan_watchdog_active_ = false;
+    void ensure_lan_watchdog_running();
+    void lan_watchdog_loop();
+
+  public:
+    // True while dev_id's cloud report subscription is deferred in favour of
+    // LAN telemetry. Lets the implicit get_user_print_info subscribe skip a
+    // device that LAN is already covering.
+    bool lan_report_priority_active(const std::string& dev_id) const;
+
+  private:
 
     // Buffer populated by bambu_network_get_setting_list2 and drained
     // by bambu_network_get_user_presets. See preset_cache_* above.

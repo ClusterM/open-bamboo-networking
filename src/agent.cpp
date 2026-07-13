@@ -30,6 +30,15 @@ namespace {
 // print; if connect arrives within this window we keep the MQTT session alive.
 constexpr auto kMqttKeepReconnectGracePeriod = std::chrono::seconds(3);
 
+// LAN-priority report subscription: once LAN telemetry stops arriving for this
+// long, fail the report subscription back to the cloud. Printers push
+// push_status roughly once per second, so 6s tolerates a few missed frames
+// before switching. Watchdog wakes on this cadence to check.
+// TODO(hardware-test): tune against real LAN dropouts; Studio uses a 5s
+// "recent message" heuristic (DeviceManager::HasRecent*Message).
+constexpr auto kLanSilenceFailback = std::chrono::seconds(6);
+constexpr auto kLanWatchdogTick    = std::chrono::seconds(2);
+
 std::string trim_ip_string(std::string s)
 {
     while (!s.empty() &&
@@ -48,6 +57,12 @@ Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent()
 {
     cancel_deferred_disconnect();
+    {
+        std::lock_guard<std::mutex> lk(lan_watchdog_mu_);
+        lan_watchdog_active_ = false;
+        lan_watchdog_cv_.notify_all();
+    }
+    if (lan_watchdog_thread_.joinable()) lan_watchdog_thread_.join();
     if (discovery_) discovery_->stop();
     if (cloud_session_) cloud_session_->stop();
 }
@@ -268,6 +283,201 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     return session->publish_json(obn::signing::maybe_sign(json_str), qos);
 }
 
+bool Agent::ensure_lan_session(const std::string& dev_id,
+                               const std::string& ip_hint,
+                               const std::string& code_hint)
+{
+    if (dev_id.empty()) return false;
+
+    // Fast path: already connected to this exact printer.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id &&
+            lan_session_->is_connected())
+            return true;
+    }
+
+    std::string ip   = ip_hint;
+    std::string code = code_hint;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (ip.empty()) {
+            auto it = lan_ip_by_dev_.find(dev_id);
+            if (it != lan_ip_by_dev_.end()) ip = it->second;
+        }
+        if (code.empty()) {
+            auto it = lan_access_code_by_dev_.find(dev_id);
+            if (it != lan_access_code_by_dev_.end()) code = it->second;
+        }
+    }
+    if (ip.empty() || code.empty()) {
+        OBN_DEBUG("ensure_lan_session: dev=%s missing %s -> cannot open LAN MQTT",
+                  dev_id.c_str(), ip.empty() ? "ip" : "access_code");
+        return false;
+    }
+
+    // connect_printer() tears down any session to a different printer,
+    // snapshots the device cert for TLS verify, honours mqtt_keep_connection
+    // reuse, and stores the resulting session in lan_session_.
+    OBN_INFO("ensure_lan_session: opening LAN MQTT to dev=%s ip=%s",
+             dev_id.c_str(), ip.c_str());
+    int rc = connect_printer(dev_id, ip, "bblp", code, /*use_ssl=*/true);
+    if (rc != BAMBU_NETWORK_SUCCESS) {
+        OBN_WARN("ensure_lan_session: connect_printer(dev=%s) rc=%d",
+                 dev_id.c_str(), rc);
+        return false;
+    }
+
+    // connect_printer returns as soon as the MQTT loop is started; the CONNACK
+    // (and our report-topic subscribe) lands asynchronously. Wait briefly so a
+    // caller that publishes immediately (the print trigger) does not race it.
+    for (int i = 0; i < 30; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (lan_session_ && lan_session_->dev_id() == dev_id &&
+                lan_session_->is_connected())
+                return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    OBN_WARN("ensure_lan_session: dev=%s not connected within 3s", dev_id.c_str());
+    return false;
+}
+
+void Agent::autostart_lan_if_selected(const std::string& dev_id)
+{
+    if (dev_id.empty()) return;
+
+    std::string ip;
+    std::string code;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // LAN is opened only for the printer the user is currently looking at,
+        // matching Studio's single-active-printer model (one LanSession).
+        if (user_selected_machine_ != dev_id) return;
+        if (lan_session_ && lan_session_->dev_id() == dev_id &&
+            lan_session_->is_connected())
+            return;
+        auto ipit = lan_ip_by_dev_.find(dev_id);
+        auto cdit = lan_access_code_by_dev_.find(dev_id);
+        if (ipit == lan_ip_by_dev_.end() || cdit == lan_access_code_by_dev_.end())
+            return;
+        ip   = ipit->second;
+        code = cdit->second;
+        if (ip.empty() || code.empty()) return;
+        // Only one attempt at a time; the ~5s SSDP hook would otherwise stack.
+        if (!lan_autostart_inflight_.insert(dev_id).second) return;
+    }
+
+    // connect_printer() does blocking work (TLS cert snapshot, MQTT connect);
+    // run it off the caller's thread (SSDP dispatch / HTTP / Studio UI).
+    try {
+        std::thread([this, dev_id, ip, code]() {
+            ensure_lan_session(dev_id, ip, code);
+            std::lock_guard<std::mutex> lk(mu_);
+            lan_autostart_inflight_.erase(dev_id);
+        }).detach();
+    } catch (const std::system_error& e) {
+        OBN_WARN("autostart_lan_if_selected: thread spawn failed (%s)", e.what());
+        std::lock_guard<std::mutex> lk(mu_);
+        lan_autostart_inflight_.erase(dev_id);
+    }
+}
+
+bool Agent::lan_report_priority_active(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return lan_report_priority_.count(dev_id) != 0;
+}
+
+void Agent::maybe_prefer_lan_subscription(const std::string& dev_id)
+{
+    if (dev_id.empty()) return;
+
+    bool newly_deferred = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        last_lan_report_[dev_id] = std::chrono::steady_clock::now();
+        // First LAN report since (re)subscription flips the device to
+        // LAN-priority; subsequent reports only refresh the timestamp.
+        newly_deferred = lan_report_priority_.insert(dev_id).second;
+    }
+    if (!newly_deferred) return;
+
+    // LAN telemetry is now authoritative. Defer-close the cloud report
+    // subscription (unsubscribe only; the cloud MQTT stays connected so command
+    // publishing and failback remain instant). Under block_cloud there is no
+    // cloud subscription to close.
+    if (!obn::config::current().block_cloud) {
+        OBN_INFO("lan-priority: LAN telemetry active for dev=%s; "
+                 "defer-closing cloud report subscription", dev_id.c_str());
+        cloud_del_subscribe({dev_id});
+    }
+    ensure_lan_watchdog_running();
+}
+
+void Agent::lan_report_failback(const std::string& dev_id)
+{
+    if (dev_id.empty()) return;
+    bool was_priority = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        was_priority = lan_report_priority_.erase(dev_id) != 0;
+    }
+    if (!was_priority) return;
+    if (!obn::config::current().block_cloud) {
+        OBN_INFO("lan-priority: failing dev=%s back to cloud report subscription",
+                 dev_id.c_str());
+        cloud_add_subscribe({dev_id});
+    }
+}
+
+void Agent::ensure_lan_watchdog_running()
+{
+    std::lock_guard<std::mutex> lk(lan_watchdog_mu_);
+    if (lan_watchdog_active_) return;
+    lan_watchdog_active_ = true;
+    try {
+        lan_watchdog_thread_ = std::thread([this]() { lan_watchdog_loop(); });
+    } catch (const std::system_error& e) {
+        OBN_WARN("ensure_lan_watchdog_running: thread spawn failed (%s)", e.what());
+        lan_watchdog_active_ = false;
+    }
+}
+
+void Agent::lan_watchdog_loop()
+{
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(lan_watchdog_mu_);
+            if (lan_watchdog_cv_.wait_for(lk, kLanWatchdogTick,
+                    [this] { return !lan_watchdog_active_; }))
+                return; // stop requested
+        }
+
+        std::vector<std::string> silent;
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (const auto& dev : lan_report_priority_) {
+                auto it = last_lan_report_.find(dev);
+                if (it == last_lan_report_.end() ||
+                    now - it->second > kLanSilenceFailback)
+                    silent.push_back(dev);
+            }
+        }
+        for (const auto& dev : silent) {
+            OBN_INFO("lan-priority: no LAN report for dev=%s within %llds; failing back",
+                     dev.c_str(),
+                     static_cast<long long>(kLanSilenceFailback.count()));
+            lan_report_failback(dev);
+            // Try to bring LAN back for the selected printer so we can
+            // re-prefer it once telemetry resumes.
+            autostart_lan_if_selected(dev);
+        }
+    }
+}
+
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
 {
     BBL::OnLocalConnectedFn   cb;
@@ -299,6 +509,12 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
         if (queue) queue(invoke);
         else       invoke();
     }
+
+    // LAN went down (lost/failed CONNACK): immediately fail the report
+    // subscription back to the cloud instead of waiting out the silence
+    // watchdog, so status keeps flowing while LAN is unavailable.
+    if (status != BBL::ConnectStatusOk)
+        lan_report_failback(dev_id);
 }
 
 namespace {
@@ -733,8 +949,13 @@ void Agent::note_device_access_code(const std::string& dev_id,
                                     const std::string& access_code)
 {
     if (dev_id.empty() || access_code.empty()) return;
-    std::lock_guard<std::mutex> lk(mu_);
-    lan_access_code_by_dev_[dev_id] = access_code;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        lan_access_code_by_dev_[dev_id] = access_code;
+    }
+    // The access code is the second half of the LAN credential pair; if the IP
+    // (from SSDP) is already known for the selected printer, bring LAN up now.
+    autostart_lan_if_selected(dev_id);
 }
 
 std::string Agent::camera_url_for(const std::string& dev_id)
@@ -780,6 +1001,10 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_security_report(dev_id, json);
     harvest_security_flags(dev_id, json);
     harvest_media_caps(dev_id, json);
+
+    // LAN telemetry is authoritative: stamp the report and, on the first one,
+    // defer-close the cloud report subscription for this device.
+    maybe_prefer_lan_subscription(dev_id);
 
     BBL::OnMessageFn cb;
     std::string connect_ip;
@@ -1239,8 +1464,17 @@ void Agent::set_extra_http_headers(std::map<std::string, std::string> headers)
 
 void Agent::set_user_selected_machine(std::string dev_id)
 {
-    std::lock_guard<std::mutex> lk(mu_);
-    user_selected_machine_ = std::move(dev_id);
+    std::string selected;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        user_selected_machine_ = std::move(dev_id);
+        selected = user_selected_machine_;
+    }
+    // The user switched active printer: bring LAN up for the newly selected one
+    // if its IP + access code are already known. connect_printer() inside
+    // ensure_lan_session tears down any LanSession that targeted the previous
+    // printer, so we don't leak the old one.
+    autostart_lan_if_selected(selected);
 }
 
 std::string Agent::country_code() const
@@ -1576,9 +1810,15 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
         // failed even though certs/<serial>.pem exists on disk.
         publish_peer_cert_pin(ip, dev_id);
     }
-    std::lock_guard<std::mutex> lk(mu_);
-    ssdp_json_by_ip_[ip] = json;
-    if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        ssdp_json_by_ip_[ip] = json;
+        if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
+    }
+    // SSDP just supplied (or refreshed) the LAN IP; if the access code for the
+    // selected printer is already known, this completes the credential pair and
+    // LAN can come up. No-op when already connected or an attempt is inflight.
+    if (!dev_id.empty()) autostart_lan_if_selected(dev_id);
 }
 
 namespace {
@@ -2020,15 +2260,29 @@ int Agent::cloud_refresh()
 int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
 {
     CloudSession* sess = nullptr;
+    std::vector<std::string> filtered;
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = cloud_session_.get();
+        // Skip devices currently covered by LAN telemetry (LAN-priority): the
+        // cloud report subscription for them is intentionally deferred. The
+        // failback path clears the device from lan_report_priority_ before
+        // calling here, so re-subscription still works.
+        for (const auto& d : dev_ids) {
+            if (lan_report_priority_.count(d)) {
+                OBN_DEBUG("cloud_add_subscribe: dev=%s under LAN priority, "
+                          "skipping cloud report subscription", d.c_str());
+                continue;
+            }
+            filtered.push_back(d);
+        }
     }
     if (!sess) {
         OBN_WARN("cloud_add_subscribe: no active cloud session");
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
-    return sess->add_subscribe(dev_ids);
+    if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
+    return sess->add_subscribe(filtered);
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)

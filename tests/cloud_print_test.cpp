@@ -5,6 +5,7 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/print_job.hpp"
 
 #include <cstdio>
 #include <string>
@@ -279,6 +280,55 @@ static void test_task_body_is_valid_json()
 }
 
 // ---------------------------------------------------------------------------
+// project_file payload: LAN channel is plaintext, cloud channel adds url_enc
+// ---------------------------------------------------------------------------
+
+static void test_lan_project_file_is_plaintext()
+{
+    // LAN-first print trigger: the printer fetches from its own storage over a
+    // local URL, so the payload must carry a cleartext `url` and NO `url_enc`
+    // (mirrors run_local_print_job). Regression guard for the LAN channel no
+    // longer routing through the RSA-encrypted cloud builder.
+    BBL::PrintParams p = default_params();
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path  = "TestProject.gcode.3mf";
+    opts.url        = "ftp:///TestProject.gcode.3mf";
+    opts.md5        = "abc123";
+    opts.project_id = "proj1";
+    opts.profile_id = "42";
+    opts.task_id    = "task9";
+
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    auto v = obn::json::parse(json);
+    CHECK(v);
+    CHECK(json.find("\"url_enc\"") == std::string::npos);
+    CHECK(field(json, "print.url") == "ftp:///TestProject.gcode.3mf");
+    CHECK(field(json, "print.command") == "project_file");
+}
+
+static void test_cloud_project_file_has_url_enc()
+{
+    // Cloud channel: the printer fetches from S3 over https, so the builder
+    // must emit `url_enc` (RSA-encrypted URL) alongside the cleartext `url`.
+    BBL::PrintParams p = default_params();
+    obn::print_job::CloudProjectFileOpts opts;
+    opts.file_path  = "slot.3mf";
+    opts.url        = "https://s3.example/obj?sig=1";
+    opts.url_enc    = "BASE64ENCRYPTEDURL==";
+    opts.md5        = "abc123";
+    opts.project_id = "proj1";
+    opts.profile_id = "42";
+    opts.task_id    = "task9";
+
+    const std::string json = obn::print_job::build_cloud_project_file_json(p, opts);
+    auto v = obn::json::parse(json);
+    CHECK(v);
+    CHECK(json.find("\"url_enc\"") != std::string::npos);
+    CHECK(field(json, "print.url_enc") == "BASE64ENCRYPTEDURL==");
+    CHECK(field(json, "print.url") == "https://s3.example/obj?sig=1");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -304,6 +354,9 @@ int main()
     test_task_body_sequence_id_is_20000();
     test_task_body_boolean_fields();
     test_task_body_is_valid_json();
+
+    test_lan_project_file_is_plaintext();
+    test_cloud_project_file_has_url_enc();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
