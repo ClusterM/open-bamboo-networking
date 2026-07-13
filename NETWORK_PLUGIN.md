@@ -576,7 +576,7 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_enable_multi_machine` | `void(void*, bool)` |
 | `bambu_network_send_message` | `int(void*, std::string dev_id, std::string json_str, int qos, int flag)` — MQTT-style call |
 
-> **DeviceSubscribeManager local↔cloud FSM (Studio-side, AGPL).** The dual-channel "LAN-first, cloud fallback" behaviour is driven by Studio's `DeviceSubscribeManager`, keyed off a `dev_id → {dev_ip, access_code}` cache: it auto-creates the **local** subscription, **defer-closes** the cloud one, and **fails back to cloud** when the local channel goes silent ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). That whole mechanism lives in Studio, not in the plugin — OBN only implements the primitive `add_subscribe`/`del_subscribe` (buffer on the plugin side, apply on the next cloud `CONNACK`). **Defensive-audit note for `block_cloud`:** when `block_cloud` is set, `bambu_network_add_subscribe` / `del_subscribe` / `connect_server` short-circuit to `SUCCESS` without ever creating a cloud subscription (`src/abi_cloud.cpp`), and `get_user_print_info` skips its implicit `cloud_add_subscribe` (`src/abi_http.cpp`). So OBN never opens a cloud subscription it then fails to tear down; any "stuck waiting for status" UI under `block_cloud` originates in Studio's FSM expecting a cloud fallback that we deliberately withhold — the printer must be reachable over LAN (LAN-Only mode + access code) for status to flow, which is the intended trade-off, not a plugin leak.
+> **Dual MQTT (LAN + cloud simultaneously) with a LAN-priority report subscription.** For a cloud-paired printer the stock stack does **not** pick one transport — it opens **both** MQTT sessions at once: the LAN broker (`mqtts://<printer_ip>:8883`, user `bblp`, password = access code) **and** the cloud broker (`*.mqtt.bambulab.com:8883`). This was confirmed on-wire: a stock capture shows the two TLS connections established in parallel, with the **LAN** session carrying the bulk of the `push_status` telemetry and the cloud session comparatively quiet. The mechanism is Studio's `DeviceSubscribeManager`, keyed off a `dev_id → {dev_ip, access_code}` cache: it auto-creates the **local** report subscription, and while local telemetry is flowing it **does not subscribe to the cloud `device/<id>/report` topic** (a defer-close of the cloud report leg — the cloud MQTT socket stays connected but silent), then **fails back to the cloud report subscription** if the local channel goes silent. So on a healthy LAN both sockets are up but only the LAN one is subscribed to reports; the cloud leg is a warm standby ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). The plugin-facing primitives are just `add_subscribe` / `del_subscribe` (buffer, apply on the next cloud `CONNACK`); which of them fires when is the caller's (Studio's) policy.
 
 #### 6.3.1. Cloud MQTT authentication
 
@@ -606,7 +606,7 @@ GET /v1/iot-service/api/user/applications/{application_token}/cert?aes256={base6
 Authorization: Bearer {access_token}
 ```
 
-`application_token` is an opaque token from the user's account (distinct from the MQTT bearer token). `aes256` is a base64url-encoded key used to decrypt the returned private key. `ver=1` is the API version.
+The two request parameters are **not** what their names suggest — both are wrappers, decoded per the *Credential rotation algorithm* below. The `{application_token}` path segment is the **AES-256-GCM ciphertext of a hardcoded client secret** (`IV||ciphertext||auth_tag`, base64url), not a bare account token. The `aes256` query parameter is the **RSA-wrapped ephemeral session key** (base64url) — it is *not itself* the AES key, it *transports* the key that decrypts the response. `ver=1` is the API version. *(RN-3)*
 
 **Response (200 OK):**
 
@@ -629,9 +629,31 @@ The `cert` field contains a **3-certificate chain** (PEM-concatenated):
 
 **Per-device CA architecture:** each device has its own intermediate CA named `{dev_uid}.bambulab.com`. Client certs are issued under this per-device CA, so the MQTT broker can verify which device a connection belongs to from the certificate alone. Revocation is per-device via the device-specific CRL returned in the `crl` field. Observed CRL validity: 30 days from issue date.
 
-**`key` field:** the private key is AES-256 encrypted and base64-encoded. The `aes256` query parameter in the request URL is the decryption key.
+**`key` field:** the private key is **AES-256-GCM** encrypted and base64-encoded (`IV||ciphertext||auth_tag`). The decryption key is the **ephemeral `session_key`** the client generated and RSA-wrapped into the `aes256` query parameter — the base64url `aes256` value on the wire is the *wrapped* key, not the key itself.
 
 **`crl` field:** a fresh CRL issued at request time, not a cached value.
+
+**Credential rotation algorithm (how the request/response are wrapped).** The stock plugin ships an embedded application credential and, at startup, fetches an up-to-date copy from the endpoint above. The convoluted AES/RSA envelope exists only to keep the secrets out of a TLS-MITM's reach — conceptually it is just "prove you are the official client, receive the current shared credential." The hardcoded `client_auth_secret` is a prefix matching the app-cert subject CN (`GLOF{…}-{…}`) followed by 16 hardcoded hex characters. *(RN-3)*
+
+```py
+# --- request construction ---
+session_key = secure_random(32)                       # ephemeral AES-256 key
+iv          = secure_random(12)
+ct, tag     = AESGCM_Encrypt(session_key, iv, client_auth_secret)
+enc_secret  = Base64url(iv || ct || tag)              # -> {application_token} path segment
+wrapped_key = Base64url(RSA_Encrypt(root_ca_public_key, session_key))  # -> aes256= query param
+GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1
+
+# --- response finalization ---  (response.key = base64 of IV||ciphertext||auth_tag)
+blob          = Base64_Decode(response.key)
+iv            = blob[0:12]
+tag           = blob[-16:]
+ct            = blob[12:-16]
+app_priv_pem  = AESGCM_Decrypt(session_key, iv, ct, tag)   # the shared app private key
+# store response.cert (chain), app_priv_pem, response.crl for MQTT signing + HTTP PoP
+```
+
+The RSA wrap uses the **root CA public key** (§ App Certificates); the server unwraps `session_key`, decrypts `enc_secret` to authenticate the client, and encrypts the returned private key back under the same `session_key`. None of this authenticates a *user* or *device* — it only proves possession of the secret baked into every official client. *(RN-3)*
 
 `fetch_device_cert()` in `include/obn/cloud_auth.hpp` documents this stock-only path; the implementation is gated with `#if 0` and intentionally not wired to `CloudSession`.
 
@@ -647,6 +669,22 @@ The `cert` field contains a **3-certificate chain** (PEM-concatenated):
 | `bambu_network_update_cert` | `int(void* agent)` — `func_check_cert`; refreshes certificates at runtime |
 | `bambu_network_install_device_cert` | `void(void*, std::string dev_id, bool lan_only)` |
 | `bambu_network_start_discovery` | `bool(void*, bool start, bool sending)` — SSDP |
+
+#### 6.4.1. Where the LAN credentials come from (incl. cloud-paired printers)
+
+A LAN MQTT session needs two facts per printer: the **IP address** and the **8-character access code** (the LAN broker login is always `user=bblp`, `password=<access code>`). A printer in **LAN-Only / Developer Mode** supplies both directly (the code is shown on its screen and typed into Studio). The interesting case is a **cloud-paired** printer that still has both MQTT sessions up (§6.3): the stock stack assembles the same two facts without any manual entry.
+
+- **IP address → SSDP.** `bambu_network_start_discovery` runs the SSDP multicast listener on `239.255.255.250:1990`; the printer's periodic `NOTIFY` beacons carry its serial (`dev_id`) and current LAN IP. This yields the `dev_id → dev_ip` half.
+- **Access code → cloud REST.** When the user is logged in, `get_user_print_info` returns `dev_access_code` in **plaintext** for every cloud-bound device (`GET /v1/iot-service/api/user/print?force=true`, or `GET /v1/iot-service/api/user/bind`; §6.10). This is the **same** 8-hex code shown on the printer display and used as the LAN MQTT / FTPS / `:6000` password. This yields the `dev_id → access_code` half. (Security consequence: any bearer-token holder can retrieve the LAN access codes of all their cloud-bound printers — see the security note in §6.10.)
+
+With both halves known, `connect_printer(dev_id, dev_ip, "bblp", <access code>, use_ssl=true)` brings the LAN MQTT session up **even though the device is cloud-paired**, which is exactly what the LAN-priority subscription in §6.3 relies on.
+
+```mermaid
+flowchart LR
+  ssdp["SSDP :1990 NOTIFY"] -->|"dev_id + dev_ip"| cache["dev_id → {dev_ip, access_code}"]
+  rest["GET /user/print?force=true\n(logged-in cloud REST)"] -->|"dev_access_code (plaintext)"| cache
+  cache -->|"connect_printer(bblp, access_code)"| lan["LAN MQTT :8883\n(mqtts, LAN-priority reports)"]
+```
 
 ### 6.5. Authentication and user
 
@@ -1234,7 +1272,7 @@ Print submission and ongoing status are **different ABI groups**:
 | Thumbnail / subtask panel | **`bambu_network_get_subtask_info`** | After print starts; unrelated to `start_*` return |
 | Cancel / pause | `MachineObject::command_task_*` → **`send_message_to_printer`** | Not via print-job API |
 
-Studio opens the LAN MQTT session through **`connect_printer`** when the user selects a LAN device in the UI — not inside `PrintJob`. The print plugin must publish `project_file` on that **already-connected** session (`send_message_to_printer` under the hood on LAN).
+The LAN MQTT session is opened through **`connect_printer`** — not inside `PrintJob` — and `project_file` is published on that **already-connected** session (`send_message_to_printer` under the hood on LAN). This is not limited to LAN-Only devices: for a **cloud-paired** printer the stock stack still brings up a LAN session (using the IP from SSDP and the `dev_access_code` fetched from the cloud REST API, §6.4.1), which is the same session the LAN-priority report subscription in §6.3 uses. So "has a LAN session" and "is cloud-paired" are orthogonal — a cloud device can have both transports live at once.
 
 ##### `PrintParams` fields Studio sets vs what the plugin must consume
 
@@ -1251,7 +1289,7 @@ Open-plugin mapping of each ABI entry point: [STATUS.md §6.8 — Open plugin: A
 
 #### 6.8.1. Cloud upload flow (stock plugin, MITM)
 
-Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. **How the open plugin maps these ABI symbols internally** (`Agent::run_cloud_print_job`, FTPS vs `:6000`, planned LAN-only refactor) is documented in [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation), not here.
+Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. The mapping of each ABI symbol to a concrete implementation is out of scope here — see [STATUS.md §6.8 — ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation).
 
 Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
@@ -1273,7 +1311,21 @@ Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
 Terminology note:
 
-- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs, not a plugin-side fixed OSS endpoint. The print-upload presigned URLs are **S3 signature V2** query-auth (`?AWSAccessKeyId=…&Expires=…&Signature=…`) — **on-wire confirmed** against genuine `POST /v1/iot-service/api/user/project` traffic on a live account (`s3.us-west-2.amazonaws.com`, 2026-07). This is **not** SigV4 (no `X-Amz-Algorithm` / `X-Amz-Signature`); issue #48's SigV4 claim was **not reproduced** here and may be region- or snapshot-dependent. We `PUT` the body opaquely and strip `Content-Type` (the V2 StringToSign covers `Content-Type`, and the presigner signs with an empty one, so any `Content-Type` we add would break the signature); the client never recomputes the signature, so the scheme itself is transport-level for the print-upload leg. **Distinct leg:** the credential-based direct-OSS path used by rating-picture upload (`get_oss_config` → `put_rating_picture_oss`) *does* sign client-side, and *that* leg uses AWS SigV4 (S3) or Aliyun OSS V1 (CN) — see §6.12 `get_oss_config`.
+- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport is a presigned object-storage `PUT` URL, not a fixed OSS endpoint. The print-upload presigned URLs are **S3 signature V2** query-auth (`?AWSAccessKeyId=…&Expires=…&Signature=…`) — **on-wire confirmed** against genuine `POST /v1/iot-service/api/user/project` traffic on a live account (`s3.us-west-2.amazonaws.com`, 2026-07). This is **not** SigV4 (no `X-Amz-Algorithm` / `X-Amz-Signature`); issue #48's SigV4 claim was **not reproduced** here and may be region- or snapshot-dependent.
+
+  The **cloud presigns** the URL; the uploading client just does an opaque `PUT` of the body and never recomputes the signature. What the presigner signs (AWS S3 V2 query-string auth):
+
+  ```py
+  StringToSign = VERB + "\n" +               # "PUT"
+                 Content-MD5 + "\n" +         # usually empty
+                 Content-Type + "\n" +        # EMPTY on the print-upload leg (see below)
+                 Expires + "\n" +             # the ?Expires= epoch seconds
+                 CanonicalizedResource        # "/<bucket>/<key>" (+ any sub-resources)
+  Signature    = Base64(HMAC-SHA1(secret_access_key, StringToSign))
+  # URL query carries: AWSAccessKeyId, Expires, Signature (URL-encoded)
+  ```
+
+  Protocol consequence: because the presigner signs an **empty `Content-Type`**, the client must **omit `Content-Type`** on the `PUT` — adding one changes the StringToSign and yields `403 SignatureDoesNotMatch`. The scheme is purely transport-level for this leg (no per-request client crypto). **Distinct leg:** the credential-based direct-OSS path used by rating-picture upload (`get_oss_config` → `put_rating_picture_oss`) *does* sign client-side, and *that* leg uses AWS SigV4 (S3) or Aliyun OSS V1 (CN) — see §6.12 `get_oss_config`.
 
 ##### 6.8.1.1. Cloud print authorization (OBN findings, on hardware 2026-07)
 
@@ -1287,7 +1339,7 @@ Getting a **cloud** print (or "local print with record") to actually start from 
 
 **3. `create_task` must hard-fail.** `/my/task` is what authorizes the printer to fetch the uploaded content, so OBN treats any non-2xx as fatal (`BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED`) instead of the old soft-fail that continued with `task_id=0` and stalled the printer on "failed to download".
 
-**4. The duplicate-submission pitfall (`start_local_print_with_record` → `start_print` fallback).** Studio's `PrintJob::process()` tries **`start_local_print_with_record` first** and only falls back to **`start_print`** if it returns `< 0`. OBN's "record" path also creates a cloud task + `/my/task`; if it then tried the LAN MQTT leg (which needs a `LanSession` Studio never establishes for a cloud-bound printer) it would fail, return `< 0`, and Studio would fire `start_print` → a **second** `/my/task`. The printer, already printing the first job, then rejects the duplicate with `0500_4004` / `0300_400C` ("Printing was cancelled"). **Fix:** for a cloud-connected printer OBN collapses the "record" entry point into a single cloud print (drops the LAN legs so the record path returns `0`), so Studio never double-fires.
+**4. The duplicate-submission pitfall (`start_local_print_with_record` → `start_print` fallback).** Studio's `PrintJob::process()` tries **`start_local_print_with_record` first** and only falls back to **`start_print`** if it returns `< 0`. Both entry points create a cloud task and hit `POST /my/task`, which is what actually dispatches the job. So a plugin that lets the "record" entry point create the cloud task **and then** return `< 0` (e.g. because a later LAN MQTT leg failed) triggers Studio's fallback into `start_print`, which fires a **second** `/my/task`. The printer, already printing the first job, then rejects the duplicate with `0500_4004` / `0300_400C` ("Printing was cancelled"). The invariant a print implementation must preserve: **exactly one `/my/task` per user action** — either succeed and return `0` from the first entry point, or fail *before* creating the cloud task so the fallback starts cleanly.
 
 **5. Studio-side crash caveat (not OBN).** After a print, if the printer reports **any** non-zero `print_error` (including a stale/latched one), Studio's `StatusPanel::update_error_message()` opens a `DeviceErrorDialog`, whose `RequestUserAttention → gtk_widget_get_realized` path **segfaults under GTK/Wayland** (`GLib-CRITICAL: Source ID … was not found`). This is a Studio/GTK bug, independent of the plugin; the workaround is to launch Studio with **`GDK_BACKEND=x11`**.
 
@@ -1465,6 +1517,56 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 - Developer Mode ON → **printer firmware** bypasses the signature check entirely: plain `url` accepted, `header` optional, `url_enc` unnecessary. This is why LAN printing works today without ever touching the cloud cert endpoint, provided the operator supplied the app key out-of-band. *(OBN; see "Developer Mode requirement" in `README.md`)*
 
 Note where the **CRL** actually lands: it is never read by the plugin's signing/encryption path — it is only shipped inside `app_cert_install` into the printer's trust store, where the firmware consults it while verifying `header.sign_string`. With an empty revocation list and no rotation it is effectively a formality; it becomes load-bearing only if Bambu revokes/rotates the shared app cert. *(RN-5; RN-4 for the observed empty, ~30-day CRL)*
+
+##### Command-security algorithms (pseudocode)
+
+The flow list above says *which* key touches *which* field; the pseudocode below is the exact wire recipe, so a command can be signed/encrypted without opening the source references. It is transcribed from RN-5 (MQTT middleware) and RN-6 (HTTP headers); primitives are OpenSSL-equivalent (`RSA_Sign` = `EVP_DigestSign` with SHA-256 + PKCS#1 v1.5; `RSA_Encrypt` = `RSA_public_encrypt` with `RSA_PKCS1_PADDING`).
+
+**1. `SignMessage` — RSA-SHA256 over the `print` object** (every privileged MQTT command):
+
+```py
+def SignMessage(app_private_key, cmd_obj):          # cmd_obj = {"print": {...}} etc.
+    json_str  = JSON_stringify(cmd_obj)             # compact, as serialized on the wire
+    json_bytes = UTF8_Encode(json_str)
+    signature  = RSA_Sign(app_private_key, json_bytes)   # RSA-SHA256, PKCS#1 v1.5
+    header = {
+        "sign_ver":    "v1.0",
+        "sign_alg":    "RSA_SHA256",
+        "sign_string": Base64_Encode(signature),
+        "cert_id":     app_cert.serialNumber.lower() + app_cert.issuer,  # NO separator
+        "payload_len": len(json_bytes),             # UTF-8 byte length of the signed object
+    }
+    return { **cmd_obj, "header": header }
+```
+
+Note the **`cert_id` serialization for MQTT is `serialNumber.lower() + issuer`** with no separator (e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`). The HTTP header uses a *different* serialization (below). *(RN-5)*
+
+**2. `EncryptField` — device-cert field encryption** (`print.project_file` → `url_enc`, `print.gcode_line` → `param_enc`):
+
+```py
+def EncryptField(device_id, value):
+    device_cert = getDeviceCert(device_id)          # from app_cert_install reply / TLS leaf
+    if device_cert is None:
+        return value                                # no cert yet -> field stays cleartext
+    ciphertext = RSA_Encrypt(device_cert.publicKey, UTF8_Encode(value))  # PKCS#1 v1.5
+    return Base64_Encode(ciphertext)                # ciphertext <= ~245 B (RSA-2048 ceiling)
+```
+
+The cleartext `url` / `param` stays in the payload alongside the encrypted `url_enc` / `param_enc`; the middleware assigns the `*_enc` field but leaves it equal to cleartext when no device cert is known yet. Other privileged commands are only signed, not field-encrypted. *(RN-5)*
+
+**3. HTTP proof-of-possession** (secured-printer REST writes, e.g. `POST /my/task`):
+
+```py
+# app_cert_certification_id header — DIFFERENT serialization from MQTT cert_id:
+headers["x-bbl-app-certification-id"] = app_cert.issuer + ":" + app_cert.serialNumber.lower()
+
+# possession token over the current time (NOT a signature over the request body):
+timestamp_ms   = str(now_ms())                      # 13-digit decimal string
+ciphertext     = RSA_Encrypt(app_private_key, UTF8_Encode(timestamp_ms))  # raw priv-key op, no hash
+headers["x-bbl-device-security-sign"] = Base64_Encode(ciphertext)
+```
+
+The server recovers the timestamp and checks recency (replay protection). Two subtleties bite in practice: the timestamp must be in **milliseconds** (13 digits — a nanosecond value fails recency), and the `x-bbl-app-certification-id` serialization (`issuer:serial.lower()`) is **not** the MQTT `cert_id` order — sending the MQTT form 403s. *(RN-6)*
 
 Other `PrintParams` members Studio populates but **does not put into the MQTT command** itself: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments`. They feed the cloud-side `POST /v1/user-service/my/task` body and the timelapse-storage preflight (see below), not `project_file`. (`task_timelapse_use_internal` *does* reach the MQTT command, but indirectly — see the `cfg` row in the table above.)
 
@@ -2607,7 +2709,37 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 
 `PublishParams` (`bambu_networking.hpp:251-258`): `project_name`, `project_3mf_file`, `preset_name`, `project_model_id`, `design_id`, `config_filename`.
 
-**OSS credential/upload leg** (`get_oss_config` + `put_rating_picture_oss`; cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)): Studio first calls `get_oss_config`, which maps to `GET /v1/user-service/my/ossconfig?useType=1` (with `.../s3config?useType=1` as fallback) and returns the server's STS-scoped credential JSON verbatim — `{endpoint, accessKeyId, accessKeySecret, securityToken, expiration, bucketName, cdnUrl}`. Studio treats the blob as opaque and passes it back into `put_rating_picture_oss`, which signs the `PUT` **client-side** (unlike the print-upload leg in §6.8.1, where the cloud presigns the URL): AWS Signature V4 (`AWS4-HMAC-SHA256`, scope `<date>/<region>/s3/aws4_request`, signed headers `host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`) for S3-style endpoints, or Aliyun OSS V1 (`Authorization: OSS <AKID>:<base64 HMAC-SHA1 sig>` + `x-oss-security-token`) for `aliyuncs.com` endpoints (CN region). The object-key convention used for rating pictures and the exact value Studio expects back in `pic_oss_path` are not wire-confirmed yet (**verify-on-hardware**, needs a live cloud account); OBN's implementation (`src/oss_sign.cpp`, `src/abi_makerworld.cpp`) fails closed on any mismatch. *(#49, OBN)*
+**OSS credential/upload leg** (`get_oss_config` + `put_rating_picture_oss`; cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)): Studio first calls `get_oss_config`, which maps to `GET /v1/user-service/my/ossconfig?useType=1` (with `.../s3config?useType=1` as fallback) and returns the server's STS-scoped credential JSON verbatim — `{endpoint, accessKeyId, accessKeySecret, securityToken, expiration, bucketName, cdnUrl}`. Studio treats the blob as opaque and passes it back into `put_rating_picture_oss`, which signs the `PUT` **client-side** (unlike the print-upload leg in §6.8.1, where the cloud presigns the URL): AWS Signature V4 (`AWS4-HMAC-SHA256`, scope `<date>/<region>/s3/aws4_request`, signed headers `host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`) for S3-style endpoints, or Aliyun OSS V1 (`Authorization: OSS <AKID>:<base64 HMAC-SHA1 sig>` + `x-oss-security-token`) for `aliyuncs.com` endpoints (CN region). The scheme is chosen from the endpoint host (`aliyuncs.com` → Aliyun OSS V1, otherwise AWS SigV4). The object-key convention used for rating pictures and the exact value expected back in `pic_oss_path` are not wire-confirmed yet (**verify-on-hardware**, needs a live cloud account). *(#49)*
+
+Both signers in detail (single-shot `PUT` of the picture body; STS `securityToken` from the credential blob is folded in as the vendor's session-token header):
+
+```py
+# --- AWS SigV4 (S3-style endpoint) ---
+scope = date_stamp + "/" + region + "/s3/aws4_request"          # date_stamp = YYYYMMDD
+CanonicalRequest = "PUT\n" + canonical_uri + "\n" + canonical_query + "\n" \
+                 + canonical_headers + "\n" + signed_headers + "\n" + hex(SHA256(payload))
+#   signed_headers = "host;x-amz-content-sha256;x-amz-date"  (+ ";x-amz-security-token" if STS)
+#   x-amz-content-sha256 header value = hex(SHA256(payload))
+StringToSign = "AWS4-HMAC-SHA256\n" + amz_date + "\n" + scope + "\n" + hex(SHA256(CanonicalRequest))
+#   amz_date = YYYYMMDDTHHMMSSZ ; its date part must equal date_stamp
+signing_key = HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date_stamp), region), "s3"), "aws4_request")
+signature   = hex(HMAC(signing_key, StringToSign))
+headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + akid + "/" + scope \
+                         + ", SignedHeaders=" + signed_headers + ", Signature=" + signature
+headers["x-amz-date"] = amz_date
+headers["x-amz-content-sha256"] = hex(SHA256(payload))
+if security_token: headers["x-amz-security-token"] = security_token
+
+# --- Aliyun OSS V1 (CN endpoint) ---
+StringToSign = "PUT\n" + Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" \
+             + CanonicalizedOSSHeaders + CanonicalizedResource
+#   Date = RFC1123 GMT ; CanonicalizedResource = "/<bucket>/<object>"
+#   CanonicalizedOSSHeaders = sorted "x-oss-*:" lines incl. x-oss-security-token
+signature = Base64(HMAC-SHA1(access_key_secret, StringToSign))
+headers["Authorization"] = "OSS " + access_key_id + ":" + signature
+headers["Date"] = Date
+if security_token: headers["x-oss-security-token"] = security_token
+```
 
 **`get_subtask` vs `get_subtask_info`** — two different symbols, easy to confuse:
 
@@ -2690,7 +2822,7 @@ Semantically, this ABI describes a "tunnel + job" bus: open a connection to the 
 
 #### 6.14.1. Stock wire transport (TLS :6000)
 
-Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the same **BambuTunnelLocal** framing as Device → Files (§7.5.1.1): TLS `:6000`, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289).
+Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the very same `:6000` wire as Device → Files — TLS, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289). The framing, handshake, chunked-upload flow (`chunk_size` in KiB, full-duplex progress), storage labels and result codes are documented once in the **canonical `:6000` protocol reference (§7.5.1.1)**; this section only maps the `ft_*` ABI `cmd_type`s onto that wire.
 
 **Send to Printer model upload is `:6000`, not FTPS.** The `.3mf` body goes over **`ft_*` / TLS :6000** (§6.14.2). Stock does touch FTPS :990 first in some flows, but only for a **tiny `verify_job` write probe** (§6.14.3) — then `QUIT`, session closed, never reused. Our earlier tcpdump of *cache-only* Send to Printer saw zero :990 packets because that UI path may skip the probe when the target storage is already known (`emmc` / `udisk` via `cmd_type=7`).
 
@@ -2708,7 +2840,7 @@ Manual probes:
 | [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Repeated delete-free pipeline uploads on one or many sessions (regression harness) |
 | [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of wire variants (confirms P2S rejects one-shot / per-chunk-ACK multi-chunk) |
 
-Open-plugin implementation of this wire path: [STATUS.md §6.14.1–6.14.2](STATUS.md#6141-native-6000-vs-ftps-fallback).
+Open-plugin implementation of this wire path: [STATUS.md §6.14.1](STATUS.md#6141-native-6000-wire).
 
 #### 6.14.2. P2S `FILE_UPLOAD` (`cmdtype` 5) — chunked pipeline (May 2026)
 
@@ -3586,7 +3718,7 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 
 | Use | Library | When | Upload transport |
 |-----|---------|------|------------------|
-| Device → Files browse (external USB) | `libBambuSource` (stock: `:6000`; our workaround: FTPS) | File browser tab | N/A (lists/downloads only) |
+| Device → Files browse (external USB) | `libBambuSource` (`:6000`) | File browser tab | N/A (lists/downloads only) |
 | **`verify_job` preflight** | `libbambu_networking` | `PrintJob` LAN preflight; optional before Send to Printer | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
 | Legacy Send-to-Printer fallback | `libbambu_networking` | `SendJob` when `!is_support_brtc` | Full `.3mf` over FTPS `STOR` — not used on P2S |
 | Legacy LAN print upload | `libbambu_networking` | `start_local_print` / cloud `_with_record` FTPS leg | Full `.3mf` over FTPS `STOR` (P2S print-start prefers `:6000` + `brtc://` — see STATUS) |
@@ -3597,15 +3729,17 @@ Stock **Send to Printer → cache** on P2S: **`verify_job` FTPS probe (optional)
 
 Internal timelapse **recording** during print (`task_timelapse_use_internal` → MQTT `project_file` `"cfg":"4"`) is handled by **`libbambu_networking`**, not the file-browser CTRL path documented here.
 
-#### 7.5.1.1. LAN wire protocol (`BambuTunnelLocal`, reverse-engineered May 2026)
+#### 7.5.1.1. The `:6000` protocol (`BambuTunnelLocal` wire) — canonical reference
 
-Stock LAN file browser traffic (verified on **P2S**; likely shared across models that use `bambu:///local/...:6000` for Files) uses **`BambuTunnelLocal`** inside `libBambuSource.so`, not the cloud TUTK UID path (`BambuTunnelTutk` / `IOTC_Connect_ByUIDEx`).
+This is the single canonical description of the printer's `:6000` LAN service (reverse-engineered on **P2S**, May 2026; likely shared across models that expose `bambu:///local/...:6000`). It is the same wire for **both** consumers that use it: the **file-browser CTRL** path in `libBambuSource.so` (Device → Files, `BambuTunnelLocal`, *not* the cloud TUTK UID path `BambuTunnelTutk` / `IOTC_Connect_ByUIDEx`) and the **file-transfer** path (`ft_*` model upload, ABI mapping in §6.14). The framing, handshake and command set below apply to both; the ABI-specific bits live in §6.14, and the per-command `req`/response shapes in §7.6/§7.5.3.
+
+**Transport and login.** TCP `:6000`, **implicit TLS** immediately after connect (leaf cert `CN=<serial>`, same LAN-TLS policy as §6.1.1). The application-layer login uses `user="bblp"` + the 8-character access code (the same code used for FTPS `:990` and the LAN MQTT password). The printer allows **several simultaneous `:6000` TLS sessions** — there is no exclusive lock on the port.
 
 **Stack:**
 
 ```text
 TCP :6000
-  └─ TLS (tutk_third_SSL_connect — OpenSSL wrapper inside libBambuSource)
+  └─ TLS (implicit; OpenSSL — tutk_third_SSL_connect wrapper in libBambuSource)
        └─ subchannel 0x01  login
        └─ subchannel 0x02  StartStreamEx setup + all CTRL JSON / binary
 ```
@@ -3658,17 +3792,17 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 
    i.e. the Studio-side object from §7.5.2 gains a leading `"mtype":12289,` (+14 bytes) before framing. Large replies (e.g. `SUB_FILE` thumbnails) append `\n\n` + binary **inside the payload** after the JSON; stock `Bambu_ReadSample` returns the combined buffer to Studio unchanged.
 
-**Frida / packet-capture caveat.** Hooking `tutk_third_SSL_write` **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing; attach early or use [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) to capture the full handshake.
+**Frida / packet-capture caveat.** Hooking the TLS write primitive **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 (login + `StartStreamEx` setup) happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing, so a full capture must attach before the browser opens, or drive the socket directly with [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) (which performs login + setup itself, so the whole handshake is under your control).
 
-**RE tools in this repo:**
+**RE tooling in this repo (how to reproduce the wire).** These scripts drive / observe the `:6000` protocol directly and were used to reverse-engineer everything above:
 
-| Tool | Role |
-|------|------|
-| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS :6000 client; performs login + `mtype` 12291 setup; auto-framed JSON lines; `/upload` uses chunked pipeline (§6.14.2) |
-| [`tools/bambu6000_ftp_proxy.py`](../tools/bambu6000_ftp_proxy.py) | Plain FTP ↔ `:6000` bridge (default `127.0.0.1:2122`); virtual `/external/*` and `/internal/*` trees map to `LIST_INFO` / `FILE_DOWNLOAD` / upload / delete |
-| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Batch regression: repeated pipeline uploads, optional delete, same-session stress |
-| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of upload wire variants (one-shot, per-chunk ACK, md5/separator permutations) |
-| [`tools/tutk_ssl_log.js`](../tools/tutk_ssl_log.js) + [`tools/frida_tutk_attach.sh`](../tools/frida_tutk_attach.sh) | Frida hooks on stock `libBambuSource.so` (`Bambu_SendMessage`, `Bambu_ReadSample`, `tutk_third_SSL_*`) |
+| Tool | Role | Typical use |
+|------|------|-------------|
+| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS `:6000` client; performs login + `mtype` 12291 setup, then auto-frames each JSON line you type | `python3 tools/bambu6000_repl.py <ip> <access_code>` then type e.g. `{"cmdtype":1,"req":{"api_version":2,"notify":"DETAIL","type":"timelapse"}}`; `/ability`, `/upload <file> emmc`, `/download mem:/26 out.jpg` are built-in helpers |
+| [`tools/bambu6000_ftp_proxy.py`](../tools/bambu6000_ftp_proxy.py) | Plain-FTP ↔ `:6000` bridge (default `127.0.0.1:2122`); virtual `/external/*` and `/internal/*` trees map to `LIST_INFO` / `FILE_DOWNLOAD` / upload / delete | Point any FTP client at `ftp://127.0.0.1:2122` to browse/pull printer files without speaking the raw framing |
+| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Batch regression: repeated pipeline uploads, optional delete, same-session stress | Confirms the chunked pipeline is stable across many uploads on one session |
+| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of upload wire variants (one-shot, per-chunk ACK, md5/separator permutations) | How the "P2S rejects one-shot / requires pipelined chunks" facts above were established |
+| [`tools/tutk_ssl_log.js`](../tools/tutk_ssl_log.js) + [`tools/frida_tutk_attach.sh`](../tools/frida_tutk_attach.sh) | Frida hooks on stock `libBambuSource.so` (`Bambu_SendMessage`, `Bambu_ReadSample`, `tutk_third_SSL_*`) | Attach *before* opening Device → Files to capture the login + setup frames that a late hook misses |
 
 **Example `LIST_INFO` round-trip** (External timelapse, after handshake):
 
@@ -3676,6 +3810,39 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 C→P  hdr(101, 0x0102013f) + {"mtype":12289,"cmdtype":1,"sequence":1,"req":{"api_version":2,"notify":"DETAIL","type":"timelapse"}}
 P→C  hdr(310, 0x0002013f) + {"cmdtype":1,"mtype":12289,"reply":{"file_lists":[...]},"result":0,"sequence":1}
 ```
+
+**Command set (`cmdtype`).** Every RPC carries a `cmdtype` selecting the operation. The enum and the per-command `req` field shapes are tabulated in §7.6; every reply carries a `result` integer from the error enum in §7.5.3. The commands whose *wire flow* is more than a single request/response are detailed below.
+
+**`FILE_UPLOAD` (5) — chunked pipeline.** Large model uploads (multi-MB `.3mf`) use a two-phase, pipelined flow (a single one-shot `{path,file,size,md5}` + whole file is **rejected** by P2S firmware for large files — connection reset / `-9203`):
+
+```text
+# Phase 1 — init (JSON only)
+C→P  {"cmdtype":5,"sequence":N,"req":{"type":"model","storage":"emmc","path":"<name>.3mf","total":<bytes>}}
+P→C  {"cmdtype":5,"sequence":N,"result":1,"reply":{"chunk_size":255,"offset":0}}    # result 1 = CONTINUE
+
+# Phase 2 — data fragments (same sequence N, increasing frag_id); file_md5 on the LAST chunk
+C→P  {"mtype":12289,"cmdtype":5,"sequence":N,"req":{"frag_id":0,"offset":0,"size":261120}}  + "\n\n" + <261120 bytes>
+     …
+C→P  {"cmdtype":5,"sequence":N,"req":{"frag_id":K,"offset":…,"size":…,"file_md5":"<hex>"}} + "\n\n" + <tail bytes>
+P→C  {"cmdtype":5,"sequence":N,"result":0}                                                  # 0 = SUCCESS
+```
+
+Two protocol details that are easy to miss:
+
+- **`chunk_size` in the init reply is in kibibytes, not bytes.** `"chunk_size":255` means ~255 KiB per fragment, i.e. each `size` on the wire is `chunk_size * 1024` (except the final, shorter tail).
+- **The connection is full-duplex during Phase 2.** While the client is still writing fragment bodies, the printer emits progress/interim reply frames on the same socket. The client **must keep draining** those frames as it sends; if it only writes and never reads, the peer's send buffer backs up and the printer **resets the connection** mid-upload.
+
+**`FILE_DOWNLOAD` (4) — mem preview.** In-memory thumbnails/previews are addressed as `mem:/<idx>`; the wire request is `{"cmdtype":4,"sequence":N,"req":{"path":"mem:/26","offset":0}}` (no `is_mem_file` on the wire). The reply streams the JPEG in fragments carrying `frag_id` / `offset` / `size` / `total`, with `file_md5` on the final fragment (`result:0`).
+
+**`REQUEST_MEDIA_ABILITY` (7) — storage probe.** `{"cmdtype":7,"sequence":N,"req":{"peer":"studio","api_version":<v>}}` returns a JSON **array of storage labels** the printer can write, e.g. `["emmc","udisk"]` on P2S. Observed `api_version` values differ by firmware/client (2 or 3); `peer` identifies the requesting side.
+
+**Storage labels.** The `storage` value in `FILE_UPLOAD`/`LIST_INFO` and the array from `REQUEST_MEDIA_ABILITY` use the labels `emmc` / `udisk` (physical volumes, current firmware) and, on older builds/logical views, `sdcard` / `usb` / `internal` / `external`. The label selects *where the file is written*; the print-start `url` scheme (§6.8.2) later selects *how firmware locates* it.
+
+**Session semantics and scope.**
+
+- The **file-browser CTRL** consumer keeps one request in flight at a time (serialised on a worker thread): strict request → response pairing, `sequence` echoed back to match callbacks.
+- The **`ft_*` file-transfer** consumer keeps one session open across a `cmdtype=7` ability probe and a `cmdtype=5` upload back-to-back **without re-handshaking**, and does not assume strict pairing: a client must **drain or filter stale framed JSON** left from a prior command and **match replies on `cmdtype` + `sequence`**, not on a bare `result:0`.
+- Do **not** conflate `:6000` with two neighbouring services: **FTPS `:990`** (a separate implicit-TLS FTP daemon, §7.6.1.1) and the **MJPEG `0x3000` 80-byte auth block** used for A1/P1 live view — sending that block on a `:6000` file session yields a 24-byte `0x0003013f` ack and the peer closes.
 
 #### 7.5.2. ABI / Studio-side JSON: `Bambu_SendMessage` payload
 
@@ -3759,7 +3926,7 @@ Asynchronous notifications (printer-initiated, no preceding `Bambu_SendMessage`)
 
 ### 7.6. CTRL command reference
 
-The full set of `cmdtype` values is in `PrinterFileSystem.h:34-45`:
+This is the per-command `req`/response detail for the command set; the transport, framing, handshake and multi-frame flows are in the canonical `:6000` protocol reference (§7.5.1.1). The full set of `cmdtype` values is in `PrinterFileSystem.h:34-45`:
 
 ```34:45:src/slic3r/GUI/Printer/PrinterFileSystem.h
     enum {
