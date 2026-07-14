@@ -1483,7 +1483,7 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 ##### Command-security key & certificate flow
 
 Two independent RSA credentials drive command-security: a **shared app key** that signs, and a **per-printer device-cert public key** that encrypts. Each line below reads as **inputs → where/when it is used → output**.
-
+ю.акшв
 **Sources.** Most of the authorization-control detail below is not our own capture — it is drawn from third-party reverse-engineering, cross-checked against our code and issue #47. Primary references, cited inline per group:
 
 - **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `bootstrap_secret`, AES-wrapped key).
@@ -2744,7 +2744,7 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | Printer firmware catalogue | stock: `GET /v1/iot-service/api/user/device/version?dev_id=<serial>` (add `X-BBL-Client-ID: slicer:<uid>:<4-char-suffix>`); ours: synthesised from MQTT state | §6.7 | SSLKEYLOGFILE (stock); synthesised (ours) |
 | Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, `PUT /v1/iot-service/api/user/notification`, `GET /v1/iot-service/api/user/notification?action=upload&ticket=<t>`, `PATCH /v1/iot-service/api/user/project/<pid>`, `GET /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf`, `POST /v1/user-service/my/task` | §6.8 | MITM |
 | User presets sync | `<m> /v1/iot-service/api/slicer/setting[/<id>]?public=false&version=<bundle>` | §6.9 | MITM + probe |
-| Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |
+| Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch|/ams/sync]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |
 | MakerWorld / Mall, OSS upload | various `design-service` / `iot-service` / OSS paths | §6.12 | not captured |
 | Camera / live view / HMS snapshot | not captured | §6.11 | — |
 | Analytics / telemetry | not captured | §6.13 | — |
@@ -3217,17 +3217,18 @@ Open-plugin coverage of this flow: [STATUS.md §6.14.2–6.14.3](STATUS.md#6142-
 
 ### 6.15. Filament Manager (cloud spool catalogue)
 
-Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through.
+Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five CRUD entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through. ABI **02.08.01** adds a sixth call, `bambu_network_sync_ams_filaments`, for bulk AMS mount-state sync (STUDIO-18155 / path B).
 
-| Symbol | Signature |
-|--------|-----------|
-| `bambu_network_get_filament_spools` | `int(void*, FilamentQueryParams, std::string* http_body)` |
-| `bambu_network_create_filament_spool` | `int(void*, std::string request_body, std::string* http_body)` |
-| `bambu_network_update_filament_spool` | `int(void*, std::string spool_id, std::string request_body, std::string* http_body)` |
-| `bambu_network_delete_filament_spools` | `int(void*, FilamentDeleteParams, std::string* http_body)` |
-| `bambu_network_get_filament_config` | `int(void*, std::string* http_body)` |
+| Symbol | Signature | Since |
+|--------|-----------|-------|
+| `bambu_network_get_filament_spools` | `int(void*, FilamentQueryParams, std::string* http_body)` | `02.06.00` |
+| `bambu_network_create_filament_spool` | `int(void*, std::string request_body, std::string* http_body)` | `02.06.00` |
+| `bambu_network_update_filament_spool` | `int(void*, std::string spool_id, std::string request_body, std::string* http_body)` | `02.06.00` |
+| `bambu_network_delete_filament_spools` | `int(void*, FilamentDeleteParams, std::string* http_body)` | `02.06.00` |
+| `bambu_network_get_filament_config` | `int(void*, std::string* http_body)` | `02.06.00` |
+| `bambu_network_sync_ams_filaments` | `int(void*, AmsSyncParams, std::string* http_body)` | `02.08.01` |
 
-`FilamentQueryParams` and `FilamentDeleteParams` are defined in `bambu_networking.hpp:260-275`:
+`FilamentQueryParams` and `FilamentDeleteParams` are defined in `bambu_networking.hpp` (ABI ≥ `02.06.00`); `AmsSyncItem` / `AmsSyncParams` land in the same header under `#if ABI_VERSION >= 0x020801`:
 
 ```cpp
 struct FilamentQueryParams {
@@ -3242,6 +3243,33 @@ struct FilamentDeleteParams {
     std::vector<std::string> ids;
     std::vector<std::string> rfids;
 };
+
+#if ABI_VERSION >= 0x020801
+struct AmsSyncItem {
+    std::string RFID;
+    std::string filamentVendor;
+    std::string filamentType;
+    std::string filamentName;
+    std::string filamentId;
+    bool        isSupport      = false;
+    std::string color;
+    int         colorType      = 0;
+    std::vector<std::string> colors;
+    int         netWeight      = 0;
+    int         totalNetWeight = 0;
+    std::string trayIdName;
+    std::string note;
+    std::string amsSn;
+    std::string slotId;
+    int         amsId          = 0;
+    int         amsType        = 0;
+    bool        createNew      = false;
+};
+struct AmsSyncParams {
+    std::string              devId;
+    std::vector<AmsSyncItem> items;
+};
+#endif
 ```
 
 #### 6.15.1. Endpoints
@@ -3255,8 +3283,9 @@ All paths are relative to the regional API host from §6.10.1, under the `design
 | `create_filament_spool` | `POST` | `/v1/design-user-service/my/filament/v2` | `CreateFilamentV2Req` | MITM |
 | `update_filament_spool` | `PUT` | `/v1/design-user-service/my/filament/v2` (id is in body, not path) | `UpdateFilamentV2Req` | MITM |
 | `delete_filament_spools` | `DELETE` | `/v1/design-user-service/my/filament/v2/batch` | `BatchDeleteFilamentV2Req` | MITM |
+| `sync_ams_filaments` | `POST` | `/v1/design-user-service/my/filament/v2/ams/sync` | `AmsSyncParams` JSON | MITM (`02.08.01.51`) |
 
-Auth and transport are the §6.10.1 defaults — `Authorization: Bearer <access_token>`, `Content-Type: application/json`. Stock `bambu_network_agent/02.06.01.50` overrides `User-Agent` for this surface (the only place it does so in the entire plugin), but the server accepts the generic `BBL-Slicer/v…` UA too — direct probes confirm there's no UA gating.
+Auth and transport are the §6.10.1 defaults — `Authorization: Bearer <access_token>`, `Content-Type: application/json`. Stock `bambu_network_agent/02.06.01.50` / `02.08.01.51` overrides `User-Agent` for this surface (the only place it does so in the entire plugin), but the server accepts the generic `BBL-Slicer/v…` UA too — direct probes confirm there's no UA gating.
 
 #### 6.15.2. Request / response shapes
 
@@ -3355,6 +3384,64 @@ A 404 response means "id not found"; Studio falls back to `POST` (create) on tha
 
 Studio caches the response for the lifetime of the WebView and keys vendor/type/name pickers off the same `filamentId` quadruples that show up under each spool.
 
+**`POST /my/filament/v2/ams/sync` — AMS mount-state sync (ABI ≥ `02.08.01`).** Studio calls this when AMS **in-printer / slot / AMS-SN** fields change for already-known spools (path B; see §6.15.3). The plugin serialises `AmsSyncParams` to camelCase JSON and `POST`s it; Studio's success callback ignores the parsed body, so plugins must forward the server response verbatim.
+
+Request (stock `bambu_network_agent/02.08.01.51`, single tray insert — MITM):
+
+```json
+{
+  "devId": "22E8BJ610801473",
+  "items": [{
+    "RFID": "C0150FF4913D492495F86923A61F8195",
+    "amsId": 0,
+    "amsSn": "19C06A610109584",
+    "amsType": 3,
+    "color": "#00000000",
+    "colorType": 2,
+    "colors": ["#00000000"],
+    "createNew": false,
+    "filamentId": "GFS05",
+    "filamentName": "Support For PLA/PETG",
+    "filamentType": "PLA-S",
+    "filamentVendor": "Bambu Lab",
+    "isSupport": false,
+    "netWeight": -5,
+    "note": "",
+    "slotId": "1",
+    "totalNetWeight": 500,
+    "trayIdName": "S05-C0"
+  }]
+}
+```
+
+Field notes (from Studio's `wgtFilaManagerCloudSync::sync_ams_to_cloud` + live traffic):
+
+| JSON key | Source | Notes |
+|----------|--------|-------|
+| `devId` | `MachineObject::get_dev_id()` | Printer serial; required. |
+| `RFID` | spool `tag_uid` | May be `""` for manual / non-RFID spools. |
+| `amsSn` / `slotId` / `amsId` / `amsType` | mount fields | On **unplug**, Studio zeroes them (`amsSn=""`, `slotId=""`, `amsId=0`, `amsType=0`) while still sending the spool identity. |
+| `netWeight` / `totalNetWeight` | grams (ints) | `netWeight` can be negative in practice (e.g. `-10`, `-5`) when Studio has not yet reconciled remain %; the server accepts it. |
+| `createNew` | always `false` in observed path-B traffic | Studio builds items from existing store entries only. |
+| `colors` | always a JSON array | Even for solid colours (`colorType: 2`) — typically a one-element array matching `color`. |
+
+`items` may contain **multiple** spools in one POST (batch mount/unmount of several trays). Empty `devId` or empty `items` should not be sent; plugins should fail locally rather than POST an empty body.
+
+Typical success response (200 OK) — per-item result list:
+
+```json
+{
+  "createdRFIDs": null,
+  "results": [
+    {"amsSn": "19C06A610109584", "slotId": "1", "spoolId": 6498430}
+  ]
+}
+```
+
+`spoolId` is the cloud `int64` id when the item matched an existing cloud spool; it is `null` when the server could not resolve one (e.g. empty RFID / unplug of a local-only entry). Malformed JSON (missing quotes on keys, etc.) returns **HTTP 400**.
+
+On transport / non-2xx failure the plugin returns `BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED` (−29); there is no dedicated sync error code in the ABI.
+
 #### 6.15.3. When Studio actually calls these
 
 `wgtFilaManagerCloudDispatcher` serialises every cloud operation onto a single in-flight queue (`enqueue_pull` / `enqueue_push_create` / `enqueue_push_update` / `enqueue_push_delete`) so the server never sees concurrent writes from the same client. The triggers are:
@@ -3362,13 +3449,15 @@ Studio caches the response for the lifetime of the WebView and keys vendor/type/
 - **Login.** `GUI_App::on_user_login` calls `m_fila_manager_cloud_disp->enqueue_pull()` once an access token is available — this is the very first call most plugins ever see, before the user even opens the Filament Manager tab.
 - **Filament Manager panel mount.** `FilaManagerVM::OnPanelShown` re-issues a pull *and* fetches `get_filament_config`. Repeated tab focuses are debounced through the dispatcher.
 - **User actions.** "Add spool" → `create_filament_spool`; field edits → `update_filament_spool` (with the fallback-to-create on 404); single or multi-select delete → `delete_filament_spools`.
-- **AMS sync.** When the printer reports a new RFID-tagged spool, Studio synthesises a `createType:"ams"` POST with the matching `RFID` and `trayIdName`.
+- **AMS sync — path A (remain weight).** On every cloud/LAN MQTT message for the **selected** online printer, `GUI_App` calls `wgtFilaManagerSync::on_device_update` → `sync_all_trays`. Spools whose remaining weight changed are pushed via throttled `update_filament_spool` (`notify_ams_synced` → PUT). Requires login; silently skipped otherwise.
+- **AMS sync — path B (mount fields, ABI ≥ `02.08.01`).** Same `sync_all_trays` pass: when `apply_mount_diff` reports changed mount ownership (`in_printer` / `dev_id` / `ams_sn` / `ams_id` / `ams_type` / `slot_id` — insert, remove, or move), Studio calls `sync_ams_to_cloud` → `bambu_network_sync_ams_filaments` (`POST …/ams/sync`). Path B is **not** throttled. Paths A and B may fire for the same spool in one sync cycle; the cloud is treated as last-write-wins / idempotent.
+- **AMS create.** When the printer reports a new RFID-tagged spool that is not yet in the store, Studio still synthesises a `createType:"ams"` POST (separate from path B, which only updates already-known spools).
 
 Every successful pull rewrites the local store: cloud is the source of truth, and any local-only entries that didn't make it to the server (e.g. a failed previous push) are dropped on each refresh.
 
 ### 6.16. Error codes
 
-The complete list of error values the plugin is expected to return through `int` lives in `src/slic3r/Utils/bambu_networking.hpp:13-94` (general, bind, `start_local_print_with_record`, `start_print`, `start_local_print`, `start_send_gcode_to_sdcard`, connection). Five additional `BAMBU_NETWORK_ERR_{GET_FILAMENTS,CREATE_FILAMENT,UPDATE_FILAMENT,DELETE_FILAMENT,GET_FILAMENT_CONFIG}_FAILED` codes (-27..-31) are returned on transport / HTTP-error paths from the §6.15 endpoints so Studio's UI can surface a meaningful toast instead of a silent retry-loop.
+The complete list of error values the plugin is expected to return through `int` lives in `src/slic3r/Utils/bambu_networking.hpp:13-94` (general, bind, `start_local_print_with_record`, `start_print`, `start_local_print`, `start_send_gcode_to_sdcard`, connection). Five additional `BAMBU_NETWORK_ERR_{GET_FILAMENTS,CREATE_FILAMENT,UPDATE_FILAMENT,DELETE_FILAMENT,GET_FILAMENT_CONFIG}_FAILED` codes (-27..-31) are returned on transport / HTTP-error paths from the §6.15 endpoints so Studio's UI can surface a meaningful toast instead of a silent retry-loop. `bambu_network_sync_ams_filaments` (ABI ≥ `02.08.01`) has no dedicated code and reuses `BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED` (−29).
 
 ---
 
