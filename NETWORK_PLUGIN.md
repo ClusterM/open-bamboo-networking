@@ -1350,7 +1350,7 @@ The print-job submission ends with a single MQTT command published to the printe
 ```json
 {
   "print": {
-    "sequence_id":             "20006",
+    "sequence_id":             "1749823456789",
     "command":                 "project_file",
     "param":                   "Metadata/plate_1.gcode",
     "project_id":              "0",
@@ -1381,7 +1381,7 @@ The print-job submission ends with a single MQTT command published to the printe
 
 | Field | Type | Source in `PrintParams` (Studio -> ABI) | Notes |
 |---|---|---|---|
-| `sequence_id` | string (decimal) | plugin-generated | Wall-clock millisecond counter; the printer echoes it on the matching ack. |
+| `sequence_id` | string (decimal) | See *MQTT `sequence_id`* below | Per-command unique id; the printer echoes it on the matching ack |
 | `command` | string | constant `"project_file"` | Selects the firmware handler. |
 | `param` | string | derived from `plate_index` | Always `Metadata/plate_<N>.gcode`; resolves to a path inside the uploaded 3mf. |
 | `project_id`, `profile_id`, `task_id`, `subtask_id` | strings | cloud task IDs from `POST /v1/user-service/my/task` (cloud) or `"0"` placeholder (LAN / Developer Mode) | Sent as **strings**, not numbers. |
@@ -1399,6 +1399,16 @@ The print-job submission ends with a single MQTT command published to the printe
 | `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it is omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01`. |
 | `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. Cross-ABI confirmation: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"`; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — a future capture showing e.g. `"1"`, `"2"` or `"5"` would identify another flag's meaning. |
 | `extrude_cali_flag` | int | derived from `auto_flow_cali` | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`** and is a **multi-valued enum, not a bool**: `0` = off, `1` = requested, and `2` (= auto) has been observed in genuine traffic ([issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)); further values may exist. OBN passes the int through verbatim, so no code change is needed. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+
+##### MQTT `sequence_id` — per-command unique id (three assignment sources)
+
+`sequence_id` is the **unique identifier of a single MQTT command** — a decimal string the sender picks so the printer (and Studio) can match an outgoing request to its ack/report echo. It is **not** a session id and **not** reset on MQTT connect; only the assignment algorithm differs by who built the frame. The stock plugin **never rewrites** an id Studio already embedded.
+
+| Source | When | Algorithm | Typical value | Studio-side check |
+|--------|------|-----------|---------------|-------------------|
+| **Stock plugin** | The plugin **constructs the MQTT frame itself** (e.g. `project_file` from the print-job ABI, or any other command the plugin assembles before publish) | **Wall-clock epoch milliseconds** at generation time: `str(unix_epoch_ms)` (13-digit decimal string). A fresh value on every frame; **not** reset on MQTT connect/reconnect. | `"1749823456789"` | — |
+| **Bambu Studio** | Studio builds the JSON and hands it to the plugin via `bambu_network_send_message` / `send_message_to_printer`; the plugin forwards (and may sign) **without replacing** the id | **Process-wide monotonic counter:** `std::to_string(MachineObject::m_sequence_id++)`. Initialized once per Studio launch to **`STUDIO_START_SEQ_ID` = 20000**; increments for *every* Studio-originated command (`print`, `system`, `info`, `camera`, `pushing`, …). Valid range **20000–29999** (`STUDIO_END_SEQ_ID` = 30000 is the exclusive upper bound). **Never reset** on MQTT connect — only a Studio restart resets back to 20000. | `"20014"`, `"20021"`, … | `DevUtil::is_studio_cmd(seq)` → `seq >= 20000 && seq < 30000` *(AGPL: `DeviceCore/DevUtil.h`, `DeviceManager.hpp`)* |
+| **Cloud dispatch** | Commands injected by Bambu cloud MQTT (cloud print dispatch, cloud-side control) | **Constant `"0"`** (`CLOUD_SEQ_ID`) for every cloud-originated command. | `"0"` | `DevUtil::is_cloud_cmd(seq)` → `seq == 0` *(AGPL: `DeviceCore/DevUtil.h`)* |
 
 ##### Cloud-start extras in `project_file` (verify on stock firmware)
 
@@ -1459,7 +1469,7 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 }
 ```
 
-`payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact payload; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+`payload_len` is the UTF-8 byte length of the **exact signed byte string** (defined precisely in the *SignMessage* pseudocode below — it is the `{`-prefixed `print` section, wrapper included, **byte-for-byte as it appears on the wire**, not the inner `print` object alone); `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact byte string; `sign_ver` labels the scheme (`v1.0` observed). **No JSON canonicalization is applied or required** — keys need not be sorted and whitespace need not be stripped (see the "what is actually signed" note below). Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
 
 **`cert_id` is a cloud-issued, _shared_ application certificate — not a per-install _device_ certificate** (correction cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) against a symbol-bearing `libbambu_networking.so`, a live VMProtect memory dump, and decrypted secured-printer captures). The example above, `a4e8faaa…CN=GLOF3813734089.bambulab.com`, is the **app** cert (subject/issuer under `GLOF{…}.bambulab.com`), *not* a device CN. Two distinct keys are in play, and they must not be confused:
 
@@ -1522,24 +1532,41 @@ Note where the **CRL** actually lands: it is never read by the plugin's signing/
 
 The flow list above says *which* key touches *which* field; the pseudocode below is the exact wire recipe, so a command can be signed/encrypted without opening the source references. It is transcribed from RN-5 (MQTT middleware) and RN-6 (HTTP headers); primitives are OpenSSL-equivalent (`RSA_Sign` = `EVP_DigestSign` with SHA-256 + PKCS#1 v1.5; `RSA_Encrypt` = `RSA_public_encrypt` with `RSA_PKCS1_PADDING`).
 
-**1. `SignMessage` — RSA-SHA256 over the `print` object** (every privileged MQTT command):
+**1. `SignMessage` — RSA-SHA256 over the `print` section** (every privileged MQTT command):
 
 ```py
-def SignMessage(app_private_key, cmd_obj):          # cmd_obj = {"print": {...}} etc.
-    json_str  = JSON_stringify(cmd_obj)             # compact, as serialized on the wire
-    json_bytes = UTF8_Encode(json_str)
+def SignMessage(app_private_key, print_text):
+    # print_text is the serialized "print" VALUE exactly as it will appear
+    # on the wire (any key order, any/no whitespace, newlines allowed).
+    to_sign    = '{"print":' + print_text + '}'   # wrapper; see exact rule below
+    json_bytes = UTF8_Encode(to_sign)
     signature  = RSA_Sign(app_private_key, json_bytes)   # RSA-SHA256, PKCS#1 v1.5
     header = {
         "sign_ver":    "v1.0",
         "sign_alg":    "RSA_SHA256",
         "sign_string": Base64_Encode(signature),
         "cert_id":     app_cert.serialNumber.lower() + app_cert.issuer,  # NO separator
-        "payload_len": len(json_bytes),             # UTF-8 byte length of the signed object
+        "payload_len": len(json_bytes),             # = len(to_sign), wrapper included
     }
-    return { **cmd_obj, "header": header }
+    # The SAME print_text bytes must be emitted in the envelope (see below).
+    return '{"header":' + JSON(header) + ',"print":' + print_text + '}'
 ```
 
+**What is actually signed (verified on P2S hardware, 2026-07).** The firmware does **not** canonicalize. It verifies the signature over a byte string it reconstructs from the received envelope as:
+
+> `"{"` **+** everything from the start of the `"print"` key up to and including the final closing `}` of the whole message.
+
+In other words: take the on-wire envelope `{"header":{…},"print"…<rest>`, drop the `{"header":{…},` prefix, prepend a single `{`, and that byte string (length = `payload_len`) is what the signature must cover. Consequences, all confirmed on hardware:
+
+- **Key sorting is _not_ required.** Any object-key order verifies.
+- **Whitespace is _not_ stripped.** Spaces, indentation, even newlines inside the `print` section are fine.
+- **The only hard rules:** (1) the signed string must start with `{`; (2) the bytes of the `print` section used to compute the signature must be **byte-identical** to the bytes placed in the envelope, **including any surrounding whitespace**. If you sign `{"print" : <dump> }` (spaces around `:` and before `}`), the envelope must end with the identical `,"print" : <dump> }`. Add a space after the `{` when signing (`{ "print" : …`) and the envelope's separator must likewise become `}, "print" : …`. A trailing space in the signed string (`… } `) must also appear in the envelope. Any byte mismatch between "what was signed" and "what is on the wire" fails verification.
+
+This is why a compact, sorted serializer *works* but is not *mandatory*: it just happens to make "what I signed" equal "what I send" trivially. The robust rule for a reimplementation is: **serialize the `print` value once, sign `{` + those exact bytes + (whatever trailing bytes you will also emit), then emit those exact same bytes after `,"print":` (or `, "print":`, matching your prefix) in the envelope.** *(RN-5 gives the algorithm shape; the "no canonicalization, byte-exact wire match" rule is from on-hardware testing.)*
+
 Note the **`cert_id` serialization for MQTT is `serialNumber.lower() + issuer`** with no separator (e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`). The HTTP header uses a *different* serialization (below). *(RN-5)*
+
+> **Unrelated pitfall that masquerades as a signature error:** a non-monotonic or reused `sequence_id` (e.g. always `"0"`) can get the command rejected even though the signature is valid. Use a monotonically increasing `sequence_id` before suspecting the signing path.
 
 **2. `EncryptField` — device-cert field encryption** (`print.project_file` → `url_enc`, `print.gcode_line` → `param_enc`):
 
@@ -1634,7 +1661,7 @@ These commands are **not implemented in the network plugin** — Studio builds t
 | Field | Type | Notes |
 |-------|------|-------|
 | `print.command` | string | Command name (see tables below) |
-| `print.sequence_id` | string | Monotonic counter (`MachineObject::m_sequence_id++`) |
+| `print.sequence_id` | string | See §6.8.2 *MQTT `sequence_id`* | Per-command unique id (Studio: monotonic **20000–29999**; plugin: epoch-ms; cloud: `"0"`). Plugin forwards Studio's value unchanged. |
 
 **Common response envelope**
 
