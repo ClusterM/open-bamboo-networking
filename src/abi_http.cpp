@@ -251,11 +251,64 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_user_tasks(void* /*agent*/,
-                                         BBL::TaskQueryParams /*params*/,
+OBN_ABI int bambu_network_get_user_tasks(void* agent,
+                                         BBL::TaskQueryParams params,
                                          std::string* http_body)
 {
     if (http_body) http_body->clear();
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+
+    // Cloud-only MakerWorld history. Under block_cloud return an empty but
+    // well-formed envelope so Studio's TaskManager / WebView parsers stay
+    // happy instead of treating a transport error as a hard failure.
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("get_user_tasks: blocked by block_cloud");
+        if (http_body) *http_body = R"({"total":0,"hits":[]})";
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        OBN_WARN("get_user_tasks: no access token");
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    // Stock: GET /v1/user-service/my/tasks?limit=&offset=&status=[&deviceId=]
+    // Confirmed against MITM of bambu_network_agent/02.08.01.51. Response is
+    // {total, hits:[...]} and Studio parses it verbatim (TaskManager.cpp /
+    // WebViewDialog.cpp) — no remapping needed.
+    std::ostringstream path;
+    path << "/v1/user-service/my/tasks"
+         << "?limit="  << params.limit
+         << "&offset=" << params.offset
+         << "&status=" << params.status;
+    if (!params.dev_id.empty())
+        path << "&deviceId=" << obn::http::url_encode(params.dev_id);
+
+    const std::string url = obn::cloud::api_host(a->cloud_region()) + path.str();
+    auto hdrs = a->cloud_api_http_headers();
+    OBN_INFO("get_user_tasks limit=%d offset=%d status=%d dev=%s",
+             params.limit, params.offset, params.status,
+             params.dev_id.empty() ? "-" : params.dev_id.c_str());
+
+    auto resp = obn::http::get_json(url, hdrs);
+    if (!resp.error.empty()) {
+        OBN_WARN("get_user_tasks: transport: %s", resp.error.c_str());
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    if (resp.status_code != 200) {
+        OBN_WARN("get_user_tasks: HTTP %ld body=%s",
+                 resp.status_code,
+                 resp.body.size() > 200
+                     ? (resp.body.substr(0, 200) + "...").c_str()
+                     : resp.body.c_str());
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    OBN_INFO("get_user_tasks: ok bytes=%zu", resp.body.size());
+    if (http_body) *http_body = std::move(resp.body);
     return BAMBU_NETWORK_SUCCESS;
 }
 
