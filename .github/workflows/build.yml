@@ -106,7 +106,9 @@ jobs:
         # Nightly abi-compat workflow compares source-side files only.
         # This step additionally nm's the freshly built .so to confirm we
         # did not lose any exported entry point in this architecture's toolchain.
-        run: tools/check_abi_compat.sh --so=build/libbambu_networking.so
+        # --abi pins the check to the ABI this job actually built, so a plugin
+        # is never verified against a different (e.g. newer) ABI's symbol list.
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.so
 
       - name: Stage artifacts
         run: |
@@ -236,7 +238,7 @@ jobs:
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
-        run: tools/check_abi_compat.sh --so=build/libbambu_networking.dylib
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
 
       - name: Stage artifacts
         run: |
@@ -299,7 +301,7 @@ jobs:
   #       run: make test
   #
   #     - name: Verify built plugin exports every ABI symbol
-  #       run: tools/check_abi_compat.sh --so=build/libbambu_networking.dylib
+  #       run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
   #
   #     - name: Stage artifacts
   #       run: |
