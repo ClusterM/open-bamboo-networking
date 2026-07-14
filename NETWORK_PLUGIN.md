@@ -599,16 +599,17 @@ This matches what Home Assistant's `pybambu` integration uses. No client certifi
 
 The stock `libbambu_networking.so` obtains a **client certificate chain** from the cloud REST API immediately before connecting and presents it during the MQTT TLS handshake (mutual TLS). The HTTPS call that fetches the cert was confirmed via SSLKEYLOGFILE decryption of the stock plugin's **REST** traffic (not by decrypting the MQTT session itself).
 
-**Certificate retrieval endpoint (stock only):**
+**Certificate / app-credential retrieval endpoint (stock; request side verified in OBN):**
 
 ```
-GET /v1/iot-service/api/user/applications/{application_token}/cert?aes256={base64url-key}&ver=1
-Authorization: Bearer {access_token}
+GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_session_key}&ver=1
 ```
 
-The two request parameters are **not** what their names suggest — both are wrappers, decoded per the *Credential rotation algorithm* below. The `{application_token}` path segment is the **AES-256-GCM ciphertext of a hardcoded client secret** (`IV||ciphertext||auth_tag`, base64url), not a bare account token. The `aes256` query parameter is the **RSA-wrapped ephemeral session key** (base64url) — it is *not itself* the AES key, it *transports* the key that decrypts the response. `ver=1` is the API version. *(RN-3)*
+No `Authorization` bearer is required for this endpoint (live probes return `code:0` anonymously when the envelope is valid). Stock Studio still sends the usual `X-BBL-*` / `User-Agent: bambu_network_agent/…` fingerprint headers; Cloudflare may 403 bare clients without them.
 
-**Response (200 OK):**
+The two URL parameters are **wrappers**, not a token and not a raw AES key — see the algorithm below. `ver=1` is the API version. *(RN-3; OBN live verify 2026-07)*
+
+**Response (200 OK)** — shape confirmed; private-key finalization is **not** fully reversed:
 
 ```json
 {
@@ -617,47 +618,62 @@ The two request parameters are **not** what their names suggest — both are wra
   "error": null,
   "cert": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
   "crl": ["-----BEGIN X509 CRL-----\n...\n-----END X509 CRL-----\n"],
-  "key": "{base64-encoded-encrypted-private-key}"
+  "key": "{base64-encoded encrypted private-key blob}"
 }
 ```
 
-The `cert` field contains a **3-certificate chain** (PEM-concatenated):
+The `cert` field is a **shared application certificate chain** (PEM-concatenated), **not** a per-printer / per-install device cert. Observed Studio leaf (2026-07):
 
-1. **Device leaf cert** — subject: `GLOF{dev_id}-{hex}`, issuer: `GLOF{dev_id}.bambulab.com`
-2. **Per-device intermediate CA** — subject: `GLOF{dev_id}.bambulab.com`, issuer: `application_root.bambulab.com`
-3. **Root CA** — subject: `application_root.bambulab.com`, issuer: `BBL CA`
+1. **App leaf** — subject/O: `GLOF3813734089-836763c70000`, issuer: `GLOF3813734089.bambulab.com`
+2. **App intermediate** — subject: `GLOF3813734089.bambulab.com`, issuer: `application_root.bambulab.com`
+3. **Application root** — subject: `application_root.bambulab.com`, issuer: `BBL CA`
 
-**Per-device CA architecture:** each device has its own intermediate CA named `{dev_uid}.bambulab.com`. Client certs are issued under this per-device CA, so the MQTT broker can verify which device a connection belongs to from the certificate alone. Revocation is per-device via the device-specific CRL returned in the `crl` field. Observed CRL validity: 30 days from issue date.
+(`cert_id` for MQTT / HTTP PoP is derived from the leaf: lowercase hex serial ‖ issuer RFC4514, e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com` — see §6.8.) Do **not** confuse this chain with the printer's LAN TLS leaf (`CN=<serial>`) or the per-device MQTT signing material discussed elsewhere.
 
-**`key` field:** the private key is **AES-256-GCM** encrypted and base64-encoded (`IV||ciphertext||auth_tag`). The decryption key is the **ephemeral `session_key`** the client generated and RSA-wrapped into the `aes256` query parameter — the base64url `aes256` value on the wire is the *wrapped* key, not the key itself.
+**`crl` field:** a fresh CRL issued at request time (array of PEM strings).
 
-**`crl` field:** a fresh CRL issued at request time, not a cached value.
+**`key` field (wire-confirmed size; decrypt algorithm open):** standard base64 of a **704-byte** blob. Layout observed on every successful response:
 
-**Credential rotation algorithm (how the request/response are wrapped).** The stock plugin ships an embedded application credential and, at startup, fetches an up-to-date copy from the endpoint above. The convoluted AES/RSA envelope exists only to keep the secrets out of a TLS-MITM's reach — conceptually it is just "prove you are the official client, receive the current shared credential." The hardcoded `client_auth_secret` is a prefix matching the app-cert subject CN (`GLOF{…}-{…}`) followed by 16 hardcoded hex characters. *(RN-3)*
-
-```py
-# --- request construction ---
-session_key = secure_random(32)                       # ephemeral AES-256 key
-iv          = secure_random(12)
-ct, tag     = AESGCM_Encrypt(session_key, iv, client_auth_secret)
-enc_secret  = Base64url(iv || ct || tag)              # -> {application_token} path segment
-wrapped_key = Base64url(RSA_Encrypt(root_ca_public_key, session_key))  # -> aes256= query param
-GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1
-
-# --- response finalization ---  (response.key = base64 of IV||ciphertext||auth_tag)
-blob          = Base64_Decode(response.key)
-iv            = blob[0:12]
-tag           = blob[-16:]
-ct            = blob[12:-16]
-app_priv_pem  = AESGCM_Decrypt(session_key, iv, ct, tag)   # the shared app private key
-# store response.cert (chain), app_priv_pem, response.crl for MQTT signing + HTTP PoP
+```
+header(28 bytes) || u32le length (= 672) || body(672 bytes)
 ```
 
-The RSA wrap uses the **root CA public key** (§ App Certificates); the server unwraps `session_key`, decrypts `enc_secret` to authenticate the client, and encrypts the returned private key back under the same `session_key`. None of this authenticates a *user* or *device* — it only proves possession of the secret baked into every official client. *(RN-3)*
+RN-3 documents this as `AES-256-GCM(session_key)` over a PEM private key (`IV(12)||ct||tag(16)`). That recipe **does not work** on live blobs: a PEM PKCS#1 RSA-2048 is ~1679 bytes (DER ~1192), which cannot fit in 672 bytes of body, and AES-GCM / AES-CBC / common KDF variants over the exact request `session_key` all fail (`InvalidTag` / garbage). Stock clients finalize via a native helper (`CM.up1(response_json)` in Bambu Connect; equivalent code inside `libbambu_networking.so`). Until that format is reversed, OBN continues to take `slicer_key.pem` out-of-band. *(OBN live verify 2026-07; also estampo cloud-print-research, bambu_connect_disasm chunk 88)*
 
-`fetch_device_cert()` in `include/obn/cloud_auth.hpp` documents this stock-only path; the implementation is gated with `#if 0` and intentionally not wired to `CloudSession`.
+**What is baked into the stock plugin binary (two pieces, both required for the request):**
 
-**Do not confuse with:** the LAN `project_file` RSA signing certificate (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from cloud MQTT broker authentication.
+| Embedded material | Role |
+|-------------------|------|
+| `client_auth_secret` | ASCII bootstrap secret. Shape: app-cert CN prefix (`GLOF3813734089-836763c70000`) + 16 hardcoded hex chars (43 bytes total for the current Studio app cert). Proves "I am an official client." |
+| `server_wrap_key` (RSA-2048 **public** key) | Dedicated cloud wrap key used **only** to PKCS#1 v1.5-encrypt the ephemeral `session_key`. **Not** `application_root` / the returned chain root / the app leaf public key. |
+
+Wrapping `session_key` with `application_root` (or any chain cert) yields HTTP 400 `code:101` `"This application is outdated"` even when the secret and encodings are correct — that error is a wrap-key mismatch, not a stale Studio version. The wrap key must be extracted from a live stock plugin (it is not published with the app-cert docs). *(OBN live verify 2026-07)*
+
+**Credential rotation — request construction (verified end-to-end):**
+
+```py
+# Both secrets come from the stock plugin binary (not from the user's login).
+client_auth_secret = ...          # e.g. b"GLOF3813734089-836763c70000" + 16 hex
+server_wrap_key    = load_pem_public_key("server_wrap_key.pem")  # RSA-2048
+
+session_key = secure_random(32)   # ephemeral; client keeps this for response finalization
+iv          = secure_random(12)
+ct_tag      = AESGCM_Encrypt(session_key, iv, client_auth_secret)  # ciphertext||tag
+enc_secret  = Base64url(iv || ct_tag)                 # path segment
+wrapped_key = Base64url(RSA_PKCS1v15(server_wrap_key, session_key))  # aes256= query
+
+GET {api}/v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1
+# Wire encodings are base64url (RFC 4648 §5, padding kept). Standard base64 in the
+# path segment produces '/' and 404s on the gateway.
+```
+
+Conceptually this is only "prove you shipped with the official client → receive the current shared app cert + CRL (+ encrypted private key)". It does **not** authenticate a user account or a printer. The AES/RSA envelope exists so a TLS MITM alone cannot recover `client_auth_secret`, `session_key`, or (once finalization is understood) the app private key. *(RN-3 corrected by OBN: wrap key ≠ root CA)*
+
+In Bambu Connect the same envelope is built by native `CM.eak()` → `{encAppKey, aes256}` (path + query), and the JSON response is passed to native `CM.up1(json)` for finalization ([bambu_connect_disasm](https://github.com/Randomblock1/bambu_connect_disasm) chunk 88).
+
+`fetch_device_cert()` in `include/obn/cloud_auth.hpp` still documents an older incomplete sketch of this path (`#if 0`); OBN does not fetch or decrypt the app private key from the cloud — `slicer_key.pem` is supplied out-of-band.
+
+**Do not confuse with:** the LAN `project_file` device-cert field encryption (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from this shared app-credential fetch.
 
 ### 6.4. Local printer connection (LAN)
 
@@ -1473,7 +1489,7 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 
 **`cert_id` is a cloud-issued, _shared_ application certificate — not a per-install _device_ certificate** (correction cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) against a symbol-bearing `libbambu_networking.so`, a live VMProtect memory dump, and decrypted secured-printer captures). The example above, `a4e8faaa…CN=GLOF3813734089.bambulab.com`, is the **app** cert (subject/issuer under `GLOF{…}.bambulab.com`), *not* a device CN. Two distinct keys are in play, and they must not be confused:
 
-- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **fetched at runtime and shared across installs**, not statically extracted per-install: it comes from the cloud cert endpoint `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3), which returns the cert chain, the CRL, and the AES-256-encrypted private key. Only a small `bootstrap_secret` is hardcoded in the stock plugin; everything else is a cloud request after login. `cert_id` is derived from the returned cert (issuer + serial), so it need not be stored separately.
+- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **shared across Studio installs** (same app leaf CN `GLOF3813734089-…`), not per-install: the stock plugin fetches it at runtime from `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3). The plugin binary hardcodes only the bootstrap `client_auth_secret` and the cloud `server_wrap_key` public key used to build that request; the returned `key` blob's decrypt recipe is still open (native `CM.up1` / equivalent). `cert_id` is derived from the returned cert (issuer + serial). In OBN, `slicer_key.pem` is supplied out-of-band until response finalization is reversed.
 - **Device-cert public key → encrypts.** The printer's device-certificate public key is used **only** for field encryption (`url_enc` / `param_enc`), never for signing.
 
 **HTTP half of command-security** (same app key, on secured-printer REST writes such as `POST /my/task`): the plugin adds `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` (a raw PKCS#1 v1.5 signature over the current time in milliseconds — the server recovers the timestamp and checks recency for replay protection) and `x-bbl-app-certification-id = issuer + ":" + serial.lower()`. Note this is a **different serialization** from the MQTT `cert_id` (which concatenates serial + issuer without a separator).
@@ -1483,23 +1499,22 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 ##### Command-security key & certificate flow
 
 Two independent RSA credentials drive command-security: a **shared app key** that signs, and a **per-printer device-cert public key** that encrypts. Each line below reads as **inputs → where/when it is used → output**.
-ю.акшв
+
 **Sources.** Most of the authorization-control detail below is not our own capture — it is drawn from third-party reverse-engineering, cross-checked against our code and issue #47. Primary references, cited inline per group:
 
-- **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `bootstrap_secret`, AES-wrapped key).
+- **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `client_auth_secret`, AES/RSA envelope). **Correction (OBN 2026-07):** the RSA wrap key is a dedicated `server_wrap_key` embedded in the plugin, **not** the `application_root` public key; RN-3's response-key AES-GCM recipe does not match live 704-byte blobs.
 - **RN-4** — reverse-networking, [4. App Certificates.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/4.%20App%20Certificates.md) (app cert chain + CRL are shared, public, not per-device).
 - **RN-5** — reverse-networking, [5. MQTT.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/5.%20MQTT.md) (`app_cert_install` / `app_cert_list`, `flag3` bit 16, `SignMessage`/`EncryptField` middleware, cleartext-when-no-cert rule).
 - **RN-6** — reverse-networking, [6. HTTP.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/6.%20HTTP.md) (`x-bbl-*` command-security headers).
 - **#47** — [ClusterM/open-bambu-networking issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) (shared-app-cert correction, PKCS#1 v1.5 sizing, verified against a symbol-bearing `libbambu_networking.so` + VMProtect dump + decrypted secured-printer captures).
 - **OBA** — [Doridian/OpenBambuAPI `mqtt.md`](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md) (base MQTT topic/command model).
-- **OBN** — our own code (`src/signing.cpp`, `src/agent.cpp`, `src/cloud_print.cpp`, `src/cloud_auth.cpp`) and the ABI harness captures described elsewhere in this document.
+- **OBN** — our own code (`src/signing.cpp`, `src/agent.cpp`, `src/cloud_print.cpp`, `src/cloud_auth.cpp`) and the ABI harness captures described elsewhere in this document; live credential-rotation request probes (2026-07).
 
-**Credential acquisition (once, at startup / login)** — sources: RN-3, RN-4, #47; OBN mirrors the response shape in `src/cloud_auth.cpp`.
+**Credential acquisition (once, at startup / login)** — sources: RN-3 (corrected), RN-4, #47, OBN live verify.
 
-- `bootstrap_secret` (only hardcoded piece) + logged-in cloud session → `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1`, done once after login by the stock plugin → response with `cert` (3-PEM chain), `key` (AES-256 encrypted app private key), `crl`. *(RN-3)*
-- Encrypted `key` blob + `aes256` unwrap key → AES-256 decrypt at finalization → **app private key** (`slicer_key.pem`), shared across all installs. In OBN this file is supplied out-of-band, not fetched. *(RN-3, RN-4; #47 confirms "shared across installs")*
-- App leaf `cert` (issuer + serial) → parsed once → **`cert_id`** (`slicer_cert_id.txt`), e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`. *(RN-4, #47)*
-- App `cert` chain + `crl` → held for the provisioning step below → **`slicer_cert.pem`** + **`slicer_crl.pem`** (only consumed by `app_cert_install`). *(RN-4, RN-5)*
+- Stock plugin embeds **`client_auth_secret`** + **`server_wrap_key`** (RSA public) → builds `enc_secret` / `aes256` per §6.3 → `GET …/applications/{enc_secret}/cert?aes256=…&ver=1` (no user bearer required) → response with `cert` (shared app chain), `crl`, and encrypted `key` (704 B). *(OBN; RN-3)*
+- `cert` + `crl` → **`slicer_cert.pem`** / **`slicer_crl.pem`**; leaf issuer+serial → **`cert_id`** / `slicer_cert_id.txt`. The request side is reproducible once both embedded secrets are known. *(OBN, RN-4, #47)*
+- Encrypted `key` blob → **finalization algorithm still open** (documented AES-GCM/`session_key` fails; native `CM.up1` / plugin equivalent). Until reversed, OBN takes **`slicer_key.pem`** out-of-band (e.g. memory extract from stock). The resulting app private key is shared across Studio installs. *(OBN; RN-3 claim superseded; #47)*
 
 **Printer device-cert public key acquisition (per printer, lazily before a secured print)** — sources: RN-5 (`app_cert_install` reply); OBN for the TLS-leaf TOFU path (`capture_peer_cert_pem`, `harvest_security_report`).
 
