@@ -326,6 +326,37 @@ bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
     return true;
 }
 
+bool prime_pub_key_from_cert_file(const std::string& dev_id,
+                                  const std::string& pem_path)
+{
+    if (dev_id.empty()) return false;
+    {
+        // Already cached (e.g. app_cert_install / capture) — nothing to do.
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        if (g_pubkey_map.count(dev_id)) return true;
+    }
+    if (pem_path.empty()) return false;
+
+    FILE* f = std::fopen(pem_path.c_str(), "rb");
+    if (!f) return false;
+    X509* cert = ::PEM_read_X509(f, nullptr, nullptr, nullptr);
+    std::fclose(f);
+    if (!cert) {
+        OBN_WARN("cert_store: PEM_read_X509(%s) failed for dev=%s",
+                 pem_path.c_str(), dev_id.c_str());
+        return false;
+    }
+    EVP_PKEY* pk = ::X509_get_pubkey(cert); // ref-bumped
+    ::X509_free(cert);
+    if (!pk) {
+        OBN_WARN("cert_store: X509_get_pubkey failed for dev=%s", dev_id.c_str());
+        return false;
+    }
+    set_printer_pub_key(dev_id, pk); // idempotent; takes its own ref
+    ::EVP_PKEY_free(pk);
+    return true;
+}
+
 void forget_printer(const std::string& dev_id)
 {
     std::lock_guard<std::mutex> lk(g_pubkey_mu);

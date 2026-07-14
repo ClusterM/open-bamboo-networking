@@ -1515,7 +1515,7 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 
 - App private key (`slicer_key.pem`) + serialized `print` object → `SignMessage` RSA-SHA256 PKCS#1 v1.5 on every privileged MQTT command → **`header.sign_string`** (+ `payload_len`, `sign_alg`, `sign_ver`). *(RN-5)*
 - `cert_id` → copied verbatim into every signed MQTT command → **`header.cert_id`** (serial + issuer concatenated, no separator). *(RN-5, #47)*
-- Printer public key + cleartext `url` (or `param`) → RSA PKCS#1 v1.5 encrypt, only for `project_file`/`gcode_line` **and only once a device cert is known** (otherwise the field keeps cleartext) → **`url_enc`** / **`param_enc`** alongside the cleartext field. *(RN-5 for the cleartext-fallback rule; #47 for PKCS#1 v1.5)*
+- Printer public key + cleartext `url` (or `param`) → RSA PKCS#1 v1.5 encrypt, only for `project_file`/`gcode_line` **and only once a device cert is known** (otherwise the field keeps cleartext) → **`url_enc`** / **`param_enc`** **replacing** the cleartext field (on the wire the cleartext `url`/`param` is dropped once the `_enc` form exists — verified on hardware). *(RN-5 for the encrypt-when-cert-known rule; #47 for PKCS#1 v1.5; the cleartext-replacement is on-hardware)*
 - App private key + current time in ms (as UTF-8 string) → RSA PKCS#1 v1.5 sign, on secured-printer REST writes (e.g. `POST /my/task`) → **`x-bbl-device-security-sign`** header (server recovers the timestamp for replay protection). *(RN-6)*
 - `cert_id` reformatted as `issuer + ":" + serial.lower()` → same REST writes → **`x-bbl-app-certification-id`** header (note: different serialization from the MQTT `cert_id`). *(RN-6, #47)*
 
@@ -1568,19 +1568,27 @@ Note the **`cert_id` serialization for MQTT is `serialNumber.lower() + issuer`**
 
 > **Unrelated pitfall that masquerades as a signature error:** a non-monotonic or reused `sequence_id` (e.g. always `"0"`) can get the command rejected even though the signature is valid. Use a monotonically increasing `sequence_id` before suspecting the signing path.
 
-**`gcode_line` is rejected by non-Developer-Mode firmware regardless of a valid signature (verified on P2S hardware, 2026-07).** The `mqtt message verify failed` reason on a `gcode_line` reply is *not* a signing bug — the firmware refuses arbitrary G-code over the normal (non-developer) path even when the envelope is signed correctly. This was isolated with a controlled matrix: using **the same** `slicer_key.pem`, the same `cert_id`, the same signing procedure and a valid studio-range `sequence_id`, all *structured* commands are accepted while *every* `gcode_line` is refused:
+**`gcode_line` on a secured (non-Developer-Mode) printer requires `param_enc`, not cleartext `param` (verified on P2S hardware, 2026-07).** A signed `gcode_line` whose G-code is carried in the cleartext `param` field is refused with `mqtt message verify failed`; the *same* G-code carried in a correctly formed `param_enc` is accepted (`result: SUCCESS`). The signature being valid is necessary but not sufficient — the firmware also insists that the G-code arrive encrypted under the device certificate. Matrix, all with **the same** `slicer_key.pem`, `cert_id`, signing procedure and a valid `sequence_id`:
 
-| Command | Kind | Result on secured P2S |
-|---|---|---|
-| `back_to_center` | structured MQTT | `success` |
-| `xyz_ctrl` (axis move) | structured MQTT | `success` |
-| `get_accessories` | structured MQTT | accepted (business-logic `FAIL`, *not* a verify failure) |
-| `gcode_line` (`G28`, `M400`, `M106 …`) | raw G-code | `failed` / `mqtt message verify failed` |
-| `gcode_line` + device-encrypted `param_enc` | raw G-code | `failed` / `mqtt message verify failed` |
+| `gcode_line` payload shape | Result on secured P2S |
+|---|---|
+| cleartext `param` only, no `param_enc` | `failed` / `mqtt message verify failed` |
+| cleartext `param` **and** `param_enc` together | `failed` / `mqtt message verify failed` |
+| `param_enc` only (device-encrypted), **no** cleartext `param` | `SUCCESS` |
+| `param_enc` only, with or without `user_id` | `SUCCESS` (either way — `user_id` is optional) |
 
-Adding `param_enc` (device-cert-encrypted `param`, per `EncryptField` below), dropping the cleartext `param`, varying `sequence_id`, and toggling key order / whitespace all make no difference — the refusal is on the command itself, not its encoding. Developer Mode lifts the restriction (as it disables verification wholesale, see "Developer Mode requirement" in `README.md`).
+So the rules for `gcode_line` on secured firmware are: **(1)** put the G-code in `param_enc` (blockwise RSA under the device cert, see `EncryptField` below), **(2)** do **not** also send the cleartext `param`, **(3)** sign the envelope as usual. Developer Mode bypasses both the signature and the encryption requirement (see "Developer Mode requirement" in `README.md`), so a plain cleartext `param` works there.
 
-This matches how stock Studio behaves: it uses `gcode_line` (`MachineObject::publish_gcode()`) only as a **fallback** and prefers a structured MQTT equivalent whenever the printer advertises support for one. For example homing:
+A genuine stock `gcode_line` captured from Studio (temperature control) confirms the shape — note `param_enc` present, `param` absent, and the 512-byte (= 2×256, two RSA-2048 blocks) ciphertext:
+
+```json
+{"header":{"cert_id":"…","payload_len":778,"sign_alg":"RSA_SHA256","sign_string":"…","sign_ver":"v1.0"},
+ "print":{"command":"gcode_line","param_enc":"…684 base64 chars = 512 bytes…","sequence_id":"20006","user_id":"3575315859"}}
+```
+
+Its `sign_string` verifies against `slicer_key.pem` over the byte-exact `{"print":…}` (`payload_len` 778 matches), and its `param_enc` decodes to exactly two RSA-2048 blocks — i.e. Studio splits the G-code into ≤245-byte chunks, RSA-PKCS#1v1.5-encrypts each under the device public key, concatenates and Base64-encodes (the same `EncryptField` scheme as `url_enc`, just applied to `param`).
+
+Note that Studio still *prefers* a structured MQTT command over `gcode_line` when the printer advertises one (e.g. `back_to_center` for homing instead of `G28`, `xyz_ctrl` for jog, `set_nozzle_temp` for nozzle temperature). `gcode_line` is the path for operations that have no structured equivalent (and, as observed, temperature control on some firmware still rides `publish_gcode`):
 
 ```cpp
 // 3rd_party/BambuStudio/src/slic3r/GUI/DeviceCore/DevAxisCtrl.cpp
@@ -1595,7 +1603,7 @@ int DevAxis::Ctrl_GoHome() {
 }
 ```
 
-The same guarded-fallback pattern appears for axis jog (`xyz_ctrl` vs `M211/G1`), nozzle temp (`set_nozzle_temp` vs `M104`), bed temp (`set_bed_temp` vs `M140`), and AMS ops. On current firmware the `m_is_support_*` capability flags are set, so Studio effectively never emits raw `gcode_line`. **Practical takeaway for a reimplementation:** drive the printer through structured commands; treat `gcode_line` as usable only on Developer-Mode or on legacy firmware that lacks the structured equivalent. *(Structured-vs-fallback dispatch: Bambu Studio source; the "signed `gcode_line` still refused off Developer Mode" result is from on-hardware matrix testing.)*
+**Practical takeaway for a reimplementation:** to send raw G-code to a secured printer, encrypt it into `param_enc` under the device cert (blockwise RSA, `EncryptField` below), omit the cleartext `param`, and sign the envelope. *(Structured-vs-fallback dispatch and `publish_gcode` shape: Bambu Studio source; the "`param_enc` required, cleartext `param` refused" result and the captured-message block analysis are from on-hardware testing.)*
 
 **2. `EncryptField` — device-cert field encryption** (`print.project_file` → `url_enc`, `print.gcode_line` → `param_enc`):
 
@@ -1604,11 +1612,18 @@ def EncryptField(device_id, value):
     device_cert = getDeviceCert(device_id)          # from app_cert_install reply / TLS leaf
     if device_cert is None:
         return value                                # no cert yet -> field stays cleartext
-    ciphertext = RSA_Encrypt(device_cert.publicKey, UTF8_Encode(value))  # PKCS#1 v1.5
-    return Base64_Encode(ciphertext)                # ciphertext <= ~245 B (RSA-2048 ceiling)
+    plaintext = UTF8_Encode(value)
+    out = b""
+    # Blockwise RSA: plaintext is split into <=245-byte chunks (RSA-2048 PKCS#1 v1.5
+    # ceiling = keylen - 11 = 245), each chunk encrypts to one 256-byte block, and the
+    # blocks are concatenated. A short value -> 1 block (256 B); e.g. Studio's captured
+    # temperature gcode_line -> 512 B == 2 blocks (see the gcode_line note above).
+    for i in range(0, len(plaintext), 245):
+        out += RSA_Encrypt(device_cert.publicKey, plaintext[i : i + 245])  # PKCS#1 v1.5
+    return Base64_Encode(out)
 ```
 
-The cleartext `url` / `param` stays in the payload alongside the encrypted `url_enc` / `param_enc`; the middleware assigns the `*_enc` field but leaves it equal to cleartext when no device cert is known yet. Other privileged commands are only signed, not field-encrypted. *(RN-5)*
+The middleware assigns the `*_enc` field; when no device cert is known yet it leaves the field cleartext. Confirmed on hardware (2026-07), on-wire the cleartext field is **replaced** by its encrypted form once a cert is known — for **both** commands: `project_file` sends `url_enc` with **no** cleartext `url`, and `gcode_line` sends `param_enc` with **no** cleartext `param` (a secured printer refuses `gcode_line` that still carries a cleartext `param`; a captured stock `project_file` likewise carries only `url_enc`). Developer Mode disables verification, so there the encrypted fields are optional and cleartext works. Other privileged commands are only signed, not field-encrypted. *(RN-5 for the scheme; the blockwise chunking and the cleartext-replacement rule for both fields are from on-hardware testing.)*
 
 **3. HTTP proof-of-possession** (secured-printer REST writes, e.g. `POST /my/task`):
 

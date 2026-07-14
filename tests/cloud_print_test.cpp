@@ -309,7 +309,8 @@ static void test_lan_project_file_is_plaintext()
 static void test_cloud_project_file_has_url_enc()
 {
     // Cloud channel: the printer fetches from S3 over https, so the builder
-    // must emit `url_enc` (RSA-encrypted URL) alongside the cleartext `url`.
+    // must emit `url_enc` (RSA-encrypted URL) INSTEAD of the cleartext `url`
+    // (on-wire behaviour verified on hardware 2026-07).
     BBL::PrintParams p = default_params();
     obn::print_job::CloudProjectFileOpts opts;
     opts.file_path  = "slot.3mf";
@@ -325,7 +326,7 @@ static void test_cloud_project_file_has_url_enc()
     CHECK(v);
     CHECK(json.find("\"url_enc\"") != std::string::npos);
     CHECK(field(json, "print.url_enc") == "BASE64ENCRYPTEDURL==");
-    CHECK(field(json, "print.url") == "https://s3.example/obj?sig=1");
+    CHECK(json.find("\"url\"") == std::string::npos); // cleartext url dropped
 }
 
 // ---------------------------------------------------------------------------

@@ -108,62 +108,12 @@ std::string redact_url(const std::string& url)
 
 // ---------------------------------------------------------------------------
 // RSA field encryption helpers (cloud project_file url_enc / param_enc).
+//
+// The RSA-PKCS#1 v1.5 blockwise field-encryption primitive lives in
+// obn::signing (rsa_pkcs1v15_encrypt_b64) so the MQTT signing path can apply
+// the same EncryptField transform to any command. This file only sources the
+// printer public key and calls into it.
 // ---------------------------------------------------------------------------
-
-// Encrypts `plaintext` with RSA-PKCS#1 v1.5 using `pkey`. The caller retains
-// ownership of `pkey`. Returns base64-encoded ciphertext, or "" on failure.
-static std::string rsa_pkcs1v15_encrypt_b64(EVP_PKEY*          pkey,
-                                             const std::string& plaintext,
-                                             std::string*       err)
-{
-    if (!pkey) {
-        if (err) *err = "null public key";
-        return {};
-    }
-
-    EVP_PKEY_CTX* ctx = ::EVP_PKEY_CTX_new(pkey, nullptr);
-    if (!ctx) {
-        if (err) *err = "EVP_PKEY_CTX_new failed";
-        return {};
-    }
-
-    bool setup_ok = (::EVP_PKEY_encrypt_init(ctx) > 0) &&
-                    (::EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0);
-    if (!setup_ok) {
-        ::EVP_PKEY_CTX_free(ctx);
-        unsigned long ecode = ::ERR_peek_last_error();
-        char ebuf[256];
-        ::ERR_error_string_n(ecode, ebuf, sizeof(ebuf));
-        if (err) *err = std::string("encrypt init/padding failed: ") + ebuf;
-        return {};
-    }
-
-    const auto* pt    = reinterpret_cast<const unsigned char*>(plaintext.data());
-    std::size_t ptlen = plaintext.size();
-
-    std::size_t outlen = 0;
-    if (::EVP_PKEY_encrypt(ctx, nullptr, &outlen, pt, ptlen) <= 0) {
-        ::EVP_PKEY_CTX_free(ctx);
-        unsigned long ecode = ::ERR_peek_last_error();
-        char ebuf[256];
-        ::ERR_error_string_n(ecode, ebuf, sizeof(ebuf));
-        if (err) *err = std::string("EVP_PKEY_encrypt size query failed: ") + ebuf;
-        return {};
-    }
-
-    std::vector<unsigned char> ct(outlen);
-    if (::EVP_PKEY_encrypt(ctx, ct.data(), &outlen, pt, ptlen) <= 0) {
-        ::EVP_PKEY_CTX_free(ctx);
-        unsigned long ecode = ::ERR_peek_last_error();
-        char ebuf[256];
-        ::ERR_error_string_n(ecode, ebuf, sizeof(ebuf));
-        if (err) *err = std::string("EVP_PKEY_encrypt failed: ") + ebuf;
-        return {};
-    }
-    ::EVP_PKEY_CTX_free(ctx);
-
-    return obn::signing::base64_encode(ct.data(), outlen);
-}
 
 // Loads the printer's public key from its PEM certificate on disk.
 // Returns a ref-bumped EVP_PKEY* (caller must free), or nullptr on failure.
@@ -1097,13 +1047,13 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
         }
 
-        // TODO(hardware-test): the "5. MQTT.md" middleware spec encrypts only
-        // `url` -> `url_enc` for the `project_file` command; `param` -> `param_enc`
-        // is documented for `gcode_line`, not `project_file`. We therefore encrypt
-        // only the URL and leave `param` cleartext. Confirm on a secured printer
-        // that `project_file` is accepted without `param_enc` before relying on it.
+        // The `project_file` command encrypts only `url` -> `url_enc` and keeps
+        // the cleartext `url` alongside it (verified on hardware; the secured
+        // printer accepts a cleartext `param` here, unlike `gcode_line`). The
+        // blockwise RSA primitive is shared with the MQTT signing path.
         std::string enc_err;
-        std::string url_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
+        std::string url_enc =
+            obn::signing::rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
         ::EVP_PKEY_free(printer_pk);
 
         OBN_DEBUG("cloud_print: url_enc built key_source=%s url_len=%zu enc_len=%zu",
@@ -1118,7 +1068,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         }
 
         print_job::CloudProjectFileOpts cloud_opts;
-        cloud_opts.url        = opts.url;   // cleartext stays alongside url_enc
+        cloud_opts.url        = opts.url;   // kept for logs; not emitted on the wire
         cloud_opts.url_enc    = std::move(url_enc);
         cloud_opts.file_path  = opts.file_path;
         cloud_opts.md5        = opts.md5;

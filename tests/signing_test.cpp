@@ -88,6 +88,55 @@ static bool verify_b64_sig(const std::string& msg, const std::string& sig_b64)
     return EVP_DigestVerifyFinal(ctx.get(), sig.data(), sig.size()) == 1;
 }
 
+static std::vector<unsigned char> b64_decode_bytes(const std::string& b64)
+{
+    std::vector<unsigned char> out;
+    out.reserve(b64.size() * 3 / 4);
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    for (std::size_t i = 0; i + 4 <= b64.size(); i += 4) {
+        int v0 = val(b64[i]), v1 = val(b64[i+1]);
+        int v2 = val(b64[i+2]), v3 = val(b64[i+3]);
+        if (v0 < 0 || v1 < 0) break;
+        out.push_back(static_cast<unsigned char>((v0 << 2) | (v1 >> 4)));
+        if (v2 >= 0) out.push_back(static_cast<unsigned char>((v1 << 4) | (v2 >> 2)));
+        if (v3 >= 0) out.push_back(static_cast<unsigned char>((v2 << 6) | v3));
+    }
+    return out;
+}
+
+// Decrypt a blockwise RSA-PKCS#1 v1.5 base64 blob with g_test_key's private
+// component (mirrors what the printer firmware does with param_enc/url_enc).
+static std::string rsa_decrypt_blocks_b64(const std::string& b64)
+{
+    std::vector<unsigned char> ct = b64_decode_bytes(b64);
+    const int key_bytes = EVP_PKEY_size(g_test_key);
+    if (key_bytes <= 0 || ct.size() % static_cast<std::size_t>(key_bytes) != 0)
+        return {};
+    struct CtxDel { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+    std::string out;
+    for (std::size_t off = 0; off < ct.size(); off += key_bytes) {
+        std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(g_test_key, nullptr));
+        if (!ctx) return {};
+        if (EVP_PKEY_decrypt_init(ctx.get()) != 1) return {};
+        if (EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) != 1) return {};
+        std::size_t plen = 0;
+        if (EVP_PKEY_decrypt(ctx.get(), nullptr, &plen,
+                             ct.data() + off, key_bytes) != 1) return {};
+        std::vector<unsigned char> pt(plen);
+        if (EVP_PKEY_decrypt(ctx.get(), pt.data(), &plen,
+                             ct.data() + off, key_bytes) != 1) return {};
+        out.append(reinterpret_cast<const char*>(pt.data()), plen);
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -275,6 +324,104 @@ static int test_device_security_sign_is_raw_timestamp()
     return 0;
 }
 
+static int test_gcode_line_param_encrypted()
+{
+    // With a device key, gcode_line's cleartext `param` must become `param_enc`
+    // (device-encrypted) and the cleartext `param` must be dropped. The
+    // signature must cover the transformed (encrypted) print block.
+    const std::string gcode   = "M104 S220\n"; // real newline after JSON decode
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"M104 S220\n","sequence_id":"7"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    // param dropped, param_enc present.
+    CHECK(val->find("print.param").kind()     == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.param_enc").kind()  == obn::json::Value::Kind::String);
+    // param_enc decrypts back to the original gcode.
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == gcode);
+    // Signature covers the transformed block.
+    std::string to_sign = "{\"print\":" + val->find("print").dump() + "}";
+    CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
+    return 0;
+}
+
+static int test_project_file_url_encrypted_drops_url()
+{
+    // With a device key, project_file's `url` becomes `url_enc` and the
+    // cleartext `url` is dropped (on-wire behaviour). A cleartext `param`
+    // (the plate path) is left untouched — only gcode_line encrypts param.
+    const std::string url = "https://example.com/model.3mf?sig=abc";
+    const std::string payload =
+        R"({"print":{"command":"project_file","param":"Metadata/plate_1.gcode","url":")" +
+        url + R"(","sequence_id":"8"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.url").kind()            == obn::json::Value::Kind::Null); // dropped
+    CHECK(val->find("print.url_enc").kind()        == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.url_enc").as_string()) == url);
+    // project_file param must NOT be encrypted/dropped.
+    CHECK(val->find("print.param").as_string()     == "Metadata/plate_1.gcode");
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_project_file_no_key_keeps_url()
+{
+    // Without a device key, url is not encrypted and must NOT be dropped
+    // (the pure-LAN plaintext ftp:// path relies on the cleartext url).
+    const std::string payload =
+        R"({"print":{"command":"project_file","url":"ftp://model.3mf","sequence_id":"8b"}})";
+    const std::string env = obn::signing::maybe_sign(payload); // no key
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.url").as_string() == "ftp://model.3mf"); // kept
+    CHECK(val->find("print.url_enc").kind()  == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_no_device_key_leaves_cleartext()
+{
+    // Without a device key, url/param are not transformed.
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"G28\n","url":"ftp://x","sequence_id":"9"}})";
+    const std::string env = obn::signing::maybe_sign(payload); // no key
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param").kind()     == obn::json::Value::Kind::String);
+    CHECK(val->find("print.param_enc").kind() == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.url_enc").kind()   == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_param_enc_idempotent()
+{
+    // If param_enc already exists, the transform must not touch param/param_enc.
+    const std::string payload =
+        R"({"print":{"command":"gcode_line","param":"G28\n","param_enc":"PREBUILT","sequence_id":"10"}})";
+    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("print.param_enc").as_string() == "PREBUILT");
+    CHECK(val->find("print.param").kind()          == obn::json::Value::Kind::String);
+    return 0;
+}
+
+static int test_blockwise_multiblock_roundtrip()
+{
+    // A plaintext longer than one RSA-2048 PKCS#1 block (245 B) must span
+    // multiple 256-byte blocks and decrypt back byte-for-byte.
+    std::string big(600, 'x');
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<char>('0' + (i % 10));
+    std::string err;
+    std::string b64 = obn::signing::rsa_pkcs1v15_encrypt_b64(g_test_key, big, &err);
+    CHECK(!b64.empty());
+    CHECK(b64_decode_bytes(b64).size() == 3 * 256); // 600 B -> 3 blocks (245*3=735>=600)
+    CHECK(rsa_decrypt_blocks_b64(b64) == big);
+    return 0;
+}
+
 namespace obn::config {
     Settings& test_settings();
     std::string& test_dir();
@@ -317,6 +464,12 @@ int main()
     if (test_sign_bytes_deterministic()    != 0) rc = 1;
     if (test_sign_bytes_verifies()         != 0) rc = 1;
     if (test_device_security_sign_is_raw_timestamp() != 0) rc = 1;
+    if (test_gcode_line_param_encrypted()  != 0) rc = 1;
+    if (test_project_file_url_encrypted_drops_url() != 0) rc = 1;
+    if (test_project_file_no_key_keeps_url() != 0) rc = 1;
+    if (test_no_device_key_leaves_cleartext() != 0) rc = 1;
+    if (test_param_enc_idempotent()        != 0) rc = 1;
+    if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 

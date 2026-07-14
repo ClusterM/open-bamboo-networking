@@ -463,18 +463,16 @@ std::string build_project_file_json(const BBL::PrintParams& p,
 
 // Cloud-print variant of build_project_file_json.
 //
-// Same payload as the LAN variant, plus the RSA-PKCS#1 v1.5 encrypted
-// `url_enc` field emitted *in addition to* the cleartext `url` (per the
-// reverse-networking "5. MQTT.md" middleware spec: "The cleartext value
-// remains in the payload; the encrypted value is stored in url_enc").
+// Same payload as the LAN variant, but the cleartext `url` is REPLACED by the
+// RSA-PKCS#1 v1.5 encrypted `url_enc` (verified on hardware 2026-07: the stock
+// plugin sends only `url_enc` on the wire, not the cleartext `url` alongside).
 //
-// `param` is kept cleartext with no `param_enc`: the middleware spec encrypts
-// `param` only for the `gcode_line` command, not `project_file`.
-// TODO(hardware-test): verify a secured printer accepts `project_file` with a
-// cleartext `param` and no `param_enc` field.
+// `param` is kept cleartext with no `param_enc`: encryption of `param` applies
+// only to the `gcode_line` command, not `project_file` (verified on hardware —
+// a secured printer accepts `project_file` with a cleartext `param`).
 //
-// `url_enc` is pre-computed by the caller (see rsa_pkcs1v15_encrypt_b64 in
-// cloud_print.cpp) using the printer's device-certificate RSA public key.
+// `url_enc` is pre-computed by the caller (obn::signing::rsa_pkcs1v15_encrypt_b64)
+// using the printer's device-certificate RSA public key.
 std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
                                           const CloudProjectFileOpts& opts)
 {
@@ -484,7 +482,6 @@ std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
     return build_project_file_json_impl(
         p, opts,
         ",\"param\":"   + json_escape(plate_param),
-        ",\"url\":"     + json_escape(opts.url) +
         ",\"url_enc\":" + json_escape(opts.url_enc));
 }
 

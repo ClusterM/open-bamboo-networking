@@ -22,6 +22,8 @@
 #include "obn/ssdp.hpp"
 #include "obn/lan_tls.hpp"
 
+#include <openssl/evp.h>
+
 namespace obn {
 
 namespace {
@@ -204,6 +206,14 @@ int Agent::connect_printer(std::string dev_id,
             }
             if (std::filesystem::is_regular_file(peer, ec)) {
                 obn::lan_tls::registry_set_peer_cert(dev_ip, peer);
+                // Seed the field-encryption pubkey cache from the on-disk
+                // device cert. capture_peer_cert_pem only populates the cache
+                // when it actually performs the TLS snapshot; when the cert
+                // already exists on disk (any reconnect after the first) that
+                // path is skipped, leaving the cache empty and url_enc/param_enc
+                // silently degrading to cleartext. Loading here keeps signed
+                // commands encrypted across sessions.
+                cert_store::prime_pub_key_from_cert_file(dev_id, peer);
             }
         }
     }
@@ -280,7 +290,10 @@ int Agent::send_message_to_printer(const std::string& dev_id,
             session = lan_session_.get();
     }
     if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    return session->publish_json(obn::signing::maybe_sign(json_str), qos);
+    EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
+    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
+    if (dev_pub) EVP_PKEY_free(dev_pub);
+    return session->publish_json(signed_json, qos);
 }
 
 bool Agent::ensure_lan_session(const std::string& dev_id,
@@ -2307,7 +2320,10 @@ int Agent::cloud_send_message(const std::string& dev_id,
                  dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
-    return sess->publish(dev_id, obn::signing::maybe_sign(json_str), qos);
+    EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
+    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
+    if (dev_pub) EVP_PKEY_free(dev_pub);
+    return sess->publish(dev_id, signed_json, qos);
 }
 
 void Agent::hydrate_session()

@@ -8,6 +8,7 @@
 #include "obn/json_lite.hpp"
 
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
@@ -223,17 +224,59 @@ bool is_print_payload(const std::string& payload) noexcept
     return true;
 }
 
-// Builds the to_sign string: {"print":{...sorted keys...}}
-// Uses json_lite, whose Object type is std::map, so parse+dump already sorts.
-std::string build_to_sign(const std::string& payload)
+// Applies device-cert field encryption to the parsed `print` object in place:
+//   * url   -> url_enc
+//   * param -> param_enc
+// Both idempotent (skip when the *_enc field already exists) and best-effort
+// (a field stays cleartext if there is no key or encryption fails).
+void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
+{
+    if (!device_pub) return;
+
+    auto enc_string_field = [&](const char* field) -> std::string {
+        auto it = obj.find(field);
+        if (it == obj.end() || !it->second.is_string()) return {};
+        std::string out = rsa_pkcs1v15_encrypt_b64(device_pub, it->second.as_string());
+        return out;
+    };
+
+    if (obj.count("url")) {
+        if (!obj.count("url_enc")) {
+            std::string enc = enc_string_field("url");
+            if (!enc.empty()) obj["url_enc"] = obn::json::Value(std::move(enc));
+        }
+        // On the wire the stock plugin REPLACES cleartext `url` with `url_enc`
+        // for project_file (verified on hardware 2026-07). Drop `url` once
+        // `url_enc` exists; if encryption was impossible (no device key) keep
+        // the cleartext `url` so the pure-LAN ftp:// path still resolves.
+        if (obj.count("url_enc")) obj.erase("url");
+    }
+
+    const auto cmd = obj.find("command");
+    const bool is_gcode_line =
+        cmd != obj.end() && cmd->second.is_string() &&
+        cmd->second.as_string() == "gcode_line";
+    if (is_gcode_line && obj.count("param") && !obj.count("param_enc")) {
+        std::string enc = enc_string_field("param");
+        if (!enc.empty()) {
+            obj["param_enc"] = obn::json::Value(std::move(enc));
+            obj.erase("param"); // secured firmware rejects cleartext param here
+        }
+    }
+}
+
+// Builds the print dump ({...sorted keys...}) after optional field encryption.
+// Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
+std::string build_print_dump(const std::string& payload, EVP_PKEY* device_pub)
 {
     auto root = obn::json::parse(payload);
     if (!root) return {};
-    std::string print_dump;
-    if (root->find("print").kind() == obn::json::Value::Kind::Object)
-        print_dump = root->find("print").dump();
-    if (print_dump.empty()) return {};
-    return std::string("{\"print\":") + print_dump + '}';
+    const obn::json::Value& print = root->find("print");
+    if (print.kind() != obn::json::Value::Kind::Object) return {};
+    if (!device_pub) return print.dump();
+    obn::json::Object obj = print.as_object(); // copy for mutation
+    encrypt_print_fields(obj, device_pub);
+    return obn::json::Value(std::move(obj)).dump();
 }
 
 // Escapes backslash and double-quote for embedding inside a JSON string
@@ -274,19 +317,19 @@ std::string build_envelope(const std::string& to_sign,
 
 } // namespace
 
-std::string maybe_sign(const std::string& payload_json)
+std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub)
 {
     if (!is_print_payload(payload_json)) return payload_json;
 
     EVP_PKEY* pkey = slicer_pkey();
     if (!pkey) return payload_json;
 
-    const std::string to_sign = build_to_sign(payload_json);
-    if (to_sign.empty()) return payload_json; // malformed; pass through
+    // Encrypt url/param into url_enc/param_enc (when a device key is given)
+    // BEFORE signing, so the signature covers exactly what goes on the wire.
+    const std::string print_dump = build_print_dump(payload_json, device_pub);
+    if (print_dump.empty()) return payload_json; // malformed; pass through
 
-    // Extract the sorted print dump from to_sign to avoid re-parsing.
-    // to_sign has the shape: {"print":<dump>}
-    const std::string print_dump = to_sign.substr(9, to_sign.size() - 10);
+    const std::string to_sign = std::string("{\"print\":") + print_dump + '}';
 
     const std::string sig_b64 = rsa_sha256_sign_b64(
         pkey,
@@ -327,6 +370,70 @@ std::string device_security_sign()
     return rsa_pkcs1_sign_raw_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
+}
+
+// Blockwise RSA-PKCS#1 v1.5 encryption -> base64. Splits `plaintext` into
+// <=kMaxChunk-byte pieces so the total ciphertext is a concatenation of
+// key-sized blocks (matching the stock plugin's url_enc / param_enc form).
+std::string rsa_pkcs1v15_encrypt_b64(EVP_PKEY* pub, const std::string& plaintext,
+                                     std::string* err)
+{
+    if (!pub) {
+        if (err) *err = "null public key";
+        return {};
+    }
+
+    // PKCS#1 v1.5 max plaintext per block = RSA modulus bytes - 11.
+    const int key_bytes = EVP_PKEY_size(pub); // ciphertext block size (e.g. 256)
+    if (key_bytes <= 11) {
+        if (err) *err = "RSA key too small";
+        return {};
+    }
+    const std::size_t max_chunk = static_cast<std::size_t>(key_bytes - 11);
+
+    std::unique_ptr<EVP_PKEY_CTX, CtxDel> ctx(EVP_PKEY_CTX_new(pub, nullptr));
+    if (!ctx) {
+        if (err) *err = "EVP_PKEY_CTX_new failed";
+        return {};
+    }
+    if (EVP_PKEY_encrypt_init(ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_padding(ctx.get(), RSA_PKCS1_PADDING) <= 0) {
+        char ebuf[256];
+        ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+        if (err) *err = std::string("encrypt init/padding failed: ") + ebuf;
+        return {};
+    }
+
+    std::vector<unsigned char> out;
+    const auto* p = reinterpret_cast<const unsigned char*>(plaintext.data());
+    std::size_t remaining = plaintext.size();
+    std::size_t offset    = 0;
+    // A zero-length input still produces one block (the plugin never encrypts
+    // empty fields, but keep the loop robust rather than emit nothing).
+    do {
+        const std::size_t chunk = remaining < max_chunk ? remaining : max_chunk;
+        std::size_t block_len = 0;
+        if (EVP_PKEY_encrypt(ctx.get(), nullptr, &block_len, p + offset, chunk) <= 0) {
+            char ebuf[256];
+            ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+            if (err) *err = std::string("EVP_PKEY_encrypt size query failed: ") + ebuf;
+            return {};
+        }
+        const std::size_t base = out.size();
+        out.resize(base + block_len);
+        if (EVP_PKEY_encrypt(ctx.get(), out.data() + base, &block_len,
+                             p + offset, chunk) <= 0) {
+            char ebuf[256];
+            ERR_error_string_n(ERR_peek_last_error(), ebuf, sizeof(ebuf));
+            if (err) *err = std::string("EVP_PKEY_encrypt failed: ") + ebuf;
+            return {};
+        }
+        out.resize(base + block_len);
+        offset    += chunk;
+        remaining -= chunk;
+    } while (remaining > 0);
+
+    return base64_encode(out.data(), out.size());
 }
 
 static constexpr char kB64Tbl[] =
