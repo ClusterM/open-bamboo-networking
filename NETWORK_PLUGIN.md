@@ -1568,6 +1568,35 @@ Note the **`cert_id` serialization for MQTT is `serialNumber.lower() + issuer`**
 
 > **Unrelated pitfall that masquerades as a signature error:** a non-monotonic or reused `sequence_id` (e.g. always `"0"`) can get the command rejected even though the signature is valid. Use a monotonically increasing `sequence_id` before suspecting the signing path.
 
+**`gcode_line` is rejected by non-Developer-Mode firmware regardless of a valid signature (verified on P2S hardware, 2026-07).** The `mqtt message verify failed` reason on a `gcode_line` reply is *not* a signing bug — the firmware refuses arbitrary G-code over the normal (non-developer) path even when the envelope is signed correctly. This was isolated with a controlled matrix: using **the same** `slicer_key.pem`, the same `cert_id`, the same signing procedure and a valid studio-range `sequence_id`, all *structured* commands are accepted while *every* `gcode_line` is refused:
+
+| Command | Kind | Result on secured P2S |
+|---|---|---|
+| `back_to_center` | structured MQTT | `success` |
+| `xyz_ctrl` (axis move) | structured MQTT | `success` |
+| `get_accessories` | structured MQTT | accepted (business-logic `FAIL`, *not* a verify failure) |
+| `gcode_line` (`G28`, `M400`, `M106 …`) | raw G-code | `failed` / `mqtt message verify failed` |
+| `gcode_line` + device-encrypted `param_enc` | raw G-code | `failed` / `mqtt message verify failed` |
+
+Adding `param_enc` (device-cert-encrypted `param`, per `EncryptField` below), dropping the cleartext `param`, varying `sequence_id`, and toggling key order / whitespace all make no difference — the refusal is on the command itself, not its encoding. Developer Mode lifts the restriction (as it disables verification wholesale, see "Developer Mode requirement" in `README.md`).
+
+This matches how stock Studio behaves: it uses `gcode_line` (`MachineObject::publish_gcode()`) only as a **fallback** and prefers a structured MQTT equivalent whenever the printer advertises support for one. For example homing:
+
+```cpp
+// 3rd_party/BambuStudio/src/slic3r/GUI/DeviceCore/DevAxisCtrl.cpp
+int DevAxis::Ctrl_GoHome() {
+    if (m_is_support_mqtt_homing) {              // structured path preferred
+        json j; j["print"]["command"] = "back_to_center"; ...
+        return m_owner->publish_json(j);
+    }
+    // gcode fallback, only when firmware lacks the structured command:
+    return m_owner->is_in_printing() ? m_owner->publish_gcode("G28 X\n")
+                                     : m_owner->publish_gcode("G28 \n");
+}
+```
+
+The same guarded-fallback pattern appears for axis jog (`xyz_ctrl` vs `M211/G1`), nozzle temp (`set_nozzle_temp` vs `M104`), bed temp (`set_bed_temp` vs `M140`), and AMS ops. On current firmware the `m_is_support_*` capability flags are set, so Studio effectively never emits raw `gcode_line`. **Practical takeaway for a reimplementation:** drive the printer through structured commands; treat `gcode_line` as usable only on Developer-Mode or on legacy firmware that lacks the structured equivalent. *(Structured-vs-fallback dispatch: Bambu Studio source; the "signed `gcode_line` still refused off Developer Mode" result is from on-hardware matrix testing.)*
+
 **2. `EncryptField` — device-cert field encryption** (`print.project_file` → `url_enc`, `print.gcode_line` → `param_enc`):
 
 ```py
