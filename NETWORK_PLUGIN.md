@@ -1230,7 +1230,33 @@ flowchart TD
   N -->|no| P
 ```
 
-**`connection_type`** on `MachineObject` is `"lan"` for Developer Mode / LAN-only printers, `"cloud"` for cloud-paired devices, `"farm"` for farm mode. Pure LAN mode (`AppConfig::lan_mode_only`) forces the `_with_record` path even when the device object is cloud-typed, but still requires IP + access code.
+**`connection_type` is not “LAN reachable”.** It is the printer’s own mode advertisement, carried in the SSDP header `devconnect.bambu.com` and forwarded by the plugin as `connect_type` (`src/ssdp.cpp` → `DeviceManager::on_machine_alive`). Studio stores it on `MachineObject` (`DevInfo::SetConnectionType`); `connection_type()` / `is_lan_mode_printer()` just read that field (`DevInfo.cpp`).
+
+| Value | Meaning | Typical Studio behaviour when printing |
+|---|---|---|
+| `"lan"` | Printer is in **LAN Only Mode** (cloud disabled on the device) | Opens LAN MQTT via `connect_printer`; print via `start_local_print` |
+| `"cloud"` | Printer is cloud-paired / not in LAN Only | Selects device via `set_user_selected_machine`; print prefers `start_local_print_with_record` when LAN credentials exist, else `start_print` |
+| `"farm"` | Farm mode (treated like LAN for path selection; SSDP may rewrite farm→lan) | Same family as LAN |
+
+A cloud-paired printer can still be on the same LAN (SSDP IP + access code known) while `connection_type` remains `"cloud"`. Access code does **not** set `connection_type` — it only enables LAN MQTT/FTPS/:6000 once Studio (or the plugin) decides to use the LAN channel.
+
+**Inputs Studio fills into `PrintJob` before the tree above** (`SelectMachine.cpp:3133-3178`):
+
+| Field | Source | Role in the tree |
+|---|---|---|
+| `connection_type` | `MachineObject::connection_type()` (SSDP / bind) | Top-level LAN vs cloud branch |
+| `cloud_print_only` | MQTT/capability `support_cloud_print_only` | Forces pure `start_print` (skips LAN-with-record) |
+| `has_sdcard` | `DevStorage::HAS_SDCARD_NORMAL` | Required for LAN-with-record upload storage |
+| `could_emmc_print` | `is_support_print_with_emmc` | Allows pure LAN print without SD; also sets `try_emmc_print` → `:6000`+`brtc://` |
+| `dev_ip` / `password` | SSDP IP + access code (UI / cloud `dev_access_code`) | Without both, Studio skips LAN-with-record |
+| `lan_mode_only` | Studio `app_config` | Force LAN-with-record even for cloud-typed devices |
+
+**ABI entry points the tree resolves to:**
+
+1. `bambu_network_start_local_print` — pure LAN (`connection_type=="lan"`). No cloud `/my/task`.
+2. `bambu_network_start_local_print_with_record` — LAN upload + MQTT trigger, plus cloud history (`mode=lan_file`). Used for cloud-typed printers when IP+code+storage are available.
+3. `bambu_network_start_print` — pure cloud. Either immediately (missing LAN prerequisites / `cloud_print_only`) or as Studio’s **own** fallback when `_with_record` returns `< 0`.
+
 
 ##### Three upload/print channels Studio actually uses
 

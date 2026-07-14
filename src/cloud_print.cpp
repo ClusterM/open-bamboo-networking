@@ -723,25 +723,15 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              p.project_name.c_str(),
              use_lan_channel ? "lan" : "cloud");
 
-    // Studio's PrintJob::process tries start_local_print_with_record
-    // (use_lan_channel=true) FIRST and only falls back to start_print
-    // (use_lan_channel=false, cloud) if the record path returns < 0
-    // (3rd_party/BambuStudio/.../PrintJob.cpp).
+    // Studio's PrintJob::process picks the ABI entry point:
+    //   start_local_print_with_record -> use_lan_channel=true
+    //   start_print                   -> use_lan_channel=false
     //
-    // LAN-first policy (mirrors the stock plugin): the "record" path uploads
-    // the 3mf straight to the printer over LAN, POSTs /my/task with
-    // mode=lan_file purely as a cloud history record (the cloud does NOT
-    // dispatch a lan_file task to the printer), and triggers the print with a
-    // plaintext LAN MQTT project_file. Only one dispatch reaches the printer,
-    // so there is no duplicate-job "printer busy" (0500_4004) / "cancelled"
-    // (0300_400C) rejection. The cloud channel (start_print) stays as the
-    // fallback: it uploads to S3 and lets the cloud dispatch the job.
-    //
-    // A cloud-bound printer never gets a LanSession from Studio's
-    // connect_printer (Studio only calls that for LAN-mode printers), so the
-    // record path establishes the LAN MQTT session itself via
-    // ensure_lan_session(); if that is not possible (no IP/access code, or the
-    // session will not come up) it degrades to the cloud channel below.
+    // LAN ("record") path: upload 3mf to the printer over LAN, POST /my/task
+    // with mode=lan_file as a cloud history record only (cloud does NOT
+    // dispatch lan_file to the printer), then trigger print with a plaintext
+    // LAN MQTT project_file. Cloud-bound printers never get a LanSession from
+    // Studio's connect_printer, so we open it ourselves via ensure_lan_session.
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -880,19 +870,23 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // -------------------------------------------------------------
     std::string lan_remote_path; // wire path / basename for MQTT
     if (use_lan_channel) {
+        // Studio asked for the LAN channel
         if (p.dev_ip.empty() || p.password.empty()) {
-            OBN_WARN("cloud_print: lan channel requested but no dev_ip/access_code "
-                     "-> degrading to cloud channel");
-            use_lan_channel = false;
-        } else if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
-            // Studio never opened a LanSession for this cloud-bound printer and
-            // we could not bring one up (unreachable / bad access code). Without
-            // it the LAN MQTT project_file trigger cannot be published, so fall
-            // back to the cloud channel rather than fail the print.
-            OBN_WARN("cloud_print: no LAN MQTT session for dev=%s "
-                     "-> degrading to cloud channel", p.dev_id.c_str());
-            use_lan_channel = false;
-        } else if (print_job::use_brtc_cache_upload(p)) {
+            OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "no dev_ip/access_code for LAN print");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
+        if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
+            OBN_ERROR("cloud_print: no LAN MQTT session for dev=%s",
+                      p.dev_id.c_str());
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "LAN MQTT session failed");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
+        if (print_job::use_brtc_cache_upload(p)) {
             OBN_INFO("cloud_print: upload path=brtc :6000 (try_emmc_print=%d, force_ftps=%d)",
                      p.try_emmc_print ? 1 : 0,
                      obn::config::current().force_ftps ? 1 : 0);
