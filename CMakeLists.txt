@@ -257,30 +257,6 @@ endif()
 # zlib is shared between BambuSource (FTPS fallback: client-side ZIP
 # extract for file-browser thumbnails) and other zlib users in the tree.
 
-# miniz submodule (third_party/miniz) — public domain, used by print_job.cpp
-# for in-place 3MF ZIP rewrite. Auto-initialised here so a plain cmake
-# configure works on a fresh clone without a manual submodule update.
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/miniz/miniz.h")
-    execute_process(
-        COMMAND git submodule update --init third_party/miniz
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    )
-endif()
-add_library(obn_miniz STATIC
-    third_party/miniz/miniz.c
-    third_party/miniz/miniz_tdef.c
-    third_party/miniz/miniz_tinfl.c
-    third_party/miniz/miniz_zip.c
-)
-target_include_directories(obn_miniz PUBLIC third_party)
-set_target_properties(obn_miniz PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# Suppress warnings from vendored code.
-if(MSVC)
-    target_compile_options(obn_miniz PRIVATE /w)
-else()
-    target_compile_options(obn_miniz PRIVATE -w)
-endif()
-
 add_library(bambu_networking SHARED
     src/abi_meta.cpp
     src/abi_lifecycle.cpp
@@ -361,7 +337,6 @@ target_compile_definitions(bambu_networking PRIVATE
 target_link_libraries(bambu_networking PRIVATE
     obn_mosquitto_iface
     obn_curl_iface
-    obn_miniz
     OpenSSL::SSL
     OpenSSL::Crypto
     ZLIB::ZLIB

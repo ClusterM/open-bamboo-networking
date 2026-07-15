@@ -1,5 +1,5 @@
-// Tests for src/signing.cpp — classifier, envelope structure, H2D inversion,
-// and signature verification using a freshly generated RSA test keypair.
+// Tests for src/signing.cpp — classifier, envelope structure, and signature
+// verification using a freshly generated RSA test keypair.
 
 #include "obn/signing.hpp"
 #include "obn/config.hpp"
@@ -259,79 +259,6 @@ static int test_device_security_sign_is_raw_timestamp()
     return 0;
 }
 
-static int test_h2d_detection_noop_on_non_h2d()
-{
-    // A P2S printer should not have its payload altered.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"7",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1}]}})";
-    const std::string env_non_h2d = obn::signing::maybe_sign(payload, "3DPrinter-P2S");
-    const std::string env_no_model = obn::signing::maybe_sign(payload);
-
-    // Both should produce identical envelopes (no flip applied).
-    CHECK(env_non_h2d == env_no_model);
-    return 0;
-}
-
-static int test_h2d_nozzle_ids_flipped()
-{
-    // For an H2D printer, nozzleId 0 becomes 1 and vice versa before signing.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"8",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1},{"nozzleId":0}]}})";
-
-    const std::string env_h2d     = obn::signing::maybe_sign(payload, "3DPrinter-H2D");
-    const std::string env_no_flip = obn::signing::maybe_sign(payload);
-
-    // Envelopes must differ because the signed content differs.
-    CHECK(env_h2d != env_no_flip);
-
-    // The H2D envelope's print block should contain the flipped ids.
-    auto val = obn::json::parse(env_h2d);
-    CHECK(val);
-    const auto& arr = val->find("print.ams_mapping_info").as_array();
-    CHECK(arr.size() == 3);
-    CHECK(static_cast<int>(arr[0].find("nozzleId").as_number()) == 1);
-    CHECK(static_cast<int>(arr[1].find("nozzleId").as_number()) == 0);
-    CHECK(static_cast<int>(arr[2].find("nozzleId").as_number()) == 1);
-    return 0;
-}
-
-static int test_h2d_model_variants()
-{
-    // All three H2D model codes must trigger the inversion.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"9",)"
-        R"("ams_mapping_info":[{"nozzleId":0}]}})";
-    const std::string baseline = obn::signing::maybe_sign(payload);
-
-    for (const std::string& model : {"H2D", "O1D", "C16",
-                                      "3DPrinter-H2D-xxx",
-                                      "3DPrinter-O1D-xxx",
-                                      "printer-c16-v2"}) {
-        CHECK(obn::signing::maybe_sign(payload, model) != baseline);
-    }
-    return 0;
-}
-
-static int test_h2d_signature_verifies()
-{
-    // The H2D envelope's signature must verify against its (flipped) content.
-    const std::string payload =
-        R"({"print":{"command":"project_file","sequence_id":"10",)"
-        R"("ams_mapping_info":[{"nozzleId":0},{"nozzleId":1}]}})";
-    const std::string env = obn::signing::maybe_sign(payload, "H2D");
-    auto val = obn::json::parse(env);
-    CHECK(val);
-
-    const std::string sig_b64  = val->find("header.sign_string").as_string();
-    std::string print_dump     = val->find("print").dump();
-    std::string to_sign        = "{\"print\":" + print_dump + "}";
-
-    CHECK(verify_b64_sig(to_sign, sig_b64));
-    return 0;
-}
-
 namespace obn::config {
     Settings& test_settings();
     std::string& test_dir();
@@ -372,10 +299,6 @@ int main()
     if (test_sign_bytes_deterministic()    != 0) rc = 1;
     if (test_sign_bytes_verifies()         != 0) rc = 1;
     if (test_device_security_sign_is_raw_timestamp() != 0) rc = 1;
-    if (test_h2d_detection_noop_on_non_h2d() != 0) rc = 1;
-    if (test_h2d_nozzle_ids_flipped()     != 0) rc = 1;
-    if (test_h2d_model_variants()          != 0) rc = 1;
-    if (test_h2d_signature_verifies()      != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 

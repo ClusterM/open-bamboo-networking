@@ -924,10 +924,41 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // this the firmware rejects the command with "mqtt message verify failed".
     std::string mqtt_json;
     {
-        // Obtain the printer's RSA public key: prefer the in-memory cache
-        // (populated by install_device_cert / capture_peer_cert_pem), fall
-        // back to reading the PEM from disk if the cache is empty.
+        // Obtain the printer's RSA public key. Preference order:
+        //   1. In-memory cache — authoritative when populated by the
+        //      app_cert_install response (harvest_security_report), or a
+        //      prior TLS-leaf capture.
+        //   2. Fresh app_cert_install request over MQTT — the documented
+        //      flow; works for cloud/proxy transports where the TLS peer
+        //      is not the printer.
+        //   3. TLS-leaf PEM snapshot on disk (LAN-direct TOFU fallback).
         EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+        // Only run the app_cert_install round-trip when the printer has
+        // advertised the new authorization-control system (flag3 bit 16).
+        // Otherwise the command is meaningless to the firmware; fall straight
+        // through to the TLS-leaf snapshot. (app_cert_list is best-effort
+        // observability — it tells us whether our cert is already trusted; we
+        // still install to obtain printer_cert.)
+        // TODO(hardware-test): confirm on a secured printer that gating on
+        // flag3 bit16 doesn't skip a printer that actually needs the install.
+        if (!printer_pk && printer_supports_new_auth(p.dev_id)) {
+            request_app_cert_list(p.dev_id, use_lan_channel);
+        }
+        if (!printer_pk && printer_supports_new_auth(p.dev_id) &&
+            request_app_cert_install(p.dev_id, use_lan_channel)) {
+            // The printer answers on the report topic; harvest_security_report
+            // fills the cache from the MQTT network thread. Poll briefly.
+            for (int i = 0; i < 20 && !printer_pk; ++i) {
+                if (cancel_fn && cancel_fn()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                printer_pk = cert_store::get_printer_pub_key(p.dev_id);
+            }
+            if (!printer_pk) {
+                OBN_WARN("cloud_print: no app_cert_install response for dev=%s "
+                         "within 5s; falling back to TLS-leaf snapshot",
+                         p.dev_id.c_str());
+            }
+        }
         if (!printer_pk) {
             std::string pem_path = cert_store::device_cert_path(config_dir(), p.dev_id);
             printer_pk = load_printer_pub_key_from_pem(pem_path);
@@ -944,15 +975,16 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
         }
 
-        std::string plate_param = "Metadata/plate_" +
-            std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) + ".gcode";
-
+        // TODO(hardware-test): the "5. MQTT.md" middleware spec encrypts only
+        // `url` -> `url_enc` for the `project_file` command; `param` -> `param_enc`
+        // is documented for `gcode_line`, not `project_file`. We therefore encrypt
+        // only the URL and leave `param` cleartext. Confirm on a secured printer
+        // that `project_file` is accepted without `param_enc` before relying on it.
         std::string enc_err;
-        std::string url_enc   = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url,   &enc_err);
-        std::string param_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, plate_param, &enc_err);
+        std::string url_enc = rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
         ::EVP_PKEY_free(printer_pk);
 
-        if (url_enc.empty() || param_enc.empty()) {
+        if (url_enc.empty()) {
             OBN_ERROR("cloud_print: RSA field encryption failed: %s", enc_err.c_str());
             if (update_fn) update_fn(BBL::PrintingStageERROR,
                                      BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
@@ -961,8 +993,8 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         }
 
         print_job::CloudProjectFileOpts cloud_opts;
+        cloud_opts.url        = opts.url;   // cleartext stays alongside url_enc
         cloud_opts.url_enc    = std::move(url_enc);
-        cloud_opts.param_enc  = std::move(param_enc);
         cloud_opts.file_path  = opts.file_path;
         cloud_opts.md5        = opts.md5;
         cloud_opts.project_id = opts.project_id;

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -65,15 +64,6 @@ private:
     std::string report_topic_() const;
     std::string request_topic_() const;
 
-    // Creates a fresh client_ and wires all three callbacks. Called from
-    // start() and from reconnect_loop() before each reconnect attempt.
-    // Throws std::runtime_error if mosquitto_new fails.
-    void setup_client();
-
-    // Background thread: waits for on_disconnect to fire with rc!=0, then
-    // retries connect() with exponential backoff {1,2,5,10,30,30} seconds.
-    void reconnect_loop();
-
     std::string dev_id_;
     std::string dev_ip_;
     std::string username_;
@@ -81,23 +71,9 @@ private:
     bool        use_ssl_;
     std::string ca_file_;
 
-    // Guarded by client_mu_. Shared so callers can snapshot and release the
-    // lock before invoking methods — preventing a race with reconnect_loop
-    // destroying the old handle while a publish is in flight.
-    mutable std::mutex            client_mu_;
-    std::shared_ptr<mqtt::Client> client_;
+    std::unique_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
-
-    // Saved at start() time; reused verbatim by every reconnect attempt.
-    mqtt::ConnectConfig connect_cfg_;
-
-    std::atomic<bool>       stopped_{false};
-    std::atomic<bool>       reconnect_wanted_{false};
-    std::atomic<int>        reconnect_attempt_{0};
-    std::mutex              reconnect_mu_;
-    std::condition_variable reconnect_cv_;
-    std::thread             reconnect_thread_;
 };
 
 // The Agent object is created per Studio call to bambu_network_create_agent().
@@ -160,6 +136,27 @@ public:
     // given `dev_id` is seen (and only in lan_only mode for now): capture the
     // printer's self-signed server certificate into <config_dir>/certs/.
     void install_device_cert(const std::string& dev_id, bool lan_only);
+
+    // Publishes the security.app_cert_install MQTT command (see
+    // reverse-networking "Authorization Control/5. MQTT.md"): sends the
+    // slicer/app certificate chain + CRL (config_dir/slicer_cert.pem,
+    // slicer_crl.pem) to the printer. The printer's success report carries
+    // `printer_cert` — the authoritative device certificate — which
+    // harvest_security_report() feeds into the cert_store pubkey cache.
+    // Returns false when the app cert PEM is missing or publish fails.
+    bool request_app_cert_install(const std::string& dev_id, bool via_lan);
+
+    // Publishes the security.app_cert_list query (see reverse-networking
+    // "5. MQTT.md"): asks the printer which app certificates it already
+    // trusts. The report response is parsed by harvest_security_report into
+    // app_certs_by_dev_. Returns false on publish failure.
+    bool request_app_cert_list(const std::string& dev_id, bool via_lan);
+
+    // True once the printer has advertised the new authorization-control
+    // system (print.flag3 bit 16) in a push_status frame. Latched by
+    // harvest_security_flags(); gates app_cert_install so we don't send the
+    // command to firmware that doesn't understand it.
+    bool printer_supports_new_auth(const std::string& dev_id) const;
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
     // printers send NOTIFY every 5 s on UDP port 2021. Returns true if the
@@ -387,16 +384,20 @@ public:
     // Studio's load_user_preset().
     std::string cloud_user_id() const;
 
-    // Returns the dev_type stored by the most recent cache_ssdp_json_for_bind()
-    // call for this dev_id, or "" if unseen. Used by agent_test to verify model
-    // tracking without requiring an active MQTT session.
-    std::string test_model_for(const std::string& dev_id) const {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = dev_model_by_id_.find(dev_id);
-        return it != dev_model_by_id_.end() ? it->second : std::string{};
-    }
-
 private:
+    // Scans an incoming MQTT report frame (LAN or cloud) for a
+    // security.app_cert_install success response and installs the returned
+    // printer_cert into the cert_store pubkey cache. Cheap substring
+    // prefilter; full JSON parse only on candidate frames.
+    void harvest_security_report(const std::string& dev_id,
+                                 const std::string& json);
+
+    // Scans a push_status frame for print.flag3 and latches whether the
+    // printer supports the new authorization-control system (bit 16). Cheap
+    // substring prefilter; full JSON parse only on candidate frames.
+    void harvest_security_flags(const std::string& dev_id,
+                                const std::string& json);
+
     mutable std::mutex mu_;
     std::string        log_dir_;
     std::string        config_dir_;
@@ -449,6 +450,13 @@ private:
     // reach them.
     std::map<std::string, DeviceFw> device_fw_;
 
+    // Command-security capability + provisioning state, keyed by dev_id.
+    // sec_new_auth_by_dev_: latched true when print.flag3 bit 16 is seen.
+    // app_certs_by_dev_: cert_ids the printer reported as trusted via the
+    // security.app_cert_list response. Both guarded by mu_.
+    std::map<std::string, bool>                 sec_new_auth_by_dev_;
+    std::map<std::string, std::set<std::string>> app_certs_by_dev_;
+
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")
     // notification. Cleared on disconnect/resubscribe so reconnects
@@ -481,10 +489,12 @@ private:
     // connect_printer() stores the MQTT/FTPS password (access code) here so
     // bambu_network_bind can POST it to the cloud as bind_code.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
+    // connect_printer() stores the LAN IP here so maybe_setup_camera() can
+    // reach the printer's MJPEG endpoint without a fresh SSDP lookup.
     std::unordered_map<std::string, std::string> lan_ip_by_dev_;
 
-    // dev_id → dev_type string populated from SSDP; used to detect multi-nozzle
-    // printers for nozzleId inversion before MQTT signing.
+    // dev_id -> dev_type from SSDP, used by maybe_setup_camera() to pick the
+    // LAN vs. Agora/TUTK camera source for the printer's model.
     std::unordered_map<std::string, std::string> dev_model_by_id_;
 
     // Buffer populated by bambu_network_get_setting_list2 and drained

@@ -326,12 +326,6 @@ bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
     return true;
 }
 
-bool has_printer_pub_key(const std::string& dev_id)
-{
-    std::lock_guard<std::mutex> lk(g_pubkey_mu);
-    return g_pubkey_map.find(dev_id) != g_pubkey_map.end();
-}
-
 void forget_printer(const std::string& dev_id)
 {
     std::lock_guard<std::mutex> lk(g_pubkey_mu);

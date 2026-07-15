@@ -1313,7 +1313,7 @@ The print-job submission ends with a single MQTT command published to the printe
 | `project_id`, `profile_id`, `task_id`, `subtask_id` | strings | cloud task IDs from `POST /v1/user-service/my/task` (cloud) or `"0"` placeholder (LAN / Developer Mode) | Sent as **strings**, not numbers. |
 | `subtask_name` | string | `project_name` (falls back to `task_name`) | Shown on the printer screen. |
 | `file` | string | `opts.file_path` | Basename or path of the `.3mf` on the printer side. Usually mirrors the trailing segment of `url` (without the scheme). See **URL schemes** below. |
-| `url` / `url_enc` | string | `opts.url` | Tells firmware **how to locate** the `.3mf`. Cleartext `url` uses one of several schemes (`ftp://`, `brtc://emmc/`, `file://`, presigned `https://…` for cloud); `url_enc` is the same URL encrypted (AES + RSA-OAEP). Non-Developer-Mode firmware requires `url_enc`; Developer Mode accepts plain `url`. Full scheme semantics: see **URL schemes** below. |
+| `url` / `url_enc` | string | `opts.url` | Tells firmware **how to locate** the `.3mf`. Cleartext `url` uses one of several schemes (`ftp://`, `brtc://emmc/`, `file://`, presigned `https://…` for cloud); `url_enc` is the same URL RSA-encrypted with the **printer's device-cert public key** using **PKCS#1 v1.5** padding (direct RSA, no AES session-key wrap — the observed ≤~245-byte ciphertext equals the RSA-2048 PKCS#1 v1.5 ceiling of `256−11=245` and rules out OAEP-SHA1, which would cap at 214; independently cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47), on-wire confirmation of the padding still pending). Non-Developer-Mode firmware requires `url_enc`; Developer Mode accepts plain `url`. Full scheme semantics: see **URL schemes** below. |
 | `md5` | string | `opts.md5` (uppercase hex) | Printer cross-checks the 3mf integrity before slicing it. |
 | `bed_type` | string | `task_bed_type` (defaults to `"auto"`) | One of the `MachineBedTypeString` values. |
 | `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams` | bool | matching `task_*` flags | Per-print toggles from the `SelectMachineDialog` checkboxes. |
@@ -1356,7 +1356,64 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 }
 ```
 
-`cert_id` identifies the device certificate used for signing (its Subject DN includes `CN=<dev_id>.bambulab.com`); `payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 signature of that exact payload computed with the per-install private key shipped inside the stock plugin's obfuscated blob; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error `84033543`). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+`payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact payload; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+
+**`cert_id` is a cloud-issued, _shared_ application certificate — not a per-install _device_ certificate** (correction cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) against a symbol-bearing `libbambu_networking.so`, a live VMProtect memory dump, and decrypted secured-printer captures). The example above, `a4e8faaa…CN=GLOF3813734089.bambulab.com`, is the **app** cert (subject/issuer under `GLOF{…}.bambulab.com`), *not* a device CN. Two distinct keys are in play, and they must not be confused:
+
+- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **fetched at runtime and shared across installs**, not statically extracted per-install: it comes from the cloud cert endpoint `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3), which returns the cert chain, the CRL, and the AES-256-encrypted private key. Only a small `bootstrap_secret` is hardcoded in the stock plugin; everything else is a cloud request after login. `cert_id` is derived from the returned cert (issuer + serial), so it need not be stored separately.
+- **Device-cert public key → encrypts.** The printer's device-certificate public key is used **only** for field encryption (`url_enc` / `param_enc`), never for signing.
+
+**HTTP half of command-security** (same app key, on secured-printer REST writes such as `POST /my/task`): the plugin adds `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` (a raw PKCS#1 v1.5 signature over the current time in milliseconds — the server recovers the timestamp and checks recency for replay protection) and `x-bbl-app-certification-id = issuer + ":" + serial.lower()`. Note this is a **different serialization** from the MQTT `cert_id` (which concatenates serial + issuer without a separator).
+
+**Provisioning surface (`security` MQTT namespace, wire-unconfirmed).** `app_cert_install` (`app_cert`, `crl`) / `app_cert_list` install and enumerate the app cert on the printer; this is the recovery path behind a `…545` rejection. Whether the `install_device_cert` ABI export maps to this provisioning flow or to a TLS-leaf TOFU snapshot (`<config>/certs/<serial>.pem`) is **not yet wire-confirmed** — flagged as a joint-capture item in issue #47.
+
+##### Command-security key & certificate flow
+
+Two independent RSA credentials drive command-security: a **shared app key** that signs, and a **per-printer device-cert public key** that encrypts. Each line below reads as **inputs → where/when it is used → output**.
+
+**Sources.** Most of the authorization-control detail below is not our own capture — it is drawn from third-party reverse-engineering, cross-checked against our code and issue #47. Primary references, cited inline per group:
+
+- **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `bootstrap_secret`, AES-wrapped key).
+- **RN-4** — reverse-networking, [4. App Certificates.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/4.%20App%20Certificates.md) (app cert chain + CRL are shared, public, not per-device).
+- **RN-5** — reverse-networking, [5. MQTT.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/5.%20MQTT.md) (`app_cert_install` / `app_cert_list`, `flag3` bit 16, `SignMessage`/`EncryptField` middleware, cleartext-when-no-cert rule).
+- **RN-6** — reverse-networking, [6. HTTP.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/6.%20HTTP.md) (`x-bbl-*` command-security headers).
+- **#47** — [ClusterM/open-bambu-networking issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) (shared-app-cert correction, PKCS#1 v1.5 sizing, verified against a symbol-bearing `libbambu_networking.so` + VMProtect dump + decrypted secured-printer captures).
+- **OBA** — [Doridian/OpenBambuAPI `mqtt.md`](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md) (base MQTT topic/command model).
+- **OBN** — our own code (`src/signing.cpp`, `src/agent.cpp`, `src/cloud_print.cpp`, `src/cloud_auth.cpp`) and the ABI harness captures described elsewhere in this document.
+
+**Credential acquisition (once, at startup / login)** — sources: RN-3, RN-4, #47; OBN mirrors the response shape in `src/cloud_auth.cpp`.
+
+- `bootstrap_secret` (only hardcoded piece) + logged-in cloud session → `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1`, done once after login by the stock plugin → response with `cert` (3-PEM chain), `key` (AES-256 encrypted app private key), `crl`. *(RN-3)*
+- Encrypted `key` blob + `aes256` unwrap key → AES-256 decrypt at finalization → **app private key** (`slicer_key.pem`), shared across all installs. In OBN this file is supplied out-of-band, not fetched. *(RN-3, RN-4; #47 confirms "shared across installs")*
+- App leaf `cert` (issuer + serial) → parsed once → **`cert_id`** (`slicer_cert_id.txt`), e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`. *(RN-4, #47)*
+- App `cert` chain + `crl` → held for the provisioning step below → **`slicer_cert.pem`** + **`slicer_crl.pem`** (only consumed by `app_cert_install`). *(RN-4, RN-5)*
+
+**Printer device-cert public key acquisition (per printer, lazily before a secured print)** — sources: RN-5 (`app_cert_install` reply); OBN for the TLS-leaf TOFU path (`capture_peer_cert_pem`, `harvest_security_report`).
+
+- Printer IP + LAN TLS handshake to `printer_ip:8883` → `capture_peer_cert_pem` on a direct LAN connection → printer device cert (`CN=<serial>`) cached on disk (`<config>/certs/<serial>.pem`); its **public key** is the TOFU/LAN-direct source. *(OBN)*
+- `app_cert_install` request (see below) → printer replies on the report topic with `printer_cert` → device cert parsed by `harvest_security_report` → **printer public key** cached in memory (authoritative source, works for cloud/proxy transports too). *(RN-5; RN-5 explicitly recommends always retrieving via this flow, even when a LAN TLS cert exists)*
+
+**Provisioning: teaching the printer to trust our app cert (once per printer, only when `print.flag3` bit 16 is set)** — sources: RN-5; OBN implements it in `Agent::request_app_cert_install` / `request_app_cert_list`.
+
+- `slicer_cert.pem` (+ optional `slicer_crl.pem`, else `crl:[]`) → published as `security.app_cert_install` when the printer advertises the new auth system → printer stores the chain + CRL in its trust store and returns `printer_cert`. *(RN-5; the empty-`crl:[]` case is OBN behaviour, not confirmed against firmware)*
+- (no inputs) → `security.app_cert_list` query → printer returns the `cert_ids` it currently trusts (observability only; confirms whether our `cert_id` is already installed). *(RN-5)*
+
+**Signing / encryption applied to each critical command** — sources: RN-5 (`SignMessage`, `EncryptField`), RN-6 (HTTP headers), #47 (PKCS#1 v1.5 padding + ≤~245-byte sizing).
+
+- App private key (`slicer_key.pem`) + serialized `print` object → `SignMessage` RSA-SHA256 PKCS#1 v1.5 on every privileged MQTT command → **`header.sign_string`** (+ `payload_len`, `sign_alg`, `sign_ver`). *(RN-5)*
+- `cert_id` → copied verbatim into every signed MQTT command → **`header.cert_id`** (serial + issuer concatenated, no separator). *(RN-5, #47)*
+- Printer public key + cleartext `url` (or `param`) → RSA PKCS#1 v1.5 encrypt, only for `project_file`/`gcode_line` **and only once a device cert is known** (otherwise the field keeps cleartext) → **`url_enc`** / **`param_enc`** alongside the cleartext field. *(RN-5 for the cleartext-fallback rule; #47 for PKCS#1 v1.5)*
+- App private key + current time in ms (as UTF-8 string) → RSA PKCS#1 v1.5 sign, on secured-printer REST writes (e.g. `POST /my/task`) → **`x-bbl-device-security-sign`** header (server recovers the timestamp for replay protection). *(RN-6)*
+- `cert_id` reformatted as `issuer + ":" + serial.lower()` → same REST writes → **`x-bbl-app-certification-id`** header (note: different serialization from the MQTT `cert_id`). *(RN-6, #47)*
+
+**Verification (consumers)** — sources: RN-5 (firmware signature/CRL check, error semantics), RN-6 (cloud REST check); Developer-Mode bypass is OBN-observed and documented in `README.md`.
+
+- `header.sign_string` + `header.cert_id` (+ trust store from `app_cert_install`, incl. CRL) → **printer firmware** checks the signature against the trusted app cert and that `cert_id` is not revoked, on every incoming critical command → accept, or reject with `MQTT Command verification failed` (`84033543`–`84033548`; `…545` = "need reset device pub key"). *(RN-5; error range cross-validated in #47)*
+- `url_enc` / `param_enc` → **printer firmware** decrypts with its own device private key → recovered `url` / `param`. *(RN-5)*
+- `x-bbl-device-security-sign` + `x-bbl-app-certification-id` → **Bambu cloud REST** validates the write. *(RN-6)*
+- Developer Mode ON → **printer firmware** bypasses the signature check entirely: plain `url` accepted, `header` optional, `url_enc` unnecessary. This is why LAN printing works today without ever touching the cloud cert endpoint, provided the operator supplied the app key out-of-band. *(OBN; see "Developer Mode requirement" in `README.md`)*
+
+Note where the **CRL** actually lands: it is never read by the plugin's signing/encryption path — it is only shipped inside `app_cert_install` into the printer's trust store, where the firmware consults it while verifying `header.sign_string`. With an empty revocation list and no rotation it is effectively a formality; it becomes load-bearing only if Bambu revokes/rotates the shared app cert. *(RN-5; RN-4 for the observed empty, ~30-day CRL)*
 
 Other `PrintParams` members Studio populates but **does not put into the MQTT command** itself: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments`. They feed the cloud-side `POST /v1/user-service/my/task` body and the timelapse-storage preflight (see below), not `project_file`. (`task_timelapse_use_internal` *does* reach the MQTT command, but indirectly — see the `cfg` row in the table above.)
 
@@ -1464,22 +1521,164 @@ Multi-extruder / new-auto-calibration paths carry:
 
 ##### Pressure advance (PA) calibration — `extrusion_cali_*`
 
-Studio uses the `extrusion_cali_*` family for **pressure advance (K factor)** calibration and for managing PA profiles persisted on the printer. Related flow-ratio calibration uses the parallel `flowrate_*` commands (see end of this section).
+MQTT command family for **pressure advance (K factor)** calibration and for managing PA profiles persisted on the printer. Related flow-ratio calibration uses the parallel `flowrate_*` commands (see end of this section).
 
-**Terminology (Studio is inconsistent here):** the same `PACalibResult` struct appears in two different lifecycles:
+###### What K and N are
 
-| Concept | MQTT command | Studio API | Meaning |
-|---------|--------------|------------|---------|
-| **Run output** | `extrusion_cali_get_result` | `GetPAResult()`, `m_pa_calib_results` | Fresh K/N values from the calibration job that just finished; not yet committed to printer storage until `extrusion_cali_set`. |
-| **Stored profiles** | `extrusion_cali_get` | `GetPAHistory()`, `m_pa_calib_tab`, UI *Calibration History* | K/N profiles already saved on the printer for a `(filament_id, nozzle, …)` key. Multiple slots per key, indexed by `cali_idx`; one is active per tray (`extrusion_cali_sel`). |
+The printer firmware uses two coefficients for pressure advance compensation:
 
-`extrusion_cali_del` removes one **stored profile slot** (`cali_idx`), not the ephemeral run output — even though Studio names the caller `delete_PA_calib_result()` (`CalibUtils.cpp:736`).
+| Coefficient | Meaning | Typical range |
+|-------------|---------|---------------|
+| **K** (`k_value`) | Pressure advance factor — how aggressively the extruder motor compensates for filament compressibility in the Bowden tube / hotend. Higher K = more compensation. | 0.01 – 0.10 (direct drive), 0.20 – 1.00+ (Bowden) |
+| **N** (`n_coef`) | Non-linearity coefficient — models the pressure/flow relationship when it deviates from linear. Used only by auto-calibration; manual calibration sets this to `0.0`. | 0.0 – 2.0 |
+
+Both coefficients are stored **on the printer**. Clients read, write, and select profiles via MQTT; the authoritative copy always lives in printer firmware storage.
+
+###### Two firmware generations
+
+Everything in this family splits on one field: `cali_version` (`push_status` → `print.cali_version`; observed `0` on P2S). It defines two incompatible models:
+
+| | **Modern** (`cali_version >= 0`) | **Legacy** (`cali_version` absent) |
+|---|---|---|
+| Storage | Named profile table, multiple slots per `(filament_id, nozzle_id, nozzle_diameter)` key | One K/N value per tray, no table |
+| Per-tray PA fields in `push_status` | `cali_idx` only (absent on empty trays) | `k`, `n` |
+| Read active K/N | `extrusion_cali_get`, match entry by the tray's `cali_idx` | Read `k` / `n` directly from `push_status` |
+| Write | `extrusion_cali_set` batch shape (`filaments[]`) | `extrusion_cali_set` single-tray shape |
+| Activate | Separate `extrusion_cali_sel` step | No select step — writing **is** the activation |
+| Delete a profile | `extrusion_cali_del` | n/a |
+
+The rest of this section describes the modern model unless marked otherwise; for legacy firmware the whole story is "write K/N with single-tray `extrusion_cali_set`, read them back from `push_status`".
+
+###### Storage model and reading the active profile (modern)
+
+The printer maintains a **profile table** keyed by `(filament_id, nozzle_id, nozzle_diameter)`. Each key can hold **multiple custom profile slots** identified by `cali_idx`. The default (factory) profile is not part of the table and is never returned by `extrusion_cali_get`.
+
+Each tray has one **active** profile; its `cali_idx` appears in the tray's `push_status` data and is changed with `extrusion_cali_sel`.
+
+To resolve the active profile's K/N for a tray:
+
+1. Take the tray's `cali_idx` from `push_status`.
+2. Send `extrusion_cali_get` for the tray's `(filament_id, nozzle_id, nozzle_diameter)`.
+3. Find the response entry whose `cali_idx` matches.
+4. **Match** → a custom profile is active; the entry carries its `name` and `k_value`.
+5. **No match** → the default profile is active. Its K/N are not exposed over MQTT; Bambu Studio falls back to hardcoded per-filament defaults (`CalibUtils.cpp:54-80`):
+
+| Filament | K | N |
+|----------|---|---|
+| TPU 95A (`GFU01`) | 0.25 | 1.0 |
+| TPU 90A (`GFU03`) | 0.35 | 1.0 |
+| TPU 85A (`GFU04`) | 0.65 | 1.0 |
+| PETG, PA, Support PLA (`GFG00`, `GFG01`, `GFS00`, …) | 0.04 | 1.0 |
+| Everything else (PLA, ABS, …) | 0.02 | 1.0 |
+
+AMS root-level fields in `push_status` (`print.ams`):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `cali_id` | int | Last calibration target tray id (`255` = external spool / none) |
+| `cali_stat` | int | Calibration status; low byte `0x01`–`0x04` = setup in progress, `0` = idle |
+
+###### Capability gates
+
+| Flag / field | Source | Effect |
+|--------------|--------|--------|
+| `is_support_pa_calibration` | `fun` bit 7 / `home_flag` bit 16 / JSON `support_flow_calibration` (**naming error** — see §6.8.0) | Master gate for all `extrusion_cali_*` commands |
+| `m_calib.support_new_auto_calib` | `fun` bit 40 | Enables the multi-filament wizard path (batch `filaments[]` commands) |
+| `is_support_pa_mode` | `fun2` bit 3 | PA tuning mode toggle |
+
+**Bambu Studio UI overrides** (hardcoded, ignoring firmware flags):
+- **P1P/P1S** (`series_p1p`, model_id C11/C12): PA calibration UI is hidden.
+- **H2D** (`series_o`): flow-ratio calibration UI is hidden (PA remains available).
+
+###### Two data lifecycles — run output vs stored profiles
+
+| Concept | MQTT command | Meaning |
+|---------|--------------|---------|
+| **Run output** (ephemeral) | `extrusion_cali_get_result` | Fresh K/N from the calibration job that just finished. **Not yet committed** to printer storage — discarded on reboot unless saved via `extrusion_cali_set`. |
+| **Stored profiles** (persistent) | `extrusion_cali_get` | K/N profiles already saved on the printer for a `(filament_id, nozzle, …)` key. Multiple slots per key, indexed by `cali_idx`; one is active per tray (`extrusion_cali_sel`). |
+
+###### End-to-end calibration workflows
+
+**Automatic calibration** (firmware measures K/N by printing test patterns):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali ────────────────>│  1. Start calibration run
+  │<── result: "success" ─────────────│     (printer prints test patterns,
+  │                                    │      progress via push_status)
+  │    ... wait for print to finish ...│
+  │                                    │
+  │─── extrusion_cali_get_result ────>│  2. Fetch measured K/N
+  │<── filaments[{k_value, n_coef}] ──│     (ephemeral, not saved yet)
+  │                                    │
+  │    [user reviews results in UI]    │
+  │                                    │
+  │─── extrusion_cali_set ───────────>│  3. Commit to printer storage
+  │<── tray_id, k_value, n_coef ──────│     (now persistent)
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  4. Mark as active for tray
+  │<── tray_id, cali_idx ─────────────│
+  │                                    │
+```
+
+**Manual calibration** (user prints a test pattern, visually picks the best K, enters it):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali (mode=1) ──────>│  1. Print PA test pattern
+  │<── result: "success" ─────────────│     (line pattern with varying K)
+  │                                    │
+  │    ... user inspects print ...     │
+  │    ... user enters K in UI ...     │
+  │                                    │
+  │─── extrusion_cali_set ───────────>│  2. Save user-chosen K directly
+  │    (k_value=<user>, n_coef="0.0") │     (n_coef is always 0.0 for manual)
+  │<── tray_id, k_value ──────────────│
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  3. Mark as active for tray
+  │<── tray_id, cali_idx ─────────────│
+  │                                    │
+```
+
+**Browsing / managing existing profiles** (no calibration run):
+
+```
+Studio                              Printer
+  │                                    │
+  │─── extrusion_cali_get ───────────>│  Read stored profiles for a
+  │    (filament_id, nozzle_id, ...)   │  filament/nozzle combination
+  │<── filaments[{cali_idx, k_value}] ─│
+  │                                    │
+  │─── extrusion_cali_sel ───────────>│  Switch active profile for a tray
+  │    (tray_id, cali_idx)             │
+  │<── ok ────────────────────────────│
+  │                                    │
+  │─── extrusion_cali_del ───────────>│  Delete a specific profile slot
+  │    (filament_id, cali_idx)         │
+  │<── ok ────────────────────────────│
+  │                                    │
+```
+
+###### Print-time PA integration
+
+When Studio submits a print job via `project_file` (§6.8.2), two fields control PA behavior:
+
+| Wire field | `PrintParams` source | Meaning |
+|------------|---------------------|---------|
+| `extrude_cali_flag` | `auto_flow_cali` (0 or 1) | Tells firmware whether to run PA calibration before printing. `1` = requested, `0` = skip. |
+| `extrude_cali_manual_mode` | `extruder_cali_manual_mode` (0 = auto, 1 = manual, -1 = omit) | If PA cali is requested, which mode to use. Omitted entirely when the value is `-1` (default sentinel). |
+
+The firmware uses the **active profile** (selected via `extrusion_cali_sel`) for the tray's `(filament_id, nozzle)` combination. If `extrude_cali_flag=1`, the printer may re-run calibration before printing rather than using the stored profile.
+
+###### Command reference
 
 **`extrusion_cali`** — start a PA calibration run
 
-Two code paths in `DeviceManager.cpp`:
+Two request shapes:
 
-*Legacy single-tray* (`command_start_extrusion_cali`, ~1679):
+*Legacy single-tray:*
 
 ```json
 {
@@ -1494,7 +1693,7 @@ Two code paths in `DeviceManager.cpp`:
 }
 ```
 
-*Multi-filament wizard* (`command_start_pa_calibration`, ~1823):
+*Multi-filament wizard* (`mode`: `0` = auto, `1` = manual):
 
 ```json
 {
@@ -1526,7 +1725,7 @@ Two code paths in `DeviceManager.cpp`:
 
 **`extrusion_cali_set`** — write K/N coefficients to printer storage
 
-*Legacy single-tray* (`command_extrusion_cali_set`, ~1708):
+*Single-tray shape* (**legacy firmware**; also used by Studio when editing K without a profile table):
 
 ```json
 {
@@ -1543,9 +1742,14 @@ Two code paths in `DeviceManager.cpp`:
 }
 ```
 
-Note: the legacy path hard-codes `n_coef` to `1.4` regardless of the UI value.
+Notes on the single-tray shape:
+- `k_value` is the only user-controlled coefficient, sent as a JSON **number** (the batch shape sends strings). `n_coef` is hard-coded to `1.4` by Studio regardless of the UI value.
+- `bed_temp`, `nozzle_temp`, and `max_volumetric_speed` are included **only when all three are `>= 0`**; when the K value is edited from the AMS slot dialog they are omitted, leaving only `tray_id`, `k_value`, `n_coef`.
+- `setting_id` and `name` are not sent (commented out in the builder).
+- For the external spool use `tray_id` `255` (main) / `254` (deputy).
+- On legacy firmware there is no separate activation step — this write immediately becomes the tray's active K/N.
 
-*Batch save after wizard* (`command_set_pa_calibration`, ~1864):
+*Batch shape* (**modern firmware**; save after the calibration wizard):
 
 ```json
 {
@@ -1575,11 +1779,15 @@ Note: the legacy path hard-codes `n_coef` to `1.4` regardless of the UI value.
 }
 ```
 
-For auto-calibration saves, `n_coef` carries the measured value; for manual saves Studio sends `"0.0"`.
+Notes on the batch shape:
+- `k_value` and `n_coef` are sent as **strings** here (the single-tray shape sends `k_value` as a number).
+- For auto-calibration saves `n_coef` carries the measured value; for manual saves it is `"0.0"`.
+- `cali_idx` is included only when `>= 0` (omit it to create a new slot; provide it to overwrite an existing one).
+- `nozzle_pos` / `nozzle_sn` are included only when a nozzle position is known.
 
-**Response:** echoes `tray_id`, `k_value`, and either `n_value` (virtual tray) or `n_coef` (AMS tray). Parsed in `DevCalib::ExtrusionCalibSetParse()` (~151).
+**Response:** echoes `tray_id`, `k_value`, and either `n_value` (virtual tray) or `n_coef` (AMS tray).
 
-**`extrusion_cali_get`** — fetch the **stored PA profile table** for a filament/nozzle combination (`command_get_pa_calibration_tab`, ~1923; Studio: `RequestPAHistory()`):
+**`extrusion_cali_get`** — fetch stored PA profiles for a filament/nozzle combination:
 
 ```json
 {
@@ -1598,24 +1806,58 @@ For auto-calibration saves, `n_coef` carries the measured value; for manual save
 
 `extruder_id`, `nozzle_id`, `nozzle_pos`, and `nozzle_sn` are omitted when not applicable.
 
-**Response:** `filaments` array of stored profile entries. Each element deserialises into `PACalibResult` (`DevCalib.cpp:54-70`):
+**Response** — real capture from a P2S (LAN MQTT, firmware `cali_version: 0`):
+
+```json
+{
+  "print": {
+    "command": "extrusion_cali_get",
+    "sequence_id": "9004",
+    "result": "success",
+    "reason": "",
+    "is_from_mqtt": true,
+    "filament_id": "P3507b3f",
+    "extruder_id": 0,
+    "nozzle_id": "HS00-0.4",
+    "nozzle_diameter": "0.4",
+    "filaments": [
+      {
+        "cali_idx": 1,
+        "extruder_id": 0,
+        "filament_id": "P3507b3f",
+        "k_value": "0.035000",
+        "name": "AzureFilm PETG Original",
+        "nozzle_diameter": "0.4",
+        "nozzle_id": "HS00-0.4",
+        "nozzle_pos": 0,
+        "nozzle_sn": "N/A"
+      }
+    ]
+  }
+}
+```
+
+Top-level fields echo the request (`filament_id`, `extruder_id`, `nozzle_id`, `nozzle_diameter`) plus `result`, `reason`, and `is_from_mqtt: true`.
+
+Per-entry fields:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `tray_id` | int | Flat tray index |
-| `ams_id`, `slot_id` | int | AMS coordinates |
-| `extruder_id` | int | |
+| `cali_idx` | int | Profile slot index. Only custom profiles are returned (the entry with `cali_idx` matching the tray's active `cali_idx` is the active custom profile). |
+| `filament_id` | string | |
+| `name` | string | Profile display name |
+| `k_value` | string | K as a string, e.g. `"0.035000"` |
 | `nozzle_id` | string | e.g. `"HS00-0.4"` |
-| `nozzle_diameter` | string or number | Top-level `nozzle_diameter` copied in when missing per entry |
-| `nozzle_pos`, `nozzle_sn` | int / string | Optional |
-| `filament_id`, `setting_id`, `name` | string | |
-| `k_value`, `n_coef` | string or number | Entries with `k_value` outside `[0, 10]` are discarded |
-| `cali_idx` | int | Slot index within the stored profile table (-1 = default) |
-| `confidence` | int | `0` success, `1` uncertain, `2` failed |
+| `nozzle_diameter` | string | |
+| `extruder_id` | int | |
+| `nozzle_pos` | int | `0` when not applicable |
+| `nozzle_sn` | string | `"N/A"` when not applicable |
 
-On failure: `{ "result": "fail", "reason": "…" }`. Parsed in `DevCalib::ExtrusionCalibGetTableParse()` (~206).
+**Note — observed vs. parser-tolerated fields.** The capture above is the complete per-entry payload this firmware sends for a stored PA profile. Bambu Studio's parser additionally *accepts* `tray_id`, `ams_id`, `slot_id`, `setting_id`, `n_coef`, and `confidence`, but this firmware does **not** send them for `extrusion_cali_get`; missing values fall back to defaults (`n_coef` → `0.0`, `confidence` → `0`). `n_coef` and `confidence` are populated in `extrusion_cali_get_result` (auto-calibration run output), not in stored-profile listings. Do not rely on them being present here.
 
-**`extrusion_cali_get_result`** — fetch **latest calibration run results** (`command_get_pa_calibration_result`, ~1944):
+On failure: `{ "result": "fail", "reason": "…" }` with `filaments: []`.
+
+**`extrusion_cali_get_result`** — fetch the **latest auto-calibration run results** (ephemeral, not the stored table):
 
 ```json
 {
@@ -1627,9 +1869,25 @@ On failure: `{ "result": "fail", "reason": "…" }`. Parsed in `DevCalib::Extrus
 }
 ```
 
-**Response:** same `filaments[]` schema as `extrusion_cali_get`. On new-auto-calibration firmware, Studio rewrites `tray_id` from `ams_id`/`slot_id` via `GetTrayIdByAmsSlotId()`. Parsed in `DevCalib::ExtrusionCalibGetResultParse()` (~243).
+**Response:** `filaments[]` in the same shape as `extrusion_cali_get`, but this is where `n_coef` and `confidence` are actually populated (measured by the run).
 
-**`extrusion_cali_sel`** — mark which stored profile (`cali_idx`) is active for a tray (`commnad_select_pa_calibration`, ~1954):
+When no run result exists, the printer returns a failure rather than an empty success — real capture from a P2S with no pending run:
+
+```json
+{
+  "print": {
+    "command": "extrusion_cali_get_result",
+    "sequence_id": "9100",
+    "result": "fail",
+    "reason": "Don't exist",
+    "is_from_mqtt": true,
+    "nozzle_diameter": "0.4",
+    "filaments": []
+  }
+}
+```
+
+**`extrusion_cali_sel`** — set the active profile for a tray (**modern firmware only**; on legacy firmware there is no profile table — write K/N via single-tray `extrusion_cali_set` instead):
 
 ```json
 {
@@ -1648,9 +1906,13 @@ On failure: `{ "result": "fail", "reason": "…" }`. Parsed in `DevCalib::Extrus
 }
 ```
 
-**Response:** echoes `tray_id`, `ams_id`, `slot_id`, `cali_idx`. Parsed in `DevCalib::ExtrusionCalibSelectParse()` (~174).
+- `cali_idx: -1` selects the default (factory) profile. After selection, the tray's `cali_idx` in `push_status` reflects the firmware's index for that profile (which may not match any custom profile returned by `extrusion_cali_get`).
+- For the external spool: `ams_id` = `255` (main) / `254` (deputy), `slot_id` = `0`, and `tray_id` = the same reserved value (`255` / `254`, **not** `ams_id * 4 + slot_id`). The rest of the frame is unchanged.
+- `nozzle_pos` / `nozzle_sn` are included only when a nozzle position is known.
 
-**`extrusion_cali_del`** — delete one stored profile slot (`command_delete_pa_calibration`, ~1905; Studio: `delete_PA_calib_result()`):
+**Response:** echoes `tray_id`, `ams_id`, `slot_id`, `cali_idx`.
+
+**`extrusion_cali_del`** — delete one stored profile slot:
 
 ```json
 {
@@ -1679,7 +1941,9 @@ Parallel to PA, Studio drives flow-ratio calibration with:
 | `flowrate_cali` | `nozzle_diameter`, `tray_id`, `filaments[]` with `tray_id`, `bed_temp`, `filament_id`, `setting_id`, `nozzle_temp`, `def_flow_ratio`, `max_volumetric_speed`, `extruder_id`, `ams_id`, `slot_id` | `result` / `reason` (same pattern as `extrusion_cali`) |
 | `flowrate_get_result` | `nozzle_diameter` | `filaments[]` with `tray_id`, `nozzle_diameter`, `filament_id`, `setting_id`, `flow_ratio`, `confidence` |
 
-Built in `command_start_flow_ratio_calibration()` (~1973) and `command_get_flow_ratio_calibration_result()` (~2017); responses parsed in `DevCalib::FlowrateGetResultParse()` (~282).
+`flowrate_cali` sends `tray_id` and `nozzle_diameter` at the top level, with the per-filament parameters repeated inside `filaments[]`.
+
+**Note — live behavior.** On a P2S over LAN MQTT, `flowrate_get_result` produced **no response** (the request was accepted but nothing was published back within a few seconds), so its response shape is unverified against real hardware. The field list above is taken from the request builder and response parser in Bambu Studio source only.
 
 ---
 
@@ -1746,7 +2010,11 @@ Unload:
 }
 ```
 
-`tray_color` is RGBA hex without `#`. For virtual trays (`ams_id` 255/254), `tray_id` is set to `254` (`VIRTUAL_TRAY_DEPUTY_ID`).
+`tray_color` is RGBA hex without `#`.
+
+**`tray_id` semantics in this command differ from the calibration commands:**
+- For AMS trays, `tray_id` = `slot_id` (0–3), **not** the flat `ams_id * 4 + slot_id`.
+- For the external spool, `tray_id` is hardcoded to `254` (`VIRTUAL_TRAY_DEPUTY_ID`) for **both** the main (`ams_id` 255) and deputy (`ams_id` 254) spools — even `ams_id: 255` is sent with `tray_id: 254`. The actual addressing is carried by `ams_id`. Contrast with `extrusion_cali_sel`, where the external spool's `tray_id` is the real reserved id (255 main / 254 deputy).
 
 **Response:** echoes `ams_id`, `tray_id`, `tray_color`, `nozzle_temp_min`, `nozzle_temp_max`, `tray_info_idx`, `tray_type`. Studio updates its local AMS model from the ack (`DeviceManager.cpp:3459-3510`).
 
@@ -1892,7 +2160,7 @@ During **`ams_get_rfid`** (with read-on-insert enabled), **`state`** flashes thr
 
 Bits **2** and **4** both change during RFID; **`tray_reading_bits`** / **`tray_read_done_bits`** in `print.ams` may correlate but were not fully mapped. **TODO:** confirm whether **`0x04`** vs **`0x10`** is feed vs tray rotation vs RFID channel; assignment may be swapped.
 
-**Related `print.ams` fields** (OpenBambuAPI [`mqtt.md`](https://github.com/Doridian/OpenBambuAPI/blob/master/mqtt.md)):
+**Related `print.ams` root-level fields** (OpenBambuAPI [`mqtt.md`](https://github.com/Doridian/OpenBambuAPI/blob/master/mqtt.md)):
 
 | Field | Role |
 |-------|------|
@@ -1900,6 +2168,26 @@ Bits **2** and **4** both change during RFID; **`tray_reading_bits`** / **`tray_
 | `tray_reading_bits` / `tray_read_done_bits` | RFID scan in progress / complete |
 | `tray_is_bbl_bits` | Recognised official Bambu RFID profile |
 | `tray_now` / `tray_tar` / `tray_pre` | Active / target / previous flat tray id |
+| `cali_id` | Last calibration target tray id (`255` = external spool / none) |
+| `cali_stat` | Calibration status; low byte parsed in `DevFilaSystem::IsAmsSettingUp()` — `0x01`–`0x04` = setup in progress, `0` = idle |
+
+**Per-tray PA fields** in `push_status` (`print.ams.ams[].tray[]`):
+
+When `print.cali_version >= 0`:
+
+| Field | Role |
+|-------|------|
+| `cali_idx` | Active PA profile index. Absent on empty trays. |
+
+When `print.cali_version` is absent (legacy firmware):
+
+| Field | Role |
+|-------|------|
+| `cali_idx` | Active PA profile index |
+| `k` | Current PA K-value |
+| `n` | Current PA N-coefficient |
+
+See §6.8.4 "Storage model and reading the active profile" for how to resolve K/N from these fields.
 
 **`ams_filament_drying`** — start or stop AMS drying (`DevFilaSystemCtrl.cpp`)
 
@@ -3536,7 +3824,7 @@ A few practical contracts that the Studio code path enforces but does not docume
 | Topic | File:lines |
 |-------|------------|
 | Timelapse storage preflight (`ipcam_get_media_info`) | `src/slic3r/GUI/DeviceManager.cpp:2067-2074, 3548-3553` |
-| PA calibration commands (`extrusion_cali_*`, `flowrate_*`) | `src/slic3r/GUI/DeviceManager.cpp:1679-2024`, `src/slic3r/GUI/DeviceCore/DevCalib.cpp:54-320` |
+| PA calibration commands (`extrusion_cali_*`, `flowrate_*`) | `src/slic3r/GUI/DeviceManager.cpp:1744-2090`, `src/slic3r/GUI/DeviceCore/DevCalib.cpp:45-324` |
 | AMS MQTT commands (`ams_*`, `print_option`) | `src/slic3r/GUI/DeviceManager.cpp:1537-1775`, `src/slic3r/GUI/DeviceCore/DevFilaSystemCtrl.cpp:11-57` |
 | AMS status / tray indexing | `src/slic3r/GUI/DeviceCore/DevFilaSystem.cpp:344-385, 522-555` |
 | `PACalibResult` / `FlowRatioCalibResult` schemas | `src/libslic3r/Calib.hpp:114-181`, `src/slic3r/GUI/DeviceCore/DevCalib.cpp:54-80` |

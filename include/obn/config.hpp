@@ -55,14 +55,16 @@ struct Settings {
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
 
-    // Slicer signing key and certificate id.
-    // Empty = config_dir/slicer_key.pem and config_dir/slicer_cert_id.txt
+    // Slicer signing key, certificate id, and app-cert provisioning files.
+    // Empty = look for the corresponding file in config_dir:
+    //   slicer_key_pem  -> slicer_key.pem
+    //   slicer_cert_id  -> slicer_cert_id.txt
+    //   slicer_cert_pem -> slicer_cert.pem   (app cert chain for app_cert_install)
+    //   slicer_crl_pem  -> slicer_crl.pem    (app CRL for app_cert_install)
     std::string slicer_key_pem;
     std::string slicer_cert_id;
-
-    // Cloud login session persistence file.
-    // Empty = config_dir/session.json
-    std::string session_path;
+    std::string slicer_cert_pem;
+    std::string slicer_crl_pem;
 
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
@@ -90,6 +92,13 @@ const Settings& current();
 // The config_dir passed to the most recent load_or_create() call.
 // All default file paths (key, cert_id, session) are relative to this.
 const std::string& dir();
+
+// Join `basename` onto the active config_dir() using the platform's native
+// path separator (via std::filesystem). Returns "" when no config_dir has
+// been set. Always use this for files living in the config directory instead
+// of hand-concatenating "dir + \"/\" + name", which is not portable to
+// Windows.
+std::string path_in_dir(const std::string& basename);
 
 // Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
 // Empty configured values fall back to production defaults.

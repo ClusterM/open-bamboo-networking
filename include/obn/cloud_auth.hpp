@@ -11,14 +11,6 @@
 //   * a profile fetch (uid / nickname / avatar).
 // The global host is `api.bambulab.com`, with a CN mirror at
 // `api.bambulab.cn`.
-//
-// Token persistence:
-//   SessionData holds tokens with absolute expiry timestamps.
-//   save_session() writes atomically (write-temp + rename) with mode 0600.
-//   Path priority: obn.conf session_path > config_dir/session.json.
-//   load_and_refresh_if_needed() is the one-call startup helper: reads the
-//   file, refreshes the access token if it is within slack_seconds of
-//   expiry, and saves the updated tokens back before returning.
 
 #include <cstdint>
 #include <string>
@@ -81,68 +73,6 @@ AuthResult refresh_token(const std::string& region,
 ProfileResult get_profile(const std::string& region,
                           const std::string& access_token);
 
-// ---- Session persistence ------------------------------------------------
-
-// Persistent session data: tokens paired with absolute epoch-second expiry
-// timestamps. Can be serialised to / deserialised from a JSON file on disk.
-struct SessionData {
-    std::string access_token;
-    std::string refresh_token;
-    int64_t     access_expires_at  = 0;   // epoch seconds; 0 = unknown
-    int64_t     refresh_expires_at = 0;   // epoch seconds; 0 = unknown (assume valid)
-    std::string user_id;
-    std::string region;
-    std::string user_email;
-
-    // True iff both tokens are non-empty (does NOT check expiry).
-    bool has_tokens() const noexcept
-    {
-        return !access_token.empty() && !refresh_token.empty();
-    }
-
-    // True iff the access token has at least slack_seconds remaining.
-    // When access_expires_at == 0 (unknown) returns false — callers will
-    // then try a refresh to be safe.
-    bool access_valid(int slack_seconds = 60) const noexcept;
-
-    // True iff the refresh token still has time.
-    // When refresh_expires_at == 0 (unknown) returns true — we assume the
-    // refresh token is long-lived and still usable.
-    bool refresh_valid(int slack_seconds = 60) const noexcept;
-};
-
-// Default file path used by save_session() / load_session() when no
-// explicit path is supplied: obn.conf session_path, or
-// config_dir/session.json when empty.
-std::string default_session_path();
-
-// Promote a login / refresh AuthResult into a SessionData, computing
-// access_expires_at from the current wall clock and the server-reported
-// expires_in.  refresh_expires_at is left at 0 (unknown) because
-// AuthResult does not carry it.
-SessionData session_from_auth(const AuthResult& r,
-                              const std::string& region,
-                              const std::string& user_id,
-                              const std::string& user_email = {});
-
-// Persist data to disk with an atomic write (write to <path>.tmp, rename)
-// and force permissions to 0600 on POSIX.  Creates the parent directory
-// if missing.  Returns true on success.
-bool save_session(const SessionData& data, const std::string& path = {});
-
-// Read a session from disk.  On any error (file absent, parse failure)
-// returns a SessionData with empty tokens — callers should check
-// has_tokens().
-SessionData load_session(const std::string& path = {});
-
-// All-in-one startup helper:
-//   1. load_session(path)
-//   2. If access_valid(slack_seconds) → return as-is.
-//   3. Else if refresh_valid(slack_seconds) → refresh_token HTTP call,
-//      save the updated tokens back to disk, return updated SessionData.
-//   4. Otherwise → return SessionData{} with empty tokens.
-SessionData load_and_refresh_if_needed(const std::string& path = {},
-                                       int slack_seconds = 60);
 // NOT YET WIRED - the following struct and function document the cloud MQTT
 // mTLS certificate endpoint. The implementation in cloud_auth.cpp is gated
 // with #if 0. See agent.cpp install_device_cert for the integration plan.

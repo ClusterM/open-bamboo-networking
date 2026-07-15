@@ -52,9 +52,6 @@ LanSession::LanSession(std::string dev_id,
 LanSession::~LanSession()
 {
     disconnect();
-    // reconnect_thread_ is joined inside disconnect(); if the session was
-    // never started the thread was never spawned, so joinable() is false.
-    if (reconnect_thread_.joinable()) reconnect_thread_.join();
 }
 
 std::string LanSession::report_topic_() const
@@ -67,23 +64,31 @@ std::string LanSession::request_topic_() const
     return "device/" + dev_id_ + "/request";
 }
 
-// ---------------------------------------------------------------------------
-// setup_client — creates a fresh mqtt::Client and wires callbacks. Called
-// from start() and from reconnect_loop() before every reconnect attempt.
-// ---------------------------------------------------------------------------
-void LanSession::setup_client()
+int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
 {
-    auto client = std::make_shared<mqtt::Client>(make_client_id());
+    on_connected_ = std::move(on_connected);
+    on_message_   = std::move(on_message);
 
-    client->set_on_connect([this](int rc) {
+    OBN_INFO("LanSession start dev=%s ip=%s user=%s ssl=%d",
+             dev_id_.c_str(), dev_ip_.c_str(), username_.c_str(), use_ssl_);
+
+    try {
+        client_ = std::make_unique<mqtt::Client>(make_client_id());
+    } catch (const std::exception& e) {
+        OBN_ERROR("LanSession mqtt::Client ctor failed: %s", e.what());
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    } catch (...) {
+        OBN_ERROR("LanSession mqtt::Client ctor failed: unknown");
+        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
+    }
+
+    client_->set_on_connect([this](int rc) {
         if (rc == 0) {
-            // Reset the backoff counter on every successful connect.
-            reconnect_attempt_.store(0, std::memory_order_relaxed);
+            // Subscribe to the printer's report topic as soon as we are
+            // connected; the printer answers LAN command requests by pushing
+            // status updates to this topic.
             OBN_INFO("LanSession connected, subscribing to %s", report_topic_().c_str());
-            // Re-subscribe the report topic (also covers post-reconnect).
-            std::shared_ptr<mqtt::Client> local_c;
-            { std::lock_guard<std::mutex> lk(client_mu_); local_c = client_; }
-            if (local_c) local_c->subscribe(report_topic_(), 0);
+            client_->subscribe(report_topic_(), 0);
             if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
         } else {
             OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
@@ -92,53 +97,37 @@ void LanSession::setup_client()
                 on_connected_(BBL::ConnectStatusFailed,
                               std::string("mqtt connect rc=")
                                   + obn::mqtt::Client::connack_str(rc));
-            // Arm backoff retry on CONNACK failure unless shutting down.
-            if (!stopped_.load()) {
-                {
-                    std::lock_guard<std::mutex> lk(reconnect_mu_);
-                    reconnect_wanted_.store(true);
-                }
-                reconnect_cv_.notify_one();
-            }
         }
     });
 
-    client->set_on_disconnect([this](int rc) {
+    client_->set_on_disconnect([this](int rc) {
         OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
         if (on_connected_) {
             on_connected_(rc == 0 ? BBL::ConnectStatusOk : BBL::ConnectStatusLost,
                           std::string("mqtt disconnect rc=") + mqtt::Client::err_str(rc));
         }
-        // rc != 0 means unexpected loss; trigger reconnect unless shutting down.
-        if (rc != 0 && !stopped_.load()) {
-            {
-                std::lock_guard<std::mutex> lk(reconnect_mu_);
-                reconnect_wanted_.store(true);
-            }
-            reconnect_cv_.notify_one();
-        }
     });
 
-    client->set_on_message([this](const mqtt::Message& msg) {
+    client_->set_on_message([this](const mqtt::Message& msg) {
         OBN_DEBUG("LanSession msg dev=%s bytes=%zu",
                   dev_id_.c_str(), msg.payload.size());
         if (on_message_) on_message_(dev_id_, msg.payload);
     });
 
-    // Publish the new client atomically so concurrent readers (publish_json,
-    // is_connected) always see a coherent shared_ptr and can hold a reference
-    // that outlives any subsequent client_.reset() in reconnect_loop.
-    std::lock_guard<std::mutex> lk(client_mu_);
-    client_ = std::move(client);
-}
+    if (!use_ssl_) {
+        OBN_DEBUG("LanSession: use_ssl=false, connecting plain on port 1883");
+    }
 
-int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
-{
-    on_connected_ = std::move(on_connected);
-    on_message_   = std::move(on_message);
-
-    OBN_INFO("LanSession start dev=%s ip=%s user=%s ssl=%d",
-             dev_id_.c_str(), dev_ip_.c_str(), username_.c_str(), use_ssl_);
+    mqtt::ConnectConfig cfg;
+    cfg.host                = dev_ip_;
+    cfg.port                = use_ssl_ ? 8883 : 1883;
+    cfg.username            = username_;
+    cfg.password            = password_;
+    cfg.use_tls             = use_ssl_;
+    cfg.ca_file             = ca_file_;
+    cfg.tls_verify_hostname = dev_id_;
+    cfg.tls_insecure        = !obn::lan_tls::verify_enabled();
+    cfg.keepalive_s         = 60;
 
     if (use_ssl_ && obn::lan_tls::verify_enabled()) {
         if (ca_file_.empty()) {
@@ -151,165 +140,37 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
         }
     }
 
-    if (!use_ssl_) {
-        OBN_DEBUG("LanSession: use_ssl=false, connecting plain on port 1883");
-    }
-
-    // Build and save the connect config once; reconnect_loop() reuses it.
-    connect_cfg_.host                = dev_ip_;
-    connect_cfg_.port                = use_ssl_ ? 8883 : 1883;
-    connect_cfg_.username            = username_;
-    connect_cfg_.password            = password_;
-    connect_cfg_.use_tls             = use_ssl_;
-    connect_cfg_.ca_file             = ca_file_;
-    connect_cfg_.tls_verify_hostname = dev_id_;
-    connect_cfg_.tls_insecure        = !obn::lan_tls::verify_enabled();
-    connect_cfg_.keepalive_s         = 60;
-
     OBN_INFO("LanSession tls=%d ca_file=%s verify_host=%s insecure=%d",
              use_ssl_ ? 1 : 0,
              ca_file_.empty() ? "<none>" : ca_file_.c_str(),
              dev_id_.c_str(),
-             connect_cfg_.tls_insecure ? 1 : 0);
+             cfg.tls_insecure ? 1 : 0);
 
-    try {
-        setup_client();
-    } catch (const std::exception& e) {
-        OBN_ERROR("LanSession mqtt::Client ctor failed: %s", e.what());
-        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
-    } catch (...) {
-        OBN_ERROR("LanSession mqtt::Client ctor failed: unknown");
-        return BAMBU_NETWORK_ERR_CONNECT_FAILED;
-    }
-
-    // Spawn the reconnect supervisor before the initial connect attempt so
-    // that if the connect itself fails synchronously the thread is already
-    // waiting to retry.
-    if (!reconnect_thread_.joinable()) {
-        reconnect_thread_ = std::thread(&LanSession::reconnect_loop, this);
-    }
-
-    std::shared_ptr<mqtt::Client> local_c;
-    { std::lock_guard<std::mutex> lk(client_mu_); local_c = client_; }
-
-    int rc = local_c->connect(connect_cfg_);
+    int rc = client_->connect(cfg);
     if (rc != 0) {
         OBN_ERROR("mqtt connect to %s:%d failed rc=%d (%s)",
-                  connect_cfg_.host.c_str(), connect_cfg_.port,
-                  rc, mqtt::Client::err_str(rc));
-        // Arm the backoff supervisor for an immediate retry.
-        {
-            std::lock_guard<std::mutex> lk(reconnect_mu_);
-            reconnect_wanted_.store(true);
-        }
-        reconnect_cv_.notify_one();
+                  cfg.host.c_str(), cfg.port, rc, mqtt::Client::err_str(rc));
     }
     return map_mqtt_err(rc);
 }
 
 int LanSession::publish_json(const std::string& json_str, int qos)
 {
-    std::shared_ptr<mqtt::Client> local_c;
-    { std::lock_guard<std::mutex> lk(client_mu_); local_c = client_; }
-    if (!local_c) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    int rc = local_c->publish(request_topic_(), json_str, qos, /*retain=*/false);
+    if (!client_) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    int rc = client_->publish(request_topic_(), json_str, qos, /*retain=*/false);
     return rc == MOSQ_ERR_SUCCESS ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
-}
-
-// ---------------------------------------------------------------------------
-// reconnect_loop — background thread with exponential backoff.
-// Wakes when on_disconnect fires with rc!=0 (reconnect_wanted_=true) or
-// when stop() is called. On each wake, waits the backoff interval (so we
-// don't hammer the printer immediately after a reboot), then tears down
-// the old client and opens a fresh connection.
-// ---------------------------------------------------------------------------
-void LanSession::reconnect_loop()
-{
-    static constexpr int kBackoff[]   = {1, 2, 5, 10, 30, 30};
-    static constexpr int kBackoffLast =
-        static_cast<int>(sizeof(kBackoff) / sizeof(kBackoff[0])) - 1;
-
-    while (true) {
-        // Wait until either a reconnect is needed or we are shutting down.
-        std::unique_lock<std::mutex> lk(reconnect_mu_);
-        reconnect_cv_.wait(lk, [&] {
-            return stopped_.load() || reconnect_wanted_.load();
-        });
-        if (stopped_.load()) return;
-
-        // Sleep the backoff window, but wake early on shutdown.
-        const int attempt = reconnect_attempt_.load(std::memory_order_relaxed);
-        const int delay   = kBackoff[attempt < kBackoffLast ? attempt : kBackoffLast];
-        if (reconnect_cv_.wait_for(lk, std::chrono::seconds(delay),
-                                   [&] { return stopped_.load(); })) {
-            return; // woken by stop()
-        }
-        if (stopped_.load()) return;
-
-        reconnect_wanted_.store(false);
-        lk.unlock();
-
-        OBN_INFO("LanSession reconnect attempt %d after %ds backoff dev=%s",
-                 attempt + 1, delay, dev_id_.c_str());
-        reconnect_attempt_.fetch_add(1, std::memory_order_relaxed);
-
-        // Destroy the old client (mosquitto_loop_stop happens inside ~Client).
-        // Hold client_mu_ only for the pointer swap; the actual ~Client runs
-        // after the lock is released (once all local shared_ptr copies drop).
-        { std::lock_guard<std::mutex> lk2(client_mu_); client_.reset(); }
-
-        // Create a fresh client and re-wire callbacks.
-        try {
-            setup_client();
-        } catch (const std::exception& e) {
-            OBN_ERROR("LanSession reconnect: client ctor failed: %s", e.what());
-            // Re-arm so we try again after the next backoff interval.
-            std::lock_guard<std::mutex> lk2(reconnect_mu_);
-            reconnect_wanted_.store(true);
-            continue;
-        }
-
-        // Snapshot the new client under the lock; use the local copy for
-        // the connect call so this pointer cannot race with another reset.
-        std::shared_ptr<mqtt::Client> local_c;
-        { std::lock_guard<std::mutex> lk2(client_mu_); local_c = client_; }
-
-        int rc = local_c->connect(connect_cfg_);
-        if (rc != 0) {
-            OBN_WARN("LanSession reconnect: connect failed rc=%d dev=%s",
-                     rc, dev_id_.c_str());
-            // Re-arm; the loop will sleep the next backoff step and retry.
-            std::lock_guard<std::mutex> lk2(reconnect_mu_);
-            reconnect_wanted_.store(true);
-        }
-        // On success: on_connect callback fires → resets reconnect_attempt_,
-        // re-subscribes the report topic, and calls on_connected_.
-    }
 }
 
 bool LanSession::is_connected() const
 {
-    std::shared_ptr<mqtt::Client> local_c;
-    { std::lock_guard<std::mutex> lk(client_mu_); local_c = client_; }
-    return local_c && local_c->is_connected();
+    return client_ && client_->is_connected();
 }
 
 int LanSession::disconnect()
 {
-    // Idempotent: exchange returns the old value; if already true, return.
-    if (stopped_.exchange(true)) return BAMBU_NETWORK_SUCCESS;
-
-    // Wake the reconnect supervisor so it exits its wait.
-    reconnect_cv_.notify_all();
-
-    // Join the supervisor thread before tearing down the client. This
-    // prevents the thread from touching client_ after we reset it below.
-    if (reconnect_thread_.joinable()) reconnect_thread_.join();
-
-    std::shared_ptr<mqtt::Client> local_c;
-    { std::lock_guard<std::mutex> lk(client_mu_); local_c = std::move(client_); }
-    if (local_c) {
-        local_c->disconnect();
+    if (client_) {
+        client_->disconnect();
+        client_.reset();
     }
     return BAMBU_NETWORK_SUCCESS;
 }
