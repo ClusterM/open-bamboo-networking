@@ -101,14 +101,5 @@ OBN_ABI int bambu_network_send_message(void* agent,
 {
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    // Try LAN first: send_message_to_printer returns INVALID_HANDLE
-    // when no LAN session matches the dev_id, in which case we fall
-    // through to cloud (unless blocked).
-    int rc = a->send_message_to_printer(dev_id, json_str, qos);
-    if (rc != BAMBU_NETWORK_ERR_INVALID_HANDLE) return rc;
-    if (obn::config::current().block_cloud) {
-        OBN_DEBUG("bambu_network_send_message: cloud fallback blocked");
-        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    }
-    return a->cloud_send_message(dev_id, json_str, qos);
+    return a->send_message(dev_id, json_str, qos);
 }

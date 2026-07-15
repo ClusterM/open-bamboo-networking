@@ -126,9 +126,17 @@ public:
                          std::string password,
                          bool        use_ssl);
     int  disconnect_printer();
+    // LAN-only publish (used by the ABI send_message_to_printer entry point).
     int  send_message_to_printer(const std::string& dev_id,
                                  const std::string& json_str,
                                  int                qos);
+    // Preferred publish path for all MQTT commands to a printer: try the LAN
+    // session when one is up for `dev_id` and the publish succeeds; otherwise
+    // fall back to cloud MQTT (unless block_cloud). Matches Studio's
+    // bambu_network_send_message transport selection.
+    int  send_message(const std::string& dev_id,
+                      const std::string& json_str,
+                      int                qos);
 
     // Ensures a live LAN MQTT session to `dev_id`, opening one if needed.
     // Studio only calls connect_printer() for LAN-mode printers; a
@@ -161,19 +169,23 @@ public:
     // `printer_cert` — the authoritative device certificate — which
     // harvest_security_report() feeds into the cert_store pubkey cache.
     // Returns false when the app cert PEM is missing or publish fails.
-    bool request_app_cert_install(const std::string& dev_id, bool via_lan);
+    bool request_app_cert_install(const std::string& dev_id);
 
     // Publishes the security.app_cert_list query (see reverse-networking
     // "5. MQTT.md"): asks the printer which app certificates it already
     // trusts. The report response is parsed by harvest_security_report into
     // app_certs_by_dev_. Returns false on publish failure.
-    bool request_app_cert_list(const std::string& dev_id, bool via_lan);
+    bool request_app_cert_list(const std::string& dev_id);
 
     // True once the printer has advertised the new authorization-control
     // system (print.flag3 bit 16) in a push_status frame. Latched by
-    // harvest_security_flags(); gates app_cert_install so we don't send the
-    // command to firmware that doesn't understand it.
+    // harvest_security_flags().
     bool printer_supports_new_auth(const std::string& dev_id) const;
+
+    // Fire-and-forget app_cert_install once per printer MQTT session when
+    // slicer_app_cert_usable(). Does not wait for the printer_cert reply —
+    // harvest_security_report installs the key asynchronously.
+    void maybe_install_app_cert(const std::string& dev_id);
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
     // printers send NOTIFY every 5 s on UDP port 2021. Returns true if the
@@ -511,6 +523,10 @@ private:
     // install_device_cert() ~1 Hz, and we don't want to pound the printer
     // with a fresh TLS handshake every tick.
     std::set<std::string> certified_devs_;
+    // Devices for which we already fired fire-and-forget app_cert_install
+    // in the current MQTT session (LAN or cloud). Cleared on disconnect so
+    // a reconnect re-provisions. Guarded by mu_.
+    std::set<std::string> app_cert_install_sent_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.

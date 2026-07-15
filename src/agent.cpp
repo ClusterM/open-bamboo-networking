@@ -275,25 +275,10 @@ int Agent::disconnect_printer()
         session->disconnect();
         // Release the cached RSA pubkey; it is re-learned on reconnect.
         cert_store::forget_printer(session->dev_id());
+        std::lock_guard<std::mutex> lk(mu_);
+        app_cert_install_sent_.erase(session->dev_id());
     }
     return BAMBU_NETWORK_SUCCESS;
-}
-
-int Agent::send_message_to_printer(const std::string& dev_id,
-                                   const std::string& json_str,
-                                   int                qos)
-{
-    LanSession* session = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (lan_session_ && lan_session_->dev_id() == dev_id)
-            session = lan_session_.get();
-    }
-    if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
-    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
-    if (dev_pub) EVP_PKEY_free(dev_pub);
-    return session->publish_json(signed_json, qos);
 }
 
 bool Agent::ensure_lan_session(const std::string& dev_id,
@@ -519,11 +504,19 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
     // get_my_machine_list(), and the just-connected LAN printer silently falls
     // back to "found but not paired" until Studio is restarted.
 
-    // LAN went down (lost/failed CONNACK): immediately fail the report
-    // subscription back to the cloud instead of waiting out the silence
-    // watchdog, so status keeps flowing while LAN is unavailable.
-    if (status != BBL::ConnectStatusOk)
+    if (status == BBL::ConnectStatusOk) {
+        // Same as stock: provision the app cert as soon as LAN MQTT is up.
+        maybe_install_app_cert(dev_id);
+    } else {
+        // LAN went down: clear the once-per-session latch and fail the report
+        // subscription back to the cloud instead of waiting out the silence
+        // watchdog, so status keeps flowing while LAN is unavailable.
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            app_cert_install_sent_.erase(dev_id);
+        }
         lan_report_failback(dev_id);
+    }
 }
 
 namespace {
@@ -925,6 +918,68 @@ bool Agent::printer_supports_new_auth(const std::string& dev_id) const
     std::lock_guard<std::mutex> lk(mu_);
     auto it = sec_new_auth_by_dev_.find(dev_id);
     return it != sec_new_auth_by_dev_.end() && it->second;
+}
+
+void Agent::maybe_install_app_cert(const std::string& dev_id)
+{
+    if (dev_id.empty()) return;
+    if (!obn::signing::slicer_app_cert_usable()) return;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!app_cert_install_sent_.insert(dev_id).second)
+            return; // already fired this session
+    }
+
+    // Fire-and-forget: printer_cert arrives later via harvest_security_report.
+    if (!request_app_cert_install(dev_id)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        app_cert_install_sent_.erase(dev_id); // allow retry on next connect
+    }
+}
+
+int Agent::send_message_to_printer(const std::string& dev_id,
+                                   const std::string& json_str,
+                                   int                qos)
+{
+    LanSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_ && lan_session_->dev_id() == dev_id)
+            session = lan_session_.get();
+    }
+    if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+
+    EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
+    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
+    if (dev_pub) EVP_PKEY_free(dev_pub);
+    return session->publish_json(signed_json, qos);
+}
+
+int Agent::send_message(const std::string& dev_id,
+                        const std::string& json_str,
+                        int                qos)
+{
+    bool have_lan = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        have_lan = lan_session_ && lan_session_->dev_id() == dev_id &&
+                   lan_session_->is_connected();
+    }
+
+    if (have_lan) {
+        int rc = send_message_to_printer(dev_id, json_str, qos);
+        if (rc == BAMBU_NETWORK_SUCCESS) return rc;
+        OBN_WARN("send_message: LAN publish failed rc=%d for %s; trying cloud",
+                 rc, dev_id.c_str());
+    }
+
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("send_message: cloud fallback blocked for %s", dev_id.c_str());
+        return have_lan ? BAMBU_NETWORK_ERR_SEND_MSG_FAILED
+                        : BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+    return cloud_send_message(dev_id, json_str, qos);
 }
 
 void Agent::harvest_media_caps(const std::string& dev_id,
@@ -1706,7 +1761,7 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     }).detach();
 }
 
-bool Agent::request_app_cert_install(const std::string& dev_id, bool via_lan)
+bool Agent::request_app_cert_install(const std::string& dev_id)
 {
     const std::string app_cert = obn::signing::slicer_cert_pem();
     if (app_cert.empty()) {
@@ -1728,29 +1783,26 @@ bool Agent::request_app_cert_install(const std::string& dev_id, bool via_lan)
     if (!crl.empty()) msg += obn::json::escape(crl);
     msg += "]}}";
 
-    int rc = via_lan ? send_message_to_printer(dev_id, msg, /*qos=*/0)
-                     : cloud_send_message(dev_id, msg, /*qos=*/0);
+    int rc = send_message(dev_id, msg, /*qos=*/0);
     if (rc != BAMBU_NETWORK_SUCCESS) {
-        OBN_WARN("app_cert_install dev=%s: publish failed rc=%d (via_lan=%d)",
-                 dev_id.c_str(), rc, via_lan ? 1 : 0);
+        OBN_WARN("app_cert_install dev=%s: publish failed rc=%d",
+                 dev_id.c_str(), rc);
         return false;
     }
-    OBN_INFO("app_cert_install dev=%s: request published (via_lan=%d)",
-             dev_id.c_str(), via_lan ? 1 : 0);
+    OBN_INFO("app_cert_install dev=%s: request published", dev_id.c_str());
     return true;
 }
 
-bool Agent::request_app_cert_list(const std::string& dev_id, bool via_lan)
+bool Agent::request_app_cert_list(const std::string& dev_id)
 {
     // Shape per reverse-networking "5. MQTT.md". The printer answers on the
     // report topic with a cert_ids array, harvested by harvest_security_report.
     const std::string msg =
         R"({"security":{"sequence_id":"0","command":"app_cert_list"}})";
-    int rc = via_lan ? send_message_to_printer(dev_id, msg, /*qos=*/0)
-                     : cloud_send_message(dev_id, msg, /*qos=*/0);
+    int rc = send_message(dev_id, msg, /*qos=*/0);
     if (rc != BAMBU_NETWORK_SUCCESS) {
-        OBN_WARN("app_cert_list dev=%s: publish failed rc=%d (via_lan=%d)",
-                 dev_id.c_str(), rc, via_lan ? 1 : 0);
+        OBN_WARN("app_cert_list dev=%s: publish failed rc=%d",
+                 dev_id.c_str(), rc);
         return false;
     }
     return true;
@@ -2229,11 +2281,20 @@ int Agent::connect_cloud()
 int Agent::disconnect_cloud()
 {
     std::unique_ptr<CloudSession> sess;
-    std::set<std::string> devs;
+    std::set<std::string>         devs;
+    std::string                   lan_dev;
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = std::move(cloud_session_);
         devs.swap(cloud_connected_devs_);
+        if (lan_session_) lan_dev = lan_session_->dev_id();
+        // Drop install latches for everything except an active LAN session
+        // (that session still owns its once-per-session install).
+        for (auto it = app_cert_install_sent_.begin();
+             it != app_cert_install_sent_.end(); ) {
+            if (*it == lan_dev) ++it;
+            else                it = app_cert_install_sent_.erase(it);
+        }
     }
     if (sess) sess->stop();
     // Release cached RSA pubkeys learned during this cloud session.
@@ -2291,7 +2352,12 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
     if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    return sess->add_subscribe(filtered);
+    int rc = sess->add_subscribe(filtered);
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        for (const auto& d : filtered)
+            maybe_install_app_cert(d);
+    }
+    return rc;
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
@@ -2300,7 +2366,10 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = cloud_session_.get();
-        for (const auto& d : dev_ids) cloud_connected_devs_.erase(d);
+        for (const auto& d : dev_ids) {
+            cloud_connected_devs_.erase(d);
+            app_cert_install_sent_.erase(d);
+        }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;
     return sess->del_subscribe(dev_ids);
@@ -2320,6 +2389,7 @@ int Agent::cloud_send_message(const std::string& dev_id,
                  dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
+
     EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
     std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
     if (dev_pub) EVP_PKEY_free(dev_pub);
