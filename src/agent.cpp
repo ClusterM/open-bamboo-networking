@@ -1,4 +1,5 @@
 #include "obn/agent.hpp"
+#include "obn/identity_headers.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -1926,18 +1927,33 @@ std::string Agent::device_display_name_for_ip(const std::string& dev_ip) const
     return root->find("dev_name").as_string();
 }
 
-std::map<std::string, std::string> Agent::cloud_api_http_headers() const
+std::map<std::string, std::string>
+Agent::cloud_api_http_headers(bool include_client_id, bool with_content_type) const
 {
-    std::map<std::string, std::string> h;
     obn::auth::Session                 s;
+    std::map<std::string, std::string> extra;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        s = auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
-        for (const auto& kv : extra_http_headers_) h[kv.first] = kv.second;
+        s     = auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
+        extra = extra_http_headers_;
     }
-    if (!s.access_token.empty()) h["Authorization"] = "Bearer " + s.access_token;
-    h["Accept"]        = "application/json";
-    h["Content-Type"]  = "application/json";
+    // Shared identity-header builder (http::perform emits them in stock order);
+    // then overlay Studio's set_extra_http_header values -- extras add new
+    // headers, the identity block wins on conflicts (matches the stock plugin).
+    // Exception: with OBN_ALLOW_VERSION_OVERRIDES set, the host slicer's own
+    // version headers win instead, so its real versions are presented.
+    auto h = obn::bbl::identity_headers(s.access_token, s.user_id,
+                                        include_client_id, with_content_type);
+    const bool allow_ver = obn::versions::allow_overrides();
+    auto is_version_header = [](std::string k) {
+        for (char& c : k) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return k == "x-bbl-client-version" || k == "x-bbl-agent-version" ||
+               k == "user-agent";
+    };
+    for (const auto& kv : extra) {
+        if (!h.count(kv.first)) { h[kv.first] = kv.second; continue; }
+        if (allow_ver && is_version_header(kv.first)) h[kv.first] = kv.second;
+    }
     return h;
 }
 

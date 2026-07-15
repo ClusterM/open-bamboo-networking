@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "obn/abi_export.hpp"
+#include "obn/identity_headers.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/auth.hpp"
@@ -162,9 +163,10 @@ bool fetch_user_print_info(obn::Agent* a,
                            std::vector<std::string>* out_dev_ids)
 {
     const std::string url = obn::cloud::api_host(a->cloud_region()) + path;
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + s.access_token},
-    };
+    // Send the full stock identity block (ordered by http::perform), not just
+    // Authorization. Genuine user/print: no X-BBL-Client-ID, with Content-Type.
+    auto hdrs = a->cloud_api_http_headers(/*include_client_id*/false,
+                                          /*with_content_type*/true);
     auto resp = obn::http::get_json(url, hdrs);
     if (out_resp) *out_resp = resp;
     if (resp.status_code != 200 || resp.body.empty()) return false;

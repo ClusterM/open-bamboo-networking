@@ -276,33 +276,18 @@ int request_web_sso_ticket(Agent* agent, std::string* ticket)
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
     auto hdrs = agent->cloud_api_http_headers();
 
-    const char* attempts[] = {
-        "/v1/user-service/user/ticket/web",
-        "/v1/user-service/user/web-ticket",
-        "/v1/user-service/user/slicer/ticket",
-    };
-    for (const char* path : attempts) {
-        std::string url = api_base(agent) + path;
-        auto        resp = obn::http::post_json(url, "{}", hdrs);
-        OBN_DEBUG("request_web_sso_ticket POST %s -> %ld", path, resp.status_code);
-        if (resp.error.empty() && resp.status_code >= 200 && resp.status_code < 300) {
-            std::string t = extract_ticket_from_json(resp.body);
-            if (!t.empty()) {
-                if (ticket) *ticket = std::move(t);
-                return BAMBU_NETWORK_SUCCESS;
-            }
-        }
-    }
-    // Some builds expose a GET with no body.
-    {
-        std::string url = api_base(agent) + "/v1/user-service/user/ticket";
-        auto        resp = obn::http::get_json(url, hdrs);
-        if (resp.error.empty() && resp.status_code == 200) {
-            std::string t = extract_ticket_from_json(resp.body);
-            if (!t.empty()) {
-                if (ticket) *ticket = std::move(t);
-                return BAMBU_NETWORK_SUCCESS;
-            }
+    // Stock request_bind_ticket: a single GET with no body (X-BBL-Client-ID +
+    // Content-Type present). The response carries the short-lived ticket, which
+    // Studio hands to the browser as .../api/sign-in/ticket?...&ticket=<t> to SSO
+    // the MakerWorld web session. (Confirmed by MITM of the genuine plugin.)
+    std::string url  = api_base(agent) + "/v1/user-service/user/ticket";
+    auto        resp = obn::http::get_json(url, hdrs);
+    OBN_DEBUG("request_web_sso_ticket GET /user/ticket -> %ld", resp.status_code);
+    if (resp.error.empty() && resp.status_code >= 200 && resp.status_code < 300) {
+        std::string t = extract_ticket_from_json(resp.body);
+        if (!t.empty()) {
+            if (ticket) *ticket = std::move(t);
+            return BAMBU_NETWORK_SUCCESS;
         }
     }
     return BAMBU_NETWORK_ERR_INVALID_RESULT;
