@@ -1340,7 +1340,8 @@ Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 2. `PUT <upload_url>`  
    uploads the config 3mf.
 3. `PUT /v1/iot-service/api/user/notification` and poll  
-   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`.
+   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`  
+   until `{"message":"success"}` (HTTP stays 200; intermediate polls return `"message":"running"`).
 4. `PATCH /v1/iot-service/api/user/project/<project_id>`  
    first patch with placeholder `ftp://...` URL (mirrors stock plugin behaviour).
 5. `GET /v1/iot-service/api/user/upload?models=<model_id>_<profile_id>_<plate>.3mf`  

@@ -447,10 +447,10 @@ int notify_upload(const std::string& api, const std::string& token,
     return 0;
 }
 
-// Polls /notification?action=upload until the server acknowledges.
-// In our MITM trace the first GET already returns {"message":"success"}
-// right away, but the original plugin polls for a few seconds; we mirror
-// that with a short retry loop to stay compatible with slower backends.
+// Polls /notification?action=upload until the async upload settles.
+// HTTP is always 200; the body is {"message":"running"|"success", ...}.
+// Keep polling while message=="running"; "success" ends the wait. Any
+// other message is a hard failure.
 int poll_upload(const std::string& api, const std::string& token,
                 const std::string& user_id,
                 const std::string& ticket,
@@ -466,13 +466,27 @@ int poll_upload(const std::string& api, const std::string& token,
     for (int attempt = 0; attempt < 20; ++attempt) {
         if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
         auto resp = obn::http::get_json(url, hdrs);
-        if (resp.error.empty() && status_ok(resp.status_code)) {
+        if (!resp.error.empty() || !status_ok(resp.status_code)) {
+            OBN_DEBUG("cloud_print: poll_upload attempt=%d status=%ld err=%s",
+                      attempt, resp.status_code, resp.error.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        auto root = obn::json::parse(resp.body);
+        const std::string msg = root ? root->find("message").as_string()
+                                     : std::string{};
+        if (msg == "running") {
+            OBN_DEBUG("cloud_print: poll_upload running attempt=%d", attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        if (msg == "success") {
             OBN_DEBUG("cloud_print: poll_upload OK attempt=%d", attempt);
             return 0;
         }
-        OBN_DEBUG("cloud_print: poll_upload attempt=%d status=%ld err=%s",
-                  attempt, resp.status_code, resp.error.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_NOTIFICATION_FAILED,
+                          "poll_upload", resp);
     }
     if (update_fn) update_fn(BBL::PrintingStageERROR,
                              BAMBU_NETWORK_ERR_PRINT_WR_GET_NOTIFICATION_TIMEOUT,
