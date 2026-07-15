@@ -53,6 +53,15 @@ std::string trim_ip_string(std::string s)
     return s;
 }
 
+// Millisecond epoch as MQTT sequence_id — same style as print_job::now_seq_id.
+std::string now_seq_id()
+{
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    return std::to_string(ms);
+}
+
 } // namespace
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
@@ -1764,24 +1773,20 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
 bool Agent::request_app_cert_install(const std::string& dev_id)
 {
     const std::string app_cert = obn::signing::slicer_cert_pem();
-    if (app_cert.empty()) {
-        OBN_INFO("app_cert_install dev=%s: no slicer_cert.pem in config dir, "
-                 "skipping (TLS-leaf TOFU fallback stays in effect)",
-                 dev_id.c_str());
-        return false;
-    }
     const std::string crl = obn::signing::slicer_crl_pem();
+    const std::string seq = now_seq_id();
 
-    // Shape per reverse-networking "5. MQTT.md". The printer stores the app
-    // cert chain + CRL and replies on the report topic with its own device
-    // certificate in `printer_cert` (picked up by harvest_security_report).
+    // The printer stores the app cert chain + CRL and replies on the report topic
+    // with its own device certificate in `printer_cert` (picked up by harvest_security_report).
     std::string msg;
     msg.reserve(app_cert.size() + crl.size() + 128);
-    msg += R"({"security":{"sequence_id":"0","command":"app_cert_install","app_cert":)";
+    msg += R"({"security":{"sequence_id":")";
+    msg += seq;
+    msg += R"(","command":"app_cert_install","app_cert":)";
     msg += obn::json::escape(app_cert);
-    msg += ",\"crl\":[";
-    if (!crl.empty()) msg += obn::json::escape(crl);
-    msg += "]}}";
+    msg += ",\"crl\":";
+    msg += obn::json::escape(crl);
+    msg += "}}";
 
     int rc = send_message(dev_id, msg, /*qos=*/0);
     if (rc != BAMBU_NETWORK_SUCCESS) {
@@ -1798,7 +1803,8 @@ bool Agent::request_app_cert_list(const std::string& dev_id)
     // Shape per reverse-networking "5. MQTT.md". The printer answers on the
     // report topic with a cert_ids array, harvested by harvest_security_report.
     const std::string msg =
-        R"({"security":{"sequence_id":"0","command":"app_cert_list"}})";
+        std::string(R"({"security":{"sequence_id":")") + now_seq_id() +
+        R"(","command":"app_cert_list"}})";
     int rc = send_message(dev_id, msg, /*qos=*/0);
     if (rc != BAMBU_NETWORK_SUCCESS) {
         OBN_WARN("app_cert_list dev=%s: publish failed rc=%d",

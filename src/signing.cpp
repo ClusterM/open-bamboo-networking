@@ -464,12 +464,12 @@ std::string base64_encode(const unsigned char* data, std::size_t len)
 
 bool slicer_app_cert_usable()
 {
-    // Need both the app private key (MQTT/HTTP signing) and the matching
-    // certificate PEM (security.app_cert_install). Defaults under config_dir
-    // count when obn.conf paths are empty.
-    if (!slicer_pkey()) return false;
+    // app_cert_install needs the app certificate PEM + CRL only (no private
+    // key). Defaults under config_dir count when obn.conf paths are empty.
     const std::string pem = slicer_cert_pem();
     if (pem.empty()) return false;
+    const std::string crl_pem = slicer_crl_pem();
+    if (crl_pem.empty()) return false;
 
     BIO* bio = ::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
     if (!bio) return false;
@@ -486,13 +486,54 @@ bool slicer_app_cert_usable()
     const ASN1_TIME* not_after  = ::X509_get0_notAfter(cert);
     const bool not_yet = not_before && ::X509_cmp_current_time(not_before) > 0;
     const bool expired = !not_after || ::X509_cmp_current_time(not_after) < 0;
-    ::X509_free(cert);
-
     if (not_yet || expired) {
+        ::X509_free(cert);
         OBN_ERROR("signing: slicer app certificate is %s — skipping app_cert_install",
                  expired ? "expired" : "not yet valid");
         return false;
     }
+
+    BIO* crl_bio = ::BIO_new_mem_buf(crl_pem.data(),
+                                     static_cast<int>(crl_pem.size()));
+    if (!crl_bio) {
+        ::X509_free(cert);
+        return false;
+    }
+    X509_CRL* crl = ::PEM_read_bio_X509_CRL(crl_bio, nullptr, nullptr, nullptr);
+    ::BIO_free(crl_bio);
+    if (!crl) {
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer_crl.pem is not a valid X.509 CRL");
+        return false;
+    }
+
+    // lastUpdate (thisUpdate) must be in the past; nextUpdate, when present,
+    // must be in the future. Missing nextUpdate is treated as still valid —
+    // some CRLs omit it; request_app_cert_install still needs the PEM.
+    const ASN1_TIME* last_update = ::X509_CRL_get0_lastUpdate(crl);
+    const ASN1_TIME* next_update = ::X509_CRL_get0_nextUpdate(crl);
+    const bool crl_not_yet = last_update && ::X509_cmp_current_time(last_update) > 0;
+    const bool crl_expired = next_update && ::X509_cmp_current_time(next_update) < 0;
+    if (crl_not_yet || crl_expired) {
+        ::X509_CRL_free(crl);
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer app CRL is %s — skipping app_cert_install",
+                 crl_expired ? "expired" : "not yet valid");
+        return false;
+    }
+
+    // Reject if this leaf appears on the CRL.
+    X509_REVOKED* revoked = nullptr;
+    if (::X509_CRL_get0_by_cert(crl, &revoked, cert) == 1) {
+        ::X509_CRL_free(crl);
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer app certificate is revoked on slicer_crl.pem "
+                  "— skipping app_cert_install");
+        return false;
+    }
+
+    ::X509_CRL_free(crl);
+    ::X509_free(cert);
     return true;
 }
 

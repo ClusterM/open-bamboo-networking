@@ -70,9 +70,10 @@ std::string slicer_cert_pem();
 // config_dir/slicer_crl.pem. "" when the file is absent.
 std::string slicer_crl_pem();
 
-// True when slicer_key.pem + slicer_cert.pem are present (config paths or
-// config_dir defaults) and the leaf certificate is currently within its
-// notBefore/notAfter window. Gates fire-and-forget app_cert_install.
+// True when slicer_cert.pem + slicer_crl.pem are present (config paths or
+// config_dir defaults), the leaf certificate is within its notBefore/notAfter
+// window, the CRL is within lastUpdate/nextUpdate, and the leaf is not listed
+// as revoked. Gates fire-and-forget app_cert_install (no private key needed).
 bool slicer_app_cert_usable();
 
 } // namespace obn::signing

@@ -552,7 +552,7 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << ",\"amsMapping\":"  << json_or_default(p.ams_mapping, "[-1]");
     os << ",\"amsMapping2\":" << ams_mapping2_for_cloud(p);
     if (!p.nozzle_mapping.empty()) {
-        os << ",\"nozzleMapping\":" << p.nozzle_mapping; // TODO: test
+        os << ",\"nozzleMapping\":" << p.nozzle_mapping;
     }
     os << ",\"autoBedLeveling\":"     << p.auto_bed_leveling;
     os << ",\"bedLeveling\":"         << to_bool(p.task_bed_leveling);
@@ -785,6 +785,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // Upload progress for the config file is tiny and confusing in the
     // UI; we report 0% at start and 10% after. The big file (step G)
     // owns 10..95%.
+    // TODO: test progress reporting
     if (int rc = s3_put(info.upload_url, config_bytes, update_fn, cancel_fn,
                         /*stage_start_pct=*/0, /*stage_end_pct=*/10,
                         BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_CONFIG_TO_OSS_FAILED);
@@ -810,7 +811,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     std::string md5         = p.ftp_file_md5;
     // The printer will re-compute md5 on download; if Studio didn't
     // give us one, keep the field so the server schema stays happy.
-    if (md5.empty()) md5 = "00000000000000000000000000000000";
+    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: ensure that it is a valid md5
 
     if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
                                md5, p.plate_index, ftp_url, update_fn);
