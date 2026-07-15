@@ -199,8 +199,6 @@ int list(Agent* a, const BBL::FilamentQueryParams& params, std::string* out_body
         OBN_WARN("cloud_filament::list: not logged in");
         return BAMBU_NETWORK_ERR_GET_FILAMENTS_FAILED;
     }
-    // GET: avoid Content-Type so picky backends don't 415.
-    hdrs.erase("Content-Type");
 
     const std::string url = base_v2(a) + build_list_query(params);
     auto resp = obn::http::get_json(url, hdrs);
@@ -307,7 +305,6 @@ int config(Agent* a, std::string* out_body)
         OBN_WARN("cloud_filament::config: not logged in");
         return BAMBU_NETWORK_ERR_GET_FILAMENT_CONFIG_FAILED;
     }
-    hdrs.erase("Content-Type");
 
     auto resp = obn::http::get_json(base_config(a), hdrs);
     OBN_INFO("cloud_filament::config http=%ld bytes=%zu",

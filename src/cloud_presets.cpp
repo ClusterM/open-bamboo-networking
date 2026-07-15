@@ -7,6 +7,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
+#include "obn/slicer_plugin_versions.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -182,9 +183,7 @@ std::string build_upload_body(const std::string& name,
         os << ",\"type\":" << obn::json::escape(typ);
         os << ",\"version\":" << obn::json::escape(ver);
     } else {
-        if (!typ.empty()) {
-            os << ",\"type\":" << obn::json::escape(typ);
-        }
+
         if (!ver.empty()) {
             os << ",\"version\":" << obn::json::escape(ver);
         }
@@ -263,17 +262,36 @@ int list(Agent* a, const std::string& bundle_version, std::vector<Meta>* out)
     if (!a || !out) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     out->clear();
 
-    auto hdrs = a->cloud_api_http_headers();
+    // Genuine slicer/setting GET: X-BBL-Client-ID present, no Content-Type
+    // (some backends also 415 if Content-Type is present on this GET).
+    auto hdrs = a->cloud_api_http_headers(/*include_client_id*/true,
+                                          /*with_content_type*/false);
     if (hdrs.find("Authorization") == hdrs.end()) {
         return BAMBU_NETWORK_ERR_GET_SETTING_LIST_FAILED;
     }
-    // GET doesn't need Content-Type; some backends 415 if present.
-    hdrs.erase("Content-Type");
 
-    std::string url = settings_base(a) + "?public=false";
-    if (!bundle_version.empty()) {
-        url += "&version=" + obn::http::url_encode(bundle_version);
+    // Preset-sync bundle version. By default we send the stock release's value
+    // from the version table and ignore the host slicer's own bundle version, so
+    // a non-Bambu host stays indistinguishable. Only when the operator opts in
+    // with OBN_ALLOW_VERSION_OVERRIDES do we obey the host-supplied version.
+    std::string version;
+    if (obn::versions::allow_overrides() && !bundle_version.empty()) {
+        version = bundle_version;
+    } else {
+#ifdef OBN_VERSION_STRING
+        version = obn::versions::sync_version(OBN_VERSION_STRING);
+#else
+        version = obn::versions::newest().sync;
+#endif
     }
+
+    // Query order matches the stock plugin: version first, then public.
+    std::string url = settings_base(a);
+    char sep = '?';
+    if (!version.empty()) {
+        url += sep; url += "version=" + obn::http::url_encode(version); sep = '&';
+    }
+    url += sep; url += "public=false";
 
     auto resp = obn::http::get_json(url, hdrs);
     OBN_INFO("cloud_presets::list http=%ld bytes=%zu",
@@ -323,10 +341,11 @@ int get_full(Agent* a,
     if (!a || !values_map || setting_id.empty())
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
-    auto hdrs = a->cloud_api_http_headers();
+    // Genuine slicer/setting/<id> GET: X-BBL-Client-ID present, no Content-Type.
+    auto hdrs = a->cloud_api_http_headers(/*include_client_id*/true,
+                                          /*with_content_type*/false);
     if (hdrs.find("Authorization") == hdrs.end())
         return BAMBU_NETWORK_ERR_GET_SETTING_LIST_FAILED;
-    hdrs.erase("Content-Type");
 
     const std::string url = settings_base(a) + "/"
                           + obn::http::url_encode(setting_id);

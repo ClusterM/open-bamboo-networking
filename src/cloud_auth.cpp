@@ -1,4 +1,5 @@
 #include "obn/cloud_auth.hpp"
+#include "obn/identity_headers.hpp"
 
 #include "obn/config.hpp"
 #include "obn/http_client.hpp"
@@ -83,7 +84,11 @@ AuthResult login_with_ticket(const std::string& region,
     // Studio will re-open the login dialog.
     std::string url  = api_host(region) + "/v1/user-service/user/ticket/" + ticket;
     std::string body = std::string("{\"ticket\":") + obn::json::escape(ticket) + "}";
-    auto resp = obn::http::post_json(url, body);
+    // Pre-auth: send the stock identity block (correct User-Agent, X-BBL-* set)
+    // but no Authorization/X-BBL-Client-ID (we have no token or user id yet).
+    auto resp = obn::http::post_json(url, body,
+        obn::bbl::identity_headers(/*token*/std::string{}, /*uid*/std::string{},
+                                   /*include_client_id*/false, /*with_content_type*/true));
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
     if (!resp.error.empty()) {
@@ -107,14 +112,15 @@ AuthResult refresh_token(const std::string& region,
                          const std::string& refresh)
 {
     AuthResult r;
-    std::map<std::string, std::string> hdrs;
-    if (!access.empty())
-        hdrs["Authorization"] = "Bearer " + access;
-    // Stock: POST /v1/user-service/user/refreshtoken + Bearer + refreshToken body.
-    auto resp = obn::http::post_json(
-        api_host(region) + "/v1/user-service/user/refreshtoken",
-        refresh_body(refresh),
-        hdrs);
+    // Note: the endpoint name varies between Studio versions and the HA
+    // community docs (`/v1/user-service/user/refreshtoken` or
+    // `/v1/user-service/user/refresh-token`). We try the more common
+    // dash-less form; if it 404s we'll iterate later.
+    // Pre-auth refresh: stock identity block, no Authorization/X-BBL-Client-ID.
+    auto resp = obn::http::post_json(api_host(region) + "/v1/user-service/user/refreshtoken",
+                                     refresh_body(refresh),
+        obn::bbl::identity_headers(/*token*/std::string{}, /*uid*/std::string{},
+                                   /*include_client_id*/false, /*with_content_type*/true)); (cloud: present the genuine stock identity on every api.bambulab.com call)
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
     if (!resp.error.empty()) {
@@ -162,9 +168,11 @@ ProfileResult get_profile(const std::string& region,
                           const std::string& access_token)
 {
     ProfileResult r;
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + access_token},
-    };
+    // Full stock identity block (ordered by http::perform). No X-BBL-Client-ID:
+    // this runs before we know the user id (it is what fetches it).
+    auto hdrs = obn::bbl::identity_headers(access_token, /*user_id*/std::string{},
+                                           /*include_client_id*/false,
+                                           /*with_content_type*/true);
     auto resp = obn::http::get_json(api_host(region) + "/v1/user-service/my/profile", hdrs);
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
@@ -199,5 +207,72 @@ ProfileResult get_profile(const std::string& region,
     r.ok = true;
     return r;
 }
+
+#if 0 // NOT YET WIRED - kept as documentation; application_token derivation unconfirmed
+DeviceCertResult fetch_device_cert(const std::string& region,
+                                   const std::string& access_token,
+                                   const std::string& application_token,
+                                   const std::string& aes256_key)
+{
+    DeviceCertResult r;
+    if (application_token.empty()) {
+        r.error_message = "application_token required (see cloud_auth.hpp comment)";
+        return r;
+    }
+    // Endpoint confirmed from MITM capture of the stock plugin:
+    //   GET /v1/iot-service/api/user/applications/{token}/cert?aes256={key}&ver=1
+    // The client generates a random 32-byte AES key, base64url-encodes it, and
+    // passes it here so the server can encrypt the returned private key with it.
+    const std::string encoded_token = obn::http::url_encode(application_token);
+    const std::string encoded_key   = obn::http::url_encode(aes256_key);
+    std::string url = api_host(region)
+        + "/v1/iot-service/api/user/applications/"
+        + encoded_token
+        + "/cert?aes256="
+        + encoded_key
+        + "&ver=1";
+    // Full stock identity block (ordered by http::perform). Genuine get_app_cert
+    // sends neither X-BBL-Client-ID nor Content-Type.
+    auto hdrs = obn::bbl::identity_headers(access_token, /*user_id*/std::string{},
+                                           /*include_client_id*/false,
+                                           /*with_content_type*/false);
+    auto resp = obn::http::get_json(url, hdrs);
+    r.http_status = resp.status_code;
+    r.raw_body    = resp.body;
+    if (!resp.error.empty()) {
+        r.error_message = resp.error;
+        return r;
+    }
+    if (resp.status_code != 200) {
+        r.error_message = "http " + std::to_string(resp.status_code);
+        return r;
+    }
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root) {
+        r.error_message = "bad JSON: " + perr;
+        return r;
+    }
+    // Response shape (from MITM capture):
+    //   {"cert": "<3-cert PEM chain>", "crl": ["<PEM CRL>"],
+    //    "key": "<AES-256-CBC encrypted private key, base64>"}
+    // Chain order: device leaf -> per-device intermediate CA
+    // ("{dev_uid}.bambulab.com") -> Bambu root CA.
+    // CRL is valid ~30 days; refresh before expiry to maintain MQTT auth.
+    // Decrypt `key` with AES-256-CBC using the caller's base64url-decoded
+    // aes256_key before passing it to mosquitto.
+    r.cert = root->find("cert").as_string();
+    // crl is an array of PEM strings; take the first entry.
+    {
+        auto crl_v = root->find("crl");
+        const auto& crl_arr = crl_v.as_array();
+        if (!crl_arr.empty()) r.crl = crl_arr[0].as_string();
+    }
+    r.key  = root->find("key").as_string();
+    r.ok   = !r.cert.empty();
+    if (!r.ok) r.error_message = "cert field missing in response";
+    return r;
+}
+#endif // NOT YET WIRED
 
 } // namespace obn::cloud
