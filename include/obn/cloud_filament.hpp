@@ -30,11 +30,16 @@
 // already set by the global extra_http_headers wired via
 // `bambu_network_set_extra_http_header`.
 
+#include "obn/bambu_networking.hpp"
+
 #include <string>
 
 namespace BBL {
 struct FilamentQueryParams;
 struct FilamentDeleteParams;
+#if ABI_VERSION >= 0x020801
+struct AmsSyncParams;
+#endif
 }
 
 namespace obn {
@@ -73,6 +78,16 @@ int batch_delete(Agent* agent, const BBL::FilamentDeleteParams& params,
 // canonical filament catalogue (vendor/type/name/id quadruples).
 // Returns BAMBU_NETWORK_SUCCESS / BAMBU_NETWORK_ERR_GET_FILAMENT_CONFIG_FAILED.
 int config(Agent* agent, std::string* out_body);
+
+#if ABI_VERSION >= 0x020801
+// POST /my/filament/v2/ams/sync. Studio calls this when AMS mount fields
+// change (insert / remove / move spool) so the cloud catalogue keeps the
+// latest in-printer snapshot. MITM shape:
+//   {"devId":"...","items":[{RFID, amsSn, slotId, ...}]}
+// Response is forwarded verbatim (createdRFIDs/results/filamentV2/hits).
+int sync_ams(Agent* agent, const BBL::AmsSyncParams& params,
+             std::string* out_body);
+#endif
 
 } // namespace cloud_filament
 } // namespace obn

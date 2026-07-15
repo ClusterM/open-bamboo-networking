@@ -66,6 +66,16 @@ struct Settings {
     std::string slicer_cert_pem;
     std::string slicer_crl_pem;
 
+    // Value sent in the `X-BBL-Client-Name` HTTP header on cloud REST calls.
+    // The MakerWorld `POST /my/task` endpoint authorizes access to the
+    // uploaded print content ONLY for the stock client name "BambuStudio";
+    // any other value is rejected with HTTP 403 ("no access rights to the
+    // content"), which blocks cloud printing and "local print with record".
+    // Empty = honest default "OpenBambooNetworking" (cloud /my/task will 403).
+    // Set to "BambuStudio" to make cloud printing work by presenting the
+    // stock client identity.
+    std::string client_name;
+
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
     std::string bambusource_log_stderr;

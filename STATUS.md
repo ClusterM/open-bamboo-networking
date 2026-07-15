@@ -96,6 +96,25 @@ Source: [src/abi_cloud.cpp](src/abi_cloud.cpp).
 | `bambu_network_enable_multi_machine` | ✅ | No-op: multi-machine mode only toggles Studio's UI; there is no plugin-side state tied to it. |
 | `bambu_network_send_message` | ✅ | LAN-first routing: tries the LAN MQTT session for the target `dev_id`; falls back to cloud MQTT when no LAN session matches. |
 
+#### LAN-priority report subscription (defer-close + failback)
+
+Stock Studio's `DeviceSubscribeManager` prefers LAN telemetry and leaves the cloud `device/<id>/report` topic unsubscribed while LAN is alive (see [NETWORK_PLUGIN.md §6.3](NETWORK_PLUGIN.md#63-cloud--connection-and-subscriptions)). Since our plugin keeps both MQTT sessions up, it reproduces that policy itself rather than double-delivering reports over both transports. The FSM lives in [src/agent.cpp](src/agent.cpp):
+
+- **Prefer LAN on first local report.** `maybe_prefer_lan_subscription(dev_id)` (called from `notify_local_message`) records `last_lan_report_[dev_id]` and, on the *first* LAN report for a device, inserts it into `lan_report_priority_` and issues `cloud_del_subscribe({dev_id})` — a **defer-close** of the cloud report leg (the cloud MQTT socket stays connected, just unsubscribed from that device's reports). It also starts the watchdog.
+- **Silence watchdog.** `lan_watchdog_loop()` wakes every `kLanWatchdogTick` (2 s); if a device in `lan_report_priority_` has produced no LAN report for longer than `kLanSilenceFailback` (6 s) it triggers failback.
+- **Failback to cloud.** `lan_report_failback(dev_id)` removes the device from `lan_report_priority_` and calls `cloud_add_subscribe({dev_id})`. It also fires immediately (not just on watchdog timeout) from `notify_local_connected` when the LAN session drops with a non-OK status.
+- **Reconcile with the implicit subscribe.** `cloud_add_subscribe` filters out any device currently in `lan_report_priority_`, so the implicit subscribe that `get_user_print_info` performs cannot re-open a cloud report subscription the FSM intends to keep deferred.
+
+```mermaid
+stateDiagram-v2
+  [*] --> CloudSubscribed
+  CloudSubscribed --> LanPreferred: first LAN report\n(cloud_del_subscribe)
+  LanPreferred --> LanPreferred: LAN report\n(refresh last_lan_report_)
+  LanPreferred --> CloudSubscribed: LAN silent > 6s\nOR LAN drop\n(cloud_add_subscribe)
+```
+
+**`block_cloud` audit.** When `block_cloud` is set, `add_subscribe` / `del_subscribe` / `connect_server` short-circuit to `SUCCESS` without ever creating a cloud subscription ([src/abi_cloud.cpp](src/abi_cloud.cpp)), and `get_user_print_info` skips its implicit `cloud_add_subscribe` ([src/abi_http.cpp](src/abi_http.cpp)). So the plugin never opens a cloud subscription it then fails to tear down; under `block_cloud` the printer must be reachable over LAN for status to flow, which is the intended trade-off.
+
 ### 6.5. Authentication and user
 
 Source: [src/abi_user.cpp](src/abi_user.cpp).
@@ -167,7 +186,7 @@ Source: [src/abi_http.cpp](src/abi_http.cpp).
 | `bambu_network_set_extra_http_header` | ✅ | Stored on the agent and applied to every outbound HTTPS request. |
 | `bambu_network_get_my_message` | ❌ | Returns `SUCCESS` with empty body; Studio shows an empty inbox. |
 | `bambu_network_check_user_task_report` | ❌ | Returns `SUCCESS` with `task_id=0, printable=false`. |
-| `bambu_network_get_user_print_info` | ✅ | Fetches `/v1/iot-service/api/user/bind`, remaps field names (`name` → `dev_name`, `online` → `dev_online`, `print_status` → `task_status`) so Studio's `DeviceManager::parse_user_print_info` finds everything, and implicitly subscribes to `device/<id>/report` for each returned device (matching stock push-delivery behaviour). |
+| `bambu_network_get_user_print_info` | ✅ | Fetches `GET /v1/iot-service/api/user/print?force=true` **first** (`src/abi_http.cpp`), which already returns Studio-native field names (`dev_name`, `dev_online`, `dev_access_code`) so no remap is needed; falls back to `GET /v1/iot-service/api/user/bind` (with the `name`→`dev_name` / `online`→`dev_online` / `print_status`→`task_status` remap) only when `/user/print` yields nothing. Implicitly subscribes to `device/<id>/report` for each returned device (matching stock push-delivery behaviour), skipping the subscribe when `block_cloud` is set. Cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49). |
 | `bambu_network_get_user_tasks` | ❌ | Returns `SUCCESS` with empty body; no MakerWorld task history is served. |
 | `bambu_network_get_task_plate_index` | ❌ | Returns `SUCCESS` with `plate_index=-1`. |
 | `bambu_network_get_subtask_info` | ✨ | LAN prints with zero ids → synthetic `lan-<fnv>` on `push_status`; reply includes loopback `thumbnail.url`. Backend: `cover_cache` **SUB_FILE on TLS :6000** (`#thumbnail` / `#Metadata/plate_N.png`). |
@@ -200,6 +219,16 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 | `bambu_network_install_device_cert` | ✅ | Snapshots the device leaf to `<config_dir>/certs/<serial>.pem` (bootstrap connect uses verify-off once); subsequent LAN TLS loads that leaf with `X509_V_FLAG_PARTIAL_CHAIN`. Deduped per device. |
 | `bambu_network_start_discovery` | ✅ | Starts the SSDP multicast listener on `239.255.255.250:1990`. SSDP updates populate the LAN TLS registry (IP → serial) when values change. |
 
+#### Always-on LAN for the selected printer
+
+Studio only calls `connect_printer` for LAN-mode devices, so a cloud-paired printer would otherwise never get a LAN MQTT session — yet the LAN-priority subscription (§6.3) and the LAN-first print path (§6.8) both need one. The plugin therefore brings the session up proactively whenever it knows the IP and access code. Implemented in [src/agent.cpp](src/agent.cpp):
+
+- **`ensure_lan_session(dev_id, ip_hint, code_hint)`** — idempotent session opener. Fast-paths to `true` when already connected to `dev_id`; otherwise resolves the IP / access code from the hints or the cached `dev_id → {dev_ip, access_code}` maps (SSDP IP + cloud `dev_access_code`, per [NETWORK_PLUGIN.md §6.4.1](NETWORK_PLUGIN.md#641-where-the-lan-credentials-come-from-incl-cloud-paired-printers)), calls `connect_printer`, and polls up to 3 s for the MQTT `CONNACK`. Returns `false` (caller degrades gracefully) when credentials are missing or the broker never accepts.
+- **`autostart_lan_if_selected(dev_id)`** — spawns a detached thread that calls `ensure_lan_session` for the currently `user_selected_machine_` when its IP and code are known, guarded by `lan_autostart_inflight_` against duplicate attempts. Hooked into the three points where new credentials/selection become known:
+  - `note_device_access_code` (a fresh access code arrived),
+  - `set_user_selected_machine` (the user switched active printer),
+  - `cache_ssdp_json_for_bind` (SSDP produced/refreshed an IP).
+
 ### 6.4.1. LAN TLS verification (MQTT, FTPS, RTSPS, MJPEG)
 
 Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp), [NETWORK_PLUGIN.md §6.1.1](NETWORK_PLUGIN.md#611-certificate-files-set_cert_file).
@@ -223,8 +252,8 @@ Source: [src/abi_print.cpp](src/abi_print.cpp). **Studio-side orchestration** (w
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_start_print` | 🔒⚠️ | Pure cloud path: Studio publishes a signed MQTT command to the cloud-paired printer. The required per-install RSA signing keys are not reproducible, so the command is rejected with `84033543 "MQTT Command verification failed"`. Works only against a printer with Developer Mode enabled, where signature validation is skipped and the command arrives via LAN MQTT. |
-| `bambu_network_start_local_print_with_record` | ⚠️ | Hybrid: cloud REST/S3 + LAN upload (`:6000`+`brtc://` or FTPS); cloud `create_task` soft-fails in Dev Mode. |
+| `bambu_network_start_print` | ⚠️ | **Cloud print works end-to-end (MVP)** via the cloud REST pipeline + presigned S3 PUT + `POST /v1/user-service/my/task`; the Bambu cloud dispatches the job to the printer, so OBN **does not** publish an MQTT `project_file` on the cloud channel (that would double-fire and 0500_4004 "printer busy"). Prerequisites: user-supplied **`slicer_key.pem`** (for `x-bbl-app-certification-id` / `x-bbl-device-security-sign`) and **`client_name = BambuStudio`** in `obn.conf` (else `/my/task` 403s). We no longer use the signed **MQTT** `project_file` for cloud (which needs the non-reproducible per-install key and would fail `84033543`). See [NETWORK_PLUGIN.md §6.8.1.1](NETWORK_PLUGIN.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
+| `bambu_network_start_local_print_with_record` | ⚠️ | **LAN-first (`use_lan_channel=true`).** Brings up a LAN MQTT session itself via `ensure_lan_session` (§6.4 — Studio establishes no `LanSession` for a cloud-bound printer), uploads the `.3mf` straight to printer storage (`:6000` brtc/emmc or FTPS), posts `/my/task` with `mode=lan_file` **purely as a cloud history record** (the cloud does *not* dispatch a `lan_file` task), and triggers the print with a **plaintext** LAN MQTT `project_file` (`build_project_file_json`, no `url_enc`). Only one dispatch reaches the printer, so no duplicate-job `0500_4004` / `0300_400C`. **Degrades to the cloud channel** (`use_lan_channel=false`) when there is no IP/access code or `ensure_lan_session` fails. `create_task` **hard-fails** on non-2xx (was a soft-fail that stalled the printer on "failed to download"). Always returns `0` on a successful single submission so Studio never falls back into a second `start_print`. |
 | `bambu_network_start_send_gcode_to_sdcard` | ✅ | FTPS STOR; destination name = `project_name`. On current Studio mostly `"verify_job"` probe; P2S model upload uses `ft_*` (§6.14.2) |
 | `bambu_network_start_local_print` | ✅ | LAN-only: `:6000` emmc upload + `brtc://emmc/` MQTT when `try_emmc_print`; else FTPS + `ftp://` (N7). |
 | `bambu_network_start_sdcard_print` | ✨ | Stock hits a signed cloud REST endpoint. This plugin publishes `{"print":{"command":"project_file", "url":"file:///<path>", …}}` directly on LAN MQTT for a file already resident on the printer. No cloud task record is produced. |
@@ -237,8 +266,8 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 
 | ABI entry point | `Agent::` handler | Source | Current transport |
 | --- | --- | --- | --- |
-| `bambu_network_start_print` | `run_cloud_print_job(..., use_lan_channel=false)` | `cloud_print.cpp` | Cloud REST + presigned S3 PUT + cloud MQTT `project_file` (`url=https://…`) |
-| `bambu_network_start_local_print_with_record` | `run_cloud_print_job(..., use_lan_channel=true)` | `cloud_print.cpp` | Same cloud REST/S3 pipeline, then LAN upload (`:6000`+`brtc://` when `try_emmc_print`, else FTPS+`ftp://`) + `POST /v1/user-service/my/task` |
+| `bambu_network_start_print` | `run_cloud_print_job(..., use_lan_channel=false)` | `cloud_print.cpp` | Cloud REST + presigned S3 PUT + `POST /v1/user-service/my/task` (cloud dispatch starts the print; **no** MQTT `project_file` on the cloud channel) |
+| `bambu_network_start_local_print_with_record` | `run_cloud_print_job(..., use_lan_channel=true)` | `cloud_print.cpp` | **LAN-first:** `ensure_lan_session` → LAN upload (`:6000`/FTPS) + `/my/task` `mode=lan_file` record + **plaintext** LAN MQTT `project_file`. Degrades to the cloud channel (`use_lan_channel=false`) when no LAN session can be established. Single `/my/task` per action; returns `0` on success so Studio does not fall back. See [NETWORK_PLUGIN.md §6.8.1.1](NETWORK_PLUGIN.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
 | `bambu_network_start_local_print` | `run_local_print_job` | `print_job.cpp` | `:6000` emmc + `brtc://emmc/` when `try_emmc_print`; else FTPS + `ftp://` (N7) |
 | `bambu_network_start_send_gcode_to_sdcard` | `run_send_gcode_to_sdcard` | `print_job.cpp` | FTPS STOR only; remote name = `project_name` (probe / legacy SendJob) |
 | `bambu_network_start_sdcard_print` | `run_sdcard_print_job` | `print_job.cpp` | LAN MQTT `project_file` only (`url=file:///<path>`; file already on printer) |
@@ -249,12 +278,14 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 
 | Gap | Open plugin | Stock / notes |
 | --- | --- | --- |
-| Cloud print pipeline | Full `cloud_print.cpp` for `start_print` and `_with_record` | Dev Mode: `start_print` often stubbed; hybrid still needs cloud REST for task history |
+| Cloud print pipeline | Full `cloud_print.cpp` for `start_print` and `_with_record`; **cloud print MVP works end-to-end** given a user-supplied `slicer_key.pem` + `client_name = BambuStudio` | Two channels: the **cloud** channel (`start_print`) uploads to S3 and lets the `/my/task` cloud dispatch trigger the print (no MQTT `project_file`); the **LAN-first record** channel (`_with_record`) uploads over LAN and triggers with a plaintext LAN MQTT `project_file` while `/my/task` `mode=lan_file` is only a history record. Extra cloud-start `project_file` fields (`job_id`/`job_type`/`design_id`) still unemitted — see [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format) |
 | Cover cache after brtc print | FTPS `RETR` from `/cache/` | May need `:6000` or emmc path once prints land in model cache |
 
 Wire-format reference for `project_file` field semantics and URL schemes: [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format). Cloud REST step list observed on stock (MITM): [NETWORK_PLUGIN.md §6.8.1](NETWORK_PLUGIN.md#681-cloud-upload-flow-stock-plugin-mitm).
 
 `project_file` wire format covers everything the firmware actually parses: `sequence_id`, `command`, `param`, `project_id`, `profile_id`, `task_id`, `subtask_id`, `subtask_name`, `file`, `url`, `md5`, `bed_type`, `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams`, `ams_mapping`, `ams_mapping2`, `nozzle_mapping` (multi-extruder only), `auto_bed_leveling`, `nozzle_offset_cali`, `extrude_cali_manual_mode`, `cfg`, `extrude_cali_flag`. **As of the cross-ABI [`tools/plugin_runner`](tools/plugin_runner/README.md) matrix the LAN `project_file` payload we generate is byte-identical (only `sequence_id` differs, by design — it's a wall-clock counter) to what the stock libbambu_networking.so emits for the same `PrintParams`** across `02.05.00` -> `02.06.01` and the variants we tried (default, AMS on, timelapse off, alternate bed types, PA cali manual mode, auto-flow-cali) **on the FTPS + `ftp://` path (N7-class)**. P2S/brtc paths use `brtc://emmc/` URLs per §6.8.2. `cfg` is a string-encoded bitmask we drive from `task_timelapse_use_internal` (bit 2 = use internal storage); other bits emit `0` in every captured stock frame so far. `extrude_cali_flag` is the wire mirror of `auto_flow_cali` (1/0) — confirmed the same way. `ams_mapping2` is emitted unconditionally as `[]` when AMS isn't in use, mirroring stock. Legacy FTPS uploads land in the **FTPS root** (not `/cache/`). `print.md5` is computed locally from the file because Studio leaves `params.ftp_file_md5` empty. We deliberately omit the stock plugin's `header` / `url_enc` envelope (RSA-signed and RSA-OAEP-encrypted with a per-install device cert key) — Developer Mode disables signature verification, which is our supported deployment. See [NETWORK_PLUGIN §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format) for the full per-field reference and the full cross-ABI / per-overlay matrix.
+
+**Device-cert field encryption is centralized in the MQTT signing path.** The `EncryptField` primitive (`obn::signing::rsa_pkcs1v15_encrypt_b64`, blockwise RSA-PKCS#1 v1.5 → base64) lives in [`src/signing.cpp`](src/signing.cpp). `maybe_sign(payload, device_pub)` now applies it to any outbound `{"print":…}` before signing, so the signature covers exactly what goes on the wire: it adds `url_enc` **and drops the cleartext `url`** (`project_file`), and for `gcode_line` adds `param_enc` **and drops the cleartext `param`**. Both match the stock on-wire form verified on P2S 2026-07 (a secured printer refuses `gcode_line` that still carries a cleartext `param`, and a captured stock `project_file` carries only `url_enc`). The `_enc` transforms are idempotent (the cleartext field is dropped even if the `_enc` field was pre-built) and degrade to cleartext when no device key is cached (keeping the pure-LAN plaintext ftp:// path working). The device public key is fetched per-publish from `cert_store` at the two `Agent` send sites; `cloud_print.cpp` still sources the key (via `app_cert_install` / TLS-leaf) and hard-fails the cloud channel when it is unavailable. Algorithm: [NETWORK_PLUGIN §6.8.2 `EncryptField`](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format).
 
 ---
 
@@ -266,7 +297,7 @@ This `bambu_networking.so` group only covers the **cloud / TUTK** camera URL acc
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_camera_url` | 🔒 | Stock returns a `bambu:///tutk?...` URL that cannot be minted without the proprietary TUTK / Agora SDK. Callback is invoked with an empty string; Studio drives itself into its normal "connection failed" path. |
+| `bambu_network_get_camera_url` | ✅ | Stock returns a `bambu:///tutk?...` URL that cannot be minted without the proprietary TUTK / Agora SDK. Instead we return the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) when the IP (SSDP / `connect_printer`) and access code (`connect_printer` / cloud `dev_access_code`) are known. This makes the file browser, device-panel snapshot and liveview work over the local network even for cloud-paired printers (Studio only requires the reply to start with `bambu:///`). The `lv=` hint makes `libBambuSource` fetch video via RTSP(S) `:322` instead of MJPEG `:6000` on X1/P1S/P2S-class printers. Falls back to an empty string (Studio's normal "connection failed" path) when no LAN route is known. |
 | `bambu_network_get_camera_url_for_golive` | 🔒 | Same as above, for the Go-Live flow. |
 | `bambu_network_get_hms_snapshot` | 🔒 | HMS photo snapshot is cloud-only and requires the same SDK. Callback is invoked with `("", -1)`. |
 
@@ -281,12 +312,12 @@ Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). MakerWorld has no open
 | `bambu_network_get_design_staffpick` | ❌ | Callback receives `{"list":[],"total":0}`. Studio renders an empty staff-pick carousel. |
 | `bambu_network_start_publish` | ❌ | Returns `ERR_INVALID_RESULT`; publishing to MakerWorld is not supported. |
 | `bambu_network_get_model_publish_url` | ❌ | Returns `https://makerworld.com/` as a safe default; stock serves the per-account upload endpoint. |
-| `bambu_network_get_subtask` | ❌ | Returns `SUCCESS` without invoking the callback. Invoking it with a fake `BBLModelTask*` would crash Studio — `StatusPanel::update_model_info` dereferences the pointer unconditionally. |
+| `bambu_network_get_subtask` | ❌ | **Stub only.** Stock fetches MakerWorld model/design metadata for the cloud `task_id` and fills `BBLModelTask` (`design_id`, `instance_id`, `model_id`, `model_name`, `profile_name`, …). OBN just echoes the caller-owned pointer through the callback unchanged — enough to avoid leaking the `new`'d object and to clear `request_model_info_flag`, but **no cloud fetch** happens. Without `design_id`/`instance_id` the in-print profile label and post-print MakerWorld rating UI stay disabled. See [NETWORK_PLUGIN.md §6.12](NETWORK_PLUGIN.md#612-makerworld--mall). |
 | `bambu_network_get_model_mall_home_url` | ❌ | Returns `https://makerworld.com/` as a safe default. |
 | `bambu_network_get_model_mall_detail_url` | ❌ | Returns `https://makerworld.com/models/<id>` as a safe default. |
 | `bambu_network_put_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`; no rating submission backend. |
-| `bambu_network_get_oss_config` | ❌ | Returns `ERR_INVALID_RESULT`; no OSS credentials are minted. |
-| `bambu_network_put_rating_picture_oss` | ❌ | Returns `ERR_INVALID_RESULT`. |
+| `bambu_network_get_oss_config` | ✅ | `GET /v1/user-service/my/ossconfig?useType=1` (fallback `.../s3config?useType=1`) with the session Bearer; the server JSON (endpoint / accessKeyId / accessKeySecret / securityToken / bucketName / cdnUrl) is returned verbatim to Studio. Needs a live cloud account to verify. |
+| `bambu_network_put_rating_picture_oss` | ✅ | Client-side signed object-storage `PUT`: AWS SigV4 (`AWS4-HMAC-SHA256`) for S3-style endpoints, Aliyun OSS V1 (`Authorization: OSS <AKID>:<sig>` + `x-oss-security-token`) for `aliyuncs.com`. [`src/oss_sign.cpp`](src/oss_sign.cpp) implements both from scratch: the crypto primitives (`sha256_hex`, `hmac_sha256`, `hmac_sha1`, `base64`, `hex_lower`, `aws_sigv4_signing_key`), the header builders (`aws_sigv4_put_headers` / `aliyun_oss_put_headers`), credential `parse_config`, and host-based scheme selection (`is_aliyun`). Primitives are pinned to FIPS/RFC/AWS published vectors in [`tests/oss_sign_test.cpp`](tests/oss_sign_test.cpp). Step-by-step algorithms: [NETWORK_PLUGIN.md §6.12](NETWORK_PLUGIN.md#612-makerworld--mall). Object-key convention marked verify-on-hardware; fails closed. |
 | `bambu_network_get_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`. |
 | `bambu_network_get_mw_user_preference` | ❌ | Callback receives `{"recommendStatus":0}`. The exact field name and type are load-bearing: Studio's JSON-to-int conversion throws through a queued lambda on a `null` here and aborts the process via `wxApp::OnUnhandledException`. |
 | `bambu_network_get_mw_user_4ulist` | ❌ | Callback receives `{"list":[],"total":0}`. |

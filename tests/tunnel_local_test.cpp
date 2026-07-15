@@ -1,4 +1,5 @@
 #include "obn/tunnel_local.hpp"
+#include "obn/json_lite.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -69,7 +70,8 @@ static void test_ft_wire_helpers()
         obn::tunnel_local::build_media_ability_abi(3);
     CHECK(abi.find("\"cmdtype\":7") != std::string::npos);
     CHECK(abi.find("\"peer\":\"studio\"") != std::string::npos);
-    CHECK(abi.find("\"api_version\":2") != std::string::npos);
+    CHECK(abi.find("\"api_version\":3") != std::string::npos);
+    CHECK(abi.find("\"peer_t\":3") != std::string::npos);
 
     const std::string upload = obn::tunnel_local::build_file_upload_abi(
         4, "sdcard", "test.gcode.3mf", 12345, "ABCD");
@@ -90,6 +92,18 @@ static void test_ft_wire_helpers()
     const std::string last = obn::tunnel_local::build_file_upload_chunk_abi(
         5, 3, 12288, 57, "deadbeef");
     CHECK(last.find("\"file_md5\":\"deadbeef\"") != std::string::npos);
+    // frag_id must sit at the frame top level (sibling of cmdtype/req),
+    // while file_md5 stays inside req (issue #48).
+    {
+        auto v = obn::json::parse(last);
+        CHECK(v);
+        CHECK(v->find("frag_id").is_number());
+        CHECK(static_cast<int>(v->find("frag_id").as_number()) == 3);
+        const auto req = v->find("req");
+        CHECK(req.is_object());
+        CHECK(!req.find("frag_id").is_number());
+        CHECK(req.find("file_md5").as_string() == "deadbeef");
+    }
 
     std::uint32_t kb = 0;
     std::uint64_t off = 999;
@@ -105,6 +119,13 @@ static void test_ft_wire_helpers()
     const std::string ft_json =
         obn::tunnel_local::parse_ability_reply_to_ft_json(reply);
     CHECK(ft_json == "[\"emmc\",\"usb\"]");
+
+    // upload_storage (writable subset) wins over the full storage list.
+    const std::string reply_upl =
+        R"({"cmdtype":7,"result":0,"reply":{"storage":["emmc","udisk"],)"
+        R"("upload_storage":["emmc"]}})";
+    CHECK(obn::tunnel_local::parse_ability_reply_to_ft_json(reply_upl)
+          == "[\"emmc\"]");
 
     int result = -1;
     const double pct_f = obn::tunnel_local::parse_upload_progress_value(

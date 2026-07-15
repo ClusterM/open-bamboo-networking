@@ -186,6 +186,9 @@ const char* kBambuNetworkSymbols[] = {
     "bambu_network_update_filament_spool",
     "bambu_network_delete_filament_spools",
     "bambu_network_get_filament_config",
+#if ABI_VERSION >= 0x020801
+    "bambu_network_sync_ams_filaments",
+#endif
     "bambu_network_get_printer_firmware",
     "bambu_network_get_task_plate_index",
     "bambu_network_get_subtask_info",

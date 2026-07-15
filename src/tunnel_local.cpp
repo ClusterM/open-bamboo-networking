@@ -205,9 +205,15 @@ std::string build_media_ability_abi(std::uint32_t sequence)
 {
     // Match PrinterFileSystem::RequestMediaAbility (peer + api_version).
     // Empty req{} yields firmware result=2 (kResErrJson) on P2S.
+    // The genuine upload-lane query is {api_version:3, peer:"studio",
+    // peer_t:3}; older builds sent api_version 2 with no peer_t and P2S
+    // firmware is lenient about it, but we mirror the genuine frame.
+    // TODO(verify-on-hardware): confirm the ability reply still parses
+    // across firmware generations after the api_version bump.
     obn::json::Object req;
     req["peer"]        = obn::json::Value("studio");
-    req["api_version"] = obn::json::Value(2.0);
+    req["peer_t"]      = obn::json::Value(3.0);
+    req["api_version"] = obn::json::Value(3.0);
 
     obn::json::Object root;
     root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdMediaAbility));
@@ -323,8 +329,12 @@ std::string build_file_upload_chunk_abi(std::uint32_t sequence,
                                         std::uint32_t size,
                                         const std::string& file_md5_lower)
 {
+    // Genuine cmdtype-5 chunk frame places `frag_id` at the frame top
+    // level (sibling of `cmdtype`/`req`), while `file_md5`/`offset`/`size`
+    // stay inside `req`. We previously nested `frag_id` under `req`.
+    // TODO(verify-on-hardware): confirm the upload still acks on firmware
+    // that reads `frag_id` at the top level (issue #48).
     obn::json::Object req;
-    req["frag_id"] = obn::json::Value(static_cast<double>(frag_id));
     req["offset"]  = obn::json::Value(static_cast<double>(offset));
     req["size"]    = obn::json::Value(static_cast<double>(size));
     if (!file_md5_lower.empty()) {
@@ -334,6 +344,7 @@ std::string build_file_upload_chunk_abi(std::uint32_t sequence,
     obn::json::Object root;
     root["cmdtype"]  = obn::json::Value(static_cast<double>(kCmdFileUpload));
     root["sequence"] = obn::json::Value(static_cast<double>(sequence));
+    root["frag_id"]  = obn::json::Value(static_cast<double>(frag_id));
     root["req"]      = obn::json::Value(std::move(req));
     return obn::json::Value(std::move(root)).dump();
 }
@@ -411,13 +422,20 @@ std::string parse_ability_reply_to_ft_json(const std::string& wire_json)
         auto v = reply.find(key);
         if (v.is_array()) storages = v.as_array();
     };
-    pick_array("storage");
+    // Prefer `upload_storage` (the writable subset) over the full
+    // `storage` list: the genuine cmdtype-7 ability reply returns both,
+    // and only `upload_storage` reflects where a file may be written.
+    // They are equal on P2S, but differ on hardware with read-only mounts
+    // (issue #48). Fall back to the full list and legacy key shapes.
+    pick_array("upload_storage");
+    if (storages.empty()) pick_array("storage");
     if (storages.empty()) pick_array("storage_list");
     if (storages.empty()) pick_array("storages");
     if (storages.empty()) {
         auto ab = reply.find("ability");
         if (ab.is_object()) {
-            auto v = ab.find("storage");
+            auto v = ab.find("upload_storage");
+            if (!v.is_array()) v = ab.find("storage");
             if (v.is_array()) storages = v.as_array();
         }
     }

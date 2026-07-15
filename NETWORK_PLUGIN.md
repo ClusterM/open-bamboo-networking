@@ -576,6 +576,8 @@ All take a `void* agent` and an `std::function<…>`:
 | `bambu_network_enable_multi_machine` | `void(void*, bool)` |
 | `bambu_network_send_message` | `int(void*, std::string dev_id, std::string json_str, int qos, int flag)` — MQTT-style call |
 
+> **Dual MQTT (LAN + cloud simultaneously) with a LAN-priority report subscription.** For a cloud-paired printer the stock stack does **not** pick one transport — it opens **both** MQTT sessions at once: the LAN broker (`mqtts://<printer_ip>:8883`, user `bblp`, password = access code) **and** the cloud broker (`*.mqtt.bambulab.com:8883`). This was confirmed on-wire: a stock capture shows the two TLS connections established in parallel, with the **LAN** session carrying the bulk of the `push_status` telemetry and the cloud session comparatively quiet. The mechanism is Studio's `DeviceSubscribeManager`, keyed off a `dev_id → {dev_ip, access_code}` cache: it auto-creates the **local** report subscription, and while local telemetry is flowing it **does not subscribe to the cloud `device/<id>/report` topic** (a defer-close of the cloud report leg — the cloud MQTT socket stays connected but silent), then **fails back to the cloud report subscription** if the local channel goes silent. So on a healthy LAN both sockets are up but only the LAN one is subscribed to reports; the cloud leg is a warm standby ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). The plugin-facing primitives are just `add_subscribe` / `del_subscribe` (buffer, apply on the next cloud `CONNACK`); which of them fires when is the caller's (Studio's) policy.
+
 #### 6.3.1. Cloud MQTT authentication
 
 Two distinct mechanisms exist on the production broker. **This open plugin uses the simpler one**; the stock closed-source plugin uses the other.
@@ -591,20 +593,23 @@ Two distinct mechanisms exist on the production broker. **This open plugin uses 
 
 This matches what Home Assistant's `pybambu` integration uses. No client certificate is required for the open plugin path; cloud auth rides on the bearer token in the MQTT password field.
 
+> **Plaintext `:1883` alongside `:8883`.** Some firmware exposes an unencrypted MQTT listener on `:1883` next to the TLS `:8883` broker ([issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)). OBN always uses the TLS port; the plaintext path is documented only so it is not mistaken for a rogue service during packet captures.
+
 **Stock plugin (reverse-engineered — not implemented here)**
 
 The stock `libbambu_networking.so` obtains a **client certificate chain** from the cloud REST API immediately before connecting and presents it during the MQTT TLS handshake (mutual TLS). The HTTPS call that fetches the cert was confirmed via SSLKEYLOGFILE decryption of the stock plugin's **REST** traffic (not by decrypting the MQTT session itself).
 
-**Certificate retrieval endpoint (stock only):**
+**Certificate / app-credential retrieval endpoint (stock; request side verified in OBN):**
 
 ```
-GET /v1/iot-service/api/user/applications/{application_token}/cert?aes256={base64url-key}&ver=1
-Authorization: Bearer {access_token}
+GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_session_key}&ver=1
 ```
 
-`application_token` is an opaque token from the user's account (distinct from the MQTT bearer token). `aes256` is a base64url-encoded key used to decrypt the returned private key. `ver=1` is the API version.
+No `Authorization` bearer is required for this endpoint (live probes return `code:0` anonymously when the envelope is valid). Stock Studio still sends the usual `X-BBL-*` / `User-Agent: bambu_network_agent/…` fingerprint headers; Cloudflare may 403 bare clients without them.
 
-**Response (200 OK):**
+The two URL parameters are **wrappers**, not a token and not a raw AES key — see the algorithm below. `ver=1` is the API version. *(RN-3; OBN live verify 2026-07)*
+
+**Response (200 OK)** — shape confirmed; private-key finalization is **not** fully reversed:
 
 ```json
 {
@@ -613,25 +618,62 @@ Authorization: Bearer {access_token}
   "error": null,
   "cert": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
   "crl": ["-----BEGIN X509 CRL-----\n...\n-----END X509 CRL-----\n"],
-  "key": "{base64-encoded-encrypted-private-key}"
+  "key": "{base64-encoded encrypted private-key blob}"
 }
 ```
 
-The `cert` field contains a **3-certificate chain** (PEM-concatenated):
+The `cert` field is a **shared application certificate chain** (PEM-concatenated), **not** a per-printer / per-install device cert. Observed Studio leaf (2026-07):
 
-1. **Device leaf cert** — subject: `GLOF{dev_id}-{hex}`, issuer: `GLOF{dev_id}.bambulab.com`
-2. **Per-device intermediate CA** — subject: `GLOF{dev_id}.bambulab.com`, issuer: `application_root.bambulab.com`
-3. **Root CA** — subject: `application_root.bambulab.com`, issuer: `BBL CA`
+1. **App leaf** — subject/O: `GLOF3813734089-836763c70000`, issuer: `GLOF3813734089.bambulab.com`
+2. **App intermediate** — subject: `GLOF3813734089.bambulab.com`, issuer: `application_root.bambulab.com`
+3. **Application root** — subject: `application_root.bambulab.com`, issuer: `BBL CA`
 
-**Per-device CA architecture:** each device has its own intermediate CA named `{dev_uid}.bambulab.com`. Client certs are issued under this per-device CA, so the MQTT broker can verify which device a connection belongs to from the certificate alone. Revocation is per-device via the device-specific CRL returned in the `crl` field. Observed CRL validity: 30 days from issue date.
+(`cert_id` for MQTT / HTTP PoP is derived from the leaf: lowercase hex serial ‖ issuer RFC4514, e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com` — see §6.8.) Do **not** confuse this chain with the printer's LAN TLS leaf (`CN=<serial>`) or the per-device MQTT signing material discussed elsewhere.
 
-**`key` field:** the private key is AES-256 encrypted and base64-encoded. The `aes256` query parameter in the request URL is the decryption key.
+**`crl` field:** a fresh CRL issued at request time (array of PEM strings).
 
-**`crl` field:** a fresh CRL issued at request time, not a cached value.
+**`key` field (wire-confirmed size; decrypt algorithm open):** standard base64 of a **704-byte** blob. Layout observed on every successful response:
 
-`fetch_device_cert()` in `include/obn/cloud_auth.hpp` documents this stock-only path; the implementation is gated with `#if 0` and intentionally not wired to `CloudSession`.
+```
+header(28 bytes) || u32le length (= 672) || body(672 bytes)
+```
 
-**Do not confuse with:** the LAN `project_file` RSA signing certificate (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from cloud MQTT broker authentication.
+RN-3 documents this as `AES-256-GCM(session_key)` over a PEM private key (`IV(12)||ct||tag(16)`). That recipe **does not work** on live blobs: a PEM PKCS#1 RSA-2048 is ~1679 bytes (DER ~1192), which cannot fit in 672 bytes of body, and AES-GCM / AES-CBC / common KDF variants over the exact request `session_key` all fail (`InvalidTag` / garbage). Stock clients finalize via a native helper (`CM.up1(response_json)` in Bambu Connect; equivalent code inside `libbambu_networking.so`). Until that format is reversed, OBN continues to take `slicer_key.pem` out-of-band. *(OBN live verify 2026-07; also estampo cloud-print-research, bambu_connect_disasm chunk 88)*
+
+**What is baked into the stock plugin binary (two pieces, both required for the request):**
+
+| Embedded material | Role |
+|-------------------|------|
+| `client_auth_secret` | ASCII bootstrap secret. Shape: app-cert CN prefix (`GLOF3813734089-836763c70000`) + 16 hardcoded hex chars (43 bytes total for the current Studio app cert). Proves "I am an official client." |
+| `server_wrap_key` (RSA-2048 **public** key) | Dedicated cloud wrap key used **only** to PKCS#1 v1.5-encrypt the ephemeral `session_key`. **Not** `application_root` / the returned chain root / the app leaf public key. |
+
+Wrapping `session_key` with `application_root` (or any chain cert) yields HTTP 400 `code:101` `"This application is outdated"` even when the secret and encodings are correct — that error is a wrap-key mismatch, not a stale Studio version. The wrap key must be extracted from a live stock plugin (it is not published with the app-cert docs). *(OBN live verify 2026-07)*
+
+**Credential rotation — request construction (verified end-to-end):**
+
+```py
+# Both secrets come from the stock plugin binary (not from the user's login).
+client_auth_secret = ...          # e.g. b"GLOF3813734089-836763c70000" + 16 hex
+server_wrap_key    = load_pem_public_key("server_wrap_key.pem")  # RSA-2048
+
+session_key = secure_random(32)   # ephemeral; client keeps this for response finalization
+iv          = secure_random(12)
+ct_tag      = AESGCM_Encrypt(session_key, iv, client_auth_secret)  # ciphertext||tag
+enc_secret  = Base64url(iv || ct_tag)                 # path segment
+wrapped_key = Base64url(RSA_PKCS1v15(server_wrap_key, session_key))  # aes256= query
+
+GET {api}/v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1
+# Wire encodings are base64url (RFC 4648 §5, padding kept). Standard base64 in the
+# path segment produces '/' and 404s on the gateway.
+```
+
+Conceptually this is only "prove you shipped with the official client → receive the current shared app cert + CRL (+ encrypted private key)". It does **not** authenticate a user account or a printer. The AES/RSA envelope exists so a TLS MITM alone cannot recover `client_auth_secret`, `session_key`, or (once finalization is understood) the app private key. *(RN-3 corrected by OBN: wrap key ≠ root CA)*
+
+In Bambu Connect the same envelope is built by native `CM.eak()` → `{encAppKey, aes256}` (path + query), and the JSON response is passed to native `CM.up1(json)` for finalization ([bambu_connect_disasm](https://github.com/Randomblock1/bambu_connect_disasm) chunk 88).
+
+`fetch_device_cert()` in `include/obn/cloud_auth.hpp` still documents an older incomplete sketch of this path (`#if 0`); OBN does not fetch or decrypt the app private key from the cloud — `slicer_key.pem` is supplied out-of-band.
+
+**Do not confuse with:** the LAN `project_file` device-cert field encryption (`CN=<dev_id>.bambulab.com`, §6.8.2) or the printer's LAN TLS server cert (`CN=<serial>`, §6.1.1) — those are separate from this shared app-credential fetch.
 
 ### 6.4. Local printer connection (LAN)
 
@@ -643,6 +685,22 @@ The `cert` field contains a **3-certificate chain** (PEM-concatenated):
 | `bambu_network_update_cert` | `int(void* agent)` — `func_check_cert`; refreshes certificates at runtime |
 | `bambu_network_install_device_cert` | `void(void*, std::string dev_id, bool lan_only)` |
 | `bambu_network_start_discovery` | `bool(void*, bool start, bool sending)` — SSDP |
+
+#### 6.4.1. Where the LAN credentials come from (incl. cloud-paired printers)
+
+A LAN MQTT session needs two facts per printer: the **IP address** and the **8-character access code** (the LAN broker login is always `user=bblp`, `password=<access code>`). A printer in **LAN-Only / Developer Mode** supplies both directly (the code is shown on its screen and typed into Studio). The interesting case is a **cloud-paired** printer that still has both MQTT sessions up (§6.3): the stock stack assembles the same two facts without any manual entry.
+
+- **IP address → SSDP.** `bambu_network_start_discovery` runs the SSDP multicast listener on `239.255.255.250:1990`; the printer's periodic `NOTIFY` beacons carry its serial (`dev_id`) and current LAN IP. This yields the `dev_id → dev_ip` half.
+- **Access code → cloud REST.** When the user is logged in, `get_user_print_info` returns `dev_access_code` in **plaintext** for every cloud-bound device (`GET /v1/iot-service/api/user/print?force=true`, or `GET /v1/iot-service/api/user/bind`; §6.10). This is the **same** 8-hex code shown on the printer display and used as the LAN MQTT / FTPS / `:6000` password. This yields the `dev_id → access_code` half. (Security consequence: any bearer-token holder can retrieve the LAN access codes of all their cloud-bound printers — see the security note in §6.10.)
+
+With both halves known, `connect_printer(dev_id, dev_ip, "bblp", <access code>, use_ssl=true)` brings the LAN MQTT session up **even though the device is cloud-paired**, which is exactly what the LAN-priority subscription in §6.3 relies on.
+
+```mermaid
+flowchart LR
+  ssdp["SSDP :1990 NOTIFY"] -->|"dev_id + dev_ip"| cache["dev_id → {dev_ip, access_code}"]
+  rest["GET /user/print?force=true\n(logged-in cloud REST)"] -->|"dev_access_code (plaintext)"| cache
+  cache -->|"connect_printer(bblp, access_code)"| lan["LAN MQTT :8883\n(mqtts, LAN-priority reports)"]
+```
 
 ### 6.5. Authentication and user
 
@@ -940,7 +998,9 @@ A single integer read by three independent parsers. Reported in legacy (non-NP) 
 
 ###### NP (New Protocol) bitmask fields
 
-NP is activated when the printer sends all four hex-string fields: `cfg`, `fun`, `aux`, `stat` in `push_status.print`. When NP is active, legacy integer fields like `home_flag` and `xcam.cfg` are **not** sent; their information is encoded in the NP fields instead.
+NP is activated when the printer sends all four hex-string fields: `cfg`, `fun`, `aux`, `stat` in `push_status.print`. When NP is active, legacy integer fields like `home_flag` and `xcam.cfg` are **not** sent; their information is encoded in the NP fields instead. The hex-bitmask nature of all four fields is independently confirmed in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49) (symbol-bearing `.so` rodata + live `02.06.00.50` / `02.07` captures).
+
+> **`support_*` capability map — flow→PA mapping quirk.** Alongside the NP bitmasks, `push_status` carries a `support_*` boolean capability map plus AMS per-tray `state`, `DevInf → connection_name`, and a (usually blanked) `dev_signal`. When decoding `support_*`, note that the **flow-calibration** capability and the **pressure-advance (PA)** capability are cross-wired in at least one firmware generation (a `support_flow_*` flag actually gates PA, or vice-versa); do not assume the flag name maps 1:1 to the feature. Flagged in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49); decode against live hardware before gating UI on it. `upgrade_state.new_ver_list[]` / `sw_new_ver` are the source `get_printer_firmware` re-synthesises "available update" state from (per-entry shape confirmed in #49).
 
 **`print.cfg`** — hex string, configuration/settings state:
 
@@ -1228,7 +1288,7 @@ Print submission and ongoing status are **different ABI groups**:
 | Thumbnail / subtask panel | **`bambu_network_get_subtask_info`** | After print starts; unrelated to `start_*` return |
 | Cancel / pause | `MachineObject::command_task_*` → **`send_message_to_printer`** | Not via print-job API |
 
-Studio opens the LAN MQTT session through **`connect_printer`** when the user selects a LAN device in the UI — not inside `PrintJob`. The print plugin must publish `project_file` on that **already-connected** session (`send_message_to_printer` under the hood on LAN).
+The LAN MQTT session is opened through **`connect_printer`** — not inside `PrintJob` — and `project_file` is published on that **already-connected** session (`send_message_to_printer` under the hood on LAN). This is not limited to LAN-Only devices: for a **cloud-paired** printer the stock stack still brings up a LAN session (using the IP from SSDP and the `dev_access_code` fetched from the cloud REST API, §6.4.1), which is the same session the LAN-priority report subscription in §6.3 uses. So "has a LAN session" and "is cloud-paired" are orthogonal — a cloud device can have both transports live at once.
 
 ##### `PrintParams` fields Studio sets vs what the plugin must consume
 
@@ -1245,7 +1305,7 @@ Open-plugin mapping of each ABI entry point: [STATUS.md §6.8 — Open plugin: A
 
 #### 6.8.1. Cloud upload flow (stock plugin, MITM)
 
-Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. **How the open plugin maps these ABI symbols internally** (`Agent::run_cloud_print_job`, FTPS vs `:6000`, planned LAN-only refactor) is documented in [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation), not here.
+Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. The mapping of each ABI symbol to a concrete implementation is out of scope here — see [STATUS.md §6.8 — ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation).
 
 Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
@@ -1267,7 +1327,37 @@ Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 
 Terminology note:
 
-- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport in this implementation is presigned object-storage `PUT` URLs (S3-style semantics in code/comments), not a plugin-side fixed OSS endpoint.
+- ABI names still use `OSS` in several places (`bambu_network_get_oss_config`, `...UPLOAD_3MF_TO_OSS...` error codes), but the observed cloud print upload transport is a presigned object-storage `PUT` URL, not a fixed OSS endpoint. The print-upload presigned URLs are **S3 signature V2** query-auth (`?AWSAccessKeyId=…&Expires=…&Signature=…`) — **on-wire confirmed** against genuine `POST /v1/iot-service/api/user/project` traffic on a live account (`s3.us-west-2.amazonaws.com`, 2026-07). This is **not** SigV4 (no `X-Amz-Algorithm` / `X-Amz-Signature`); issue #48's SigV4 claim was **not reproduced** here and may be region- or snapshot-dependent.
+
+  The **cloud presigns** the URL; the uploading client just does an opaque `PUT` of the body and never recomputes the signature. What the presigner signs (AWS S3 V2 query-string auth):
+
+  ```py
+  StringToSign = VERB + "\n" +               # "PUT"
+                 Content-MD5 + "\n" +         # usually empty
+                 Content-Type + "\n" +        # EMPTY on the print-upload leg (see below)
+                 Expires + "\n" +             # the ?Expires= epoch seconds
+                 CanonicalizedResource        # "/<bucket>/<key>" (+ any sub-resources)
+  Signature    = Base64(HMAC-SHA1(secret_access_key, StringToSign))
+  # URL query carries: AWSAccessKeyId, Expires, Signature (URL-encoded)
+  ```
+
+  Protocol consequence: because the presigner signs an **empty `Content-Type`**, the client must **omit `Content-Type`** on the `PUT` — adding one changes the StringToSign and yields `403 SignatureDoesNotMatch`. The scheme is purely transport-level for this leg (no per-request client crypto). **Distinct leg:** the credential-based direct-OSS path used by rating-picture upload (`get_oss_config` → `put_rating_picture_oss`) *does* sign client-side, and *that* leg uses AWS SigV4 (S3) or Aliyun OSS V1 (CN) — see §6.12 `get_oss_config`.
+
+##### 6.8.1.1. Cloud print authorization (OBN findings, on hardware 2026-07)
+
+Getting a **cloud** print (or "local print with record") to actually start from OBN on a stock, non-Developer-Mode P2S required more than the upload sequence above. The findings below were established on live hardware and drive OBN's current cloud-print implementation (`src/cloud_print.cpp`, `run_cloud_print_job`); the MVP is working end-to-end.
+
+**1. `POST /my/task` is the trigger, not the MQTT `project_file`.** For a cloud-connected printer the Bambu cloud dispatches the job to the printer itself the moment `/my/task` succeeds. OBN therefore **does not** publish an MQTT `project_file` on the cloud channel — doing so makes the printer reject the second, duplicate job with **`0500_4004`** ("The printer can't receive new print jobs while printing"). The MQTT `project_file` (§6.8.2) is the print trigger **only** on the pure-LAN path (`start_local_print`).
+
+**2. Required headers on `/my/task`** (beyond the `Authorization: Bearer` token):
+- **`X-BBL-Client-Name: BambuStudio`** and a matching **`X-BBL-OS-Type`** — mandatory; a wrong/missing value 403s. See the header block in §6.10.1 for the full write-up and the `client_name` config knob.
+- **`x-bbl-app-certification-id`** and **`x-bbl-device-security-sign`** — the HTTP half of command-security for a *secured* printer, signed with the user-supplied `slicer_key.pem`. Serialization: `x-bbl-app-certification-id = issuer + ":" + serial.lower()` (a **different** serialization from the MQTT `cert_id`, which is `serial + issuer` with no separator — getting this wrong 403s), and `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` over the current time in **milliseconds** (13 digits; a nanosecond timestamp fails signature recency). Both are best-effort: absent a configured slicer key OBN omits them rather than sending blanks. See the *Command-security key & certificate flow* subsection later in §6.8 and [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47).
+
+**3. `create_task` must hard-fail.** `/my/task` is what authorizes the printer to fetch the uploaded content, so OBN treats any non-2xx as fatal (`BAMBU_NETWORK_ERR_PRINT_WR_POST_TASK_FAILED`) instead of the old soft-fail that continued with `task_id=0` and stalled the printer on "failed to download".
+
+**4. The duplicate-submission pitfall (`start_local_print_with_record` → `start_print` fallback).** Studio's `PrintJob::process()` tries **`start_local_print_with_record` first** and only falls back to **`start_print`** if it returns `< 0`. Both entry points create a cloud task and hit `POST /my/task`, which is what actually dispatches the job. So a plugin that lets the "record" entry point create the cloud task **and then** return `< 0` (e.g. because a later LAN MQTT leg failed) triggers Studio's fallback into `start_print`, which fires a **second** `/my/task`. The printer, already printing the first job, then rejects the duplicate with `0500_4004` / `0300_400C` ("Printing was cancelled"). The invariant a print implementation must preserve: **exactly one `/my/task` per user action** — either succeed and return `0` from the first entry point, or fail *before* creating the cloud task so the fallback starts cleanly.
+
+**5. Studio-side crash caveat (not OBN).** After a print, if the printer reports **any** non-zero `print_error` (including a stale/latched one), Studio's `StatusPanel::update_error_message()` opens a `DeviceErrorDialog`, whose `RequestUserAttention → gtk_widget_get_realized` path **segfaults under GTK/Wayland** (`GLib-CRITICAL: Source ID … was not found`). This is a Studio/GTK bug, independent of the plugin; the workaround is to launch Studio with **`GDK_BACKEND=x11`**.
 
 #### 6.8.2. The MQTT `project_file` command (wire format)
 
@@ -1276,7 +1366,7 @@ The print-job submission ends with a single MQTT command published to the printe
 ```json
 {
   "print": {
-    "sequence_id":             "20006",
+    "sequence_id":             "1749823456789",
     "command":                 "project_file",
     "param":                   "Metadata/plate_1.gcode",
     "project_id":              "0",
@@ -1307,7 +1397,7 @@ The print-job submission ends with a single MQTT command published to the printe
 
 | Field | Type | Source in `PrintParams` (Studio -> ABI) | Notes |
 |---|---|---|---|
-| `sequence_id` | string (decimal) | plugin-generated | Wall-clock millisecond counter; the printer echoes it on the matching ack. |
+| `sequence_id` | string (decimal) | See *MQTT `sequence_id`* below | Per-command unique id; the printer echoes it on the matching ack |
 | `command` | string | constant `"project_file"` | Selects the firmware handler. |
 | `param` | string | derived from `plate_index` | Always `Metadata/plate_<N>.gcode`; resolves to a path inside the uploaded 3mf. |
 | `project_id`, `profile_id`, `task_id`, `subtask_id` | strings | cloud task IDs from `POST /v1/user-service/my/task` (cloud) or `"0"` placeholder (LAN / Developer Mode) | Sent as **strings**, not numbers. |
@@ -1318,13 +1408,51 @@ The print-job submission ends with a single MQTT command published to the printe
 | `bed_type` | string | `task_bed_type` (defaults to `"auto"`) | One of the `MachineBedTypeString` values. |
 | `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams` | bool | matching `task_*` flags | Per-print toggles from the `SelectMachineDialog` checkboxes. |
 | `ams_mapping` | int array | `ams_mapping` (Studio passes a JSON array string `[0,-1,...]`) | Index = filament slot in the 3mf, value = AMS tray id (`-1` = no mapping, `255` = virtual tray). Legacy single-AMS shape. |
-| `ams_mapping2` | object array | `ams_mapping2` (Studio passes a JSON-array string of `{ams_id, slot_id}` objects) | Newer multi-AMS schema, one entry per filament. `255/255` means "external spool / not via AMS". Required for printers with >1 AMS unit; firmware that supports both fields prefers `ams_mapping2` over `ams_mapping`. |
+| `ams_mapping2` | object array | `ams_mapping2` (Studio passes a JSON-array string of `{ams_id, slot_id}` objects) | Newer multi-AMS schema, one entry per filament. `255/255` means "external spool / not via AMS". Required for printers with >1 AMS unit; firmware that supports both fields prefers `ams_mapping2` over `ams_mapping`. **Note the cloud `POST /my/task` body uses a *different* serialization** — camelCase keys (`amsId`/`slotId`) and the external-spool sentinel is `{amsId:255,slotId:0}` (slot `0`, **not** `255`); the endpoint 400s on the wrong shape. Cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48); our `/my/task` derive-from-flat path in `src/cloud_print.cpp` emits `slotId:0`. |
 | `nozzle_mapping` | int array | `nozzle_mapping` (Studio passes a JSON-array string of ints, e.g. `"[0,1]"`) | Index = filament slot in the 3mf, value = physical nozzle/extruder position id. **Emitted only on multi-extruder printers** — Studio gates every assignment to `task_nozzle_mapping` on `MachineObject::GetNozzleRack()->IsSupported()` (see `SelectMachine.cpp:3107` and `CalibUtils.cpp:2225`/`2358`), so on single-nozzle hardware (P2S, X1C, A1, etc.) the field is omitted entirely from `project_file`. The Studio-side value is sourced verbatim from the printer's reply to the `get_auto_nozzle_mapping` MQTT query (`DevMappingNozzle.cpp:277-282` deserialises the `mapping` field into `std::vector<int>`), so the type is **always** a flat `int` array — no objects, no string-wrapped numbers, no `[0,-1,…]` sentinels analogous to `ams_mapping`. Stock-plugin observation: when Studio hands it a string with whitespace (e.g. `"[0,1, 2]"`), the stock plugin re-emits it as canonical `"[0,1,2]"`; this normalization is cosmetic and not required for firmware acceptance. |
 | `auto_bed_leveling` | int | `auto_bed_leveling` | Bed-leveling option as an int (0 = off, 1 = on, 2 = auto). Coexists with the boolean `bed_leveling`: the boolean is the user toggle, the int is the resolved policy after taking firmware capabilities into account. |
 | `nozzle_offset_cali` | int | `auto_offset_cali` (**name mismatch is intentional in upstream**) | Nozzle-offset calibration option (0 = off, 2 = auto). |
 | `extrude_cali_manual_mode` | int | `extruder_cali_manual_mode` (**`extrude` vs `extruder` asymmetry is intentional in upstream**) | PA calibration mode (0 = automatic, 1 = manual). **Field is gated on the value, not the ABI** — the stock plugin emits it only when `extruder_cali_manual_mode != -1` (the `PrintParams` default). With the default sentinel it is omitted entirely from `project_file`. Confirmed across ABI `02.05.00`, `02.05.03`, `02.06.01`. |
 | `cfg` | string (decimal int) | derived from `task_timelapse_use_internal` (other bits unknown) | Bitmask the stock plugin builds from `PrintParams` flags that don't have a dedicated MQTT field. **Bit 2 (`0x4`) = use internal storage for timelapse**, driven by `task_timelapse_use_internal` (`task_timelapse_use_internal=true` -> `"4"`, `false` -> `"0"`). Always emitted as a string, not a number. **Field is present in `project_file` for *every* observed ABI from `02.05.00` upwards** — but on builds older than `02.05.03` (where `PrintParams::task_timelapse_use_internal` does not exist yet) the value is permanently `"0"` and the plugin has no way to surface a `"4"`. Cross-ABI confirmation: `02.05.00`/`02.05.01`/`02.05.02` always emit `cfg="0"`; `02.05.03`/`02.06.00`/`02.06.01` emit `cfg="4"` when `task_timelapse_use_internal=true` and `cfg="0"` otherwise. **`task_record_timelapse` does NOT influence `cfg`** — only the `timelapse` boolean in the same payload. No other bit values have been observed in the wild yet — a future capture showing e.g. `"1"`, `"2"` or `"5"` would identify another flag's meaning. |
-| `extrude_cali_flag` | int | derived from `auto_flow_cali` (1 = enabled, 0 = disabled) | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`**: setting `auto_flow_cali=1` flips `extrude_cali_flag` from `0` to `1` across ABI `02.05.00` and `02.06.01`. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+| `extrude_cali_flag` | int | derived from `auto_flow_cali` | Stock-plugin-only field present in every observed `project_file`. **The value is taken straight from `PrintParams::auto_flow_cali`** and is a **multi-valued enum, not a bool**: `0` = off, `1` = requested, and `2` (= auto) has been observed in genuine traffic ([issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)); further values may exist. OBN passes the int through verbatim, so no code change is needed. Captured Studio sessions almost always ship `auto_flow_cali=0`, which is why the field looks hardcoded at first glance. Likely a "PA cali requested" guard the firmware uses to short-circuit redundant calibration runs. |
+
+##### MQTT `sequence_id` — per-command unique id (three assignment sources)
+
+`sequence_id` is the **unique identifier of a single MQTT command** — a decimal string the sender picks so the printer (and Studio) can match an outgoing request to its ack/report echo. It is **not** a session id and **not** reset on MQTT connect; only the assignment algorithm differs by who built the frame. The stock plugin **never rewrites** an id Studio already embedded.
+
+| Source | When | Algorithm | Typical value | Studio-side check |
+|--------|------|-----------|---------------|-------------------|
+| **Stock plugin** | The plugin **constructs the MQTT frame itself** (e.g. `project_file` from the print-job ABI, or any other command the plugin assembles before publish) | **Wall-clock epoch milliseconds** at generation time: `str(unix_epoch_ms)` (13-digit decimal string). A fresh value on every frame; **not** reset on MQTT connect/reconnect. | `"1749823456789"` | — |
+| **Bambu Studio** | Studio builds the JSON and hands it to the plugin via `bambu_network_send_message` / `send_message_to_printer`; the plugin forwards (and may sign) **without replacing** the id | **Process-wide monotonic counter:** `std::to_string(MachineObject::m_sequence_id++)`. Initialized once per Studio launch to **`STUDIO_START_SEQ_ID` = 20000**; increments for *every* Studio-originated command (`print`, `system`, `info`, `camera`, `pushing`, …). Valid range **20000–29999** (`STUDIO_END_SEQ_ID` = 30000 is the exclusive upper bound). **Never reset** on MQTT connect — only a Studio restart resets back to 20000. | `"20014"`, `"20021"`, … | `DevUtil::is_studio_cmd(seq)` → `seq >= 20000 && seq < 30000` *(AGPL: `DeviceCore/DevUtil.h`, `DeviceManager.hpp`)* |
+| **Cloud dispatch** | Commands injected by Bambu cloud MQTT (cloud print dispatch, cloud-side control) | **Constant `"0"`** (`CLOUD_SEQ_ID`) for every cloud-originated command. | `"0"` | `DevUtil::is_cloud_cmd(seq)` → `seq == 0` *(AGPL: `DeviceCore/DevUtil.h`)* |
+
+##### Cloud-start extras in `project_file` (verify on stock firmware)
+
+The **cloud** variant of `project_file` (job started through `/my/task`, not LAN) carries extra fields beyond the table above, per genuine captures cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48):
+
+- `job_id` — **int** (unlike `task_id`/`subtask_id`, which are strings), echoing the id minted by `POST /v1/user-service/my/task`;
+- `job_type: 1` — constant in observed cloud starts;
+- `design_id` — the MakerWorld design id when the print originates from a downloaded model (`0`/absent otherwise);
+- a trailing `"reason":"success","result":"success"` pair — present in the *published command* itself in some captures (not only in the printer's ack echo).
+
+OBN's cloud `project_file` builder does not emit these yet; they are documented as a **possible cloud-start gap** — whether stock firmware requires them (or silently tolerates their absence) still needs verification on hardware.
+
+##### `/my/task` body: `amsDetailMapping[]` element schema
+
+Besides `amsMapping`/`amsMapping2` (see the `ams_mapping2` row above for the camelCase/sentinel caveat), the cloud `POST /v1/user-service/my/task` body carries a **per-filament detail array** `amsDetailMapping[]` with elements of the shape ([issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)):
+
+```json
+{
+  "ams":          0,
+  "filamentId":   "GFA00",
+  "filamentType": "PLA",
+  "nozzleId":     0,
+  "sourceColor":  "#FFFFFFFF",
+  "targetColor":  "#FFFFFFFF"
+}
+```
+
+Colors are **RGBA hex strings with a leading `#`** (8 hex digits). Studio hands the plugin the source data via `PrintParams::ams_mapping_info`; the stock plugin re-serializes it into this schema for the task body.
 
 ##### URL schemes for model location (`file` / `url`)
 
@@ -1333,6 +1461,7 @@ The MQTT command is always `project_file`; there is **no** separate `storage: em
 | URL prefix | Example | Firmware behaviour (inferred) |
 |---|---|---|
 | `ftp://` | `ftp://skadis_spool-Body.gcode.3mf` | **Legacy LAN print.** Observed on classic `start_local_print` / cloud `_with_record` FTPS legs on N7-class hardware in older captures. P2S Send-to-Printer print-start in recent stock traffic uses `brtc://emmc/` instead (see row above). Current open-plugin behaviour per entry point: [STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation). |
+| `ftp:///` (three slashes) | `ftp:///skadis_spool-Body.gcode.3mf` | **Offline / pre-pushed variant of the row above, not a defect.** Genuine traffic shows both spellings and they are **scenario-dependent**: two slashes when the plugin has just FTPS-uploaded the file, three slashes (empty authority = "local", absolute path) when the file was pushed to the printer earlier and the job starts offline against the already-present copy. Firmware accepts both. Cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48). |
 | `brtc://emmc/` | `brtc://emmc/skadis_spool-Body.gcode.3mf` | **Send-to-Printer model-cache lookup.** Despite the `emmc` token in the scheme, resolution mirrors the dual-volume upload path in §6.14.2: the firmware searches the **external (udisk) model cache first**, then the **internal (emmc) cache** — first hit wins, external has priority. No absolute path is required; only the filename after the prefix matters. |
 | `file://` | `file:///media/usb0/cache/skadis_spool-Body.gcode.3mf` | **Explicit filesystem path.** No cache heuristics — open exactly that file. Typical for **Print from Device** when the `.3mf` is already on storage. Paths observed under `/media/usb0/` with or without a `/cache/` segment (e.g. `file:///media/usb0/skadis_spool-Body.gcode.3mf`). |
 | `https://` | presigned object URL | **Cloud print.** Printer downloads from Bambu object storage; unrelated to local emmc/udisk caches. |
@@ -1356,11 +1485,11 @@ Sibling `header` object the stock plugin wraps the command in (cloud and LAN ali
 }
 ```
 
-`payload_len` is the byte length of the serialized `print` object; `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact payload; `sign_ver` versions the canonicalization rules. Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
+`payload_len` is the UTF-8 byte length of the **exact signed byte string** (defined precisely in the *SignMessage* pseudocode below — it is the `{`-prefixed `print` section, wrapper included, **byte-for-byte as it appears on the wire**, not the inner `print` object alone); `sign_string` is the Base64 RSA-SHA256 (PKCS#1 v1.5) signature of that exact byte string; `sign_ver` labels the scheme (`v1.0` observed). **No JSON canonicalization is applied or required** — keys need not be sorted and whitespace need not be stripped (see the "what is actually signed" note below). Non-Developer-Mode firmware rejects unsigned `project_file` (and other privileged) commands with `MQTT Command verification failed` (error range `84033543`–`84033548`; `…543` = "verification failed", `…545` = "need reset device pub key" → triggers a device-cert re-issue). Developer Mode bypasses the check entirely (see "Developer Mode requirement" in `README.md`), making the `header` envelope optional.
 
 **`cert_id` is a cloud-issued, _shared_ application certificate — not a per-install _device_ certificate** (correction cross-validated in [issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) against a symbol-bearing `libbambu_networking.so`, a live VMProtect memory dump, and decrypted secured-printer captures). The example above, `a4e8faaa…CN=GLOF3813734089.bambulab.com`, is the **app** cert (subject/issuer under `GLOF{…}.bambulab.com`), *not* a device CN. Two distinct keys are in play, and they must not be confused:
 
-- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **fetched at runtime and shared across installs**, not statically extracted per-install: it comes from the cloud cert endpoint `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3), which returns the cert chain, the CRL, and the AES-256-encrypted private key. Only a small `bootstrap_secret` is hardcoded in the stock plugin; everything else is a cloud request after login. `cert_id` is derived from the returned cert (issuer + serial), so it need not be stored separately.
+- **App private key → signs.** The `sign_string` and the HTTP command-security headers (below) are produced with the application private key. That key is **shared across Studio installs** (same app leaf CN `GLOF3813734089-…`), not per-install: the stock plugin fetches it at runtime from `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1` (§6.3). The plugin binary hardcodes only the bootstrap `client_auth_secret` and the cloud `server_wrap_key` public key used to build that request; the returned `key` blob's decrypt recipe is still open (native `CM.up1` / equivalent). `cert_id` is derived from the returned cert (issuer + serial). In OBN, `slicer_key.pem` is supplied out-of-band until response finalization is reversed.
 - **Device-cert public key → encrypts.** The printer's device-certificate public key is used **only** for field encryption (`url_enc` / `param_enc`), never for signing.
 
 **HTTP half of command-security** (same app key, on secured-printer REST writes such as `POST /my/task`): the plugin adds `x-bbl-device-security-sign = base64(RSA_PKCS1v15(app_priv, utf8(unix_ms)))` (a raw PKCS#1 v1.5 signature over the current time in milliseconds — the server recovers the timestamp and checks recency for replay protection) and `x-bbl-app-certification-id = issuer + ":" + serial.lower()`. Note this is a **different serialization** from the MQTT `cert_id` (which concatenates serial + issuer without a separator).
@@ -1373,20 +1502,19 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 
 **Sources.** Most of the authorization-control detail below is not our own capture — it is drawn from third-party reverse-engineering, cross-checked against our code and issue #47. Primary references, cited inline per group:
 
-- **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `bootstrap_secret`, AES-wrapped key).
+- **RN-3** — reverse-networking, [3. Credential Rotation.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/3.%20Credential%20Rotation.md) (cloud cert endpoint, `client_auth_secret`, AES/RSA envelope). **Correction (OBN 2026-07):** the RSA wrap key is a dedicated `server_wrap_key` embedded in the plugin, **not** the `application_root` public key; RN-3's response-key AES-GCM recipe does not match live 704-byte blobs.
 - **RN-4** — reverse-networking, [4. App Certificates.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/4.%20App%20Certificates.md) (app cert chain + CRL are shared, public, not per-device).
 - **RN-5** — reverse-networking, [5. MQTT.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/5.%20MQTT.md) (`app_cert_install` / `app_cert_list`, `flag3` bit 16, `SignMessage`/`EncryptField` middleware, cleartext-when-no-cert rule).
 - **RN-6** — reverse-networking, [6. HTTP.md](https://f.sfconservancy.org/j4k0xb/reverse-networking/src/branch/authorization-control/Authorization%20Control/6.%20HTTP.md) (`x-bbl-*` command-security headers).
 - **#47** — [ClusterM/open-bambu-networking issue #47](https://github.com/ClusterM/open-bamboo-networking/issues/47) (shared-app-cert correction, PKCS#1 v1.5 sizing, verified against a symbol-bearing `libbambu_networking.so` + VMProtect dump + decrypted secured-printer captures).
 - **OBA** — [Doridian/OpenBambuAPI `mqtt.md`](https://github.com/Doridian/OpenBambuAPI/blob/main/mqtt.md) (base MQTT topic/command model).
-- **OBN** — our own code (`src/signing.cpp`, `src/agent.cpp`, `src/cloud_print.cpp`, `src/cloud_auth.cpp`) and the ABI harness captures described elsewhere in this document.
+- **OBN** — our own code (`src/signing.cpp`, `src/agent.cpp`, `src/cloud_print.cpp`, `src/cloud_auth.cpp`) and the ABI harness captures described elsewhere in this document; live credential-rotation request probes (2026-07).
 
-**Credential acquisition (once, at startup / login)** — sources: RN-3, RN-4, #47; OBN mirrors the response shape in `src/cloud_auth.cpp`.
+**Credential acquisition (once, at startup / login)** — sources: RN-3 (corrected), RN-4, #47, OBN live verify.
 
-- `bootstrap_secret` (only hardcoded piece) + logged-in cloud session → `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256={wrapped_key}&ver=1`, done once after login by the stock plugin → response with `cert` (3-PEM chain), `key` (AES-256 encrypted app private key), `crl`. *(RN-3)*
-- Encrypted `key` blob + `aes256` unwrap key → AES-256 decrypt at finalization → **app private key** (`slicer_key.pem`), shared across all installs. In OBN this file is supplied out-of-band, not fetched. *(RN-3, RN-4; #47 confirms "shared across installs")*
-- App leaf `cert` (issuer + serial) → parsed once → **`cert_id`** (`slicer_cert_id.txt`), e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`. *(RN-4, #47)*
-- App `cert` chain + `crl` → held for the provisioning step below → **`slicer_cert.pem`** + **`slicer_crl.pem`** (only consumed by `app_cert_install`). *(RN-4, RN-5)*
+- Stock plugin embeds **`client_auth_secret`** + **`server_wrap_key`** (RSA public) → builds `enc_secret` / `aes256` per §6.3 → `GET …/applications/{enc_secret}/cert?aes256=…&ver=1` (no user bearer required) → response with `cert` (shared app chain), `crl`, and encrypted `key` (704 B). *(OBN; RN-3)*
+- `cert` + `crl` → **`slicer_cert.pem`** / **`slicer_crl.pem`**; leaf issuer+serial → **`cert_id`** / `slicer_cert_id.txt`. The request side is reproducible once both embedded secrets are known. *(OBN, RN-4, #47)*
+- Encrypted `key` blob → **finalization algorithm still open** (documented AES-GCM/`session_key` fails; native `CM.up1` / plugin equivalent). Until reversed, OBN takes **`slicer_key.pem`** out-of-band (e.g. memory extract from stock). The resulting app private key is shared across Studio installs. *(OBN; RN-3 claim superseded; #47)*
 
 **Printer device-cert public key acquisition (per printer, lazily before a secured print)** — sources: RN-5 (`app_cert_install` reply); OBN for the TLS-leaf TOFU path (`capture_peer_cert_pem`, `harvest_security_report`).
 
@@ -1402,7 +1530,7 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 
 - App private key (`slicer_key.pem`) + serialized `print` object → `SignMessage` RSA-SHA256 PKCS#1 v1.5 on every privileged MQTT command → **`header.sign_string`** (+ `payload_len`, `sign_alg`, `sign_ver`). *(RN-5)*
 - `cert_id` → copied verbatim into every signed MQTT command → **`header.cert_id`** (serial + issuer concatenated, no separator). *(RN-5, #47)*
-- Printer public key + cleartext `url` (or `param`) → RSA PKCS#1 v1.5 encrypt, only for `project_file`/`gcode_line` **and only once a device cert is known** (otherwise the field keeps cleartext) → **`url_enc`** / **`param_enc`** alongside the cleartext field. *(RN-5 for the cleartext-fallback rule; #47 for PKCS#1 v1.5)*
+- Printer public key + cleartext `url` (or `param`) → RSA PKCS#1 v1.5 encrypt, only for `project_file`/`gcode_line` **and only once a device cert is known** (otherwise the field keeps cleartext) → **`url_enc`** / **`param_enc`** **replacing** the cleartext field (on the wire the cleartext `url`/`param` is dropped once the `_enc` form exists — verified on hardware). *(RN-5 for the encrypt-when-cert-known rule; #47 for PKCS#1 v1.5; the cleartext-replacement is on-hardware)*
 - App private key + current time in ms (as UTF-8 string) → RSA PKCS#1 v1.5 sign, on secured-printer REST writes (e.g. `POST /my/task`) → **`x-bbl-device-security-sign`** header (server recovers the timestamp for replay protection). *(RN-6)*
 - `cert_id` reformatted as `issuer + ":" + serial.lower()` → same REST writes → **`x-bbl-app-certification-id`** header (note: different serialization from the MQTT `cert_id`). *(RN-6, #47)*
 
@@ -1414,6 +1542,117 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 - Developer Mode ON → **printer firmware** bypasses the signature check entirely: plain `url` accepted, `header` optional, `url_enc` unnecessary. This is why LAN printing works today without ever touching the cloud cert endpoint, provided the operator supplied the app key out-of-band. *(OBN; see "Developer Mode requirement" in `README.md`)*
 
 Note where the **CRL** actually lands: it is never read by the plugin's signing/encryption path — it is only shipped inside `app_cert_install` into the printer's trust store, where the firmware consults it while verifying `header.sign_string`. With an empty revocation list and no rotation it is effectively a formality; it becomes load-bearing only if Bambu revokes/rotates the shared app cert. *(RN-5; RN-4 for the observed empty, ~30-day CRL)*
+
+##### Command-security algorithms (pseudocode)
+
+The flow list above says *which* key touches *which* field; the pseudocode below is the exact wire recipe, so a command can be signed/encrypted without opening the source references. It is transcribed from RN-5 (MQTT middleware) and RN-6 (HTTP headers); primitives are OpenSSL-equivalent (`RSA_Sign` = `EVP_DigestSign` with SHA-256 + PKCS#1 v1.5; `RSA_Encrypt` = `RSA_public_encrypt` with `RSA_PKCS1_PADDING`).
+
+**1. `SignMessage` — RSA-SHA256 over the `print` section** (every privileged MQTT command):
+
+```py
+def SignMessage(app_private_key, print_text):
+    # print_text is the serialized "print" VALUE exactly as it will appear
+    # on the wire (any key order, any/no whitespace, newlines allowed).
+    to_sign    = '{"print":' + print_text + '}'   # wrapper; see exact rule below
+    json_bytes = UTF8_Encode(to_sign)
+    signature  = RSA_Sign(app_private_key, json_bytes)   # RSA-SHA256, PKCS#1 v1.5
+    header = {
+        "sign_ver":    "v1.0",
+        "sign_alg":    "RSA_SHA256",
+        "sign_string": Base64_Encode(signature),
+        "cert_id":     app_cert.serialNumber.lower() + app_cert.issuer,  # NO separator
+        "payload_len": len(json_bytes),             # = len(to_sign), wrapper included
+    }
+    # The SAME print_text bytes must be emitted in the envelope (see below).
+    return '{"header":' + JSON(header) + ',"print":' + print_text + '}'
+```
+
+**What is actually signed (verified on P2S hardware, 2026-07).** The firmware does **not** canonicalize. It verifies the signature over a byte string it reconstructs from the received envelope as:
+
+> `"{"` **+** everything from the start of the `"print"` key up to and including the final closing `}` of the whole message.
+
+In other words: take the on-wire envelope `{"header":{…},"print"…<rest>`, drop the `{"header":{…},` prefix, prepend a single `{`, and that byte string (length = `payload_len`) is what the signature must cover. Consequences, all confirmed on hardware:
+
+- **Key sorting is _not_ required.** Any object-key order verifies.
+- **Whitespace is _not_ stripped.** Spaces, indentation, even newlines inside the `print` section are fine.
+- **The only hard rules:** (1) the signed string must start with `{`; (2) the bytes of the `print` section used to compute the signature must be **byte-identical** to the bytes placed in the envelope, **including any surrounding whitespace**. If you sign `{"print" : <dump> }` (spaces around `:` and before `}`), the envelope must end with the identical `,"print" : <dump> }`. Add a space after the `{` when signing (`{ "print" : …`) and the envelope's separator must likewise become `}, "print" : …`. A trailing space in the signed string (`… } `) must also appear in the envelope. Any byte mismatch between "what was signed" and "what is on the wire" fails verification.
+
+This is why a compact, sorted serializer *works* but is not *mandatory*: it just happens to make "what I signed" equal "what I send" trivially. The robust rule for a reimplementation is: **serialize the `print` value once, sign `{` + those exact bytes + (whatever trailing bytes you will also emit), then emit those exact same bytes after `,"print":` (or `, "print":`, matching your prefix) in the envelope.** *(RN-5 gives the algorithm shape; the "no canonicalization, byte-exact wire match" rule is from on-hardware testing.)*
+
+Note the **`cert_id` serialization for MQTT is `serialNumber.lower() + issuer`** with no separator (e.g. `a4e8faaa…CN=GLOF3813734089.bambulab.com`). The HTTP header uses a *different* serialization (below). *(RN-5)*
+
+> **Unrelated pitfall that masquerades as a signature error:** a non-monotonic or reused `sequence_id` (e.g. always `"0"`) can get the command rejected even though the signature is valid. Use a monotonically increasing `sequence_id` before suspecting the signing path.
+
+**`gcode_line` on a secured (non-Developer-Mode) printer requires `param_enc`, not cleartext `param` (verified on P2S hardware, 2026-07).** A signed `gcode_line` whose G-code is carried in the cleartext `param` field is refused with `mqtt message verify failed`; the *same* G-code carried in a correctly formed `param_enc` is accepted (`result: SUCCESS`). The signature being valid is necessary but not sufficient — the firmware also insists that the G-code arrive encrypted under the device certificate. Matrix, all with **the same** `slicer_key.pem`, `cert_id`, signing procedure and a valid `sequence_id`:
+
+| `gcode_line` payload shape | Result on secured P2S |
+|---|---|
+| cleartext `param` only, no `param_enc` | `failed` / `mqtt message verify failed` |
+| cleartext `param` **and** `param_enc` together | `failed` / `mqtt message verify failed` |
+| `param_enc` only (device-encrypted), **no** cleartext `param` | `SUCCESS` |
+| `param_enc` only, with or without `user_id` | `SUCCESS` (either way — `user_id` is optional) |
+
+So the rules for `gcode_line` on secured firmware are: **(1)** put the G-code in `param_enc` (blockwise RSA under the device cert, see `EncryptField` below), **(2)** do **not** also send the cleartext `param`, **(3)** sign the envelope as usual. Developer Mode bypasses both the signature and the encryption requirement (see "Developer Mode requirement" in `README.md`), so a plain cleartext `param` works there.
+
+A genuine stock `gcode_line` captured from Studio (temperature control) confirms the shape — note `param_enc` present, `param` absent, and the 512-byte (= 2×256, two RSA-2048 blocks) ciphertext:
+
+```json
+{"header":{"cert_id":"…","payload_len":778,"sign_alg":"RSA_SHA256","sign_string":"…","sign_ver":"v1.0"},
+ "print":{"command":"gcode_line","param_enc":"…684 base64 chars = 512 bytes…","sequence_id":"20006","user_id":"3575315859"}}
+```
+
+Its `sign_string` verifies against `slicer_key.pem` over the byte-exact `{"print":…}` (`payload_len` 778 matches), and its `param_enc` decodes to exactly two RSA-2048 blocks — i.e. Studio splits the G-code into ≤245-byte chunks, RSA-PKCS#1v1.5-encrypts each under the device public key, concatenates and Base64-encodes (the same `EncryptField` scheme as `url_enc`, just applied to `param`).
+
+Note that Studio still *prefers* a structured MQTT command over `gcode_line` when the printer advertises one (e.g. `back_to_center` for homing instead of `G28`, `xyz_ctrl` for jog, `set_nozzle_temp` for nozzle temperature). `gcode_line` is the path for operations that have no structured equivalent (and, as observed, temperature control on some firmware still rides `publish_gcode`):
+
+```cpp
+// 3rd_party/BambuStudio/src/slic3r/GUI/DeviceCore/DevAxisCtrl.cpp
+int DevAxis::Ctrl_GoHome() {
+    if (m_is_support_mqtt_homing) {              // structured path preferred
+        json j; j["print"]["command"] = "back_to_center"; ...
+        return m_owner->publish_json(j);
+    }
+    // gcode fallback, only when firmware lacks the structured command:
+    return m_owner->is_in_printing() ? m_owner->publish_gcode("G28 X\n")
+                                     : m_owner->publish_gcode("G28 \n");
+}
+```
+
+**Practical takeaway for a reimplementation:** to send raw G-code to a secured printer, encrypt it into `param_enc` under the device cert (blockwise RSA, `EncryptField` below), omit the cleartext `param`, and sign the envelope. *(Structured-vs-fallback dispatch and `publish_gcode` shape: Bambu Studio source; the "`param_enc` required, cleartext `param` refused" result and the captured-message block analysis are from on-hardware testing.)*
+
+**2. `EncryptField` — device-cert field encryption** (`print.project_file` → `url_enc`, `print.gcode_line` → `param_enc`):
+
+```py
+def EncryptField(device_id, value):
+    device_cert = getDeviceCert(device_id)          # from app_cert_install reply / TLS leaf
+    if device_cert is None:
+        return value                                # no cert yet -> field stays cleartext
+    plaintext = UTF8_Encode(value)
+    out = b""
+    # Blockwise RSA: plaintext is split into <=245-byte chunks (RSA-2048 PKCS#1 v1.5
+    # ceiling = keylen - 11 = 245), each chunk encrypts to one 256-byte block, and the
+    # blocks are concatenated. A short value -> 1 block (256 B); e.g. Studio's captured
+    # temperature gcode_line -> 512 B == 2 blocks (see the gcode_line note above).
+    for i in range(0, len(plaintext), 245):
+        out += RSA_Encrypt(device_cert.publicKey, plaintext[i : i + 245])  # PKCS#1 v1.5
+    return Base64_Encode(out)
+```
+
+The middleware assigns the `*_enc` field; when no device cert is known yet it leaves the field cleartext. Confirmed on hardware (2026-07), on-wire the cleartext field is **replaced** by its encrypted form once a cert is known — for **both** commands: `project_file` sends `url_enc` with **no** cleartext `url`, and `gcode_line` sends `param_enc` with **no** cleartext `param` (a secured printer refuses `gcode_line` that still carries a cleartext `param`; a captured stock `project_file` likewise carries only `url_enc`). Developer Mode disables verification, so there the encrypted fields are optional and cleartext works. Other privileged commands are only signed, not field-encrypted. *(RN-5 for the scheme; the blockwise chunking and the cleartext-replacement rule for both fields are from on-hardware testing.)*
+
+**3. HTTP proof-of-possession** (secured-printer REST writes, e.g. `POST /my/task`):
+
+```py
+# app_cert_certification_id header — DIFFERENT serialization from MQTT cert_id:
+headers["x-bbl-app-certification-id"] = app_cert.issuer + ":" + app_cert.serialNumber.lower()
+
+# possession token over the current time (NOT a signature over the request body):
+timestamp_ms   = str(now_ms())                      # 13-digit decimal string
+ciphertext     = RSA_Encrypt(app_private_key, UTF8_Encode(timestamp_ms))  # raw priv-key op, no hash
+headers["x-bbl-device-security-sign"] = Base64_Encode(ciphertext)
+```
+
+The server recovers the timestamp and checks recency (replay protection). Two subtleties bite in practice: the timestamp must be in **milliseconds** (13 digits — a nanosecond value fails recency), and the `x-bbl-app-certification-id` serialization (`issuer:serial.lower()`) is **not** the MQTT `cert_id` order — sending the MQTT form 403s. *(RN-6)*
 
 Other `PrintParams` members Studio populates but **does not put into the MQTT command** itself: `nozzles_info`, `ams_mapping_info`, `extra_options`, `task_ext_change_assist`, `try_emmc_print`, `comments`. They feed the cloud-side `POST /v1/user-service/my/task` body and the timelapse-storage preflight (see below), not `project_file`. (`task_timelapse_use_internal` *does* reach the MQTT command, but indirectly — see the `cfg` row in the table above.)
 
@@ -1481,7 +1720,7 @@ These commands are **not implemented in the network plugin** — Studio builds t
 | Field | Type | Notes |
 |-------|------|-------|
 | `print.command` | string | Command name (see tables below) |
-| `print.sequence_id` | string | Monotonic counter (`MachineObject::m_sequence_id++`) |
+| `print.sequence_id` | string | See §6.8.2 *MQTT `sequence_id`* | Per-command unique id (Studio: monotonic **20000–29999**; plugin: epoch-ms; cloud: `"0"`). Plugin forwards Studio's value unchanged. |
 
 **Common response envelope**
 
@@ -1667,7 +1906,7 @@ When Studio submits a print job via `project_file` (§6.8.2), two fields control
 
 | Wire field | `PrintParams` source | Meaning |
 |------------|---------------------|---------|
-| `extrude_cali_flag` | `auto_flow_cali` (0 or 1) | Tells firmware whether to run PA calibration before printing. `1` = requested, `0` = skip. |
+| `extrude_cali_flag` | `auto_flow_cali` (enum, passed verbatim) | Tells firmware whether/how to run PA calibration before printing. `0` = skip, `1` = requested, `2` = auto (observed in genuine traffic, [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48)); not a plain bool. |
 | `extrude_cali_manual_mode` | `extruder_cali_manual_mode` (0 = auto, 1 = manual, -1 = omit) | If PA cali is requested, which mode to use. Omitted entirely when the value is `-1` (default sentinel). |
 
 The firmware uses the **active profile** (selected via `extrusion_cali_sel`) for the tray's `(filament_id, nozzle)` combination. If `extrude_cali_flag=1`, the printer may re-run calibration before printing rather than using the stored profile.
@@ -2462,7 +2701,13 @@ X-BBL-Agent-OS-Type: linux
 
 `X-BBL-Client-Version` is the slicer version; `X-BBL-Agent-Version` is the networking plugin version. `X-BBL-OS-Type` and `X-BBL-Agent-OS-Type` both report `linux` when running through pjarczak's WSL2 bridge; native Linux builds send `linux` directly. `X-BBL-OS-Version` carries the OS build string (Windows build number when relayed through pjarczak). `X-BBL-Executable-info` is always the literal string `{}`. `X-BBL-Device-ID` is a machine-local UUID, not the printer serial.
 
-Plus anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for the API to accept the call. They influence analytics only.
+Plus anything Studio injects through `bambu_network_set_extra_http_header`. Direct probes against the production server confirm that **none** of the `X-BBL-*` headers, nor even the custom `User-Agent`, are required for **most** endpoints (auth, profile, presets, bind, project/upload) — there they influence analytics only.
+
+> **Exception — `POST /v1/user-service/my/task` (cloud print / "local print with record").** On live hardware two of these headers are **hard requirements**; without them the endpoint returns **HTTP 403** ("no access rights to the content") and the cloud print never starts:
+> - **`X-BBL-Client-Name: BambuStudio`** — MakerWorld's user-service authorizes access to the just-uploaded print content only for the stock client identity. Our honest default `OpenBambooNetworking` is rejected with 403. In OBN this value is configurable via `obn.conf` `client_name` (empty ⇒ honest default ⇒ cloud print 403s; set to `BambuStudio` to make cloud printing work — see STATUS.md §6.8).
+> - **`X-BBL-OS-Type`** — must match the OS that performed the upload (`linux` / `windows` / `macos`); a mismatch also 403s. OBN sets it from a compile-time platform macro.
+>
+> Subtractive bisection against the production server (2026-07) narrowed the requirement to exactly these two `X-BBL-*` headers; the remaining fingerprint headers stay analytics-only even on `/my/task`. The signed **command-security** headers (`x-bbl-app-certification-id`, `x-bbl-device-security-sign`) are additionally needed for a *secured* printer — see §6.8.1.1 "Cloud print authorization".
 
 An additional header `X-BBL-Client-ID` appears on **device-scoped endpoints** (e.g. firmware version query, device metadata) but not on account-scoped endpoints (auth, profile, presets):
 
@@ -2514,7 +2759,7 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | Printer firmware catalogue | stock: `GET /v1/iot-service/api/user/device/version?dev_id=<serial>` (add `X-BBL-Client-ID: slicer:<uid>:<4-char-suffix>`); ours: synthesised from MQTT state | §6.7 | SSLKEYLOGFILE (stock); synthesised (ours) |
 | Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, `PUT /v1/iot-service/api/user/notification`, `GET /v1/iot-service/api/user/notification?action=upload&ticket=<t>`, `PATCH /v1/iot-service/api/user/project/<pid>`, `GET /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf`, `POST /v1/user-service/my/task` | §6.8 | MITM |
 | User presets sync | `<m> /v1/iot-service/api/slicer/setting[/<id>]?public=false&version=<bundle>` | §6.9 | MITM + probe |
-| Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |
+| Filament Manager (spool catalogue) | `<m> /v1/design-user-service/my/filament/v2[/batch|/ams/sync]`, `GET /v1/design-user-service/filament/config` | §6.15 | MITM |
 | MakerWorld / Mall, OSS upload | various `design-service` / `iot-service` / OSS paths | §6.12 | not captured |
 | Camera / live view / HMS snapshot | not captured | §6.11 | — |
 | Analytics / telemetry | not captured | §6.13 | — |
@@ -2526,6 +2771,10 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | `bambu_network_get_camera_url` | `int(void*, std::string dev_id, std::function<void(std::string)>)` |
 | `bambu_network_get_camera_url_for_golive` | `int(void*, std::string dev_id, std::string sdev_id, std::function<void(std::string)>)` |
 | `bambu_network_get_hms_snapshot` | `int(void*, std::string& dev_id, std::string& file_name, std::function<void(std::string, int)>)` |
+
+> **Remote-camera URL grammar (documentation only; vendor-locked).** For the cloud/remote leg of `get_camera_url` (distinct from the LAN `bambu:///local/...` / `rtsps___` shapes in §7.6), stock mints `bambu:///tutk?uid=<ttcode>&authkey=&passwd=&region=&device=&net_ver=&dev_ver=` after `GET %1%/iot-service/api/user/ttcode`. The `get_camera_url` input key is `dev|fw|proto[|channel]`, and go-live returns a CDN `cdnUrl`. This stays out of OBN's scope: the TUTK/Agora token is single-use and gated against a live cloud account, so remote camera remains 🔒. Shape documented from [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49) for completeness only.
+
+> **OBN LAN fallback.** Studio only checks that the `get_camera_url` reply **starts with `bambu:///`** (`MediaPlayCtrl.cpp:504,523`, `MediaFilePanel.cpp:608,624`), so instead of a TUTK URL OBN returns the printer's **LAN URL** `bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]` when both the LAN IP (SSDP / `connect_printer`) and the access code (`connect_printer` / cloud `dev_access_code` from `/user/print`) are known. This routes the cloud-mode file browser (`PrinterFileSystem` CTRL over `:6000`), the device-panel snapshot (`mem:/N` via `FileTransferObject`) and liveview over the local network. The non-standard `lv=` query hint (parsed only by OBN's `libBambuSource`; Studio and firmware ignore it) redirects the **video** stream to RTSP(S) `:322` on printers whose push_status advertises `ipcam.rtsp_url` (X1/P1S/P2S-class) — the CTRL channel stays on `:6000`. [OBN]
 
 ### 6.12. MakerWorld / Mall
 
@@ -2545,6 +2794,52 @@ The plugin's other HTTP-heavy surfaces follow the same transport and envelope ru
 | `bambu_network_get_mw_user_4ulist` | `int(void*, int seed, int limit, std::function<void(std::string)>)` |
 
 `PublishParams` (`bambu_networking.hpp:251-258`): `project_name`, `project_3mf_file`, `preset_name`, `project_model_id`, `design_id`, `config_filename`.
+
+**OSS credential/upload leg** (`get_oss_config` + `put_rating_picture_oss`; cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49)): Studio first calls `get_oss_config`, which maps to `GET /v1/user-service/my/ossconfig?useType=1` (with `.../s3config?useType=1` as fallback) and returns the server's STS-scoped credential JSON verbatim — `{endpoint, accessKeyId, accessKeySecret, securityToken, expiration, bucketName, cdnUrl}`. Studio treats the blob as opaque and passes it back into `put_rating_picture_oss`, which signs the `PUT` **client-side** (unlike the print-upload leg in §6.8.1, where the cloud presigns the URL): AWS Signature V4 (`AWS4-HMAC-SHA256`, scope `<date>/<region>/s3/aws4_request`, signed headers `host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`) for S3-style endpoints, or Aliyun OSS V1 (`Authorization: OSS <AKID>:<base64 HMAC-SHA1 sig>` + `x-oss-security-token`) for `aliyuncs.com` endpoints (CN region). The scheme is chosen from the endpoint host (`aliyuncs.com` → Aliyun OSS V1, otherwise AWS SigV4). The object-key convention used for rating pictures and the exact value expected back in `pic_oss_path` are not wire-confirmed yet (**verify-on-hardware**, needs a live cloud account). *(#49)*
+
+Both signers in detail (single-shot `PUT` of the picture body; STS `securityToken` from the credential blob is folded in as the vendor's session-token header):
+
+```py
+# --- AWS SigV4 (S3-style endpoint) ---
+scope = date_stamp + "/" + region + "/s3/aws4_request"          # date_stamp = YYYYMMDD
+CanonicalRequest = "PUT\n" + canonical_uri + "\n" + canonical_query + "\n" \
+                 + canonical_headers + "\n" + signed_headers + "\n" + hex(SHA256(payload))
+#   signed_headers = "host;x-amz-content-sha256;x-amz-date"  (+ ";x-amz-security-token" if STS)
+#   x-amz-content-sha256 header value = hex(SHA256(payload))
+StringToSign = "AWS4-HMAC-SHA256\n" + amz_date + "\n" + scope + "\n" + hex(SHA256(CanonicalRequest))
+#   amz_date = YYYYMMDDTHHMMSSZ ; its date part must equal date_stamp
+signing_key = HMAC(HMAC(HMAC(HMAC("AWS4"+secret, date_stamp), region), "s3"), "aws4_request")
+signature   = hex(HMAC(signing_key, StringToSign))
+headers["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + akid + "/" + scope \
+                         + ", SignedHeaders=" + signed_headers + ", Signature=" + signature
+headers["x-amz-date"] = amz_date
+headers["x-amz-content-sha256"] = hex(SHA256(payload))
+if security_token: headers["x-amz-security-token"] = security_token
+
+# --- Aliyun OSS V1 (CN endpoint) ---
+StringToSign = "PUT\n" + Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" \
+             + CanonicalizedOSSHeaders + CanonicalizedResource
+#   Date = RFC1123 GMT ; CanonicalizedResource = "/<bucket>/<object>"
+#   CanonicalizedOSSHeaders = sorted "x-oss-*:" lines incl. x-oss-security-token
+signature = Base64(HMAC-SHA1(access_key_secret, StringToSign))
+headers["Authorization"] = "OSS " + access_key_id + ":" + signature
+headers["Date"] = Date
+if security_token: headers["x-oss-security-token"] = security_token
+```
+
+**`get_subtask` vs `get_subtask_info`** — two different symbols, easy to confuse:
+
+| Symbol | Input | Expected output | Studio consumer |
+|--------|-------|-----------------|-----------------|
+| `get_subtask_info` (§6.10.2) | `subtask_id` string | JSON blob; hero thumbnail from `context.plates[<plate_idx>].thumbnail.url` | `DeviceManager` → printer-card cover during print |
+| `get_subtask` (this section) | `BBLModelTask*` with only `task_id` pre-filled | Same pointer, **enriched** with MakerWorld model/design fields | `StatusPanel::update_model_info` → `set_modeltask` |
+
+Stock `get_subtask` is a cloud REST lookup keyed by `task_id`. It should populate the `BBLModelTask` members Studio cares about (`ProjectTask.hpp`):
+
+- `design_id`, `instance_id`, `profile_id`, `job_id` (ints) — `instance_id > 0` is what lets `MachineObject::update_model_task()` call `get_model_mall_rating_result` after the print finishes (post-print MakerWorld rating dialog).
+- `model_id`, `model_name`, `profile_name` (strings) — when `design_id > 0`, `StatusPanel` shows `profile_name` in the in-print task panel.
+
+The stock cloud URL is **not captured** (likely a MakerWorld/user-service endpoint). OBN's current implementation (`src/abi_makerworld.cpp`) is an **ABI-safe stub only**: it echoes the caller-owned pointer through the callback without fetching anything. That prevents Studio from leaking the freshly-`new`'d `BBLModelTask` and clears `request_model_info_flag`, but leaves all metadata fields at their zero/empty defaults — so MakerWorld-specific UI (profile label, rating prompt) stays off. For user-uploaded prints (no published MakerWorld model behind the job) a no-op may be acceptable; for prints started from a downloaded MakerWorld model the real fetch is still missing.
 
 ### 6.13. Tracking / telemetry
 
@@ -2605,13 +2900,15 @@ struct ft_job_result { int ec; int resp_ec; const char *json; const void *bin; u
 struct ft_job_msg    { int kind; const char *json; };
 ```
 
+The `ft_job_result { int ec; int resp_ec; const char* json; const void* bin; uint32_t bin_size; }` layout above is independently confirmed in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49), reproduced from a disassembly of `ft_job_result_destroy` in a symbol-bearing build — the same source that recovered **79 exact demangled C++ ABI signatures** (cross-checking the whole §6 contract), the `bambu_network_create_agent` body that VMProtect hid in DLL-only efforts, and an **open-coded `PrintParams` serializer with a 6-bool block at struct offset `+0x278..+0x27d`**. These are corroboration of the ABI documented here, not new plugin work.
+
 Studio expects `ft_abi_version() == 1` (the default `abi_required` in `InitFTModule`).
 
 Semantically, this ABI describes a "tunnel + job" bus: open a connection to the printer (`ft_tunnel_create` from a `url`), start jobs on it, listen for results and messages.
 
 #### 6.14.1. Stock wire transport (TLS :6000)
 
-Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the same **BambuTunnelLocal** framing as Device → Files (§7.5.1.1): TLS `:6000`, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289).
+Stock `libbambu_networking.so` serves LAN `ft_*` jobs over the very same `:6000` wire as Device → Files — TLS, login + `mtype` 12291 setup, then framed CTRL JSON (`mtype` 12289). The framing, handshake, chunked-upload flow (`chunk_size` in KiB, full-duplex progress), storage labels and result codes are documented once in the **canonical `:6000` protocol reference (§7.5.1.1)**; this section only maps the `ft_*` ABI `cmd_type`s onto that wire.
 
 **Send to Printer model upload is `:6000`, not FTPS.** The `.3mf` body goes over **`ft_*` / TLS :6000** (§6.14.2). Stock does touch FTPS :990 first in some flows, but only for a **tiny `verify_job` write probe** (§6.14.3) — then `QUIT`, session closed, never reused. Our earlier tcpdump of *cache-only* Send to Printer saw zero :990 packets because that UI path may skip the probe when the target storage is already known (`emmc` / `udisk` via `cmd_type=7`).
 
@@ -2629,7 +2926,7 @@ Manual probes:
 | [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Repeated delete-free pipeline uploads on one or many sessions (regression harness) |
 | [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of wire variants (confirms P2S rejects one-shot / per-chunk-ACK multi-chunk) |
 
-Open-plugin implementation of this wire path: [STATUS.md §6.14.1–6.14.2](STATUS.md#6141-native-6000-vs-ftps-fallback).
+Open-plugin implementation of this wire path: [STATUS.md §6.14.1](STATUS.md#6141-native-6000-wire).
 
 #### 6.14.2. P2S `FILE_UPLOAD` (`cmdtype` 5) — chunked pipeline (May 2026)
 
@@ -2935,17 +3232,18 @@ Open-plugin coverage of this flow: [STATUS.md §6.14.2–6.14.3](STATUS.md#6142-
 
 ### 6.15. Filament Manager (cloud spool catalogue)
 
-Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through.
+Bambu Studio 02.06.01 introduced the **Filament Manager** tab — a WebView-driven dashboard that tracks every spool the user owns (RFID, vendor, type, current weight, color, AMS slot binding, …). The list lives in the cloud; the network plugin exposes five CRUD entry points that Studio's `wgtFilaManagerCloudClient` (`src/slic3r/GUI/fila_manager/wgtFilaManagerCloudClient.cpp`) drives all reads and writes through. ABI **02.08.01** adds a sixth call, `bambu_network_sync_ams_filaments`, for bulk AMS mount-state sync (STUDIO-18155 / path B).
 
-| Symbol | Signature |
-|--------|-----------|
-| `bambu_network_get_filament_spools` | `int(void*, FilamentQueryParams, std::string* http_body)` |
-| `bambu_network_create_filament_spool` | `int(void*, std::string request_body, std::string* http_body)` |
-| `bambu_network_update_filament_spool` | `int(void*, std::string spool_id, std::string request_body, std::string* http_body)` |
-| `bambu_network_delete_filament_spools` | `int(void*, FilamentDeleteParams, std::string* http_body)` |
-| `bambu_network_get_filament_config` | `int(void*, std::string* http_body)` |
+| Symbol | Signature | Since |
+|--------|-----------|-------|
+| `bambu_network_get_filament_spools` | `int(void*, FilamentQueryParams, std::string* http_body)` | `02.06.00` |
+| `bambu_network_create_filament_spool` | `int(void*, std::string request_body, std::string* http_body)` | `02.06.00` |
+| `bambu_network_update_filament_spool` | `int(void*, std::string spool_id, std::string request_body, std::string* http_body)` | `02.06.00` |
+| `bambu_network_delete_filament_spools` | `int(void*, FilamentDeleteParams, std::string* http_body)` | `02.06.00` |
+| `bambu_network_get_filament_config` | `int(void*, std::string* http_body)` | `02.06.00` |
+| `bambu_network_sync_ams_filaments` | `int(void*, AmsSyncParams, std::string* http_body)` | `02.08.01` |
 
-`FilamentQueryParams` and `FilamentDeleteParams` are defined in `bambu_networking.hpp:260-275`:
+`FilamentQueryParams` and `FilamentDeleteParams` are defined in `bambu_networking.hpp` (ABI ≥ `02.06.00`); `AmsSyncItem` / `AmsSyncParams` land in the same header under `#if ABI_VERSION >= 0x020801`:
 
 ```cpp
 struct FilamentQueryParams {
@@ -2960,6 +3258,33 @@ struct FilamentDeleteParams {
     std::vector<std::string> ids;
     std::vector<std::string> rfids;
 };
+
+#if ABI_VERSION >= 0x020801
+struct AmsSyncItem {
+    std::string RFID;
+    std::string filamentVendor;
+    std::string filamentType;
+    std::string filamentName;
+    std::string filamentId;
+    bool        isSupport      = false;
+    std::string color;
+    int         colorType      = 0;
+    std::vector<std::string> colors;
+    int         netWeight      = 0;
+    int         totalNetWeight = 0;
+    std::string trayIdName;
+    std::string note;
+    std::string amsSn;
+    std::string slotId;
+    int         amsId          = 0;
+    int         amsType        = 0;
+    bool        createNew      = false;
+};
+struct AmsSyncParams {
+    std::string              devId;
+    std::vector<AmsSyncItem> items;
+};
+#endif
 ```
 
 #### 6.15.1. Endpoints
@@ -2973,8 +3298,9 @@ All paths are relative to the regional API host from §6.10.1, under the `design
 | `create_filament_spool` | `POST` | `/v1/design-user-service/my/filament/v2` | `CreateFilamentV2Req` | MITM |
 | `update_filament_spool` | `PUT` | `/v1/design-user-service/my/filament/v2` (id is in body, not path) | `UpdateFilamentV2Req` | MITM |
 | `delete_filament_spools` | `DELETE` | `/v1/design-user-service/my/filament/v2/batch` | `BatchDeleteFilamentV2Req` | MITM |
+| `sync_ams_filaments` | `POST` | `/v1/design-user-service/my/filament/v2/ams/sync` | `AmsSyncParams` JSON | MITM (`02.08.01.51`) |
 
-Auth and transport are the §6.10.1 defaults — `Authorization: Bearer <access_token>`, `Content-Type: application/json`. Stock `bambu_network_agent/02.06.01.50` overrides `User-Agent` for this surface (the only place it does so in the entire plugin), but the server accepts the generic `BBL-Slicer/v…` UA too — direct probes confirm there's no UA gating.
+Auth and transport are the §6.10.1 defaults — `Authorization: Bearer <access_token>`, `Content-Type: application/json`. Stock `bambu_network_agent/02.06.01.50` / `02.08.01.51` overrides `User-Agent` for this surface (the only place it does so in the entire plugin), but the server accepts the generic `BBL-Slicer/v…` UA too — direct probes confirm there's no UA gating.
 
 #### 6.15.2. Request / response shapes
 
@@ -3073,6 +3399,64 @@ A 404 response means "id not found"; Studio falls back to `POST` (create) on tha
 
 Studio caches the response for the lifetime of the WebView and keys vendor/type/name pickers off the same `filamentId` quadruples that show up under each spool.
 
+**`POST /my/filament/v2/ams/sync` — AMS mount-state sync (ABI ≥ `02.08.01`).** Studio calls this when AMS **in-printer / slot / AMS-SN** fields change for already-known spools (path B; see §6.15.3). The plugin serialises `AmsSyncParams` to camelCase JSON and `POST`s it; Studio's success callback ignores the parsed body, so plugins must forward the server response verbatim.
+
+Request (stock `bambu_network_agent/02.08.01.51`, single tray insert — MITM):
+
+```json
+{
+  "devId": "22E8BJ610801473",
+  "items": [{
+    "RFID": "C0150FF4913D492495F86923A61F8195",
+    "amsId": 0,
+    "amsSn": "19C06A610109584",
+    "amsType": 3,
+    "color": "#00000000",
+    "colorType": 2,
+    "colors": ["#00000000"],
+    "createNew": false,
+    "filamentId": "GFS05",
+    "filamentName": "Support For PLA/PETG",
+    "filamentType": "PLA-S",
+    "filamentVendor": "Bambu Lab",
+    "isSupport": false,
+    "netWeight": -5,
+    "note": "",
+    "slotId": "1",
+    "totalNetWeight": 500,
+    "trayIdName": "S05-C0"
+  }]
+}
+```
+
+Field notes (from Studio's `wgtFilaManagerCloudSync::sync_ams_to_cloud` + live traffic):
+
+| JSON key | Source | Notes |
+|----------|--------|-------|
+| `devId` | `MachineObject::get_dev_id()` | Printer serial; required. |
+| `RFID` | spool `tag_uid` | May be `""` for manual / non-RFID spools. |
+| `amsSn` / `slotId` / `amsId` / `amsType` | mount fields | On **unplug**, Studio zeroes them (`amsSn=""`, `slotId=""`, `amsId=0`, `amsType=0`) while still sending the spool identity. |
+| `netWeight` / `totalNetWeight` | grams (ints) | `netWeight` can be negative in practice (e.g. `-10`, `-5`) when Studio has not yet reconciled remain %; the server accepts it. |
+| `createNew` | always `false` in observed path-B traffic | Studio builds items from existing store entries only. |
+| `colors` | always a JSON array | Even for solid colours (`colorType: 2`) — typically a one-element array matching `color`. |
+
+`items` may contain **multiple** spools in one POST (batch mount/unmount of several trays). Empty `devId` or empty `items` should not be sent; plugins should fail locally rather than POST an empty body.
+
+Typical success response (200 OK) — per-item result list:
+
+```json
+{
+  "createdRFIDs": null,
+  "results": [
+    {"amsSn": "19C06A610109584", "slotId": "1", "spoolId": 6498430}
+  ]
+}
+```
+
+`spoolId` is the cloud `int64` id when the item matched an existing cloud spool; it is `null` when the server could not resolve one (e.g. empty RFID / unplug of a local-only entry). Malformed JSON (missing quotes on keys, etc.) returns **HTTP 400**.
+
+On transport / non-2xx failure the plugin returns `BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED` (−29); there is no dedicated sync error code in the ABI.
+
 #### 6.15.3. When Studio actually calls these
 
 `wgtFilaManagerCloudDispatcher` serialises every cloud operation onto a single in-flight queue (`enqueue_pull` / `enqueue_push_create` / `enqueue_push_update` / `enqueue_push_delete`) so the server never sees concurrent writes from the same client. The triggers are:
@@ -3080,13 +3464,15 @@ Studio caches the response for the lifetime of the WebView and keys vendor/type/
 - **Login.** `GUI_App::on_user_login` calls `m_fila_manager_cloud_disp->enqueue_pull()` once an access token is available — this is the very first call most plugins ever see, before the user even opens the Filament Manager tab.
 - **Filament Manager panel mount.** `FilaManagerVM::OnPanelShown` re-issues a pull *and* fetches `get_filament_config`. Repeated tab focuses are debounced through the dispatcher.
 - **User actions.** "Add spool" → `create_filament_spool`; field edits → `update_filament_spool` (with the fallback-to-create on 404); single or multi-select delete → `delete_filament_spools`.
-- **AMS sync.** When the printer reports a new RFID-tagged spool, Studio synthesises a `createType:"ams"` POST with the matching `RFID` and `trayIdName`.
+- **AMS sync — path A (remain weight).** On every cloud/LAN MQTT message for the **selected** online printer, `GUI_App` calls `wgtFilaManagerSync::on_device_update` → `sync_all_trays`. Spools whose remaining weight changed are pushed via throttled `update_filament_spool` (`notify_ams_synced` → PUT). Requires login; silently skipped otherwise.
+- **AMS sync — path B (mount fields, ABI ≥ `02.08.01`).** Same `sync_all_trays` pass: when `apply_mount_diff` reports changed mount ownership (`in_printer` / `dev_id` / `ams_sn` / `ams_id` / `ams_type` / `slot_id` — insert, remove, or move), Studio calls `sync_ams_to_cloud` → `bambu_network_sync_ams_filaments` (`POST …/ams/sync`). Path B is **not** throttled. Paths A and B may fire for the same spool in one sync cycle; the cloud is treated as last-write-wins / idempotent.
+- **AMS create.** When the printer reports a new RFID-tagged spool that is not yet in the store, Studio still synthesises a `createType:"ams"` POST (separate from path B, which only updates already-known spools).
 
 Every successful pull rewrites the local store: cloud is the source of truth, and any local-only entries that didn't make it to the server (e.g. a failed previous push) are dropped on each refresh.
 
 ### 6.16. Error codes
 
-The complete list of error values the plugin is expected to return through `int` lives in `src/slic3r/Utils/bambu_networking.hpp:13-94` (general, bind, `start_local_print_with_record`, `start_print`, `start_local_print`, `start_send_gcode_to_sdcard`, connection). Five additional `BAMBU_NETWORK_ERR_{GET_FILAMENTS,CREATE_FILAMENT,UPDATE_FILAMENT,DELETE_FILAMENT,GET_FILAMENT_CONFIG}_FAILED` codes (-27..-31) are returned on transport / HTTP-error paths from the §6.15 endpoints so Studio's UI can surface a meaningful toast instead of a silent retry-loop.
+The complete list of error values the plugin is expected to return through `int` lives in `src/slic3r/Utils/bambu_networking.hpp:13-94` (general, bind, `start_local_print_with_record`, `start_print`, `start_local_print`, `start_send_gcode_to_sdcard`, connection). Five additional `BAMBU_NETWORK_ERR_{GET_FILAMENTS,CREATE_FILAMENT,UPDATE_FILAMENT,DELETE_FILAMENT,GET_FILAMENT_CONFIG}_FAILED` codes (-27..-31) are returned on transport / HTTP-error paths from the §6.15 endpoints so Studio's UI can surface a meaningful toast instead of a silent retry-loop. `bambu_network_sync_ams_filaments` (ABI ≥ `02.08.01`) has no dedicated code and reuses `BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED` (−29).
 
 ---
 
@@ -3507,7 +3893,7 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 
 | Use | Library | When | Upload transport |
 |-----|---------|------|------------------|
-| Device → Files browse (external USB) | `libBambuSource` (stock: `:6000`; our workaround: FTPS) | File browser tab | N/A (lists/downloads only) |
+| Device → Files browse (external USB) | `libBambuSource` (`:6000`) | File browser tab | N/A (lists/downloads only) |
 | **`verify_job` preflight** | `libbambu_networking` | `PrintJob` LAN preflight; optional before Send to Printer | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
 | Legacy Send-to-Printer fallback | `libbambu_networking` | `SendJob` when `!is_support_brtc` | Full `.3mf` over FTPS `STOR` — not used on P2S |
 | Legacy LAN print upload | `libbambu_networking` | `start_local_print` / cloud `_with_record` FTPS leg | Full `.3mf` over FTPS `STOR` (P2S print-start prefers `:6000` + `brtc://` — see STATUS) |
@@ -3518,15 +3904,17 @@ Stock **Send to Printer → cache** on P2S: **`verify_job` FTPS probe (optional)
 
 Internal timelapse **recording** during print (`task_timelapse_use_internal` → MQTT `project_file` `"cfg":"4"`) is handled by **`libbambu_networking`**, not the file-browser CTRL path documented here.
 
-#### 7.5.1.1. LAN wire protocol (`BambuTunnelLocal`, reverse-engineered May 2026)
+#### 7.5.1.1. The `:6000` protocol (`BambuTunnelLocal` wire) — canonical reference
 
-Stock LAN file browser traffic (verified on **P2S**; likely shared across models that use `bambu:///local/...:6000` for Files) uses **`BambuTunnelLocal`** inside `libBambuSource.so`, not the cloud TUTK UID path (`BambuTunnelTutk` / `IOTC_Connect_ByUIDEx`).
+This is the single canonical description of the printer's `:6000` LAN service (reverse-engineered on **P2S**, May 2026; likely shared across models that expose `bambu:///local/...:6000`). It is the same wire for **both** consumers that use it: the **file-browser CTRL** path in `libBambuSource.so` (Device → Files, `BambuTunnelLocal`, *not* the cloud TUTK UID path `BambuTunnelTutk` / `IOTC_Connect_ByUIDEx`) and the **file-transfer** path (`ft_*` model upload, ABI mapping in §6.14). The framing, handshake and command set below apply to both; the ABI-specific bits live in §6.14, and the per-command `req`/response shapes in §7.6/§7.5.3.
+
+**Transport and login.** TCP `:6000`, **implicit TLS** immediately after connect (leaf cert `CN=<serial>`, same LAN-TLS policy as §6.1.1). The application-layer login uses `user="bblp"` + the 8-character access code (the same code used for FTPS `:990` and the LAN MQTT password). The printer allows **several simultaneous `:6000` TLS sessions** — there is no exclusive lock on the port.
 
 **Stack:**
 
 ```text
 TCP :6000
-  └─ TLS (tutk_third_SSL_connect — OpenSSL wrapper inside libBambuSource)
+  └─ TLS (implicit; OpenSSL — tutk_third_SSL_connect wrapper in libBambuSource)
        └─ subchannel 0x01  login
        └─ subchannel 0x02  StartStreamEx setup + all CTRL JSON / binary
 ```
@@ -3579,17 +3967,17 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 
    i.e. the Studio-side object from §7.5.2 gains a leading `"mtype":12289,` (+14 bytes) before framing. Large replies (e.g. `SUB_FILE` thumbnails) append `\n\n` + binary **inside the payload** after the JSON; stock `Bambu_ReadSample` returns the combined buffer to Studio unchanged.
 
-**Frida / packet-capture caveat.** Hooking `tutk_third_SSL_write` **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing; attach early or use [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) to capture the full handshake.
+**Frida / packet-capture caveat.** Hooking the TLS write primitive **after** Device → Files is already open shows **only step 4** (16-byte header + ~100–200 B JSON). Steps 1–3 (login + `StartStreamEx` setup) happen during `Bambu_Open` / `Bambu_StartStreamEx` before browsing, so a full capture must attach before the browser opens, or drive the socket directly with [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) (which performs login + setup itself, so the whole handshake is under your control).
 
-**RE tools in this repo:**
+**RE tooling in this repo (how to reproduce the wire).** These scripts drive / observe the `:6000` protocol directly and were used to reverse-engineer everything above:
 
-| Tool | Role |
-|------|------|
-| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS :6000 client; performs login + `mtype` 12291 setup; auto-framed JSON lines; `/upload` uses chunked pipeline (§6.14.2) |
-| [`tools/bambu6000_ftp_proxy.py`](../tools/bambu6000_ftp_proxy.py) | Plain FTP ↔ `:6000` bridge (default `127.0.0.1:2122`); virtual `/external/*` and `/internal/*` trees map to `LIST_INFO` / `FILE_DOWNLOAD` / upload / delete |
-| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Batch regression: repeated pipeline uploads, optional delete, same-session stress |
-| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of upload wire variants (one-shot, per-chunk ACK, md5/separator permutations) |
-| [`tools/tutk_ssl_log.js`](../tools/tutk_ssl_log.js) + [`tools/frida_tutk_attach.sh`](../tools/frida_tutk_attach.sh) | Frida hooks on stock `libBambuSource.so` (`Bambu_SendMessage`, `Bambu_ReadSample`, `tutk_third_SSL_*`) |
+| Tool | Role | Typical use |
+|------|------|-------------|
+| [`tools/bambu6000_repl.py`](../tools/bambu6000_repl.py) | Interactive TLS `:6000` client; performs login + `mtype` 12291 setup, then auto-frames each JSON line you type | `python3 tools/bambu6000_repl.py <ip> <access_code>` then type e.g. `{"cmdtype":1,"req":{"api_version":2,"notify":"DETAIL","type":"timelapse"}}`; `/ability`, `/upload <file> emmc`, `/download mem:/26 out.jpg` are built-in helpers |
+| [`tools/bambu6000_ftp_proxy.py`](../tools/bambu6000_ftp_proxy.py) | Plain-FTP ↔ `:6000` bridge (default `127.0.0.1:2122`); virtual `/external/*` and `/internal/*` trees map to `LIST_INFO` / `FILE_DOWNLOAD` / upload / delete | Point any FTP client at `ftp://127.0.0.1:2122` to browse/pull printer files without speaking the raw framing |
+| [`tools/repl_upload_sweep.py`](../tools/repl_upload_sweep.py) | Batch regression: repeated pipeline uploads, optional delete, same-session stress | Confirms the chunked pipeline is stable across many uploads on one session |
+| [`tools/upload_experiments.py`](../tools/upload_experiments.py) | Matrix of upload wire variants (one-shot, per-chunk ACK, md5/separator permutations) | How the "P2S rejects one-shot / requires pipelined chunks" facts above were established |
+| [`tools/tutk_ssl_log.js`](../tools/tutk_ssl_log.js) + [`tools/frida_tutk_attach.sh`](../tools/frida_tutk_attach.sh) | Frida hooks on stock `libBambuSource.so` (`Bambu_SendMessage`, `Bambu_ReadSample`, `tutk_third_SSL_*`) | Attach *before* opening Device → Files to capture the login + setup frames that a late hook misses |
 
 **Example `LIST_INFO` round-trip** (External timelapse, after handshake):
 
@@ -3597,6 +3985,39 @@ Byte at offset **7** of the magic distinguishes client (`0x01`) vs server (`0x00
 C→P  hdr(101, 0x0102013f) + {"mtype":12289,"cmdtype":1,"sequence":1,"req":{"api_version":2,"notify":"DETAIL","type":"timelapse"}}
 P→C  hdr(310, 0x0002013f) + {"cmdtype":1,"mtype":12289,"reply":{"file_lists":[...]},"result":0,"sequence":1}
 ```
+
+**Command set (`cmdtype`).** Every RPC carries a `cmdtype` selecting the operation. The enum and the per-command `req` field shapes are tabulated in §7.6; every reply carries a `result` integer from the error enum in §7.5.3. The commands whose *wire flow* is more than a single request/response are detailed below.
+
+**`FILE_UPLOAD` (5) — chunked pipeline.** Large model uploads (multi-MB `.3mf`) use a two-phase, pipelined flow (a single one-shot `{path,file,size,md5}` + whole file is **rejected** by P2S firmware for large files — connection reset / `-9203`):
+
+```text
+# Phase 1 — init (JSON only)
+C→P  {"cmdtype":5,"sequence":N,"req":{"type":"model","storage":"emmc","path":"<name>.3mf","total":<bytes>}}
+P→C  {"cmdtype":5,"sequence":N,"result":1,"reply":{"chunk_size":255,"offset":0}}    # result 1 = CONTINUE
+
+# Phase 2 — data fragments (same sequence N, increasing frag_id); file_md5 on the LAST chunk
+C→P  {"mtype":12289,"cmdtype":5,"sequence":N,"req":{"frag_id":0,"offset":0,"size":261120}}  + "\n\n" + <261120 bytes>
+     …
+C→P  {"cmdtype":5,"sequence":N,"req":{"frag_id":K,"offset":…,"size":…,"file_md5":"<hex>"}} + "\n\n" + <tail bytes>
+P→C  {"cmdtype":5,"sequence":N,"result":0}                                                  # 0 = SUCCESS
+```
+
+Two protocol details that are easy to miss:
+
+- **`chunk_size` in the init reply is in kibibytes, not bytes.** `"chunk_size":255` means ~255 KiB per fragment, i.e. each `size` on the wire is `chunk_size * 1024` (except the final, shorter tail).
+- **The connection is full-duplex during Phase 2.** While the client is still writing fragment bodies, the printer emits progress/interim reply frames on the same socket. The client **must keep draining** those frames as it sends; if it only writes and never reads, the peer's send buffer backs up and the printer **resets the connection** mid-upload.
+
+**`FILE_DOWNLOAD` (4) — mem preview.** In-memory thumbnails/previews are addressed as `mem:/<idx>`; the wire request is `{"cmdtype":4,"sequence":N,"req":{"path":"mem:/26","offset":0}}` (no `is_mem_file` on the wire). The reply streams the JPEG in fragments carrying `frag_id` / `offset` / `size` / `total`, with `file_md5` on the final fragment (`result:0`).
+
+**`REQUEST_MEDIA_ABILITY` (7) — storage probe.** `{"cmdtype":7,"sequence":N,"req":{"peer":"studio","api_version":<v>}}` returns a JSON **array of storage labels** the printer can write, e.g. `["emmc","udisk"]` on P2S. Observed `api_version` values differ by firmware/client (2 or 3); `peer` identifies the requesting side.
+
+**Storage labels.** The `storage` value in `FILE_UPLOAD`/`LIST_INFO` and the array from `REQUEST_MEDIA_ABILITY` use the labels `emmc` / `udisk` (physical volumes, current firmware) and, on older builds/logical views, `sdcard` / `usb` / `internal` / `external`. The label selects *where the file is written*; the print-start `url` scheme (§6.8.2) later selects *how firmware locates* it.
+
+**Session semantics and scope.**
+
+- The **file-browser CTRL** consumer keeps one request in flight at a time (serialised on a worker thread): strict request → response pairing, `sequence` echoed back to match callbacks.
+- The **`ft_*` file-transfer** consumer keeps one session open across a `cmdtype=7` ability probe and a `cmdtype=5` upload back-to-back **without re-handshaking**, and does not assume strict pairing: a client must **drain or filter stale framed JSON** left from a prior command and **match replies on `cmdtype` + `sequence`**, not on a bare `result:0`.
+- Do **not** conflate `:6000` with two neighbouring services: **FTPS `:990`** (a separate implicit-TLS FTP daemon, §7.6.1.1) and the **MJPEG `0x3000` 80-byte auth block** used for A1/P1 live view — sending that block on a `:6000` file session yields a 24-byte `0x0003013f` ack and the peer closes.
 
 #### 7.5.2. ABI / Studio-side JSON: `Bambu_SendMessage` payload
 
@@ -3680,7 +4101,7 @@ Asynchronous notifications (printer-initiated, no preceding `Bambu_SendMessage`)
 
 ### 7.6. CTRL command reference
 
-The full set of `cmdtype` values is in `PrinterFileSystem.h:34-45`:
+This is the per-command `req`/response detail for the command set; the transport, framing, handshake and multi-frame flows are in the canonical `:6000` protocol reference (§7.5.1.1). The full set of `cmdtype` values is in `PrinterFileSystem.h:34-45`:
 
 ```34:45:src/slic3r/GUI/Printer/PrinterFileSystem.h
     enum {

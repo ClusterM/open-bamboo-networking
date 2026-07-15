@@ -104,7 +104,7 @@ jobs:
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
-        run: tools/check_abi_compat.sh --so=build/libbambu_networking.so
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.so
 
       - name: Stage artifacts
         run: |
@@ -240,7 +240,7 @@ jobs:
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
-        run: tools/check_abi_compat.sh --so=build/libbambu_networking.dylib
+        run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
 
       - name: Stage artifacts
         run: |

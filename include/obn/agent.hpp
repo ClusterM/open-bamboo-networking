@@ -131,6 +131,24 @@ public:
                                  const std::string& json_str,
                                  int                qos);
 
+    // Ensures a live LAN MQTT session to `dev_id`, opening one if needed.
+    // Studio only calls connect_printer() for LAN-mode printers; a
+    // cloud-bound printer therefore has no LanSession even though we hold its
+    // LAN IP + access code (from SSDP + the cloud /user/print dev_access_code,
+    // or passed straight from PrintParams). This lets LAN-first paths (print
+    // trigger, LAN-priority telemetry) bring the session up themselves.
+    //
+    // `ip_hint` / `code_hint` override the cached lan_ip_by_dev_ /
+    // lan_access_code_by_dev_ values when non-empty (the print path passes
+    // PrintParams::dev_ip / password directly). Returns true when a connected
+    // session to `dev_id` exists on return. Idempotent: a no-op (returns true)
+    // when the current session already targets `dev_id` and is connected.
+    // Blocks up to ~3s waiting for the MQTT CONNACK so an immediate publish
+    // succeeds.
+    bool ensure_lan_session(const std::string& dev_id,
+                            const std::string& ip_hint   = {},
+                            const std::string& code_hint = {});
+
     // Studio calls this every ~1 s from its refresh timer, plus once right
     // after on_printer_connected_fn. We only do real work the first time a
     // given `dev_id` is seen (and only in lan_only mode for now): capture the
@@ -358,6 +376,23 @@ public:
     // Last LAN access code seen in connect_printer for this dev_id (needed
     // because bambu_network_bind does not pass the code in the ABI).
     std::string lan_access_code_for(const std::string& dev_id) const;
+    // Remember the LAN access code learned outside connect_printer (the
+    // cloud /user/print endpoint returns it as dev_access_code). Lets
+    // camera_url_for() mint LAN URLs in cloud-only sessions where no LAN
+    // MQTT connect ever ran.
+    void note_device_access_code(const std::string& dev_id,
+                                 const std::string& access_code);
+    // LAN fallback for bambu_network_get_camera_url: stock plugin mints a
+    // bambu:///tutk?... URL via the proprietary TUTK/Agora SDK, which we
+    // don't ship. When the printer's LAN IP (SSDP / connect_printer) and
+    // access code (connect_printer / cloud dev_access_code) are both known
+    // we return "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>"
+    // instead, so Studio's PrinterFileSystem (file browser), the device
+    // image flow (mem:/N snapshot) and — with the lv=rtsps hint handled in
+    // libBambuSource — liveview all run over the local network even while
+    // the printer is cloud-paired. Returns "" when either piece is missing;
+    // Studio then shows its normal "connection failed" state.
+    std::string camera_url_for(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
@@ -397,6 +432,23 @@ private:
     // substring prefilter; full JSON parse only on candidate frames.
     void harvest_security_flags(const std::string& dev_id,
                                 const std::string& json);
+
+    // Scans a push_status frame for ipcam.rtsp_url and latches the LAN
+    // liveview protocol ("rtsps"/"rtsp") per device. camera_url_for()
+    // forwards it as the lv= hint so libBambuSource knows to fetch video
+    // over RTSP(S) instead of MJPEG :6000 on X1/P1S/P2S-class printers.
+    void harvest_media_caps(const std::string& dev_id,
+                            const std::string& json);
+
+    // Publishes the LAN-TLS peer pin for (ip -> dev_id) so the env-only
+    // consumers (:6000 FileTransfer tunnel, FTPS, camera in libBambuSource)
+    // can verify the printer's self-signed leaf even when no LAN
+    // connect_printer ran this session (e.g. cloud-only usage). No-op when
+    // the config dir is unknown or the cert is not yet on disk. The FT/TLS
+    // side never sees the config dir; the cert path only reaches it through
+    // OBN_LAN_TLS_PEER_<ip>, so every path that learns ip<->serial must call
+    // this. Safe/cheap to call repeatedly (registry dedups).
+    void publish_peer_cert_pin(const std::string& ip, const std::string& dev_id);
 
     mutable std::mutex mu_;
     std::string        log_dir_;
@@ -487,15 +539,68 @@ private:
     // ssdp::to_device_info_json). Used by lookup_bind_detect().
     std::unordered_map<std::string, std::string> ssdp_json_by_ip_;
     // connect_printer() stores the MQTT/FTPS password (access code) here so
-    // bambu_network_bind can POST it to the cloud as bind_code.
+    // bambu_network_bind can POST it to the cloud as bind_code. Also fed
+    // from the cloud /user/print dev_access_code via note_device_access_code
+    // so camera_url_for() works in cloud-only sessions.
     std::unordered_map<std::string, std::string> lan_access_code_by_dev_;
-    // connect_printer() stores the LAN IP here so maybe_setup_camera() can
-    // reach the printer's MJPEG endpoint without a fresh SSDP lookup.
+    // Reverse of the lan_tls ip->serial registry: last known LAN IP per
+    // dev_id (SSDP / connect_printer). Used by camera_url_for() and by
+    // maybe_setup_camera() to reach the printer's MJPEG endpoint.
     std::unordered_map<std::string, std::string> lan_ip_by_dev_;
+    // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
+    // from push_status ipcam.rtsp_url by harvest_media_caps().
+    std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;
 
     // dev_id -> dev_type from SSDP, used by maybe_setup_camera() to pick the
     // LAN vs. Agora/TUTK camera source for the printer's model.
     std::unordered_map<std::string, std::string> dev_model_by_id_;
+
+    // dev_ids for which an asynchronous LAN-autostart worker is currently
+    // running, so the ~5s SSDP / access-code hooks don't stack duplicate
+    // connect attempts. Guarded by mu_.
+    std::set<std::string> lan_autostart_inflight_;
+    // Fires ensure_lan_session(dev_id) on a detached thread when dev_id is the
+    // user-selected machine, both LAN IP and access code are known, and no
+    // live/inflight session already targets it. Non-blocking; safe to call
+    // from the SSDP dispatch / HTTP threads that already learned an IP or code.
+    void autostart_lan_if_selected(const std::string& dev_id);
+
+    // --- LAN-priority report subscription (mirrors Studio's conceptual
+    // DeviceSubscribeManager local-first behaviour, see issue #49). LAN MQTT
+    // and the cloud both carry device/<id>/report; when LAN is delivering we
+    // "defer-close" the cloud report subscription (unsubscribe, keep the cloud
+    // MQTT connected) to avoid double telemetry, and fail back to cloud if LAN
+    // goes silent. All guarded by mu_ unless noted. ---
+    // Last time a LAN report frame arrived per dev_id (steady clock).
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        last_lan_report_;
+    // Devices whose cloud report subscription is currently deferred because LAN
+    // telemetry is authoritative. cloud_add_subscribe() skips these.
+    std::set<std::string> lan_report_priority_;
+    // Called from notify_local_message on every LAN report: stamps
+    // last_lan_report_ and, on the first report for a device, defer-closes the
+    // cloud report subscription and starts the silence watchdog.
+    void maybe_prefer_lan_subscription(const std::string& dev_id);
+    // Re-subscribes the cloud report topic for dev_id (failback) and clears its
+    // LAN-priority state. Safe to call when not deferred (no-op-ish).
+    void lan_report_failback(const std::string& dev_id);
+
+    // Silence watchdog: re-subscribes cloud report for any LAN-priority device
+    // that hasn't sent a LAN report within kLanSilenceFailback.
+    std::mutex              lan_watchdog_mu_;
+    std::condition_variable lan_watchdog_cv_;
+    std::thread             lan_watchdog_thread_;
+    bool                    lan_watchdog_active_ = false;
+    void ensure_lan_watchdog_running();
+    void lan_watchdog_loop();
+
+  public:
+    // True while dev_id's cloud report subscription is deferred in favour of
+    // LAN telemetry. Lets the implicit get_user_print_info subscribe skip a
+    // device that LAN is already covering.
+    bool lan_report_priority_active(const std::string& dev_id) const;
+
+  private:
 
     // Buffer populated by bambu_network_get_setting_list2 and drained
     // by bambu_network_get_user_presets. See preset_cache_* above.

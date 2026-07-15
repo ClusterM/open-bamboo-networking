@@ -93,6 +93,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "slicer_cert_id")              out.slicer_cert_id = val;
     else if (key == "slicer_cert_pem")             out.slicer_cert_pem = val;
     else if (key == "slicer_crl_pem")              out.slicer_crl_pem = val;
+    else if (key == "client_name")                 out.client_name = val;
     else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
     else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
     else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;

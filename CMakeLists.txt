@@ -301,6 +301,7 @@ add_library(bambu_networking SHARED
     src/plugin_load_banner.cpp
     src/mqtt_client.cpp
     src/os_compat.cpp
+    src/oss_sign.cpp
     src/print_job.cpp
     src/print_job_naming.cpp
     src/signing.cpp
@@ -778,6 +779,70 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME signing COMMAND signing_test)
+
+    # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
+    # build_task_body). OBN_TESTING promotes the anonymous-namespace
+    # helpers to obn::cloud_print::test_* wrappers.
+    add_executable(cloud_print_test tests/cloud_print_test.cpp
+        src/agent.cpp
+        src/auth.cpp
+        src/camera.cpp
+        src/camera/AgoraUrl.cpp
+        src/camera/CameraSourceFactory.cpp
+        src/camera/JpegCameraSource.cpp
+        src/camera/oss_agora/OssAgoraBambuSource.cpp
+        src/camera/oss_agora/OssAgoraEngine.cpp
+        src/camera/OssTutkCameraSource.cpp
+        src/camera/oss_agora/OssAgoraSignaling.cpp
+        src/camera/oss_tutk/IotcClient.cpp
+        src/cert_store.cpp
+        src/config.cpp
+        src/cloud_auth.cpp
+        src/cloud_presets.cpp
+        src/cloud_print.cpp
+        src/cloud_session.cpp
+        src/cover_cache.cpp
+        src/cover_server.cpp
+        src/ftps.cpp
+        src/http_client.cpp
+        src/json_lite.cpp
+        src/lan_session.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/mqtt_client.cpp
+        src/print_job.cpp
+        src/print_job_naming.cpp
+        src/print_params_ftp_prefs.cpp
+        src/os_compat.cpp
+        src/signing.cpp
+        src/ssdp.cpp
+        src/tls_dial.cpp
+        src/tunnel_local.cpp
+        src/tunnel_upload.cpp)
+    target_include_directories(cloud_print_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(cloud_print_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(cloud_print_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME cloud_print COMMAND cloud_print_test)
+
+    # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
+    # the AWS SigV4 signing-key derivation against the vendors' published
+    # test vectors, plus config parsing and header construction.
+    add_executable(oss_sign_test tests/oss_sign_test.cpp
+        src/json_lite.cpp
+        src/oss_sign.cpp)
+    target_include_directories(oss_sign_test PRIVATE include)
+    target_link_libraries(oss_sign_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME oss_sign COMMAND oss_sign_test)
 
 endif()
 

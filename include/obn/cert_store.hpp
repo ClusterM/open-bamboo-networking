@@ -71,6 +71,17 @@ void      set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey);
 bool      set_printer_pub_key_from_cert_pem(const std::string& dev_id,
                                             const std::string& cert_pem);
 
+// Seeds the cache for dev_id from an on-disk device-certificate PEM file
+// (e.g. the TLS-leaf snapshot at <config_dir>/certs/<dev_id>.pem), but only
+// when no key is cached yet — an existing (authoritative app_cert_install)
+// entry is left untouched. Use at LAN connect time so the field-encryption
+// path has a key even when the cert was captured in a previous session and
+// capture_peer_cert_pem is skipped. Returns true if a key is present for
+// dev_id afterwards (already cached or freshly loaded); false on read/parse
+// failure with an empty cache.
+bool      prime_pub_key_from_cert_file(const std::string& dev_id,
+                                       const std::string& pem_path);
+
 // Removes and releases the cached key for dev_id. No-op if absent.
 void      forget_printer(const std::string& dev_id);
 

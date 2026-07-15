@@ -55,3 +55,16 @@ OBN_ABI int bambu_network_get_filament_config(void* agent,
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     return obn::cloud_filament::config(a, http_body);
 }
+
+#if ABI_VERSION >= 0x020801
+
+OBN_ABI int bambu_network_sync_ams_filaments(void* agent,
+                                              BBL::AmsSyncParams params,
+                                              std::string* http_body)
+{
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return obn::cloud_filament::sync_ams(a, params, http_body);
+}
+
+#endif

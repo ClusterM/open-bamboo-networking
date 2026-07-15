@@ -76,8 +76,10 @@ std::string dump_or_null(const obn::json::Value& v)
 //
 // Security note: dev_access_code is the LAN MQTT password (also shown
 // on the printer display). It is returned in plaintext from this endpoint.
-std::string remap_bind_payload(const std::string& raw_body,
-                               std::vector<std::string>* out_dev_ids)
+std::string remap_bind_payload(
+    const std::string& raw_body,
+    std::vector<std::string>* out_dev_ids,
+    std::vector<std::pair<std::string, std::string>>* out_access_codes)
 {
     std::string perr;
     auto root = obn::json::parse(raw_body, &perr);
@@ -120,7 +122,10 @@ std::string remap_bind_payload(const std::string& raw_body,
                 !ts.is_null() ? ts.as_string() : d.find("print_status").as_string());
         }
         out << ',';
-        out << "\"dev_access_code\":" << obn::json::escape(d.find("dev_access_code").as_string());
+        const auto access_code = d.find("dev_access_code").as_string();
+        if (out_access_codes && !dev_id.empty() && !access_code.empty())
+            out_access_codes->emplace_back(dev_id, access_code);
+        out << "\"dev_access_code\":" << obn::json::escape(access_code);
         // Pass-through extras; Studio code paths occasionally look them up.
         if (auto v = d.find("dev_product_name"); !v.is_null())
             out << ",\"dev_product_name\":" << obn::json::escape(v.as_string());
@@ -164,8 +169,16 @@ bool fetch_user_print_info(obn::Agent* a,
     if (out_resp) *out_resp = resp;
     if (resp.status_code != 200 || resp.body.empty()) return false;
 
-    std::string mapped = remap_bind_payload(resp.body, out_dev_ids);
+    std::vector<std::pair<std::string, std::string>> access_codes;
+    std::string mapped = remap_bind_payload(resp.body, out_dev_ids,
+                                            &access_codes);
     if (count_devices(resp.body) == 0) return false;
+
+    // Remember the LAN access code per device so camera_url_for() can mint
+    // bambu:///local URLs (file browser / liveview over LAN) even when no
+    // LAN connect_printer ever runs in this session.
+    for (const auto& [dev_id, code] : access_codes)
+        a->note_device_access_code(dev_id, code);
 
     if (out_mapped) *out_mapped = std::move(mapped);
     return true;

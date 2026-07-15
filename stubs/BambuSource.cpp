@@ -242,6 +242,12 @@ struct TunnelUrl {
     std::string cli_ver;
     std::string net_ver;
     std::string path = "/streaming/live/1"; // RTSP(S) only
+    // LAN liveview hint appended by the plugin's get_camera_url fallback
+    // ("rtsps"/"rtsp"). On a local-scheme tunnel it redirects the VIDEO
+    // stream (Bambu_StartStream) to RTSP(S) :322/:554 while the CTRL
+    // channel (file browser) keeps using TLS :6000. Empty for URLs minted
+    // by Studio itself.
+    std::string lv;
 };
 
 std::string url_decode(const std::string& s)
@@ -362,6 +368,7 @@ bool parse_url(const std::string& url, TunnelUrl* out)
         else if (key == "cli_id") { out->cli_id = val; }
         else if (key == "cli_ver") { out->cli_ver = val; }
         else if (key == "net_ver") { out->net_ver = val; }
+        else if (key == "lv")     { out->lv = val; }
         i = amp + 1;
     }
 
@@ -1676,6 +1683,37 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
+
+    // lv= hint from the plugin's get_camera_url LAN fallback: this local-
+    // scheme tunnel was minted for a printer whose LAN video is RTSP(S)
+    // (X1/P1S/P2S-class), not MJPEG :6000. The VIDEO stream starts here
+    // (the CTRL/file-browser channel goes through Bambu_StartStreamEx and
+    // must keep the :6000 socket), so drop the :6000 TLS session and open
+    // the RTSP(S) passthrough instead. One-shot: open_rtsp flips
+    // url.scheme, so repeated StartStream calls fall through below.
+    if (t->url.scheme == Scheme::Local && !t->ctrl_mode &&
+        (t->url.lv == "rtsps" || t->url.lv == "rtsp")) {
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_StartStream: lv=%s hint, redirecting video to RTSP(S)",
+                t->url.lv.c_str());
+        {
+            std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+            if (t->ssl) {
+                SSL_shutdown(t->ssl);
+                SSL_free(t->ssl);
+                t->ssl = nullptr;
+            }
+            if (obn::os::socket_valid(t->fd)) {
+                obn::os::close_socket(t->fd);
+                t->fd = obn::os::kInvalidSocket;
+            }
+        }
+        t->url.scheme = (t->url.lv == "rtsps") ? Scheme::Rtsps : Scheme::Rtsp;
+        t->url.port   = (t->url.lv == "rtsps") ? 322 : 554;
+        t->url.path   = "/streaming/live/1";
+        return open_rtsp(t);
+    }
+
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return -1;
