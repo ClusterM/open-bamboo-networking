@@ -37,7 +37,6 @@
 #include "obn/agent.hpp"
 
 #include "obn/bambu_networking.hpp"
-#include "obn/cert_store.hpp"
 #include "obn/signing.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
@@ -48,12 +47,6 @@
 #include "obn/print_job.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/tunnel_upload.hpp"
-
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/rsa.h>
-#include <openssl/x509.h>
 
 #include <algorithm>
 #include <chrono>
@@ -105,29 +98,6 @@ std::string redact_url(const std::string& url)
     }
     out += ']';
     return out;
-}
-
-// ---------------------------------------------------------------------------
-// RSA field encryption helpers (cloud project_file url_enc / param_enc).
-//
-// The RSA-PKCS#1 v1.5 blockwise field-encryption primitive lives in
-// obn::signing (rsa_pkcs1v15_encrypt_b64) so the MQTT signing path can apply
-// the same EncryptField transform to any command. This file only sources the
-// printer public key and calls into it.
-// ---------------------------------------------------------------------------
-
-// Loads the printer's public key from its PEM certificate on disk.
-// Returns a ref-bumped EVP_PKEY* (caller must free), or nullptr on failure.
-static EVP_PKEY* load_printer_pub_key_from_pem(const std::string& pem_path)
-{
-    FILE* f = std::fopen(pem_path.c_str(), "r");
-    if (!f) return nullptr;
-    X509* cert = ::PEM_read_X509(f, nullptr, nullptr, nullptr);
-    std::fclose(f);
-    if (!cert) return nullptr;
-    EVP_PKEY* pk = ::X509_get_pubkey(cert);
-    ::X509_free(cert);
-    return pk;
 }
 
 // Reads the whole file into memory. The print-ready 3mf is typically
@@ -427,10 +397,10 @@ int notify_upload(const std::string& api, const std::string& token,
     return 0;
 }
 
-// Polls /notification?action=upload until the server acknowledges.
-// In our MITM trace the first GET already returns {"message":"success"}
-// right away, but the original plugin polls for a few seconds; we mirror
-// that with a short retry loop to stay compatible with slower backends.
+// Polls /notification?action=upload until the async upload settles.
+// HTTP is always 200; the body is {"message":"running"|"success", ...}.
+// Keep polling while message=="running"; "success" ends the wait. Any
+// other message is a hard failure.
 int poll_upload(const std::string& api, const std::string& token,
                 const std::string& user_id,
                 const std::string& ticket,
@@ -446,13 +416,27 @@ int poll_upload(const std::string& api, const std::string& token,
     for (int attempt = 0; attempt < 20; ++attempt) {
         if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
         auto resp = obn::http::get_json(url, hdrs);
-        if (resp.error.empty() && status_ok(resp.status_code)) {
+        if (!resp.error.empty() || !status_ok(resp.status_code)) {
+            OBN_DEBUG("cloud_print: poll_upload attempt=%d status=%ld err=%s",
+                      attempt, resp.status_code, resp.error.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        auto root = obn::json::parse(resp.body);
+        const std::string msg = root ? root->find("message").as_string()
+                                     : std::string{};
+        if (msg == "running") {
+            OBN_DEBUG("cloud_print: poll_upload running attempt=%d", attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+        if (msg == "success") {
             OBN_DEBUG("cloud_print: poll_upload OK attempt=%d", attempt);
             return 0;
         }
-        OBN_DEBUG("cloud_print: poll_upload attempt=%d status=%ld err=%s",
-                  attempt, resp.status_code, resp.error.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_NOTIFICATION_FAILED,
+                          "poll_upload", resp);
     }
     if (update_fn) update_fn(BBL::PrintingStageERROR,
                              BAMBU_NETWORK_ERR_PRINT_WR_GET_NOTIFICATION_TIMEOUT,
@@ -560,7 +544,7 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << ",\"amsMapping\":"  << json_or_default(p.ams_mapping, "[-1]");
     os << ",\"amsMapping2\":" << ams_mapping2_for_cloud(p);
     if (!p.nozzle_mapping.empty()) {
-        os << ",\"nozzleMapping\":" << p.nozzle_mapping; // TODO: test
+        os << ",\"nozzleMapping\":" << p.nozzle_mapping;
     }
     os << ",\"autoBedLeveling\":"     << p.auto_bed_leveling;
     os << ",\"bedLeveling\":"         << to_bool(p.task_bed_leveling);
@@ -574,13 +558,13 @@ std::string build_task_body(const BBL::PrintParams& p,
             cfg_bits |= 4;
     #endif
     os << ",\"cfg\":\"" << cfg_bits << "\"";
-    os << ",\"cover\":\"\"";
+    os << ",\"cover\":\"\""; // TODO: investigate 
     os << ",\"deviceId\":"     << json_escape(p.dev_id);
     os << ",\"extrudeCaliFlag\":"         << p.auto_flow_cali;
     #if ABI_VERSION >= 0x020400
         os << ",\"extrudeCaliManualMode\":"   << p.extruder_cali_manual_mode;
     #endif
-    os << ",\"filamentSettingIds\":[]";
+    os << ",\"filamentSettingIds\":[]"; // TODO: investigate 
     os << ",\"flowCali\":"            << to_bool(p.task_flow_cali);
     os << ",\"layerInspect\":"        << to_bool(p.task_layer_inspect);
     os << ",\"mode\":"
@@ -594,7 +578,7 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << ",\"plateIndex\":"  << (p.plate_index <= 0 ? 1 : p.plate_index);
     // profileId must be a number in the MITM baseline.
     os << ",\"profileId\":"   << (profile_id.empty() ? std::string{"0"} : profile_id);
-    os << ",\"sequence_id\":\"20000\"";
+    os << ",\"sequence_id\":\"20000\""; // TODO: is it always 20000?
     os << ",\"timelapse\":"   << to_bool(p.task_record_timelapse);
     os << ",\"title\":"       << json_escape(p.project_name.empty()
                                              ? p.task_name : p.project_name);
@@ -709,31 +693,22 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                BBL::WasCancelledFn     cancel_fn,
                                bool                    use_lan_channel)
 {
+    use_lan_channel = true;
     OBN_INFO("cloud_print dev=%s ip=%s plate=%d file=%s config=%s project=%s chan=%s",
              p.dev_id.c_str(), p.dev_ip.c_str(), p.plate_index,
              p.filename.c_str(), p.config_filename.c_str(),
              p.project_name.c_str(),
              use_lan_channel ? "lan" : "cloud");
 
-    // Studio's PrintJob::process tries start_local_print_with_record
-    // (use_lan_channel=true) FIRST and only falls back to start_print
-    // (use_lan_channel=false, cloud) if the record path returns < 0
-    // (3rd_party/BambuStudio/.../PrintJob.cpp).
+    // Studio's PrintJob::process picks the ABI entry point:
+    //   start_local_print_with_record -> use_lan_channel=true
+    //   start_print                   -> use_lan_channel=false
     //
-    // LAN-first policy (mirrors the stock plugin): the "record" path uploads
-    // the 3mf straight to the printer over LAN, POSTs /my/task with
-    // mode=lan_file purely as a cloud history record (the cloud does NOT
-    // dispatch a lan_file task to the printer), and triggers the print with a
-    // plaintext LAN MQTT project_file. Only one dispatch reaches the printer,
-    // so there is no duplicate-job "printer busy" (0500_4004) / "cancelled"
-    // (0300_400C) rejection. The cloud channel (start_print) stays as the
-    // fallback: it uploads to S3 and lets the cloud dispatch the job.
-    //
-    // A cloud-bound printer never gets a LanSession from Studio's
-    // connect_printer (Studio only calls that for LAN-mode printers), so the
-    // record path establishes the LAN MQTT session itself via
-    // ensure_lan_session(); if that is not possible (no IP/access code, or the
-    // session will not come up) it degrades to the cloud channel below.
+    // LAN ("record") path: upload 3mf to the printer over LAN, POST /my/task
+    // with mode=lan_file as a cloud history record only (cloud does NOT
+    // dispatch lan_file to the printer), then trigger print with a plaintext
+    // LAN MQTT project_file. Cloud-bound printers never get a LanSession from
+    // Studio's connect_printer, so we open it ourselves via ensure_lan_session.
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -802,6 +777,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // Upload progress for the config file is tiny and confusing in the
     // UI; we report 0% at start and 10% after. The big file (step G)
     // owns 10..95%.
+    // TODO: test progress reporting
     if (int rc = s3_put(info.upload_url, config_bytes, update_fn, cancel_fn,
                         /*stage_start_pct=*/0, /*stage_end_pct=*/10,
                         BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_CONFIG_TO_OSS_FAILED);
@@ -827,7 +803,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     std::string md5         = p.ftp_file_md5;
     // The printer will re-compute md5 on download; if Studio didn't
     // give us one, keep the field so the server schema stays happy.
-    if (md5.empty()) md5 = "00000000000000000000000000000000";
+    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: ensure that it is a valid md5
 
     if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
                                md5, p.plate_index, ftp_url, update_fn);
@@ -877,19 +853,23 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // -------------------------------------------------------------
     std::string lan_remote_path; // wire path / basename for MQTT
     if (use_lan_channel) {
+        // Studio asked for the LAN channel
         if (p.dev_ip.empty() || p.password.empty()) {
-            OBN_WARN("cloud_print: lan channel requested but no dev_ip/access_code "
-                     "-> degrading to cloud channel");
-            use_lan_channel = false;
-        } else if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
-            // Studio never opened a LanSession for this cloud-bound printer and
-            // we could not bring one up (unreachable / bad access code). Without
-            // it the LAN MQTT project_file trigger cannot be published, so fall
-            // back to the cloud channel rather than fail the print.
-            OBN_WARN("cloud_print: no LAN MQTT session for dev=%s "
-                     "-> degrading to cloud channel", p.dev_id.c_str());
-            use_lan_channel = false;
-        } else if (print_job::use_brtc_cache_upload(p)) {
+            OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "no dev_ip/access_code for LAN print");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
+        if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
+            OBN_ERROR("cloud_print: no LAN MQTT session for dev=%s",
+                      p.dev_id.c_str());
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "LAN MQTT session failed");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
+        if (print_job::use_brtc_cache_upload(p)) {
             OBN_INFO("cloud_print: upload path=brtc :6000 (try_emmc_print=%d, force_ftps=%d)",
                      p.try_emmc_print ? 1 : 0,
                      obn::config::current().force_ftps ? 1 : 0);
@@ -976,124 +956,23 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              use_lan_channel ? "lan" : "cloud",
              opts.file_path.c_str(), redact_url(opts.url).c_str());
 
-    std::string mqtt_json;
-    if (use_lan_channel) {
-        // LAN channel: the printer fetches the 3mf from its own storage over a
-        // local URL (ftp:// or brtc://emmc/), so there is nothing sensitive to
-        // encrypt. This is exactly what run_local_print_job publishes; the
-        // firmware accepts plaintext `url` on the LAN report/request channel.
-        mqtt_json = print_job::build_project_file_json(p, opts);
-    } else {
-        // Cloud channel: the printer fetches from an S3 presigned https URL. The
-        // firmware requires that URL RSA-PKCS#1 v1.5 encrypted to its own public
-        // key (url_enc), emitted alongside the cleartext url. Without it the
-        // command is rejected with "mqtt message verify failed".
-        // Obtain the printer's RSA public key. Preference order:
-        //   1. In-memory cache — authoritative when populated by the
-        //      app_cert_install response (harvest_security_report), or a
-        //      prior TLS-leaf capture.
-        //   2. Fresh app_cert_install request over MQTT — the documented
-        //      flow; works for cloud/proxy transports where the TLS peer
-        //      is not the printer.
-        //   3. TLS-leaf PEM snapshot on disk (LAN-direct TOFU fallback).
-        EVP_PKEY* printer_pk = cert_store::get_printer_pub_key(p.dev_id);
-        const char* pk_source = printer_pk ? "cache" : "none";
-        // Only run the app_cert_install round-trip when the printer has
-        // advertised the new authorization-control system (flag3 bit 16).
-        // Otherwise the command is meaningless to the firmware; fall straight
-        // through to the TLS-leaf snapshot. (app_cert_list is best-effort
-        // observability — it tells us whether our cert is already trusted; we
-        // still install to obtain printer_cert.)
-        // TODO(hardware-test): confirm on a secured printer that gating on
-        // flag3 bit16 doesn't skip a printer that actually needs the install.
-        if (!printer_pk && printer_supports_new_auth(p.dev_id)) {
-            request_app_cert_list(p.dev_id, /*via_lan=*/false);
-        }
-        if (!printer_pk && printer_supports_new_auth(p.dev_id) &&
-            request_app_cert_install(p.dev_id, /*via_lan=*/false)) {
-            // The printer answers on the report topic; harvest_security_report
-            // fills the cache from the MQTT network thread. Poll briefly.
-            for (int i = 0; i < 20 && !printer_pk; ++i) {
-                if (cancel_fn && cancel_fn()) break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                printer_pk = cert_store::get_printer_pub_key(p.dev_id);
-            }
-            if (printer_pk) pk_source = "app_cert_install";
-            if (!printer_pk) {
-                OBN_WARN("cloud_print: no app_cert_install response for dev=%s "
-                         "within 5s; falling back to TLS-leaf snapshot",
-                         p.dev_id.c_str());
-            }
-        }
-        if (!printer_pk) {
-            std::string pem_path = cert_store::device_cert_path(config_dir(), p.dev_id);
-            printer_pk = load_printer_pub_key_from_pem(pem_path);
-            if (printer_pk) {
-                cert_store::set_printer_pub_key(p.dev_id, printer_pk);
-                pk_source = "tls-leaf-pem";
-                OBN_INFO("cloud_print: printer pubkey from TLS-leaf snapshot %s",
-                         pem_path.c_str());
-            }
-        }
-        if (!printer_pk) {
-            OBN_ERROR("cloud_print: no public key for dev=%s; "
-                      "ensure install_device_cert() has run", p.dev_id.c_str());
-            if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                                     "no printer public key for RSA encryption");
-            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
-        }
+    // Plaintext project_file JSON. send_message prefers LAN MQTT when a
+    // session is up; cloud MQTT is only the fallback. REST already recorded
+    // the job for MakerWorld — no need to force cloud for the trigger.
+    // const std::string mqtt_json = print_job::build_project_file_json(p, opts);
+    // OBN_DEBUG("cloud_print mqtt: %s", mqtt_json.c_str());
 
-        // The `project_file` command encrypts only `url` -> `url_enc` and keeps
-        // the cleartext `url` alongside it (verified on hardware; the secured
-        // printer accepts a cleartext `param` here, unlike `gcode_line`). The
-        // blockwise RSA primitive is shared with the MQTT signing path.
-        std::string enc_err;
-        std::string url_enc =
-            obn::signing::rsa_pkcs1v15_encrypt_b64(printer_pk, opts.url, &enc_err);
-        ::EVP_PKEY_free(printer_pk);
-
-        OBN_DEBUG("cloud_print: url_enc built key_source=%s url_len=%zu enc_len=%zu",
-                  pk_source, opts.url.size(), url_enc.size());
-
-        if (url_enc.empty()) {
-            OBN_ERROR("cloud_print: RSA field encryption failed: %s", enc_err.c_str());
-            if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                                     "RSA field encryption failed: " + enc_err);
-            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
-        }
-
-        print_job::CloudProjectFileOpts cloud_opts;
-        cloud_opts.url        = opts.url;   // kept for logs; not emitted on the wire
-        cloud_opts.url_enc    = std::move(url_enc);
-        cloud_opts.file_path  = opts.file_path;
-        cloud_opts.md5        = opts.md5;
-        cloud_opts.project_id = opts.project_id;
-        cloud_opts.profile_id = opts.profile_id;
-        cloud_opts.task_id    = opts.task_id;
-        cloud_opts.subtask_id = opts.subtask_id;
-
-        mqtt_json = print_job::build_cloud_project_file_json(p, cloud_opts);
-    }
-    OBN_DEBUG("cloud_print mqtt: %s", mqtt_json.c_str());
-
-    int pub_rc = 0;
-    if (use_lan_channel) {
-        pub_rc = send_message_to_printer(p.dev_id, mqtt_json, /*qos=*/0);
-    } else {
-        pub_rc = cloud_send_message(p.dev_id, mqtt_json, /*qos=*/0);
-    }
-    if (pub_rc != 0) {
-        OBN_ERROR("cloud_print: mqtt publish failed rc=%d", pub_rc);
-        if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                 BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
-                                 "MQTT publish failed");
-        return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
-    }
+    // int pub_rc = send_message(p.dev_id, mqtt_json, /*qos=*/0);
+    // if (pub_rc != 0) {
+    //     OBN_ERROR("cloud_print: mqtt publish failed rc=%d", pub_rc);
+    //     if (update_fn) update_fn(BBL::PrintingStageERROR,
+    //                              BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
+    //                              "MQTT publish failed");
+    //     return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
+    // }
 
     if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
-    OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s chan=%s)",
+    OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s upload=%s)",
              p.dev_id.c_str(), info.project_id.c_str(), task_id.c_str(),
              use_lan_channel ? "lan" : "cloud");
     return 0;

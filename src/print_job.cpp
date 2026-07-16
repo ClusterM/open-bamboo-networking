@@ -336,16 +336,9 @@ int ftp_upload(const BBL::PrintParams&    p,
 
 namespace {
 
-// Shared body for both the LAN (`build_project_file_json`) and cloud
-// (`build_cloud_project_file_json`) variants of the `project_file` MQTT
-// command. The two variants differ only in two slots:
-//   * the "param"/"param_enc" field (plaintext plate path vs RSA-encrypted)
-//   * the "url"/"url_enc"     field (plaintext fetch URL vs RSA-encrypted)
-// The caller passes those two slots fully formed (key + value, including the
-// leading comma) so the rest of the payload — and its exact field ordering —
-// stays byte-identical between the two. `Opts` is duck-typed: both
-// ProjectFileOpts and CloudProjectFileOpts expose project_id / profile_id /
-// task_id / subtask_id / file_path / md5.
+// Shared body for the `project_file` MQTT command. Emits cleartext `url` /
+// `param`; MQTT publish runs the payload through signing::maybe_sign, which
+// replaces both with `url_enc` / `param_enc` when a device pubkey is available.
 template <typename Opts>
 std::string build_project_file_json_impl(const BBL::PrintParams& p,
                                          const Opts&             opts,
@@ -459,30 +452,6 @@ std::string build_project_file_json(const BBL::PrintParams& p,
         p, opts,
         ",\"param\":" + json_escape(plate_param),
         ",\"url\":"   + json_escape(opts.url));
-}
-
-// Cloud-print variant of build_project_file_json.
-//
-// Same payload as the LAN variant, but the cleartext `url` is REPLACED by the
-// RSA-PKCS#1 v1.5 encrypted `url_enc` (verified on hardware 2026-07: the stock
-// plugin sends only `url_enc` on the wire, not the cleartext `url` alongside).
-//
-// `param` is kept cleartext with no `param_enc`: encryption of `param` applies
-// only to the `gcode_line` command, not `project_file` (verified on hardware —
-// a secured printer accepts `project_file` with a cleartext `param`).
-//
-// `url_enc` is pre-computed by the caller (obn::signing::rsa_pkcs1v15_encrypt_b64)
-// using the printer's device-certificate RSA public key.
-std::string build_cloud_project_file_json(const BBL::PrintParams&    p,
-                                          const CloudProjectFileOpts& opts)
-{
-    std::string plate_param = "Metadata/plate_" +
-                              std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
-                              ".gcode";
-    return build_project_file_json_impl(
-        p, opts,
-        ",\"param\":"   + json_escape(plate_param),
-        ",\"url_enc\":" + json_escape(opts.url_enc));
 }
 
 } // namespace obn::print_job
@@ -615,7 +584,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());
 
-    int pub = send_message_to_printer(params.dev_id, json, /*qos=*/0);
+    int pub = send_message(params.dev_id, json, /*qos=*/0);
     if (pub != 0) {
         OBN_ERROR("local_print: publish project_file failed rc=%d", pub);
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -688,12 +657,12 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
 
     if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
 
-    int pub = send_message_to_printer(params.dev_id, json, /*qos=*/0);
+    int pub = send_message(params.dev_id, json, /*qos=*/0);
     if (pub != 0) {
-        OBN_ERROR("sdcard_print: publish project_file failed rc=%d (no LAN session?)", pub);
+        OBN_ERROR("sdcard_print: publish project_file failed rc=%d", pub);
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
-                                 "MQTT publish failed (no LAN session)");
+                                 "MQTT publish failed");
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 

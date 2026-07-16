@@ -13,17 +13,12 @@ namespace obn::signing {
 //
 // When `device_pub` is non-null, device-cert field encryption is applied to
 // the `print` object *before* signing (so the signature covers the encrypted
-// form that goes on the wire). In both cases the cleartext field is REPLACED
-// by its `_enc` form (verified on hardware 2026-07 — the stock plugin sends
-// only the encrypted field on the wire):
-//   * `url`   -> adds `url_enc` and removes the cleartext `url`;
-//   * `param` -> adds `param_enc` and removes the cleartext `param`, but only
-//               for the `gcode_line` command.
-// Both transforms are idempotent (skipped when the `_enc` field already
-// exists, but the cleartext field is still dropped) and no-ops when
-// `device_pub` is null or encryption fails, in which case the field stays
-// cleartext (matching the "no device cert yet" rule, keeping the pure-LAN
-// plaintext ftp:// path working).
+// form that goes on the wire). Cleartext fields `url` and `param` are each
+// REPLACED by `url_enc` / `param_enc` when present (stock sends only the
+// encrypted field on the wire). Transforms are idempotent (skipped when the
+// `_enc` field already exists) and no-ops when `device_pub` is null or
+// encryption fails, in which case the cleartext field is kept (pure-LAN
+// ftp:// path without a device key).
 std::string maybe_sign(const std::string& payload_json,
                        EVP_PKEY* device_pub = nullptr);
 
@@ -74,5 +69,11 @@ std::string slicer_cert_pem();
 // PEM CRL entry accompanying the app certificate, read from
 // config_dir/slicer_crl.pem. "" when the file is absent.
 std::string slicer_crl_pem();
+
+// True when slicer_cert.pem + slicer_crl.pem are present (config paths or
+// config_dir defaults), the leaf certificate is within its notBefore/notAfter
+// window, the CRL is within lastUpdate/nextUpdate, and the leaf is not listed
+// as revoked. Gates fire-and-forget app_cert_install (no private key needed).
+bool slicer_app_cert_usable();
 
 } // namespace obn::signing
