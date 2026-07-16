@@ -348,22 +348,22 @@ static int test_gcode_line_param_encrypted()
 
 static int test_project_file_url_encrypted_drops_url()
 {
-    // With a device key, project_file's `url` becomes `url_enc` and the
-    // cleartext `url` is dropped (on-wire behaviour). A cleartext `param`
-    // (the plate path) is left untouched — only gcode_line encrypts param.
-    const std::string url = "https://example.com/model.3mf?sig=abc";
+    // With a device key, project_file's `url` and `param` both become *_enc
+    // (encrypt_print_fields walks a fixed field list).
+    const std::string url   = "https://example.com/model.3mf?sig=abc";
+    const std::string param = "Metadata/plate_1.gcode";
     const std::string payload =
-        R"({"print":{"command":"project_file","param":"Metadata/plate_1.gcode","url":")" +
-        url + R"(","sequence_id":"8"}})";
+        R"({"print":{"command":"project_file","param":")" + param +
+        R"(","url":")" + url + R"(","sequence_id":"8"}})";
     const std::string env = obn::signing::maybe_sign(payload, g_test_key);
     auto val = obn::json::parse(env);
     CHECK(val);
-    CHECK(val->find("print.url").kind()            == obn::json::Value::Kind::Null); // dropped
+    CHECK(val->find("print.url").kind()            == obn::json::Value::Kind::Null);
     CHECK(val->find("print.url_enc").kind()        == obn::json::Value::Kind::String);
     CHECK(rsa_decrypt_blocks_b64(val->find("print.url_enc").as_string()) == url);
-    // project_file param must NOT be encrypted/dropped.
-    CHECK(val->find("print.param").as_string()     == "Metadata/plate_1.gcode");
-    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.param").kind()          == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == param);
     return 0;
 }
 

@@ -1230,7 +1230,33 @@ flowchart TD
   N -->|no| P
 ```
 
-**`connection_type`** on `MachineObject` is `"lan"` for Developer Mode / LAN-only printers, `"cloud"` for cloud-paired devices, `"farm"` for farm mode. Pure LAN mode (`AppConfig::lan_mode_only`) forces the `_with_record` path even when the device object is cloud-typed, but still requires IP + access code.
+**`connection_type` is not “LAN reachable”.** It is the printer’s own mode advertisement, carried in the SSDP header `devconnect.bambu.com` and forwarded by the plugin as `connect_type` (`src/ssdp.cpp` → `DeviceManager::on_machine_alive`). Studio stores it on `MachineObject` (`DevInfo::SetConnectionType`); `connection_type()` / `is_lan_mode_printer()` just read that field (`DevInfo.cpp`).
+
+| Value | Meaning | Typical Studio behaviour when printing |
+|---|---|---|
+| `"lan"` | Printer is in **LAN Only Mode** (cloud disabled on the device) | Opens LAN MQTT via `connect_printer`; print via `start_local_print` |
+| `"cloud"` | Printer is cloud-paired / not in LAN Only | Selects device via `set_user_selected_machine`; print prefers `start_local_print_with_record` when LAN credentials exist, else `start_print` |
+| `"farm"` | Farm mode (treated like LAN for path selection; SSDP may rewrite farm→lan) | Same family as LAN |
+
+A cloud-paired printer can still be on the same LAN (SSDP IP + access code known) while `connection_type` remains `"cloud"`. Access code does **not** set `connection_type` — it only enables LAN MQTT/FTPS/:6000 once Studio (or the plugin) decides to use the LAN channel.
+
+**Inputs Studio fills into `PrintJob` before the tree above** (`SelectMachine.cpp:3133-3178`):
+
+| Field | Source | Role in the tree |
+|---|---|---|
+| `connection_type` | `MachineObject::connection_type()` (SSDP / bind) | Top-level LAN vs cloud branch |
+| `cloud_print_only` | MQTT/capability `support_cloud_print_only` | Forces pure `start_print` (skips LAN-with-record) |
+| `has_sdcard` | `DevStorage::HAS_SDCARD_NORMAL` | Required for LAN-with-record upload storage |
+| `could_emmc_print` | `is_support_print_with_emmc` | Allows pure LAN print without SD; also sets `try_emmc_print` → `:6000`+`brtc://` |
+| `dev_ip` / `password` | SSDP IP + access code (UI / cloud `dev_access_code`) | Without both, Studio skips LAN-with-record |
+| `lan_mode_only` | Studio `app_config` | Force LAN-with-record even for cloud-typed devices |
+
+**ABI entry points the tree resolves to:**
+
+1. `bambu_network_start_local_print` — pure LAN (`connection_type=="lan"`). No cloud `/my/task`.
+2. `bambu_network_start_local_print_with_record` — LAN upload + MQTT trigger, plus cloud history (`mode=lan_file`). Used for cloud-typed printers when IP+code+storage are available.
+3. `bambu_network_start_print` — pure cloud. Either immediately (missing LAN prerequisites / `cloud_print_only`) or as Studio’s **own** fallback when `_with_record` returns `< 0`.
+
 
 ##### Three upload/print channels Studio actually uses
 
@@ -1314,7 +1340,8 @@ Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
 2. `PUT <upload_url>`  
    uploads the config 3mf.
 3. `PUT /v1/iot-service/api/user/notification` and poll  
-   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`.
+   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`  
+   until `{"message":"success"}` (HTTP stays 200; intermediate polls return `"message":"running"`).
 4. `PATCH /v1/iot-service/api/user/project/<project_id>`  
    first patch with placeholder `ftp://...` URL (mirrors stock plugin behaviour).
 5. `GET /v1/iot-service/api/user/upload?models=<model_id>_<profile_id>_<plate>.3mf`  
@@ -2744,7 +2771,7 @@ All paths below are relative to the regional API host from §6.10.1. The "eviden
   - `GET /v1/iot-service/api/user/bind` — returns `{ "devices":[{ "dev_id", "name", "online", "print_status", "dev_model_name", "dev_product_name", "dev_access_code", "print_job", "nozzle_diameter", "dev_structure", ... }]}`. Uses `name`/`online`/`print_status` — requires remapping to Studio's expected `dev_name`/`dev_online`/`task_status`. *Evidence: MITM + probe.*
   - `GET /v1/iot-service/api/user/print?force=true` — returns `{ "devices":[{ "dev_id", "dev_name", "dev_model_name", "dev_product_name", "dev_online", "dev_access_code" }]}`. Field names match Studio's parser directly; no remapping needed. Also polled repeatedly by the stock plugin as a cloud print-job queue check (returns `{"message":"success","code":0,"error":null}` with no `devices` key when the queue is empty). *Evidence: SSLKEYLOGFILE capture.*
   - **Security note:** `dev_access_code` is returned in plaintext by both endpoints. This is the same 8-hex-character code shown on the printer display and used as the LAN MQTT password (`bblp` / access code). Any bearer token holder can retrieve LAN access codes for all cloud-bound devices.
-- **`get_user_tasks`** — the Cloud Task / History grid. Studio passes the whole `http_body` through to its JSON parser. The stock endpoint is not captured. *Evidence: source; URL unconfirmed.*
+- **`get_user_tasks`** — Cloud Task / History grid (`TaskManager`, Print History WebView). Stock: `GET /v1/user-service/my/tasks?limit=&offset=&status=[&deviceId=]` with Bearer auth. Response `{ "total": N, "hits":[{ "id", "title", "deviceId", "deviceName", "cover", "status", "startTime", "endTime", "profileId", "designId", "designTitle", "mode", ... }] }` is passed through to Studio's JSON parser unchanged. *Evidence: MITM of stock `bambu_network_agent/02.08.01.51`.*
 - **`get_task_plate_index`** — looks up which plate a given cloud `task_id` ran on. Studio falls back to plate `0` on failure. *Evidence: source; URL unconfirmed.*
 - **`get_subtask_info`** — MakerWorld subtask detail fetch; Studio pulls the printer-card hero image from `context.plates[<plate_idx>].thumbnail.url` in the response. `content` is a JSON *string* holding an inner `{info:{plate_idx}}` envelope — both shapes are in `DeviceManager.cpp`. The stock cloud URL is unconfirmed. *Evidence: source; cloud URL unconfirmed.*
 - **`get_slice_info`** — slice summary (time / weight / material cost / layer thumbnails) for a cloud task. *Evidence: source; URL unconfirmed.*

@@ -6,12 +6,14 @@
 #include "obn/signing.hpp"
 #include "obn/config.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/log.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/x509.h>
 
 #include <cctype>
 #include <chrono>
@@ -224,44 +226,50 @@ bool is_print_payload(const std::string& payload) noexcept
     return true;
 }
 
-// Applies device-cert field encryption to the parsed `print` object in place:
-//   * url   -> url_enc
-//   * param -> param_enc
-// Both idempotent (skip when the *_enc field already exists) and best-effort
-// (a field stays cleartext if there is no key or encryption fails).
+// Applies device-cert field encryption to the parsed `print` object in place.
+// For each cleartext field in kEncryptFields, adds `<field>_enc` (RSA) and
+// drops the cleartext. Idempotent when `*_enc` already exists. If a field
+// needs encryption but there is no device key (or RSA fails), logs ERROR and
+// leaves the cleartext — the printer will reject and surface the error.
 void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
 {
-    if (!device_pub) return;
+    static constexpr const char* kEncryptFields[] = {"url", "param"};
 
-    auto enc_string_field = [&](const char* field) -> std::string {
-        auto it = obj.find(field);
-        if (it == obj.end() || !it->second.is_string()) return {};
-        std::string out = rsa_pkcs1v15_encrypt_b64(device_pub, it->second.as_string());
-        return out;
-    };
-
-    if (obj.count("url")) {
-        if (!obj.count("url_enc")) {
-            std::string enc = enc_string_field("url");
-            if (!enc.empty()) obj["url_enc"] = obn::json::Value(std::move(enc));
+    bool needs_encrypt = false;
+    for (const char* field : kEncryptFields) {
+        if (!obj.count(field)) continue;
+        const std::string enc_key = std::string(field) + "_enc";
+        if (!obj.count(enc_key)) {
+            needs_encrypt = true;
+            break;
         }
-        // On the wire the stock plugin REPLACES cleartext `url` with `url_enc`
-        // for project_file (verified on hardware 2026-07). Drop `url` once
-        // `url_enc` exists; if encryption was impossible (no device key) keep
-        // the cleartext `url` so the pure-LAN ftp:// path still resolves.
-        if (obj.count("url_enc")) obj.erase("url");
+    }
+    if (!needs_encrypt) return;
+
+    if (!device_pub) {
+        OBN_ERROR("no device public key; leaving url/param cleartext "
+                  "(printer will reject if secured)");
+        return;
     }
 
-    const auto cmd = obj.find("command");
-    const bool is_gcode_line =
-        cmd != obj.end() && cmd->second.is_string() &&
-        cmd->second.as_string() == "gcode_line";
-    if (is_gcode_line && obj.count("param") && !obj.count("param_enc")) {
-        std::string enc = enc_string_field("param");
-        if (!enc.empty()) {
-            obj["param_enc"] = obn::json::Value(std::move(enc));
-            obj.erase("param"); // secured firmware rejects cleartext param here
+    for (const char* field : kEncryptFields) {
+        if (!obj.count(field)) continue;
+        const std::string enc_key = std::string(field) + "_enc";
+        if (obj.count(enc_key)) continue; // already encrypted
+
+        auto it = obj.find(field);
+        if (it == obj.end() || !it->second.is_string()) continue;
+        std::string enc_err;
+        std::string enc = rsa_pkcs1v15_encrypt_b64(device_pub,
+                                                   it->second.as_string(),
+                                                   &enc_err);
+        if (enc.empty()) {
+            OBN_ERROR("RSA encrypt of '%s' failed: %s; leaving cleartext",
+                      field, enc_err.empty() ? "unknown" : enc_err.c_str());
+            continue;
         }
+        obj[enc_key] = obn::json::Value(std::move(enc));
+        obj.erase(field);
     }
 }
 
@@ -273,7 +281,6 @@ std::string build_print_dump(const std::string& payload, EVP_PKEY* device_pub)
     if (!root) return {};
     const obn::json::Value& print = root->find("print");
     if (print.kind() != obn::json::Value::Kind::Object) return {};
-    if (!device_pub) return print.dump();
     obn::json::Object obj = print.as_object(); // copy for mutation
     encrypt_print_fields(obj, device_pub);
     return obn::json::Value(std::move(obj)).dump();
@@ -461,6 +468,81 @@ std::string base64_encode(const unsigned char* data, std::size_t len)
         out.push_back(i + 2 < len ? kB64Tbl[w & 63] : '=');
     }
     return out;
+}
+
+bool slicer_app_cert_usable()
+{
+    // app_cert_install needs the app certificate PEM + CRL only (no private
+    // key). Defaults under config_dir count when obn.conf paths are empty.
+    const std::string pem = slicer_cert_pem();
+    if (pem.empty()) return false;
+    const std::string crl_pem = slicer_crl_pem();
+    if (crl_pem.empty()) return false;
+
+    BIO* bio = ::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return false;
+    X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    ::BIO_free(bio);
+    if (!cert) {
+        OBN_ERROR("signing: slicer_cert.pem is not a valid X.509 certificate");
+        return false;
+    }
+
+    // notBefore must be in the past; notAfter must be in the future.
+    // X509_cmp_current_time: <0 if asn1_time is before now, >0 if after.
+    const ASN1_TIME* not_before = ::X509_get0_notBefore(cert);
+    const ASN1_TIME* not_after  = ::X509_get0_notAfter(cert);
+    const bool not_yet = not_before && ::X509_cmp_current_time(not_before) > 0;
+    const bool expired = !not_after || ::X509_cmp_current_time(not_after) < 0;
+    if (not_yet || expired) {
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer app certificate is %s — skipping app_cert_install",
+                 expired ? "expired" : "not yet valid");
+        return false;
+    }
+
+    BIO* crl_bio = ::BIO_new_mem_buf(crl_pem.data(),
+                                     static_cast<int>(crl_pem.size()));
+    if (!crl_bio) {
+        ::X509_free(cert);
+        return false;
+    }
+    X509_CRL* crl = ::PEM_read_bio_X509_CRL(crl_bio, nullptr, nullptr, nullptr);
+    ::BIO_free(crl_bio);
+    if (!crl) {
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer_crl.pem is not a valid X.509 CRL");
+        return false;
+    }
+
+    // lastUpdate (thisUpdate) must be in the past; nextUpdate, when present,
+    // must be in the future. Missing nextUpdate is treated as still valid —
+    // some CRLs omit it; request_app_cert_install still needs the PEM.
+    const ASN1_TIME* last_update = ::X509_CRL_get0_lastUpdate(crl);
+    const ASN1_TIME* next_update = ::X509_CRL_get0_nextUpdate(crl);
+    const bool crl_not_yet = last_update && ::X509_cmp_current_time(last_update) > 0;
+    const bool crl_expired = next_update && ::X509_cmp_current_time(next_update) < 0;
+    if (crl_not_yet || crl_expired) {
+        ::X509_CRL_free(crl);
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer app CRL is %s — skipping app_cert_install",
+                 crl_expired ? "expired" : "not yet valid");
+        return false;
+    }
+
+    // Reject if this leaf appears on the CRL.
+    X509_REVOKED* revoked = nullptr;
+    if (::X509_CRL_get0_by_cert(crl, &revoked, cert) == 1) {
+        ::X509_CRL_free(crl);
+        ::X509_free(cert);
+        OBN_ERROR("signing: slicer app certificate is revoked on slicer_crl.pem "
+                  "— skipping app_cert_install");
+        return false;
+    }
+
+    ::X509_CRL_free(crl);
+    ::X509_free(cert);
+    return true;
 }
 
 } // namespace obn::signing
