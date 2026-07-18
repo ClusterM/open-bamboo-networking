@@ -2250,21 +2250,27 @@ int Agent::connect_cloud()
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
         // notification so Studio moves the device from "subscribing"
-        // to "online" in its UI.
+        // to "online" in its UI. That first report is also our proof the
+        // printer is reachable via cloud MQTT — fire app_cert_install here
+        // (not at subscribe time), because a reboot wipes the trust store
+        // from RAM and subscribe alone does not mean the device is online.
         bool first = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             first = cloud_connected_devs_.insert(dev_id).second;
         }
-        if (first && on_printer_connected) {
-            BBL::OnPrinterConnectedFn cb = on_printer_connected;
-            BBL::QueueOnMainFn        q;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                q = queue_on_main_;
+        if (first) {
+            maybe_install_app_cert(dev_id);
+            if (on_printer_connected) {
+                BBL::OnPrinterConnectedFn cb = on_printer_connected;
+                BBL::QueueOnMainFn        q;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    q = queue_on_main_;
+                }
+                auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
+                if (q) q(invoke); else invoke();
             }
-            auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
-            if (q) q(invoke); else invoke();
         }
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
@@ -2358,12 +2364,7 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
     if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    int rc = sess->add_subscribe(filtered);
-    if (rc == BAMBU_NETWORK_SUCCESS) {
-        for (const auto& d : filtered)
-            maybe_install_app_cert(d);
-    }
-    return rc;
+    return sess->add_subscribe(filtered);
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
