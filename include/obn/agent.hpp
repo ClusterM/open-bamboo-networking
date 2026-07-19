@@ -183,8 +183,12 @@ public:
     bool printer_supports_new_auth(const std::string& dev_id) const;
 
     // Fire-and-forget app_cert_install once per printer MQTT session when
-    // slicer_app_cert_usable(). Does not wait for the printer_cert reply —
-    // harvest_security_report installs the key asynchronously.
+    // slicer_app_cert_usable(). Triggers: LAN CONNACK Ok, or the first cloud
+    // report for a device (proof the printer is online). Not on cloud
+    // subscribe alone — the trust store lives in printer RAM and is wiped
+    // on reboot, so we only publish when delivery is likely. Does not wait
+    // for the printer_cert reply; harvest_security_report installs the key
+    // asynchronously.
     void maybe_install_app_cert(const std::string& dev_id);
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
