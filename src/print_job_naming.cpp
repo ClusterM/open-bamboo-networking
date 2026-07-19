@@ -100,4 +100,16 @@ std::string build_ftp_url(const std::string& stored_path)
     return "ftp://" + strip_leading_slash(stored_path);
 }
 
+std::string build_ftp_remote_path(const BBL::PrintParams& p,
+                                  const std::string&      remote_name)
+{
+    std::string folder = p.ftp_folder;
+    while (!folder.empty() && (folder.front() == '/' || folder.front() == '\\'))
+        folder.erase(folder.begin());
+    while (!folder.empty() && (folder.back() == '/' || folder.back() == '\\'))
+        folder.pop_back();
+    if (folder.empty()) return "/" + strip_leading_slash(remote_name);
+    return "/" + folder + "/" + strip_leading_slash(remote_name);
+}
+
 } // namespace obn::print_job
