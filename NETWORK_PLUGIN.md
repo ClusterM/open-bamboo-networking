@@ -1548,10 +1548,11 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 - Printer IP + LAN TLS handshake to `printer_ip:8883` → `capture_peer_cert_pem` on a direct LAN connection → printer device cert (`CN=<serial>`) cached on disk (`<config>/certs/<serial>.pem`); its **public key** is the TOFU/LAN-direct source. *(OBN)*
 - `app_cert_install` request (see below) → printer replies on the report topic with `printer_cert` → device cert parsed by `harvest_security_report` → **printer public key** cached in memory (authoritative source, works for cloud/proxy transports too). *(RN-5; RN-5 explicitly recommends always retrieving via this flow, even when a LAN TLS cert exists)*
 
-**Provisioning: teaching the printer to trust our app cert (once per printer, only when `print.flag3` bit 16 is set)** — sources: RN-5; OBN implements it in `Agent::request_app_cert_install` / `request_app_cert_list`.
+**Provisioning: teaching the printer to trust the app cert** — sources: RN-5; hardware notes below are wire/firmware observations.
 
-- `slicer_cert.pem` (+ optional `slicer_crl.pem`, else `crl:[]`) → published as `security.app_cert_install` when the printer advertises the new auth system → printer stores the chain + CRL in its trust store and returns `printer_cert`. *(RN-5; the empty-`crl:[]` case is OBN behaviour, not confirmed against firmware)*
-- (no inputs) → `security.app_cert_list` query → printer returns the `cert_ids` it currently trusts (observability only; confirms whether our `cert_id` is already installed). *(RN-5)*
+- App cert chain + CRL → published as `security.app_cert_install` → printer stores them in its trust store and returns `printer_cert` on the report topic. *(RN-5)*
+- **Volatility (hardware):** the installed app cert / CRL live in **printer RAM**, not persistent storage. A power cycle or reboot clears the trust store completely, so `app_cert_install` must be repeated after every reboot / fresh session. Treating install as a one-time bind-time step is incorrect.
+- (no inputs) → `security.app_cert_list` query → printer returns the `cert_ids` it currently trusts (observability only; confirms whether a given `cert_id` is already installed). *(RN-5)*
 
 **Signing / encryption applied to each critical command** — sources: RN-5 (`SignMessage`, `EncryptField`), RN-6 (HTTP headers), #47 (PKCS#1 v1.5 padding + ≤~245-byte sizing).
 
@@ -1569,6 +1570,8 @@ Two independent RSA credentials drive command-security: a **shared app key** tha
 - Developer Mode ON → **printer firmware** bypasses the signature check entirely: plain `url` accepted, `header` optional, `url_enc` unnecessary. This is why LAN printing works today without ever touching the cloud cert endpoint, provided the operator supplied the app key out-of-band. *(OBN; see "Developer Mode requirement" in `README.md`)*
 
 Note where the **CRL** actually lands: it is never read by the plugin's signing/encryption path — it is only shipped inside `app_cert_install` into the printer's trust store, where the firmware consults it while verifying `header.sign_string`. With an empty revocation list and no rotation it is effectively a formality; it becomes load-bearing only if Bambu revokes/rotates the shared app cert. *(RN-5; RN-4 for the observed empty, ~30-day CRL)*
+
+**CRL validity is not enforced by the printer (hardware 2026-07):** the official current CRL from Bambu's cert endpoint is already **past its `nextUpdate`**, yet firmware still accepts `app_cert_install` and uses the CRL body for serial/issuer revocation checks. An older CRL that does not yet list a revoked app-cert leaf can therefore still be installed; revocation only applies if the CRL last installed on the printer actually contains that leaf.
 
 ##### Command-security algorithms (pseudocode)
 
