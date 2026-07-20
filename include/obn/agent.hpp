@@ -240,21 +240,14 @@ public:
     // Implements bambu_network_start_print (use_lan_channel=false) and
     // bambu_network_start_local_print_with_record (use_lan_channel=true).
     //
-    // Orchestrates Bambu's cloud-print sequence reverse-engineered from
-    // MITM of the original plugin:
-    //   1.  POST /iot-service/api/user/project          - create project
-    //   2.  PUT  <presigned S3 url>                     - upload config 3mf
-    //   3.  PUT  /iot-service/api/user/notification     - notify upload
-    //   4.  GET  /iot-service/api/user/notification?... - poll
-    //   5.  PATCH /iot-service/api/user/project/<pid>   - register (ftp:// url)
-    //   6.  GET  /iot-service/api/user/upload?models=.. - request second url
-    //   7.  PUT  <presigned S3 url>                     - upload full 3mf
-    //   8.  PATCH /iot-service/api/user/project/<pid>   - register (https:// url)
-    //   9.  (LAN only) FTPS STOR to /cache/<name>.gcode.3mf
-    //  10.  POST /user-service/my/task                  - create task
-    //  11.  MQTT publish project_file:
-    //         - LAN channel: via LanSession, url=ftp://<name>
-    //         - cloud channel: via CloudSession, url=<S3 presigned>
+    // Shared: create project, upload config 3mf to S3 (history/preview),
+    // notify/poll. Then delivery fork:
+    //   use_lan_channel: FTPS STOR (ftp_folder) → PATCH ftp:// →
+    //                    POST /my/task mode=lan_file
+    //   !use_lan_channel: S3 PUT main → PATCH S3 URL →
+    //                     POST /my/task mode=cloud_file
+    // Cloud /my/task dispatches the print; no plugin MQTT project_file.
+    // LAN failures return < 0 so Studio can fall back to start_print.
     int run_cloud_print_job(const BBL::PrintParams& params,
                             BBL::OnUpdateStatusFn   update_fn,
                             BBL::WasCancelledFn     cancel_fn,

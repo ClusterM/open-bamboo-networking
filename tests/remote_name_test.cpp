@@ -70,6 +70,22 @@ int main()
            obn::print_job::pick_remote_name(params("", "", "")),
            "print.gcode.3mf");
 
+    // --- build_ftp_remote_path (ftp_folder) ---
+    {
+        auto p = params("job");
+        expect("ftp path root",
+               obn::print_job::build_ftp_remote_path(p, "job.gcode.3mf"),
+               "/job.gcode.3mf");
+        p.ftp_folder = "cache";
+        expect("ftp path folder",
+               obn::print_job::build_ftp_remote_path(p, "job.gcode.3mf"),
+               "/cache/job.gcode.3mf");
+        p.ftp_folder = "/cache/";
+        expect("ftp path normalize",
+               obn::print_job::build_ftp_remote_path(p, "job.gcode.3mf"),
+               "/cache/job.gcode.3mf");
+    }
+
     std::printf("remote_name_test: %s\n", g_failed ? "FAILED" : "ok");
     return g_failed ? 1 : 0;
 }

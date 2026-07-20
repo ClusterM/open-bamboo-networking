@@ -1,38 +1,30 @@
-// Cloud print pipeline.
+// Cloud print pipeline (start_print / start_local_print_with_record).
 //
-// Reverse-engineered from a MITM capture of Studio 02.05.02.51 + the
-// original closed-source Bambu plugin pushing a job through
-// "start_local_print_with_record" (which is what Studio picks whenever
-// the printer is reachable on the LAN and an access code is known -
-// the bare "start_print" path we still share all the HTTP plumbing
-// with, only the final delivery channel changes).
+// Shared cloud bookkeeping for both ABI entry points, then a delivery
+// fork that intentionally diverges from current stock hybrid behaviour
+// (stock uploads the main .3mf to S3 even on "LAN+record" and the
+// printer re-downloads it — see NETWORK_PLUGIN.md §6.8.1.2):
 //
-// End-to-end sequence for a single plate:
-//
-//   [A]  POST   /v1/iot-service/api/user/project                body {"name":"<job>"}
-//        -> { project_id, model_id, profile_id, upload_url,
-//             upload_ticket }                                     << [A1]
-//   [B]  PUT    <upload_url from A1>                              config 3mf
-//   [C]  PUT    /v1/iot-service/api/user/notification             notify
+//   [A]  POST   /v1/iot-service/api/user/project
+//   [B]  PUT    <presigned>                                       config 3mf
+//   [C]  PUT    /v1/iot-service/api/user/notification
 //   [D]  GET    /v1/iot-service/api/user/notification?action=upload&ticket=..
-//   [E]  PATCH  /v1/iot-service/api/user/project/<pid>            {"profile_id","profile_print_3mf":[{..,"url":"ftp://..."}]}
-//   [F]  GET    /v1/iot-service/api/user/upload?models=<mid>_<plate>.3mf
-//        -> { urls: [{ url }] }                                   << [F1]
-//   [G]  PUT    <F1 url>                                          full 3mf with gcode
-//   [H]  PATCH  /v1/iot-service/api/user/project/<pid>            register real url
-//   [I]  POST   /v1/user-service/my/task                          {..,"mode":"lan_file"/"cloud_file"}
-//        -> { id: <task_id> }                                     << [I1]
-//   [J]  MQTT publish project_file on the appropriate channel.
 //
-// In the LAN-channel ("start_local_print_with_record") variant we also
-// push the .3mf to the printer (:6000 emmc cache on brtc hardware, else
-// FTPS STOR); the cloud record exists for MakerWorld task history.
+//   use_lan_channel=true  (_with_record):
+//   [E]  FTPS STOR main .3mf to printer (PrintParams.ftp_folder)
+//   [F]  PATCH  /v1/iot-service/api/user/project/<pid>            url=ftp://...
+//   [G]  POST   /v1/user-service/my/task                          mode=lan_file
 //
-// Anything that needs to be kept in sync with Studio's internal
-// format is commented inline rather than factored out, because small
-// field-name drifts here break the flow silently (the printer either
-// refuses the MQTT, or the cloud server 500s the create_task call,
-// and neither surface a helpful error to the user).
+//   use_lan_channel=false (start_print):
+//   [E]  GET    /v1/iot-service/api/user/upload?models=...
+//   [F]  PUT    <presigned>                                       main 3mf
+//   [G]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3
+//   [H]  POST   /v1/user-service/my/task                          mode=cloud_file
+//
+// Config upload [B]/[D] is required for Print History thumbnails.
+// Print start is cloud /my/task dispatch — the plugin does not publish
+// MQTT project_file (would double-fire). On LAN failure the plugin
+// returns < 0 so Studio can fall back to start_print.
 
 #include "obn/agent.hpp"
 
@@ -45,7 +37,6 @@
 #include "obn/log.hpp"
 #include "obn/print_job.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
-#include "obn/tunnel_upload.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -701,7 +692,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                BBL::WasCancelledFn     cancel_fn,
                                bool                    use_lan_channel)
 {
-    use_lan_channel = true;
     OBN_INFO("cloud_print dev=%s ip=%s plate=%d file=%s config=%s project=%s chan=%s",
              p.dev_id.c_str(), p.dev_ip.c_str(), p.plate_index,
              p.filename.c_str(), p.config_filename.c_str(),
@@ -711,12 +701,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // Studio's PrintJob::process picks the ABI entry point:
     //   start_local_print_with_record -> use_lan_channel=true
     //   start_print                   -> use_lan_channel=false
-    //
-    // LAN ("record") path: upload 3mf to the printer over LAN, POST /my/task
-    // with mode=lan_file as a cloud history record only (cloud does NOT
-    // dispatch lan_file to the printer), then trigger print with a plaintext
-    // LAN MQTT project_file. Cloud-bound printers never get a LanSession from
-    // Studio's connect_printer, so we open it ourselves via ensure_lan_session.
+    // On LAN failure we return < 0 so Studio can fall back to start_print.
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -724,11 +709,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                  "empty filename");
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
-
-    // Ensure the :6000 upload leg (brtc/emmc) can verify the printer's
-    // self-signed leaf: publish the LAN-TLS peer pin from the on-disk cert
-    // even when no LAN connect_printer ran this session (cloud-only usage).
-    publish_peer_cert_pin(p.dev_ip, p.dev_id);
 
     // Hard stop: never push a print file through Bambu's cloud when the
     // user has opted out. Studio normally avoids this path because the
@@ -767,11 +747,15 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         rc != 0) return rc;
 
     // -------------------------------------------------------------
-    // [B] Upload the config 3mf (small). Studio generates it next to
-    // the main 3mf; if it's missing we fall back to the main file so
-    // we at least have *something* for the archive.
+    // [B] Upload the config 3mf (small). Required for Print History
+    // thumbnails even when the main model is delivered over FTPS.
     // -------------------------------------------------------------
-    std::string config_path = p.config_filename.empty() ? p.filename : p.config_filename;
+    std::string config_path = p.config_filename;
+    if (p.config_filename.empty()) {
+        OBN_WARN("cloud_print: config_filename is empty, uploading the main file (%s) instead",
+                 p.filename.c_str());
+        config_path = p.filename;
+    }
     std::string slurp_err;
     std::string config_bytes = slurp_file(config_path, &slurp_err);
     if (config_bytes.empty()) {
@@ -782,10 +766,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                  "config_filename not readable");
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
-    // Upload progress for the config file is tiny and confusing in the
-    // UI; we report 0% at start and 10% after. The big file (step G)
-    // owns 10..95%.
-    // TODO: test progress reporting
+    OBN_INFO("cloud_print: uploading config %s to S3", config_path.c_str());
     if (int rc = s3_put(info.upload_url, config_bytes, update_fn, cancel_fn,
                         /*stage_start_pct=*/0, /*stage_end_pct=*/10,
                         BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_CONFIG_TO_OSS_FAILED);
@@ -802,61 +783,17 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                              update_fn, cancel_fn);
         rc != 0) return rc;
 
-    // -------------------------------------------------------------
-    // [E] First PATCH - placeholder ftp:// url. Studio always does
-    // this before uploading the real 3mf.
-    // -------------------------------------------------------------
     std::string remote_name = print_job::pick_remote_name(p);
-    std::string ftp_url     = "ftp://" + remote_name;
     std::string md5         = p.ftp_file_md5;
-    // The printer will re-compute md5 on download; if Studio didn't
-    // give us one, keep the field so the server schema stays happy.
-    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: ensure that it is a valid md5
+    // Schema placeholder when Studio left ftp_file_md5 empty.
+    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: compute real md5
 
-    if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
-                               md5, p.plate_index, ftp_url, update_fn);
-        rc != 0) return rc;
+    std::string project_url; // ftp://… or S3 https — registered via PATCH
 
-    // -------------------------------------------------------------
-    // [F] Get the second presigned URL (for the main 3mf).
-    // Studio composes model_slot = "<model_id>_<profile_id>_<plate>.3mf".
-    // -------------------------------------------------------------
-    std::string plate_tag = std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
-    std::string model_slot = info.model_id + "_" + info.profile_id + "_" + plate_tag + ".3mf";
-    std::string main_upload_url;
-    if (int rc = get_upload_url(api, token, uid, model_slot, &main_upload_url, update_fn);
-        rc != 0) return rc;
-
-    // -------------------------------------------------------------
-    // [G] Upload the print-ready 3mf (big).
-    // -------------------------------------------------------------
-    std::string main_bytes = slurp_file(p.filename, &slurp_err);
-    if (main_bytes.empty()) {
-        OBN_ERROR("cloud_print: main read %s: %s", p.filename.c_str(), slurp_err.c_str());
-        if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                 BAMBU_NETWORK_ERR_FILE_NOT_EXIST,
-                                 "filename not readable");
-        return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
-    }
-    if (int rc = s3_put(main_upload_url, main_bytes, update_fn, cancel_fn,
-                        /*stage_start_pct=*/10, /*stage_end_pct=*/95,
-                        BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
-        rc != 0) return rc;
-
-    // -------------------------------------------------------------
-    // [H] Second PATCH with the real URL.
-    // -------------------------------------------------------------
-    if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
-                               md5, p.plate_index, main_upload_url, update_fn);
-        rc != 0) return rc;
-
-    // -------------------------------------------------------------
-    // [9/I] LAN-only: upload to printer storage, then POST task with
-    // mode=lan_file. Cloud variant skips local upload.
-    // -------------------------------------------------------------
-    std::string lan_remote_path; // wire path / basename for MQTT
     if (use_lan_channel) {
-        // Studio asked for the LAN channel
+        // ---------------------------------------------------------
+        // LAN delivery: FTPS STOR + PATCH ftp:// (no main S3 upload).
+        // ---------------------------------------------------------
         if (p.dev_ip.empty() || p.password.empty()) {
             OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
             if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -864,66 +801,70 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                      "no dev_ip/access_code for LAN print");
             return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
         }
-        if (!ensure_lan_session(p.dev_id, p.dev_ip, p.password)) {
-            OBN_ERROR("cloud_print: no LAN MQTT session for dev=%s",
-                      p.dev_id.c_str());
+
+        // Peer pin for FTPS TLS hostname verify when no prior connect_printer.
+        publish_peer_cert_pin(p.dev_ip, p.dev_id);
+
+        std::string lan_remote_path =
+            print_job::build_ftp_remote_path(p, remote_name);
+        OBN_INFO("cloud_print: upload path=ftps :990 remote=%s ftp_folder='%s'",
+                 lan_remote_path.c_str(), p.ftp_folder.c_str());
+
+        print_params_set_use_ssl_for_ftp(p.use_ssl_for_ftp);
+
+        std::uint64_t total = 0;
+        std::string ca_file = bambu_ca_bundle_path();
+        std::string stored_path;
+        if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
+                                           update_fn, cancel_fn,
+                                           BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
+                                           total, &stored_path);
+            rc != 0) return rc;
+        if (!stored_path.empty()) lan_remote_path = stored_path;
+        project_url = print_job::build_ftp_url(lan_remote_path);
+        OBN_INFO("cloud_print: lan-ftps uploaded %llu bytes to %s (url=%s)",
+                 static_cast<unsigned long long>(total),
+                 lan_remote_path.c_str(), project_url.c_str());
+
+        if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
+                                   md5, p.plate_index, project_url, update_fn);
+            rc != 0) return rc;
+    } else {
+        // ---------------------------------------------------------
+        // Cloud delivery: main .3mf to S3 + PATCH S3 URL.
+        // ---------------------------------------------------------
+        std::string main_upload_url;
+        std::string plate_tag =
+            std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
+        std::string model_slot =
+            info.model_id + "_" + info.profile_id + "_" + plate_tag + ".3mf";
+        if (int rc = get_upload_url(api, token, uid, model_slot,
+                                    &main_upload_url, update_fn);
+            rc != 0) return rc;
+
+        std::string main_bytes = slurp_file(p.filename, &slurp_err);
+        if (main_bytes.empty()) {
+            OBN_ERROR("cloud_print: main read %s: %s",
+                      p.filename.c_str(), slurp_err.c_str());
             if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                                     "LAN MQTT session failed");
-            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+                                    BAMBU_NETWORK_ERR_FILE_NOT_EXIST,
+                                    "filename not readable");
+            return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
         }
-        if (print_job::use_brtc_cache_upload(p)) {
-            OBN_INFO("cloud_print: upload path=brtc :6000 (try_emmc_print=%d, force_ftps=%d)",
-                     p.try_emmc_print ? 1 : 0,
-                     obn::config::current().force_ftps ? 1 : 0);
-            obn::tunnel_upload::ConnectParams cp =
-                obn::tunnel_upload::connect_params_from_print(
-                    p.dev_ip, p.dev_id, p.password);
-            obn::tunnel_upload::UploadRequest ureq;
-            ureq.local_path   = p.filename;
-            ureq.dest_storage = "emmc";
-            ureq.dest_name    = remote_name;
+        if (int rc = s3_put(main_upload_url, main_bytes, update_fn, cancel_fn,
+                            /*stage_start_pct=*/10, /*stage_end_pct=*/95,
+                            BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
+            rc != 0) return rc;
 
-            obn::tunnel_upload::UploadCallbacks cb;
-            cb.cancelled = [&]() { return cancel_fn && cancel_fn(); };
-            cb.progress = [&](int pct) {
-                if (update_fn) update_fn(BBL::PrintingStageUpload, pct, "");
-            };
-
-            obn::tunnel_upload::UploadOutcome outcome;
-            if (int rc = obn::tunnel_upload::upload_file(
-                    cp, ureq, cb, &outcome,
-                    BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED);
-                rc != 0) return rc;
-            lan_remote_path = remote_name;
-            OBN_INFO("cloud_print: brtc upload %llu bytes to emmc/%s",
-                     static_cast<unsigned long long>(outcome.bytes),
-                     remote_name.c_str());
-        } else {
-            OBN_INFO("cloud_print: upload path=ftps :990 (try_emmc_print=%d, force_ftps=%d)",
-                     p.try_emmc_print ? 1 : 0,
-                     obn::config::current().force_ftps ? 1 : 0);
-            std::string folder = p.ftp_folder;
-            if (!folder.empty() && folder.back() != '/') folder += '/';
-            if (!folder.empty() && folder.front() == '/') folder.erase(0, 1);
-            lan_remote_path = "/" + folder + remote_name;
-
-            print_params_set_use_ssl_for_ftp(p.use_ssl_for_ftp);
-
-            std::uint64_t total = 0;
-            std::string ca_file = bambu_ca_bundle_path();
-            std::string stored_path;
-            if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
-                                               update_fn, cancel_fn,
-                                               BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
-                                               total, &stored_path);
-                rc != 0) return rc;
-            if (!stored_path.empty()) lan_remote_path = stored_path;
-            OBN_INFO("cloud_print: lan-ftps uploaded %llu bytes to %s",
-                     static_cast<unsigned long long>(total), lan_remote_path.c_str());
-        }
+        project_url = main_upload_url;
+        if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
+                                   md5, p.plate_index, project_url, update_fn);
+            rc != 0) return rc;
     }
 
+    // -------------------------------------------------------------
+    // POST /my/task — cloud dispatches the print (no plugin MQTT).
+    // -------------------------------------------------------------
     if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
 
     std::string task_body = build_task_body(p, info.project_id, info.model_id,
@@ -932,52 +873,12 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
 
-    // -------------------------------------------------------------
-    // [J] MQTT publish the project_file command. The printer watches
-    // for this on its report/request channel and starts the job the
-    // moment it lands.
-    // -------------------------------------------------------------
-    print_job::ProjectFileOpts opts;
-    opts.project_id = info.project_id;
-    opts.profile_id = info.profile_id;
-    opts.task_id    = task_id;
-    opts.subtask_id = "0";
-    opts.md5        = md5;
-    if (use_lan_channel) {
-        opts.file_path = lan_remote_path;
-        if (print_job::use_brtc_cache_upload(p)) {
-            opts.url = print_job::build_brtc_emmc_url(remote_name);
-        } else {
-            opts.url = print_job::build_ftp_url(lan_remote_path);
-        }
-    } else {
-        // Cloud: the printer fetches directly from S3 over HTTPS.
-        opts.file_path = remote_name;
-        opts.url       = main_upload_url;
-    }
-    OBN_INFO("cloud_print: project_file chan=%s file=%s url=%s",
-             use_lan_channel ? "lan" : "cloud",
-             opts.file_path.c_str(), redact_url(opts.url).c_str());
-
-    // Plaintext project_file JSON. send_message prefers LAN MQTT when a
-    // session is up; cloud MQTT is only the fallback. REST already recorded
-    // the job for MakerWorld — no need to force cloud for the trigger.
-    // const std::string mqtt_json = print_job::build_project_file_json(p, opts);
-    // OBN_DEBUG("cloud_print mqtt: %s", mqtt_json.c_str());
-
-    // int pub_rc = send_message(p.dev_id, mqtt_json, /*qos=*/0);
-    // if (pub_rc != 0) {
-    //     OBN_ERROR("cloud_print: mqtt publish failed rc=%d", pub_rc);
-    //     if (update_fn) update_fn(BBL::PrintingStageERROR,
-    //                              BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
-    //                              "MQTT publish failed");
-    //     return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
-    // }
-
     if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
-    OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s upload=%s)",
+    OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
              p.dev_id.c_str(), info.project_id.c_str(), task_id.c_str(),
-             use_lan_channel ? "lan" : "cloud");
+             use_lan_channel ? "ftps" : "s3",
+             use_lan_channel ? project_url.c_str()
+                             : redact_url(project_url).c_str());
     return 0;
 }
 
