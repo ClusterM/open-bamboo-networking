@@ -795,8 +795,15 @@ Response (200 OK):
 | `bambu_network_bind_detect` | `int(void*, std::string dev_ip, std::string sec_link, detectResult& detect)` |
 | `bambu_network_bind` | `int(void*, std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn)` |
 | `bambu_network_unbind` | `int(void*, std::string dev_id)` |
-| `bambu_network_request_bind_ticket` | `int(void*, std::string* ticket)` |
+| `bambu_network_request_bind_ticket` | `int(void*, std::string* ticket)` — WebView SSO short code (Print History detail, MakerWorld, bind). See SSO note below. |
 | `bambu_network_query_bind_status` | `int(void*, std::vector<std::string> query_list, unsigned int* http_code, std::string* http_body)` |
+
+**WebView SSO ticket (`request_bind_ticket`, MITM 2026-07).** Studio asks the plugin for a short alphanumeric ticket, then opens the embedded browser at `makerworld.com/api/sign-in/ticket?to=<target>&ticket=<T>`. Stock does **two** cloud REST calls before that navigation:
+
+1. `GET /v1/user-service/user/ticket` (Bearer) → `{"ticket":"ABV5MR","pincode":"ABV5MR"}` — mint an unbound code.
+2. `POST /v1/user-service/my/ticket/<T>` with body `{"ticket":"<T>"}` (Bearer) → **binds** that code to the logged-in session (empty 200 body).
+
+Only after step 2 does `GET …/api/sign-in/ticket?…&ticket=<T>` respond with `Set-Cookie: token=<accessToken>` and redirect to the target (Print History detail, etc.). If step 2 is skipped, MakerWorld still 307s to the target URL but sets an **empty** `token` cookie (`Max-Age=NaN`); the next navigation then 302s to `/sign-in/service` / bambulab login. Step 1 alone is not enough.
 
 The `detectResult` struct (`src/slic3r/Utils/bambu_networking.hpp:180-189`):
 

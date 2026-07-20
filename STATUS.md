@@ -145,7 +145,7 @@ Source: [src/abi_bind.cpp](src/abi_bind.cpp).
 | `bambu_network_bind_detect` | ✅ | Passively waits up to 5.5 s (`ssdp::kBindDetectWaitMs`) for an SSDP NOTIFY on UDP 2021 (printers broadcast every 5 s). |
 | `bambu_network_bind` | ✅ | LAN → cloud bind flow; reports progress through `OnUpdateStatusFn`. |
 | `bambu_network_unbind` | ✅ | Cloud unbind call. |
-| `bambu_network_request_bind_ticket` | ✅ | Requests the WebView SSO ticket used by the browser bind flow. |
+| `bambu_network_request_bind_ticket` | ✅ | WebView SSO ticket: `GET /user-service/user/ticket` then **`POST /user-service/my/ticket/<T>`** to bind the code to the session (required — mint alone leaves MakerWorld with an empty `token` cookie / sign-in page). Used for Print History detail, MakerWorld, bind WebViews. |
 | `bambu_network_query_bind_status` | ✅ | Cloud bind-status query. |
 | `bambu_network_report_consent` | ❌ | No-op (returns `SUCCESS`). No consent-collection endpoint is exposed by this plugin. |
 
