@@ -1,6 +1,7 @@
 #include "obn/agent.hpp"
 #include "obn/identity_headers.hpp"
 
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -704,6 +705,93 @@ bool json_peek_string_field(const std::string& payload,
     return true;
 }
 
+// Cheap int peek for fields firmware emits as bare numbers or quoted
+// digits (`"plate_idx":2` / `"plate_idx":"2"`). Same ASCII-only
+// assumption as json_peek_string_field.
+bool json_peek_int_field(const std::string& payload,
+                         const std::string& key,
+                         int*               out)
+{
+    if (!out) return false;
+    std::string needle = "\"" + key + "\":";
+    std::size_t pos = payload.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < payload.size() && payload[pos] == ' ') ++pos;
+    if (pos >= payload.size()) return false;
+
+    if (payload[pos] == '"') {
+        std::string s;
+        if (!json_peek_string_field(payload, key, &s) || s.empty()) return false;
+        try {
+            *out = std::stoi(s);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    const std::size_t start = pos;
+    if (payload[pos] == '-') ++pos;
+    if (pos >= payload.size() ||
+        !std::isdigit(static_cast<unsigned char>(payload[pos]))) {
+        return false;
+    }
+    while (pos < payload.size() &&
+           std::isdigit(static_cast<unsigned char>(payload[pos]))) {
+        ++pos;
+    }
+    try {
+        *out = std::stoi(payload.substr(start, pos - start));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Extract N from paths like `/data/Metadata/plate_2.gcode` or
+// `Metadata/plate_2.gcode`. Returns 0 when no plate marker is found.
+int plate_idx_from_path(const std::string& path)
+{
+    static constexpr char kMarker[] = "plate_";
+    const std::size_t pos = path.rfind(kMarker);
+    if (pos == std::string::npos) return 0;
+    std::size_t i = pos + sizeof(kMarker) - 1;
+    if (i >= path.size() ||
+        !std::isdigit(static_cast<unsigned char>(path[i]))) {
+        return 0;
+    }
+    int n = 0;
+    while (i < path.size() &&
+           std::isdigit(static_cast<unsigned char>(path[i]))) {
+        n = n * 10 + (path[i] - '0');
+        ++i;
+        if (n > 9999) return 0;
+    }
+    return n;
+}
+
+// Prefer print.plate_idx from push_status (Studio reads the same field).
+// Fall back to gcode_file / param paths, then plate 1.
+int resolve_cover_plate_idx(const std::string& payload)
+{
+    int plate = 0;
+    if (json_peek_int_field(payload, "plate_idx", &plate) && plate > 0) {
+        return plate;
+    }
+    std::string path;
+    if (json_peek_string_field(payload, "gcode_file", &path)) {
+        plate = plate_idx_from_path(path);
+        if (plate > 0) return plate;
+    }
+    path.clear();
+    if (json_peek_string_field(payload, "param", &path)) {
+        plate = plate_idx_from_path(path);
+        if (plate > 0) return plate;
+    }
+    return 1;
+}
+
 // Rewrites `"key":"0"` or `"key":""` to `"key":"<value>"` in place.
 // LAN prints may emit zeros or empty strings for cloud ids.
 bool patch_string_zero_to(std::string&       payload,
@@ -1175,12 +1263,10 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     }
 
     if (!cover_id.empty()) {
-        // Bambu firmware doesn't ship plate_idx in push_status; the
-        // original .3mf is the source of truth (Metadata/slice_info.
-        // config) but we haven't downloaded it yet. Default to 1 -
-        // this matches our start_sdcard_print param path and is right
-        // for 99% of single-plate .3mfs.
-        int plate_idx = 1;
+        // Firmware push_status usually carries print.plate_idx (and
+        // gcode_file/param as Metadata/plate_N.gcode). cover_cache
+        // fetches #Metadata/plate_N.png for that index.
+        const int plate_idx = resolve_cover_plate_idx(patched);
 
         std::string host, user, pass;
         {

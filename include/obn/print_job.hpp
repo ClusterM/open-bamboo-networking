@@ -1,11 +1,9 @@
 #pragma once
 
-// Shared helpers for LAN print submission (FTPS legacy + :6000/brtc).
+// Shared helpers for LAN / hybrid print submission (FTPS + :6000/brtc).
 //
-// The LAN `run_local_print_job` and the cloud `run_cloud_print_job`
-// pipelines both need to (a) pick a printer-friendly remote filename,
-// (b) push the .3mf to the printer (FTPS or :6000 cache upload), and
-// (c) build a `{"print":{"command":"project_file", ...}}` payload for MQTT.
+// `run_local_print_job` uses FTPS or :6000 + MQTT project_file.
+// `run_cloud_print_job` (LAN channel) uses FTPS + cloud /my/task only.
 
 #include <cstdint>
 #include <functional>
@@ -42,6 +40,12 @@ std::string build_file_url(const std::string& absolute_path);
 
 // MQTT url for legacy LAN print after FTPS upload.
 std::string build_ftp_url(const std::string& stored_path);
+
+// Absolute FTPS STOR path: "/[<ftp_folder>/]<remote_name>".
+// Respects PrintParams.ftp_folder (normalized). Does not create the
+// directory — printer FTPS has no MKD; missing folders fail at STOR.
+std::string build_ftp_remote_path(const BBL::PrintParams& p,
+                                  const std::string&      remote_name);
 
 // Performs the actual FTPS STOR of params.filename to remote_path,
 // streaming progress through update_fn as PrintingStageUpload. Obeys

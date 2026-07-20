@@ -795,8 +795,15 @@ Response (200 OK):
 | `bambu_network_bind_detect` | `int(void*, std::string dev_ip, std::string sec_link, detectResult& detect)` |
 | `bambu_network_bind` | `int(void*, std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn)` |
 | `bambu_network_unbind` | `int(void*, std::string dev_id)` |
-| `bambu_network_request_bind_ticket` | `int(void*, std::string* ticket)` |
+| `bambu_network_request_bind_ticket` | `int(void*, std::string* ticket)` — WebView SSO short code (Print History detail, MakerWorld, bind). See SSO note below. |
 | `bambu_network_query_bind_status` | `int(void*, std::vector<std::string> query_list, unsigned int* http_code, std::string* http_body)` |
+
+**WebView SSO ticket (`request_bind_ticket`, MITM 2026-07).** Studio asks the plugin for a short alphanumeric ticket, then opens the embedded browser at `makerworld.com/api/sign-in/ticket?to=<target>&ticket=<T>`. Stock does **two** cloud REST calls before that navigation:
+
+1. `GET /v1/user-service/user/ticket` (Bearer) → `{"ticket":"ABV5MR","pincode":"ABV5MR"}` — mint an unbound code.
+2. `POST /v1/user-service/my/ticket/<T>` with body `{"ticket":"<T>"}` (Bearer) → **binds** that code to the logged-in session (empty 200 body).
+
+Only after step 2 does `GET …/api/sign-in/ticket?…&ticket=<T>` respond with `Set-Cookie: token=<accessToken>` and redirect to the target (Print History detail, etc.). If step 2 is skipped, MakerWorld still 307s to the target URL but sets an **empty** `token` cookie (`Max-Age=NaN`); the next navigation then 302s to `/sign-in/service` / bambulab login. Step 1 alone is not enough.
 
 The `detectResult` struct (`src/slic3r/Utils/bambu_networking.hpp:180-189`):
 
@@ -1203,7 +1210,7 @@ On dialog open, brtc printers **prefer TCP/TUTK** over FTP for the connection ha
 
 ##### Decision tree: `PrintJob::process()` (`PrintJob.cpp:149-624`)
 
-**Note:** The Send-to-Printer mermaid above is upload-only. Print jobs use the tree below; open plugin upload inside `start_local_print` / `_with_record` mirrors stock P2S when Studio sets `try_emmc_print` (`:6000` emmc + MQTT `brtc://emmc/`).
+**Note:** The Send-to-Printer mermaid above is upload-only. Print jobs use the tree below. Studio sets `try_emmc_print = could_emmc_print` for **every** print path the same way; which LAN transport the **stock plugin** then uses for the model body is decided **inside the plugin by ABI entry point**, not by that flag alone (wire-confirmed 2026-07 — see §6.8.1.2).
 
 After `SelectMachineDialog::on_send_print()` exports the plate `.3mf` (and, for cloud-bound printers, a config `.3mf`), it fills `PrintParams` and starts the background `PrintJob`.
 
@@ -1220,7 +1227,7 @@ flowchart TD
   F -->|from_sdcard_view| G["start_sdcard_print"]
   F -->|from_normal| H{connection_type?}
   H -->|lan| I{has_sdcard OR could_emmc_print?}
-  I -->|yes| J["start_local_print\n(:6000+brtc if try_emmc_print)"]
+  I -->|yes| J["start_local_print"]
   I -->|no| K["abort: no storage"]
   H -->|cloud / farm| L{lan_mode_only?}
   L -->|yes| M["start_local_print_with_record"]
@@ -1247,22 +1254,22 @@ A cloud-paired printer can still be on the same LAN (SSDP IP + access code known
 | `connection_type` | `MachineObject::connection_type()` (SSDP / bind) | Top-level LAN vs cloud branch |
 | `cloud_print_only` | MQTT/capability `support_cloud_print_only` | Forces pure `start_print` (skips LAN-with-record) |
 | `has_sdcard` | `DevStorage::HAS_SDCARD_NORMAL` | Required for LAN-with-record upload storage |
-| `could_emmc_print` | `is_support_print_with_emmc` | Allows pure LAN print without SD; also sets `try_emmc_print` → `:6000`+`brtc://` |
+| `could_emmc_print` | `is_support_print_with_emmc` | Allows pure LAN print without SD; copied into `try_emmc_print` for the plugin |
 | `dev_ip` / `password` | SSDP IP + access code (UI / cloud `dev_access_code`) | Without both, Studio skips LAN-with-record |
 | `lan_mode_only` | Studio `app_config` | Force LAN-with-record even for cloud-typed devices |
 
 **ABI entry points the tree resolves to:**
 
 1. `bambu_network_start_local_print` — pure LAN (`connection_type=="lan"`). No cloud `/my/task`.
-2. `bambu_network_start_local_print_with_record` — LAN upload + MQTT trigger, plus cloud history (`mode=lan_file`). Used for cloud-typed printers when IP+code+storage are available.
-3. `bambu_network_start_print` — pure cloud. Either immediately (missing LAN prerequisites / `cloud_print_only`) or as Studio’s **own** fallback when `_with_record` returns `< 0`.
+2. `bambu_network_start_local_print_with_record` — hybrid / “LAN with cloud record” (`mode=lan_file` on `/my/task`). Used for cloud-typed printers when IP+code+storage are available.
+3. `bambu_network_start_print` — pure cloud (`mode=cloud_file`). Either immediately (missing LAN prerequisites / `cloud_print_only`) or as Studio’s **own** fallback when `_with_record` returns `< 0`.
 
 
 ##### Three upload/print channels Studio actually uses
 
 | Channel | Who calls it | Upload transport | Print start | Starts a print? |
 |---|---|---|---|:---:|
-| **`bambu_network_start_*`** | `PrintJob` (print paths), `SendJob` (Send-to-Printer fallback only) | Inside plugin (stock: cloud S3 + optional FTPS, or LAN FTPS / `:6000` depending on entry point — see STATUS) | Plugin publishes MQTT `project_file` (except upload-only / probe entries) | PrintJob yes; SendJob / verify_job no |
+| **`bambu_network_start_*`** | `PrintJob` (print paths), `SendJob` (Send-to-Printer fallback only) | Inside plugin (stock: S3 ± FTPS / `:6000` by entry point — §6.8.1.2) | Pure LAN: plugin MQTT `project_file`. Cloud / hybrid: `POST /my/task` (cloud dispatch); upload-only / probe: none | PrintJob yes; SendJob / verify_job no |
 | **`ft_*` ABI** | `SendToPrinterDialog`, `FileTransferTunnel` in `PrintJob` preflight | Studio → `ft_tunnel_*` + `ft_job_create` / `ft_tunnel_start_job` (`FileTransferUtils.cpp`) | **Never** — upload completes with `get_send_finished_event()` | No |
 | **`bambu_network_send_message_to_printer`** | `MachineObject::publish_json()` | N/A (opaque JSON passthrough) | Timelapse preflight, AMS queries, user commands — **not** the print job itself | No |
 
@@ -1272,10 +1279,10 @@ A cloud-paired printer can still be on the same LAN (SSDP IP + access code known
 
 | Scenario | Plugin calls (in order) | Required for firmware to start printing | Tracking / UI only |
 |---|---|---|---|
-| **LAN print** (`connection_type=="lan"`, normal) | Preflight: optional `:6000` tunnel test + `start_send_gcode_to_sdcard(verify_job)` → **`start_local_print`** (`:6000`+`brtc://` when `try_emmc_print`, else FTPS+`ftp://`) | Plugin upload + MQTT `project_file` (§6.8.2) | Preflight probes; `update_fn` progress |
-| **Cloud print** (no LAN credentials) | **`start_print`** | Cloud S3 upload + signed cloud MQTT `project_file` | `wait_fn` waits for `job_id` / printing status; `Record` stage = cloud task metadata |
-| **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Same LAN upload as above; cloud REST + task record if LAN leg succeeds | `wait_fn` on hybrid path; `params.comments` records fallback reason |
-| **`lan_mode_only` config** | **`start_local_print_with_record`** only | LAN `:6000`/FTPS + MQTT + best-effort cloud `create_task` | Same as hybrid LAN leg |
+| **LAN print** (`connection_type=="lan"`, normal) | Preflight: optional `:6000` tunnel test + `start_send_gcode_to_sdcard(verify_job)` → **`start_local_print`** | Plugin LAN upload + MQTT `project_file` (§6.8.2). On P2S stock: model over **`:6000`**, URL `brtc://emmc/…` (§6.8.1.2) | Preflight probes; `update_fn` progress |
+| **Cloud print** (no LAN credentials) | **`start_print`** | Cloud S3 upload of config + full `.3mf` + `POST /my/task` (`mode=cloud_file`); **cloud** dispatches the print (no LAN model upload) | `wait_fn` waits for `job_id` / printing status; `Record` stage = cloud task metadata |
+| **Hybrid** (cloud device + LAN IP/code) | **`start_local_print_with_record`** → on failure **`start_print`** | Stock ABI name is misleading: dual FTPS+S3 upload, final project URL is **S3**, printer **re-downloads from cloud** (`mode=lan_file` — §6.8.1 / §6.8.1.2). Not a real LAN print. | `wait_fn`; Studio download % after start; `params.comments` on fallback |
+| **`lan_mode_only` config** | **`start_local_print_with_record`** only | Same hybrid path as above | Same as hybrid |
 | **Print existing file** (`from_sdcard_view`) | **`start_sdcard_print`** | MQTT `project_file` with `url=file:///<path>` | UI labels it “cloud service” but plugin call is the same ABI |
 | **Upload only** (Send to Printer, brtc printers) | `ft_tunnel_*` + `ft_job` **`cmd_type=7`** → **`cmd_type=5`** | Nothing | Progress via `ft_job` `msg_cb` |
 | **Upload only** (Send to Printer, **no** `is_support_brtc`) | `verify_job` probe → **`SendJob`** → **`start_send_gcode_to_sdcard`** (full `.3mf` over FTPS) | Nothing | Legacy fallback; not P2S |
@@ -1325,32 +1332,50 @@ Notable `PrintParams` cases:
 - **`project_name="verify_job"`** — Studio's name for the FTPS write probe (`PrintJob.cpp:236`, `SendJob.cpp:134`). Same ABI as any other upload; not a separate plugin code path.
 - **`print_type=="from_sdcard_view"`** — sets **`dst_file`** instead of local **`filename`**; triggers **`start_sdcard_print`** only.
 - **`ftp_folder`** — passed through but **never assigned by Studio** in the public tree (`PrintJob.cpp:256` reads `obj_->get_ftp_folder()` which is usually empty); stock plugin uploads to FTPS root when empty.
-- **`try_emmc_print` / `could_emmc_print`** — gates the `:6000` preflight tunnel test; does not appear on the MQTT wire.
+- **`try_emmc_print` / `could_emmc_print`** — Studio copies `could_emmc_print` into `try_emmc_print` for **all** print paths and uses it to gate the `:6000` **preflight** tunnel test. It does **not** appear on the MQTT wire. Stock’s choice of FTPS vs `:6000` for the **model body** is not “`try_emmc_print` ⇒ brtc”; it follows the ABI entry point (§6.8.1.2).
 
 Open-plugin mapping of each ABI entry point: [STATUS.md §6.8 — Open plugin: ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation).
 
 #### 6.8.1. Cloud upload flow (stock plugin, MITM)
 
-Studio exposes two cloud-facing print entry points — `bambu_network_start_print` (pure cloud channel) and `bambu_network_start_local_print_with_record` (same cloud-side bookkeeping, but the final `project_file` goes out over the LAN MQTT session and the printer may pull the `.3mf` via FTPS). Both drive the same HTTPS project lifecycle on the stock plugin; only the last-mile MQTT/FTPS leg differs. The mapping of each ABI symbol to a concrete implementation is out of scope here — see [STATUS.md §6.8 — ABI → internal implementation](STATUS.md#open-plugin-abi--internal-implementation).
+Studio exposes two cloud-facing print entry points — `bambu_network_start_print` and `bambu_network_start_local_print_with_record`. Despite the name, **stock `_with_record` is not a real LAN print** on current plugin builds (P2S, Studio/plugin ~02.08; also reproduced on 02.04 — MITM + LAN pcap, 2026-07): it still uploads the **full** print-ready `.3mf` to S3, ends with a project URL that is **https (S3)**, and the printer **re-downloads from the cloud** after `/my/task`. The FTPS leg + first `ftp://` PATCH look like leftover “lan+record” staging that the second PATCH immediately undoes. §6.8.1.2.
 
-Observed cloud-side sequence (stock `libbambu_networking.so`, MITM):
+Open-plugin mapping of each ABI symbol is out of scope here — see [STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation).
 
-1. `POST /v1/iot-service/api/user/project`  
-   returns `project_id`, `model_id`, `profile_id`, plus the first presigned `upload_url` and `upload_ticket`.
-2. `PUT <upload_url>`  
-   uploads the config 3mf.
-3. `PUT /v1/iot-service/api/user/notification` and poll  
-   `GET /v1/iot-service/api/user/notification?action=upload&ticket=<ticket>`  
-   until `{"message":"success"}` (HTTP stays 200; intermediate polls return `"message":"running"`).
-4. `PATCH /v1/iot-service/api/user/project/<project_id>`  
-   first patch with placeholder `ftp://...` URL (mirrors stock plugin behaviour).
-5. `GET /v1/iot-service/api/user/upload?models=<model_id>_<profile_id>_<plate>.3mf`  
-   returns the second presigned URL for the main print-ready 3mf.
-6. `PUT <second presigned URL>`  
-   uploads the main 3mf.
-7. `PATCH /v1/iot-service/api/user/project/<project_id>`  
-   second patch with the real uploaded URL.
-8. `POST /v1/user-service/my/task`, then MQTT `project_file` publish.
+##### Stock `start_local_print_with_record` — observed order (MITM + LAN)
+
+Exact HTTPS order from stock hybrid MITM (relative to `POST …/user/project`):
+
+1. **`POST /v1/iot-service/api/user/project`** `{"name":"<job>"}`  
+   → `project_id`, `model_id`, `profile_id`, first presigned `upload_url`, `upload_ticket`.
+2. **`PUT <upload_url>`** — small **config/profile** `.3mf` (history / preview; Studio’s `export_config_3mf`).
+3. **`PUT /v1/iot-service/api/user/notification`** + poll  
+   `GET …/notification?action=upload&ticket=…` until `"message":"success"`.
+4. **LAN FTPS `:990`** — full print-ready `.3mf` `STOR` to the printer (not visible in mitmproxy; ~1.2 MB on the LAN pcap). Stock uses **FTPS here, never `:6000`/brtc**, on this ABI.
+5. **`PATCH …/user/project/<pid>`** — first project register, **`url":"ftp://<name>.gcode.3mf"`**  
+   Example body:  
+   `{"profile_id":"…","profile_print_3mf":[{"md5":"…","plate_idx":1,"url":"ftp://….gcode.3mf"}]}`
+6. **`GET /v1/iot-service/api/user/upload?models=<model_id>_<profile_id>_<plate>.3mf`**  
+   → second presigned URL for the **full** model.
+7. **`PUT <second URL>`** — **full** print-ready `.3mf` to S3 (~1.2 MB again — same file already STORed over FTPS).
+8. **`PATCH …/user/project/<pid>`** — **second** register, **`url":"https://s3…/<model>.3mf?…"`** (overwrites step 5).
+9. **`POST /v1/user-service/my/task`** with **`mode":"lan_file"`** — print trigger; cloud dispatches to the printer. Plugin does **not** need a local MQTT `project_file` (§6.8.1.1).
+
+Pure **`start_print`** skips steps 4–5 (no FTPS, no `ftp://` PATCH); step 9 uses `mode":"cloud_file"`. Steps 2–3 / 6–8 are the same shape.
+
+**Why this is “fake” lan+record.** After step 9 the printer pulls the model from **cloud object storage** (Studio shows a post-start **download** percent). Blocking the printer’s WAN (while Studio↔API still works) fails the job (`fail_reason` / download errors such as `50348044`) even though FTPS already placed a copy. The early `ftp://` PATCH has **no lasting effect** once the S3 PATCH lands. Uploading only the full model to S3 + the https PATCH reproduces the same print start; the FTPS prologue is redundant for the body the firmware actually opens.
+
+**Config vs main (steps 2–3).** Skipping the small config upload still allows `/my/task` to start the print, but Print History is incomplete (no thumbnail — generic logo / “Gcode” badge). Stock always does 2–3.
+
+**Cloud-dispatched URL schemes.** For jobs started via `/my/task`, the project / task URL the cloud hands the printer appears limited to **`https://…` (S3)** and **`ftp://…`**. There is no evidence the cloud path accepts or forwards **`brtc://…`**; stock never registers a brtc URL on `_with_record` / `start_print`. BRTC remains a **pure-LAN MQTT** scheme (`start_local_print` only — §6.8.1.2).
+
+**Printer → cloud status after start.** Once the job is running, the **printer itself** keeps reporting print state upstream to Bambu’s cloud (almost certainly over the same cloud MQTT session the device already holds — `device/<serial>/report` / related telemetry, not a slicer HTTPS poll). The slicer plugin does not have to push progress for these cloud-side features. Observed / product uses of that uplink include at least:
+
+- problem / HMS-style **notifications in the mobile app**;
+- keeping **Print History** status current (running / finished / canceled / failed);
+- **MakerWorld** prompts to rate a finished model after a successful cloud-linked print.
+
+Pure LAN-only prints (`start_local_print`, no `/my/task`) do not create that cloud task record, so those cloud UX hooks do not apply the same way.
 
 Terminology note:
 
@@ -1385,6 +1410,29 @@ Getting a **cloud** print (or "local print with record") to actually start from 
 **4. The duplicate-submission pitfall (`start_local_print_with_record` → `start_print` fallback).** Studio's `PrintJob::process()` tries **`start_local_print_with_record` first** and only falls back to **`start_print`** if it returns `< 0`. Both entry points create a cloud task and hit `POST /my/task`, which is what actually dispatches the job. So a plugin that lets the "record" entry point create the cloud task **and then** return `< 0` (e.g. because a later LAN MQTT leg failed) triggers Studio's fallback into `start_print`, which fires a **second** `/my/task`. The printer, already printing the first job, then rejects the duplicate with `0500_4004` / `0300_400C` ("Printing was cancelled"). The invariant a print implementation must preserve: **exactly one `/my/task` per user action** — either succeed and return `0` from the first entry point, or fail *before* creating the cloud task so the fallback starts cleanly.
 
 **5. Studio-side crash caveat (not OBN).** After a print, if the printer reports **any** non-zero `print_error` (including a stale/latched one), Studio's `StatusPanel::update_error_message()` opens a `DeviceErrorDialog`, whose `RequestUserAttention → gtk_widget_get_realized` path **segfaults under GTK/Wayland** (`GLib-CRITICAL: Source ID … was not found`). This is a Studio/GTK bug, independent of the plugin; the workaround is to launch Studio with **`GDK_BACKEND=x11`**.
+
+##### 6.8.1.2. Stock print transports: FTPS vs BRTC (wire-confirmed, P2S, 2026-07)
+
+Studio sets `try_emmc_print = could_emmc_print` the same way for LAN and hybrid; that flag alone does **not** select the model transport. Stock picks by **ABI entry point** (MITM + LAN pcap on P2S, 2026-07):
+
+| Studio / plugin entry | Cloud HTTPS | LAN model upload (stock) | Winning model URL / who prints |
+|---|---|---|---|
+| `bambu_network_start_local_print` | none | Full `.3mf` over **TLS `:6000` (brtc)** | LAN MQTT `project_file` with `brtc://emmc/<name>` — **only** honest LAN path |
+| `bambu_network_start_local_print_with_record` | Config + **full** `.3mf` to S3; **two** project PATCHes (`ftp://` then **https S3**) | Full `.3mf` over **FTPS `:990` only** (never brtc on this ABI) | **Not LAN:** cloud `/my/task` `mode=lan_file` → printer **re-downloads S3**. Name “local … with record” is misleading on current stock. |
+| `bambu_network_start_print` | Config + full `.3mf` to S3; PATCH → S3 | none | Cloud `/my/task` `mode=cloud_file` → S3 download |
+
+**Stock hybrid always FTPS for the LAN side-trip.** On `_with_record`, stock does **not** use `:6000`/brtc for the model body — only FTPS — then still pushes the same file to S3. BRTC appears on **pure** `start_local_print` and on Send-to-Printer cache upload (§6.14), not on cloud-dispatched hybrid.
+
+**Cloud dispatch vs BRTC.** Cloud-started jobs (`/my/task`) appear to understand project URLs of **`https://…`** and **`ftp://…` only**. Stock never PATCHes or tasks a `brtc://` URL on the cloud path; putting the file only in the brtc cache while advertising `ftp://` or relying on cloud dispatch does not match stock and fails unless a same-named file already exists on the FTPS volume (cache coincidence). Firmware **on the printer** still resolves `brtc://emmc/` for **LAN MQTT** `project_file` (§6.8.2); that is a different channel than the cloud forwarder.
+
+**Two PATCHes are the smoking gun.** Captured bodies on the same `project_id`:
+
+1. `"url":"ftp://….gcode.3mf"`
+2. `"url":"https://s3.us-west-2.amazonaws.com/…/<model>_1.3mf?…"` (wins)
+
+So stock performs a theatrical lan+record prologue, then converts the job into a cloud download. Whether this is an intentional product change or a regression is unclear from the wire; functionally **`start_local_print_with_record` is not a LAN print anymore**.
+
+**“Block cloud” vs Studio↔cloud MQTT.** Blocking the **printer’s** WAN while Studio still reaches `api.bambulab.com` does **not** make stock print the FTPS copy. Plugin returns success after FTPS+S3+`/my/task`; printer fails on cloud download. Only `start_local_print` keeps model + trigger entirely on LAN.
 
 #### 6.8.2. The MQTT `project_file` command (wire format)
 
@@ -1487,13 +1535,13 @@ The MQTT command is always `project_file`; there is **no** separate `storage: em
 
 | URL prefix | Example | Firmware behaviour (inferred) |
 |---|---|---|
-| `ftp://` | `ftp://skadis_spool-Body.gcode.3mf` | **Legacy LAN print.** Observed on classic `start_local_print` / cloud `_with_record` FTPS legs on N7-class hardware in older captures. P2S Send-to-Printer print-start in recent stock traffic uses `brtc://emmc/` instead (see row above). Current open-plugin behaviour per entry point: [STATUS.md §6.8](STATUS.md#open-plugin-abi--internal-implementation). |
+| `ftp://` | `ftp://skadis_spool-Body.gcode.3mf` | **FTPS / sdcard-style volume**, and one of the two URL schemes cloud dispatch appears to accept (with `https://`). Stock `_with_record` briefly PATCHes this, then **overwrites** with S3 https (§6.8.1). Older N7-class pure-LAN FTPS legs use it for real. A `:6000` cache file of the same name does **not** satisfy `ftp://`. |
 | `ftp:///` (three slashes) | `ftp:///skadis_spool-Body.gcode.3mf` | **Offline / pre-pushed variant of the row above, not a defect.** Genuine traffic shows both spellings and they are **scenario-dependent**: two slashes when the plugin has just FTPS-uploaded the file, three slashes (empty authority = "local", absolute path) when the file was pushed to the printer earlier and the job starts offline against the already-present copy. Firmware accepts both. Cross-validated in [issue #48](https://github.com/ClusterM/open-bamboo-networking/issues/48). |
-| `brtc://emmc/` | `brtc://emmc/skadis_spool-Body.gcode.3mf` | **Send-to-Printer model-cache lookup.** Despite the `emmc` token in the scheme, resolution mirrors the dual-volume upload path in §6.14.2: the firmware searches the **external (udisk) model cache first**, then the **internal (emmc) cache** — first hit wins, external has priority. No absolute path is required; only the filename after the prefix matters. |
+| `brtc://emmc/` | `brtc://emmc/skadis_spool-Body.gcode.3mf` | **LAN MQTT model-cache lookup** after `:6000` `cmd_type=5`. Stock P2S **`start_local_print`** and Send-to-Printer use this. **Not** used on stock `_with_record` / `start_print`; cloud `/my/task` path shows no support for registering or dispatching `brtc://` (§6.8.1.2). Despite the `emmc` token, firmware searches udisk cache then emmc (§6.14.2). |
 | `file://` | `file:///media/usb0/cache/skadis_spool-Body.gcode.3mf` | **Explicit filesystem path.** No cache heuristics — open exactly that file. Typical for **Print from Device** when the `.3mf` is already on storage. Paths observed under `/media/usb0/` with or without a `/cache/` segment (e.g. `file:///media/usb0/skadis_spool-Body.gcode.3mf`). |
 | `https://` | presigned object URL | **Cloud print.** Printer downloads from Bambu object storage; unrelated to local emmc/udisk caches. |
 
-**Upload vs print-start:** choosing Cache vs External in Send to Printer sets `dest_storage` (`"emmc"` / `"udisk"`) in the `:6000` `cmdtype=5` upload (§6.14.2) — that decides **where the file is written**. The `url` scheme at print-start decides **how firmware finds** the file afterward (`brtc://emmc/` = search both caches; `file://` = fixed path).
+**Upload vs print-start:** choosing Cache vs External in Send to Printer sets `dest_storage` (`"emmc"` / `"udisk"`) in the `:6000` `cmdtype=5` upload (§6.14.2) — that decides **where the file is written** in the model cache. The `url` scheme at print-start decides **how firmware finds** the file afterward (`brtc://emmc/` = search both caches; `ftp://` = FTPS volume; `file://` = fixed path). Hybrid stock print writes via FTPS and starts with `ftp://` — not via the Send-to-Printer cache path (§6.8.1.2).
 
 **Not model storage:** the `cfg` bitmask (`"4"` when `task_timelapse_use_internal=true`) and the `ipcam_get_media_info` preflight (§6.8.3) govern **timelapse video recording** destination, not which `.3mf` is printed.
 
@@ -3919,14 +3967,15 @@ Payload on :6000 is TLS application data (opaque in Wireshark unless decrypted).
 
 **Multiple clients.** Unlike an earlier working assumption, the printer **does allow several simultaneous TLS :6000 sessions** (verified with two independent REPL connections while Studio also had Files open). There is no exclusive lock on the port.
 
-**Do not conflate with FTPS :990.** Three distinct uses of FTPS on P2S:
+**Do not conflate `:6000` with FTPS `:990`.** Print/upload paths that touch either port on P2S:
 
 | Use | Library | When | Upload transport |
 |-----|---------|------|------------------|
 | Device → Files browse (external USB) | `libBambuSource` (`:6000`) | File browser tab | N/A (lists/downloads only) |
-| **`verify_job` preflight** | `libbambu_networking` | `PrintJob` LAN preflight; optional before Send to Printer | Tiny `STOR verify_job` only; then **`:6000`** for `.3mf` (§6.14.3) |
+| **`verify_job` preflight** | `libbambu_networking` | `PrintJob` LAN preflight; optional before Send to Printer | Tiny FTPS `STOR verify_job` only |
 | Legacy Send-to-Printer fallback | `libbambu_networking` | `SendJob` when `!is_support_brtc` | Full `.3mf` over FTPS `STOR` — not used on P2S |
-| Legacy LAN print upload | `libbambu_networking` | `start_local_print` / cloud `_with_record` FTPS leg | Full `.3mf` over FTPS `STOR` (P2S print-start prefers `:6000` + `brtc://` — see STATUS) |
+| Hybrid / fake “with record” | `libbambu_networking` | `start_local_print_with_record` | FTPS `STOR` + `ftp://` PATCH, then **full S3** + https PATCH; `/my/task` `lan_file`; printer prints **S3** (§6.8.1) — not a real LAN print |
+| Pure LAN model (P2S stock) | `libbambu_networking` | `start_local_print` | Full `.3mf` over **`:6000`**; MQTT URL `brtc://emmc/…` (§6.8.1.2) |
 
 Stock **Send to Printer → cache** on P2S: **`verify_job` FTPS probe (optional) + `:6000` chunked upload** — not a full FTPS model transfer.
 
