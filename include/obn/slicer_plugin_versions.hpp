@@ -65,8 +65,7 @@ struct SlicerPluginVersion {
 // to across an ABI or version boundary.
 //
 // Add a release by inserting its `#elif ABI_VERSION == 0x0MMmmpp` line. The
-// `#else` catches 0x020800 and any newer/unmapped build, presenting the newest
-// known row.
+// `#else` catches any newer/unmapped build, presenting the newest known row.
 inline constexpr SlicerPluginVersion kSlicerPluginVersions[] = {
 #if   ABI_VERSION == 0x020300
     {"02.03.00", "02.03.00.70", "02.03.00.62", "2.3.0.2"},
@@ -88,9 +87,16 @@ inline constexpr SlicerPluginVersion kSlicerPluginVersions[] = {
     {"02.07.00", "02.07.00.55", "02.07.00.50", "2.7.0.2"},
 #elif ABI_VERSION == 0x020701
     {"02.07.01", "02.07.01.62", "02.07.01.51", "2.7.0.8"},
-#else
-    // 0x020800 and any newer/unmapped release: use the newest known row.
+#elif ABI_VERSION == 0x020800
     {"02.08.00", "02.08.00.50", "02.08.00.51", "2.8.0.1"},
+#elif ABI_VERSION == 0x020801
+    // slicer/sync from BambuStudio tag v02.08.01.55 (version.inc, BBL.json);
+    // agent from a live query against api.bambulab.com's own resource API
+    // (slicer/plugins/cloud=02.08.01.00 -> resources[].version), 2026-07-22.
+    {"02.08.01", "02.08.01.55", "02.08.01.53", "2.8.0.4"},
+#else
+    // Newer/unmapped release: use the newest known row.
+    {"02.08.01", "02.08.01.55", "02.08.01.53", "2.8.0.4"},
 #endif
 };
 
