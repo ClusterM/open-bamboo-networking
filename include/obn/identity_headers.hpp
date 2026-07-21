@@ -32,6 +32,7 @@
 #  include <windows.h>
 #elif defined(__APPLE__)
 #  include <unistd.h>        // gethostuuid
+#  include <sys/sysctl.h>    // kern.osproductversion
 #else
 #  include <sys/utsname.h>   // Linux/BSD kernel version
 #endif
@@ -79,12 +80,22 @@ inline std::string detect_os_version() {
 inline const char* default_os_type() { return "windows"; }
 
 #elif defined(__APPLE__)
-// TODO: confirm the genuine macOS identity the stock agent sends -- needs a
-// macOS BambuStudio capture. Best guess: X-BBL-OS-Type "macos" and the macOS
-// *product* version (e.g. "14.5.0"), not the Darwin kernel version uname()
-// reports. Reading the product version needs CoreFoundation/sysctl; until we
-// capture the real format we return a plausible constant (env-overridable).
-inline std::string detect_os_version() { return "14.5.0"; }  // TODO: real product version + format
+// The macOS *product* version (e.g. "14.5.0"), not the Darwin kernel version
+// uname() reports -- read via sysctlbyname("kern.osproductversion"), stable
+// and documented since macOS 10.13, no CoreFoundation link needed.
+//
+// TODO: confirm against a genuine macOS BambuStudio capture -- the product
+// version itself is real (unlike the old hardcoded constant), but the exact
+// dotted-component count/padding stock Studio sends, and whether
+// X-BBL-OS-Type is "mac" or "darwin", are still unverified guesses.
+inline std::string detect_os_version() {
+    char buf[32];
+    size_t len = sizeof buf;
+    if (::sysctlbyname("kern.osproductversion", buf, &len, nullptr, 0) == 0 &&
+        len > 1)
+        return three_component(std::string(buf, len - 1));  // drop the NUL
+    return "14.5.0";  // fallback if sysctl is ever unavailable
+}
 inline const char* default_os_type() { return "mac"; }    // TODO: confirm ("mac"/"darwin"?)
 
 #else
