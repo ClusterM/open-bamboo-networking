@@ -18,6 +18,7 @@
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
+#include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
@@ -318,6 +319,9 @@ void Agent::maybe_setup_camera(const std::string& dev_id)
     spec.model       = model;
     spec.lan_ip      = ip;
     spec.access_code = access_code;
+    // A cloud camera ticket turns this into a real remote stream (TUTK);
+    // without one the factory falls back to the JPEG/LAN sources.
+    spec.camera_url  = camera_ticket_url_for(dev_id);
     std::string url = obn::camera::start_camera(spec);
     if (url.empty())
         OBN_DEBUG("camera: no source for %s (model='%s')", dev_id.c_str(), model.c_str());
@@ -1156,6 +1160,49 @@ void Agent::note_device_access_code(const std::string& dev_id,
     // The access code is the second half of the LAN credential pair; if the IP
     // (from SSDP) is already known for the selected printer, bring LAN up now.
     autostart_lan_if_selected(dev_id);
+}
+
+std::string Agent::camera_ticket_url_for(const std::string& dev_id)
+{
+    if (dev_id.empty()) return {};
+    auto s = user_session_snapshot();
+    if (s.access_token.empty()) return {};
+
+    const std::string url = obn::cloud::api_host(cloud_region())
+                          + "/v1/iot-service/api/user/ttcode";
+    const std::string body = "{\"dev_id\":\"" + dev_id + "\"}";
+    auto resp = obn::http::post_json(url, body,
+                                     cloud_api_http_headers(false, true));
+    if (!resp.error.empty()) {
+        OBN_INFO("camera_ticket: dev=%s transport: %s", dev_id.c_str(),
+                 resp.error.c_str());
+        return {};
+    }
+    if (resp.status_code != 200) {
+        // 403 is the normal answer for printers the cloud does not hand a
+        // camera ticket for; log it once at info and fall back to the LAN URL.
+        OBN_INFO("camera_ticket: dev=%s HTTP %ld", dev_id.c_str(),
+                 resp.status_code);
+        return {};
+    }
+
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root) return {};
+    const std::string uid    = root->find("ttcode").as_string();
+    const std::string key    = root->find("passwd").as_string();
+    const std::string region = root->find("region").as_string();
+    if (uid.empty() || key.empty()) {
+        OBN_INFO("camera_ticket: dev=%s reply carried no ttcode/passwd",
+                 dev_id.c_str());
+        return {};
+    }
+
+    std::string u = "bambu:///tutk?uid=" + uid + "&key=" + key;
+    if (!region.empty()) u += "&region=" + region;
+    OBN_INFO("camera_ticket: dev=%s minted tutk URL (region=%s)",
+             dev_id.c_str(), region.empty() ? "?" : region.c_str());
+    return u;
 }
 
 std::string Agent::camera_url_for(const std::string& dev_id)

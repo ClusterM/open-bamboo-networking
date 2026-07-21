@@ -402,6 +402,15 @@ public:
     // the printer is cloud-paired. Returns "" when either piece is missing;
     // Studio then shows its normal "connection failed" state.
     std::string camera_url_for(const std::string& dev_id);
+
+    // Mint a remote-camera URL from the cloud camera ticket:
+    //   POST /v1/iot-service/api/user/ttcode {"dev_id":...}
+    //     -> {"ttcode","authkey","passwd","region","type":"tutk"}
+    // Returns bambu:///tutk?uid=<ttcode>&key=<passwd>&region=<region>, which
+    // CameraSourceFactory turns into an OssTutkCameraSource. Empty when there is
+    // no cloud session or the device is not entitled to a ticket (the cloud
+    // answers 403 for O1S/H2-class printers).
+    std::string camera_ticket_url_for(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
