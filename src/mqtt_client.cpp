@@ -304,8 +304,11 @@ int Client::connect(const ConnectConfig& cfg)
                                     /*reconnect_delay_max=*/10,
                                     /*reconnect_exponential_backoff=*/true);
 
-    // mosquitto_connect_async only kicks off a non-blocking connect; the real
-    // work (TCP + TLS handshake + CONNECT/CONNACK) runs on the loop thread.
+    // mosquitto_connect_async only kicks off a non-blocking TCP/TLS
+    // connect; the handshake + CONNECT/CONNACK run on the loop thread.
+    // Hostname resolution is still synchronous in the caller, so do not
+    // invoke this from Studio's UI timer once a loop is already running
+    // (see Agent::cloud_refresh).
     //
     // We deliberately do NOT fall back to the synchronous mosquitto_connect:
     // it blocks the calling Studio ABI/UI thread for the full TCP timeout
@@ -313,7 +316,8 @@ int Client::connect(const ConnectConfig& cfg)
     // already-closed socket — which clobbers the real error with a misleading
     // WSAENOTSOCK ("not a socket" / "Bad file descriptor"). A failed async
     // attempt is not fatal: mosquitto_loop_forever() (run by loop_start) sees
-    // MOSQ_ERR_NO_CONN / MOSQ_ERR_ERRNO and reconnects on its own.
+    // MOSQ_ERR_NO_CONN / MOSQ_ERR_ERRNO / MOSQ_ERR_LOOKUP and reconnects on
+    // its own.
     int rc = ::mosquitto_connect_async(mosq_,
                                        cfg.host.c_str(),
                                        cfg.port,

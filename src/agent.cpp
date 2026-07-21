@@ -2425,19 +2425,25 @@ bool Agent::cloud_connected() const
 int Agent::cloud_refresh()
 {
     // Studio's DeviceManagerRefresher calls refresh_connection() on a
-    // 1-second wx timer as a keep-alive / "reconnect if dropped" probe
-    // (see DevManager.cpp DeviceManagerRefresher::on_timer). Doing a
-    // hard disconnect+connect here produces a tight loop where every
-    // tick tears down a healthy session, which Studio reports back to
-    // the user as "failed to connect".
+    // 1-second wx timer (DevManager.cpp DeviceManagerRefresher::on_timer).
+    // That runs on the UI thread, so this ABI must stay cheap.
+    //
+    // Once CloudSession::start() has spun up mosquitto_loop_start, the
+    // loop thread owns reconnects — including DNS for the broker host.
+    // Calling disconnect+connect here on every "not connected" tick used
+    // to re-enter mosquitto_connect_async on the UI thread; offline,
+    // getaddrinfo(us.mqtt.bambulab.com) blocks ~10s per tick and freezes
+    // Studio until the net returns.
     //
     // Policy:
-    //   * if we already have a live MQTT session -> no-op
-    //   * otherwise -> (re)connect with the current credentials
-    if (cloud_connected()) {
-        return BAMBU_NETWORK_SUCCESS;
+    //   * session already started -> no-op (background reconnect)
+    //   * otherwise -> connect_cloud() with current credentials
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (cloud_session_ && cloud_session_->is_started()) {
+            return BAMBU_NETWORK_SUCCESS;
+        }
     }
-    disconnect_cloud();
     return connect_cloud();
 }
 
