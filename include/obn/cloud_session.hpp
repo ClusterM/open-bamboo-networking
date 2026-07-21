@@ -80,6 +80,11 @@ public:
 
     bool is_connected() const { return connected_.load(std::memory_order_acquire); }
 
+    // True once start() has handed the client to mosquitto_loop_start.
+    // Distinct from is_connected(): after a transport drop the loop keeps
+    // running and reconnects in the background while this stays true.
+    bool is_started() const { return started_.load(std::memory_order_acquire); }
+
 private:
     std::string report_topic_(const std::string& dev_id) const;
     std::string request_topic_(const std::string& dev_id) const;
