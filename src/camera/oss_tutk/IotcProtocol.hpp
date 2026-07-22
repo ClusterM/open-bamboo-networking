@@ -481,6 +481,13 @@ struct DtlsSession {
     uint64_t tx_seq;
     uint64_t rx_seq;
     bool     handshake_complete;
+
+    // OpenSSL-driven DTLS session (LAN-direct path). When ssl != nullptr the AV
+    // layer sends/receives ApplicationData via SSL_write/SSL_read over a custom
+    // IOTC-framing BIO instead of the hand-rolled ChaCha20-Poly1305 helpers.
+    void* ssl;      // SSL*
+    void* ssl_ctx;  // SSL_CTX*
+    void* bio_ctx;  // IotcBioCtx* (owns socket ref + IOTC transport framing)
 };
 
 // --------------------------------------------------------------------------

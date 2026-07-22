@@ -69,6 +69,9 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
 #include "obn/log.hpp"
 
 namespace bambu_net {
@@ -705,6 +708,287 @@ static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0,
                        (const struct sockaddr*)dst, sizeof(*dst));
     return (n == sizeof(pkt)) ? 0 : -1;
+}
+
+// ==========================================================================
+// OpenSSL DTLS over an IOTC-framing BIO  (LAN-direct path)
+// ==========================================================================
+//
+// The genuine plugin runs a stock OpenSSL DTLS 1.2 client. On the wire each
+// DTLS record (or coalesced flight) rides inside a 28-byte IOTC transport
+// header, and the first 80 bytes of every datagram are obfuscated with
+// trans_code_partial (key "Charlie is the d"). The negotiated cipher is
+// ECDHE-PSK-CHACHA20-POLY1305 (0xCCAC) over x25519; PSK identity is
+// "AUTHPWD_<account>" and PSK = SHA256(passwd). After the handshake, the AV
+// login/control/video all flow as DTLS ApplicationData through the same BIO.
+//
+// IOTC transport header (28 bytes, wire-confirmed against genuine H2S capture):
+//   [0..1]  0x0204            IOTC magic
+//   [2]     0x1c              version
+//   [3]     0x0b              DTLS-data flags
+//   [4..5]  payload_len LE    = 12 + dtls_len
+//   [6..7]  record-seq mirror (low 16 bits of the DTLS record sequence)
+//   [8..11] 07 04 21 00       C->P DTLS message type (P->C is 08 04 12 00)
+//   [12..13] session_token[0..1]
+//   [14..15] 00 01
+//   [16]    0x0c              sub-header tag
+//   [17..19] 00 00 00
+//   [20..27] session_token (8 bytes)
+//   [28..]  DTLS record(s)
+
+struct IotcBioCtx {
+    obn::net::socket_t sock;
+    struct sockaddr_in peer;
+    uint8_t            token[8];
+    std::string        account;   // PSK identity suffix ("admin")
+    std::string        passwd;    // PSK source (PSK = SHA256(passwd))
+};
+
+static int g_iotc_bio_type = -1;
+
+static int iotc_bio_write(BIO* b, const char* data, int len)
+{
+    IotcBioCtx* c = static_cast<IotcBioCtx*>(BIO_get_data(b));
+    BIO_clear_retry_flags(b);
+    if (!c || len <= 0) return len;
+
+    size_t total = 28 + (size_t)len;
+    std::vector<uint8_t> pkt(total, 0);
+    uint16_t payload_len = (uint16_t)(12 + len);
+
+    pkt[0] = 0x04; pkt[1] = 0x02; pkt[2] = 0x1c; pkt[3] = 0x0b;
+    pkt[4] = (uint8_t)(payload_len & 0xff);
+    pkt[5] = (uint8_t)(payload_len >> 8);
+    // [6..7] mirror the DTLS record sequence low 16 bits (record hdr: ct(1)
+    // ver(2) epoch(2) seq(6) len(2) — low seq byte at data[10], next at data[9]).
+    if (len >= 11) { pkt[6] = (uint8_t)data[10]; pkt[7] = (uint8_t)data[9]; }
+    pkt[8] = 0x07; pkt[9] = 0x04; pkt[10] = 0x21;
+    pkt[12] = c->token[0]; pkt[13] = c->token[1];
+    pkt[14] = 0x00; pkt[15] = 0x01;
+    pkt[16] = 0x0c;
+    memcpy(pkt.data() + 20, c->token, 8);
+    memcpy(pkt.data() + 28, data, (size_t)len);
+
+    trans_code_partial(pkt.data(), std::min(total, (size_t)80));
+
+    ssize_t n = sendto(c->sock, reinterpret_cast<const char*>(pkt.data()),
+                       total, 0, (const struct sockaddr*)&c->peer, sizeof(c->peer));
+    if (n < 0) { BIO_set_retry_write(b); return -1; }
+    return len;
+}
+
+static int iotc_bio_read(BIO* b, char* out, int outlen)
+{
+    IotcBioCtx* c = static_cast<IotcBioCtx*>(BIO_get_data(b));
+    BIO_clear_retry_flags(b);
+    if (!c || outlen <= 0) return 0;
+
+    uint8_t raw[65536];
+    struct sockaddr_in src{};
+    socklen_t sl = sizeof(src);
+    ssize_t n = recvfrom(c->sock, reinterpret_cast<char*>(raw), sizeof(raw), 0,
+                         (struct sockaddr*)&src, &sl);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK
+#ifdef ETIMEDOUT
+            || errno == ETIMEDOUT
+#endif
+           )
+            BIO_set_retry_read(b);
+        return -1;
+    }
+    if (n < 28) { BIO_set_retry_read(b); return -1; }
+
+    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+
+    // Only forward genuine DTLS datagrams to OpenSSL; skip IOTC control echoes
+    // (LAN_SEARCH_R, ctrl 0x33) that share the transport but carry no record.
+    if (raw[0] != 0x04 || raw[1] != 0x02) { BIO_set_retry_read(b); return -1; }
+    uint8_t ct = raw[28];
+    if (ct != 20 && ct != 21 && ct != 22 && ct != 23) {
+        BIO_set_retry_read(b);
+        return -1;
+    }
+
+    size_t dtls_len = (size_t)n - 28;
+    if (dtls_len > (size_t)outlen) dtls_len = (size_t)outlen;
+    memcpy(out, raw + 28, dtls_len);
+    return (int)dtls_len;
+}
+
+static long iotc_bio_ctrl(BIO* b, int cmd, long num, void* ptr)
+{
+    (void)b; (void)num; (void)ptr;
+    switch (cmd) {
+        case BIO_CTRL_FLUSH:
+        case BIO_CTRL_DGRAM_SET_NEXT_TIMEOUT:
+        case BIO_CTRL_DGRAM_SET_PEER:
+        case BIO_CTRL_PUSH:
+        case BIO_CTRL_POP:
+            return 1;
+        case BIO_CTRL_DGRAM_QUERY_MTU:
+        case BIO_CTRL_DGRAM_GET_FALLBACK_MTU:
+            return 1400;
+        case BIO_CTRL_WPENDING:
+        case BIO_CTRL_PENDING:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+static int iotc_bio_create(BIO* b) { BIO_set_init(b, 1); return 1; }
+static int iotc_bio_destroy(BIO* b) { (void)b; return 1; }
+
+static BIO_METHOD* iotc_bio_method()
+{
+    static BIO_METHOD* meth = nullptr;
+    if (!meth) {
+        g_iotc_bio_type = BIO_get_new_index() | BIO_TYPE_SOURCE_SINK;
+        meth = BIO_meth_new(g_iotc_bio_type, "iotc-dtls");
+        BIO_meth_set_write(meth, iotc_bio_write);
+        BIO_meth_set_read(meth, iotc_bio_read);
+        BIO_meth_set_ctrl(meth, iotc_bio_ctrl);
+        BIO_meth_set_create(meth, iotc_bio_create);
+        BIO_meth_set_destroy(meth, iotc_bio_destroy);
+    }
+    return meth;
+}
+
+static unsigned int iotc_psk_client_cb(SSL* ssl, const char* /*hint*/,
+                                       char* identity, unsigned int max_identity_len,
+                                       unsigned char* psk, unsigned int max_psk_len)
+{
+    IotcBioCtx* c = static_cast<IotcBioCtx*>(SSL_get_app_data(ssl));
+    if (!c) return 0;
+    std::string id = "AUTHPWD_" + c->account;
+    if (id.size() + 1 > max_identity_len) return 0;
+    memcpy(identity, id.c_str(), id.size() + 1);
+
+    uint8_t h[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const uint8_t*>(c->passwd.data()), c->passwd.size(), h);
+    if (max_psk_len < sizeof(h)) return 0;
+    memcpy(psk, h, sizeof(h));
+    return (unsigned int)sizeof(h);
+}
+
+// Run a stock OpenSSL DTLS 1.2 ECDHE-PSK handshake over the IOTC BIO.
+// Sends the pre-handshake ctrl 0x33 (channel open) first, then drives
+// SSL_connect with DTLS retransmit handling. On success, out->ssl/ssl_ctx/
+// bio_ctx are populated and out->handshake_complete is set.
+static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
+                                     const struct sockaddr_in* dst,
+                                     const uint8_t session_token[8],
+                                     const char* uid_upper_str,
+                                     const char* passwd, const char* account,
+                                     DtlsSession* out)
+{
+    memset(out, 0, sizeof(*out));
+
+    IotcBioCtx* ctx = new IotcBioCtx();
+    ctx->sock    = sock;
+    ctx->peer    = *dst;
+    ctx->account = account ? account : "admin";
+    ctx->passwd  = passwd ? passwd : "";
+    memcpy(ctx->token, session_token, 8);
+
+    // Channel-open control packet (genuine sends this before the ClientHello).
+    if (uid_upper_str && uid_upper_str[0])
+        send_ctrl0x33(sock, dst, uid_upper_str, session_token);
+
+    SSL_CTX* sctx = SSL_CTX_new(DTLS_client_method());
+    if (!sctx) { delete ctx; return -1; }
+    SSL_CTX_set_min_proto_version(sctx, DTLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(sctx, DTLS1_2_VERSION);
+    SSL_CTX_set_security_level(sctx, 0);   // allow PSK / x25519 at any strength
+    SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, nullptr);
+    if (SSL_CTX_set_cipher_list(sctx, "ECDHE-PSK-CHACHA20-POLY1305") != 1) {
+        OBN_ERROR("[dtls] cipher list not available");
+        SSL_CTX_free(sctx); delete ctx; return -1;
+    }
+    SSL_CTX_set_psk_client_callback(sctx, iotc_psk_client_cb);
+
+    SSL* ssl = SSL_new(sctx);
+    if (!ssl) { SSL_CTX_free(sctx); delete ctx; return -1; }
+    SSL_set_app_data(ssl, ctx);
+    SSL_set_options(ssl, SSL_OP_NO_QUERY_MTU);
+    SSL_set_mtu(ssl, 1400);
+
+    BIO* bio = BIO_new(iotc_bio_method());
+    BIO_set_data(bio, ctx);
+    BIO_set_init(bio, 1);
+    SSL_set_bio(ssl, bio, bio);   // SSL takes ownership of bio
+    SSL_set_connect_state(ssl);
+
+    // Keep BIO reads short so the loop can drive DTLS retransmit + deadline.
+    set_recv_timeout(sock, 400);
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    int rc = -1;
+    for (;;) {
+        int ret = SSL_do_handshake(ssl);
+        if (ret == 1) { rc = 0; break; }
+        int err = SSL_get_error(ssl, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                OBN_ERROR("[dtls] handshake timeout (state=%s)", SSL_state_string_long(ssl));
+                break;
+            }
+            DTLSv1_handle_timeout(ssl);   // retransmit flight if timer expired
+            continue;
+        }
+        unsigned long e = ERR_get_error();
+        char ebuf[256]; ERR_error_string_n(e, ebuf, sizeof(ebuf));
+        OBN_ERROR("[dtls] handshake failed: ssl_err=%d %s (state=%s)",
+                  err, e ? ebuf : "", SSL_state_string_long(ssl));
+        break;
+    }
+
+    if (rc != 0) {
+        SSL_free(ssl);        // frees bio
+        SSL_CTX_free(sctx);
+        delete ctx;
+        return -1;
+    }
+
+    OBN_INFO("[dtls] handshake complete: %s", SSL_get_cipher_name(ssl));
+    out->ssl     = ssl;
+    out->ssl_ctx = sctx;
+    out->bio_ctx = ctx;
+    out->handshake_complete = true;
+    return 0;
+}
+
+// Send one ApplicationData record over the established OpenSSL DTLS session.
+static int dtls_ssl_write(DtlsSession* ds, const uint8_t* data, size_t len)
+{
+    SSL* ssl = static_cast<SSL*>(ds->ssl);
+    int r = SSL_write(ssl, data, (int)len);
+    return (r == (int)len) ? 0 : -1;
+}
+
+// Receive one ApplicationData plaintext record. Returns byte count, 0 on
+// timeout, -1 on error/close.
+static ssize_t dtls_ssl_read(DtlsSession* ds, uint8_t* out, size_t max,
+                             int timeout_ms)
+{
+    IotcBioCtx* ctx = static_cast<IotcBioCtx*>(ds->bio_ctx);
+    SSL* ssl = static_cast<SSL*>(ds->ssl);
+    set_recv_timeout(ctx->sock, timeout_ms);
+    int r = SSL_read(ssl, out, (int)max);
+    if (r > 0) return r;
+    int err = SSL_get_error(ssl, r);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+        return 0;   // timeout / no data
+    return -1;
+}
+
+static void dtls_ssl_free(DtlsSession* ds)
+{
+    if (ds->ssl)     { SSL_free(static_cast<SSL*>(ds->ssl)); ds->ssl = nullptr; }
+    if (ds->ssl_ctx) { SSL_CTX_free(static_cast<SSL_CTX*>(ds->ssl_ctx)); ds->ssl_ctx = nullptr; }
+    if (ds->bio_ctx) { delete static_cast<IotcBioCtx*>(ds->bio_ctx); ds->bio_ctx = nullptr; }
+    ds->handshake_complete = false;
 }
 
 // ==========================================================================
@@ -2007,9 +2291,18 @@ OssSession* iotc_connect(const std::string& uid,
                              partial_mac, (uint16_t)sess->dtls_epoch, true);
             OBN_DEBUG("[oss-iotc] directed LAN_SEARCH3 -> %s:%u", ip_str, ntohs(src.sin_port));
 
-            int dtls_rc = dtls_psk_handshake(
+            // NOTE (verified 2026-07-22 against the H2S): the printer answers
+            // LAN discovery unconditionally, but its TUTK *data* listener only
+            // opens for a client the cloud has authorized via a current camera
+            // ticket (GET /v1/iot-service/api/user/ttcode -> uid/authkey/passwd).
+            // With an expired ticket the printer stays silent after the
+            // ClientHello (no ServerHello) — a byte-exact replay of the genuine
+            // ctrl-0x33 + ClientHello reproduces the same silence. Mint a fresh
+            // ticket (Agent::camera_ticket_url_for) before this path can reach
+            // ServerHello; the handshake itself below is stock OpenSSL DTLS.
+            int dtls_rc = iotc_dtls_openssl_connect(
                 sess->udp_sock, &src,
-                sess->dtls_epoch, sess->session_token,
+                sess->session_token,
                 uid_up.c_str(),
                 sess->password.c_str(), "admin",
                 &sess->dtls);
@@ -2110,6 +2403,7 @@ void iotc_close(OssSession* sess)
         obn::net::close_socket(sess->udp_sock);
         sess->udp_sock = obn::net::kInvalid;
     }
+    dtls_ssl_free(&sess->dtls);
     delete sess;
 }
 
@@ -2793,6 +3087,10 @@ static int dtls_decrypt_one(DtlsSession* ds,
 
 static int av_channel_write(AvChannel* ch, const void* buf, size_t len)
 {
+    if (ch->use_dtls && ch->dtls_sess && ch->dtls_sess->ssl) {
+        return dtls_ssl_write(ch->dtls_sess,
+                              static_cast<const uint8_t*>(buf), len);
+    }
     if (ch->use_dtls && ch->dtls_sess) {
         return dtls_encrypt_and_send(ch->dtls_sess, ch->sock_fd, &ch->peer,
                                       ch->session_token,
@@ -2808,6 +3106,10 @@ static ssize_t av_channel_read_plain(AvChannel* ch,
                                       uint8_t* plain_out, size_t plain_max,
                                       int timeout_ms)
 {
+    if (ch->use_dtls && ch->dtls_sess && ch->dtls_sess->ssl) {
+        return dtls_ssl_read(ch->dtls_sess, plain_out, plain_max, timeout_ms);
+    }
+
     set_recv_timeout(ch->sock_fd, timeout_ms);
 
     if (!ch->use_dtls || !ch->dtls_sess) {
@@ -3153,6 +3455,20 @@ extern "C" int avRecvFrameData2(int av_index,
 
     static constexpr int kMaxRetries = 32;
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        if (ch.use_dtls && ch.dtls_sess && ch.dtls_sess->ssl) {
+            // OpenSSL DTLS: read one ApplicationData plaintext record.
+            ssize_t pn = dtls_ssl_read(ch.dtls_sess, pkt_buf.data(),
+                                       pkt_buf.size(), kRecvTimeoutMs);
+            if (pn == 0) return AV_ER_TIMEOUT;
+            if (pn < 0)  return AV_ER_SESSION_CLOSE_BY_REMOTE;
+            frame_data = pkt_buf.data();
+            frame_len  = (size_t)pn;
+            if (frame_len >= sizeof(AvFrameHeader) && is_av_frame_header(frame_data))
+                break;
+            frame_data = nullptr;
+            continue;
+        }
+
         ssize_t n = recv(ch.sock_fd, raw_buf.data(), raw_buf.size(), 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
