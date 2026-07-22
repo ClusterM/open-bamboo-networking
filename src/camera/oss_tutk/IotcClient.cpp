@@ -980,8 +980,10 @@ static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
     ctx->passwd  = passwd ? passwd : "";
     memcpy(ctx->token, session_token, 8);
 
-    // Channel-open control packet (genuine sends this before the ClientHello).
-    if (uid_upper_str && uid_upper_str[0])
+    // Channel-open control packet. The genuine plugin's live camera session was
+    // observed going search -> ClientHello directly (no ctrl-0x33), so allow
+    // skipping it to match that path.
+    if (uid_upper_str && uid_upper_str[0] && !getenv("OBN_TUTK_SKIP_CTRL33"))
         send_ctrl0x33(sock, dst, uid_upper_str, session_token);
 
     SSL_CTX* sctx = SSL_CTX_new(DTLS_client_method());
