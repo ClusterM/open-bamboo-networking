@@ -980,11 +980,14 @@ static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
     ctx->passwd  = passwd ? passwd : "";
     memcpy(ctx->token, session_token, 8);
 
-    // Channel-open control packet. The genuine plugin's live camera session was
-    // observed going search -> ClientHello directly (no ctrl-0x33), so allow
-    // skipping it to match that path.
-    if (uid_upper_str && uid_upper_str[0] && !getenv("OBN_TUTK_SKIP_CTRL33"))
-        send_ctrl0x33(sock, dst, uid_upper_str, session_token);
+    // Channel-open control packet (ctrl-0x33). Live genuine capture shows the
+    // printer requires the ClientHello to be sent FIRST, then the ctrl-0x33; the
+    // printer acks the ctrl-0x33 (08 04 -> 04 04) and only then emits ServerHello
+    // (~228ms later). A ctrl-0x33 sent BEFORE the ClientHello is dropped and the
+    // printer stays in LAN-search state (re-answers LAN_SEARCH_R only). It is
+    // therefore sent inside the handshake loop, right after the first
+    // SSL_do_handshake flushes the ClientHello flight. See OBN_TUTK_SKIP_CTRL33
+    // to suppress entirely.
 
     SSL_CTX* sctx = SSL_CTX_new(DTLS_client_method());
     if (!sctx) { delete ctx; return -1; }
@@ -1018,16 +1021,31 @@ static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
     SSL_set_bio(ssl, bio, bio);   // SSL takes ownership of bio
     SSL_set_connect_state(ssl);
 
-    // Keep BIO reads short so the loop can drive DTLS retransmit + deadline.
-    set_recv_timeout(sock, 400);
+    // Short initial recv timeout so the first SSL_do_handshake returns WANT_READ
+    // promptly after flushing the ClientHello (genuine sends ctrl-0x33 ~6ms
+    // after the ClientHello; a long first read would delay it ~200ms until the
+    // master reply arrives on the same socket). Restored to 400ms once ctrl-0x33
+    // is on the wire.
+    set_recv_timeout(sock, 20);
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     int rc = -1;
+    bool ctrl33_sent = false;
     for (;;) {
         int ret = SSL_do_handshake(ssl);
         if (ret == 1) { rc = 0; break; }
         int err = SSL_get_error(ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+            // The first SSL_do_handshake has now flushed the ClientHello flight.
+            // Send the ctrl-0x33 immediately after it (matching genuine order:
+            // ClientHello -> ctrl-0x33 -> printer ack -> ServerHello). Sent once,
+            // as the genuine plugin does.
+            if (!ctrl33_sent) {
+                ctrl33_sent = true;
+                if (uid_upper_str && uid_upper_str[0] && !getenv("OBN_TUTK_SKIP_CTRL33"))
+                    send_ctrl0x33(sock, dst, uid_upper_str, session_token);
+                set_recv_timeout(sock, 400);   // normal cadence for the rest
+            }
             if (std::chrono::steady_clock::now() > deadline) {
                 OBN_ERROR("[dtls] handshake timeout (state=%s)", SSL_state_string_long(ssl));
                 break;
