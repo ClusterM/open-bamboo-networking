@@ -637,7 +637,8 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
 //
 static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* dst,
                              const char* uid_up, uint32_t client_random,
-                             uint32_t partial_mac, uint16_t epoch, bool directed)
+                             uint32_t partial_mac, uint16_t epoch, bool directed,
+                             uint64_t authkey = 0)
 {
     uint8_t pkt[88];
     memset(pkt, 0, sizeof(pkt));
@@ -663,8 +664,30 @@ static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* d
     memcpy(pkt + 56, &cr_le, 4);
     uint32_t pm_le = htole32(partial_mac);
     memcpy(pkt + 60, &pm_le, 4);
-    pkt[64] = directed ? 0x02 : 0x01;
-    // pkt[65..66] MUST stay zero (see note above).
+    // Bytes [64..87]: 24-byte connection-hint tail. Wire-confirmed against the
+    // genuine H2S session. The directed search (which immediately precedes the
+    // accepted ctrl-0x33 + ClientHello) carries a fixed hint block; the broadcast
+    // search additionally embeds the URL authkey ASCII. Omitting this tail (all
+    // zeros) leaves the printer's session listener silent.
+    if (directed) {
+        // [64]=0x02, framing 63 04 13 13 04 0c 0c 63 at [80..87].
+        static const uint8_t kDir[24] = {
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x63, 0x04, 0x13, 0x13, 0x04, 0x0c, 0x0c, 0x63
+        };
+        memcpy(pkt + 64, kDir, 24);
+    } else {
+        // [64]=0x01; [74..80]=authkey ASCII (first 7 bytes); 63 04 13 13 .. 0c 0c
+        // framing. authkey is reconstructed from the little-endian uint64.
+        pkt[64] = 0x01;
+        uint8_t ak[8];
+        for (int i = 0; i < 8; ++i) ak[i] = (uint8_t)((authkey >> (8 * i)) & 0xff);
+        if (authkey) memcpy(pkt + 74, ak, 7);
+        pkt[80] = (authkey ? ak[6] : 0x63);
+        pkt[81] = 0x04; pkt[82] = 0x13; pkt[83] = 0x13;
+        pkt[85] = 0x0c; pkt[86] = 0x0c;
+    }
 
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0,
@@ -908,7 +931,12 @@ static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
     SSL_CTX_set_max_proto_version(sctx, DTLS1_2_VERSION);
     SSL_CTX_set_security_level(sctx, 0);   // allow PSK / x25519 at any strength
     SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, nullptr);
-    if (SSL_CTX_set_cipher_list(sctx, "ECDHE-PSK-CHACHA20-POLY1305") != 1) {
+    // The genuine plugin sends a FULL OpenSSL-style ClientHello (~285-byte IOTC
+    // packet) offering the standard suite list PLUS the ECDHE-PSK suites; the
+    // printer selects ECDHE-PSK-CHACHA20-POLY1305 (0xCCAC). A single-cipher
+    // ClientHello (187 bytes) is silently dropped by the printer, so offer the
+    // broad list to match genuine's flight and carry the same extension set.
+    if (SSL_CTX_set_cipher_list(sctx, "DEFAULT:ECDHE-PSK:PSK:@SECLEVEL=0") != 1) {
         OBN_ERROR("[dtls] cipher list not available");
         SSL_CTX_free(sctx); delete ctx; return -1;
     }
@@ -1656,6 +1684,12 @@ struct OssSession {
     struct sockaddr_in device_wan;  // device WAN address (from master/LAN)
     P2PState    state;
 
+    // Master rendezvous (ThroughTek :10240 LOOKUP) state.
+    uint8_t     p2p_token[16];      // 16-byte ASCII session nonce sent to masters
+    bool        have_reflexive = false;
+    struct sockaddr_in reflexive{}; // our public IP:port as seen by the master
+    std::vector<struct sockaddr_in> p2p_candidates; // device P2P candidate addrs
+
     DtlsSession dtls;            // filled by dtls_psk_handshake on connect
 
     // Keepalive thread (started after P2P session established)
@@ -2156,6 +2190,176 @@ static void keepalive_thread_fn(OssSession* sess)
 }
 
 // ==========================================================================
+// ThroughTek master-server rendezvous (UDP :10240)
+// ==========================================================================
+//
+// Before the printer will answer a LAN DTLS session, the client must register
+// the device UID with ThroughTek's region master servers over UDP :10240.
+// The printer opens its LAN session listener only after the masters have been
+// contacted for that UID; a pure LAN-direct handshake is silently ignored.
+//
+// The LOOKUP request reuses the same transport framing as the relay JOIN, but
+// the WHOLE datagram is scrambled with trans_code_partial (not just 80 bytes).
+// Deobfuscated request (54 bytes), wire-confirmed against a genuine capture:
+//   [0..3]   04 02 1c 02   magic=0x0204, ver=0x1c, flags=0x02
+//   [4..7]   26 00 00 00   payload_len=0x26 (38) LE
+//   [8..11]  07 10 18 00   msg type (LOOKUP / QUERY_DEVICE5)
+//   [12..15] 00 00 00 00
+//   [16..35] UID (20B, UPPERCASE ASCII)
+//   [36..51] 16-byte ASCII session nonce (client-random, GenShortRandomID)
+//   [52..53] 06 00
+//
+// Reply (142 bytes, also full-length scrambled):
+//   [8..11]  08 10 83 00   response type
+//   [16..35] UID echoed
+//   [52..53] 02 00
+//   [54..55] our reflexive port (big-endian)
+//   [56..59] our reflexive public IP (4 bytes, network order)
+//   then repeated candidate entries: 02 00 <port BE> <4-byte device addr>
+
+static const char kShortIdCharset[] =
+    "0123456789abcdefghijklmnopqrstuvwxyz";
+
+// GenShortRandomID-equivalent: N ASCII chars from [0-9a-z].
+static void gen_short_random_id(char* out, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+        out[i] = kShortIdCharset[rand32() % 36];
+}
+
+// Resolve the region master servers. Prefers DNS resolution of the public TUTK
+// hostnames; falls back to the captured region-us master IPs when DNS is
+// unavailable (the SDK hostname format does not always resolve off-device).
+static std::vector<struct sockaddr_in> resolve_masters(TutkRegion region)
+{
+    std::vector<struct sockaddr_in> out;
+    auto push_unique = [&](const struct sockaddr_in& a) {
+        for (const auto& e : out)
+            if (e.sin_addr.s_addr == a.sin_addr.s_addr) return;
+        out.push_back(a);
+    };
+
+    // Primary is the iotcplatform.com host; secondary is the kalayservice.com
+    // variant (master_hostname() only knows iotcplatform / kalay.net.cn, so the
+    // kalayservice host is built inline).
+    std::string primary = master_hostname(region, false);
+    const char* rname = "";
+    switch (region) {
+        case TutkRegion::CN:   rname = "cn";   break;
+        case TutkRegion::EU:   rname = "eu";   break;
+        case TutkRegion::US:   rname = "us";   break;
+        case TutkRegion::Asia: rname = "asia"; break;
+        default:               rname = "";     break;
+    }
+    std::string kalay = (rname[0] ? std::string(rname) + "-c-master" : "c-master")
+                        + ".kalayservice.com";
+
+    const std::string try_hosts[2] = { primary, kalay };
+    for (const std::string& h : try_hosts) {
+        struct sockaddr_in a{};
+        if (resolve_master(h, 10240, &a)) {
+            a.sin_port = htons(10240);
+            push_unique(a);
+            OBN_DEBUG("[oss-iotc] master resolved %s -> %s", h.c_str(),
+                      inet_ntoa(a.sin_addr));
+        }
+    }
+
+    if (out.empty() && region == TutkRegion::US) {
+        // Captured region-us master IPs (fallback when DNS is unavailable).
+        const char* fallback[2] = { "45.79.40.130", "34.193.155.98" };
+        for (const char* ip : fallback) {
+            struct sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port   = htons(10240);
+            if (inet_pton(AF_INET, ip, &a.sin_addr) == 1) push_unique(a);
+        }
+        OBN_DEBUG("[oss-iotc] master DNS unavailable; using captured region-us IPs");
+    }
+    return out;
+}
+
+// Build + send the 54-byte LOOKUP request (full-length scrambled).
+static int send_master_lookup(obn::net::socket_t sock, const struct sockaddr_in* dst,
+                              const char* uid_upper, const uint8_t token16[16])
+{
+    uint8_t pkt[54];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x04; pkt[1] = 0x02; pkt[2] = 0x1c; pkt[3] = 0x02;
+    pkt[4] = 0x26;                              // payload_len = 38 LE
+    pkt[8] = 0x07; pkt[9] = 0x10; pkt[10] = 0x18;
+    memcpy(pkt + 16, uid_upper, kUidLen);
+    memcpy(pkt + 36, token16, 16);
+    pkt[52] = 0x06; pkt[53] = 0x00;
+
+    trans_code_partial(pkt, sizeof(pkt));       // whole datagram scrambled
+    ssize_t n = sendto(sock, pkt, sizeof(pkt), 0,
+                       (const struct sockaddr*)dst, sizeof(*dst));
+    return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
+}
+
+// Parse a deobfuscated master reply: extract our reflexive addr + device
+// P2P candidate addresses. Returns true if it is a valid LOOKUP response.
+static bool parse_master_reply(const uint8_t* raw, size_t n, OssSession* sess)
+{
+    if (n < 60 || raw[0] != 0x04 || raw[1] != 0x02) return false;
+    // Response msg-type triplet 08 10 83 (accept any; presence of magic is enough).
+    if (raw[52] == 0x02 && raw[53] == 0x00) {
+        sess->reflexive.sin_family = AF_INET;
+        sess->reflexive.sin_port   = htons(((uint16_t)raw[54] << 8) | raw[55]);
+        memcpy(&sess->reflexive.sin_addr, raw + 56, 4);
+        sess->have_reflexive = true;
+    }
+    // Candidate entries: 02 00 <port BE 2B> <addr 4B>, starting past reflexive.
+    for (size_t i = 60; i + 8 <= n; ++i) {
+        if (raw[i] == 0x02 && raw[i + 1] == 0x00) {
+            uint16_t port = ((uint16_t)raw[i + 2] << 8) | raw[i + 3];
+            if (port == 0) continue;
+            struct sockaddr_in c{};
+            c.sin_family = AF_INET;
+            c.sin_port   = htons(port);
+            memcpy(&c.sin_addr, raw + i + 4, 4);
+            // Skip our own reflexive echo.
+            if (sess->have_reflexive &&
+                c.sin_addr.s_addr == sess->reflexive.sin_addr.s_addr &&
+                c.sin_port == sess->reflexive.sin_port)
+                continue;
+            sess->p2p_candidates.push_back(c);
+            i += 7;
+        }
+    }
+    return true;
+}
+
+// Send the LOOKUP to every region master on the session socket. This is
+// fire-and-continue: the genuine plugin does NOT wait for the master reply
+// before starting the LAN handshake — it fires the broadcast search in parallel
+// (its ClientHello leaves the wire ~150ms before its own master reply arrives).
+// Blocking on the reply here would delay the LAN handshake past the printer's
+// post-notification acceptance window. The replies (reflexive addr + device P2P
+// candidates) are parsed opportunistically by the LAN recv loop instead.
+static bool master_send_lookups(OssSession* sess)
+{
+    gen_short_random_id(reinterpret_cast<char*>(sess->p2p_token), 16);
+    std::string uid_up = uid_upper(sess->uid);
+
+    std::vector<struct sockaddr_in> masters = resolve_masters(sess->region);
+    if (masters.empty()) {
+        OBN_WARN("[oss-iotc] master rendezvous: no master servers resolved");
+        return false;
+    }
+
+    for (const auto& m : masters) {
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &m.sin_addr, ip_str, sizeof(ip_str));
+        int rc = send_master_lookup(sess->udp_sock, &m, uid_up.c_str(), sess->p2p_token);
+        OBN_DEBUG("[oss-iotc] master LOOKUP -> %s:10240 (%s)", ip_str,
+                  rc == 0 ? "sent" : "send-failed");
+    }
+    return true;
+}
+
+// ==========================================================================
 // Public API
 // ==========================================================================
 
@@ -2193,6 +2397,14 @@ OssSession* iotc_connect(const std::string& uid,
     }
     OBN_DEBUG("[oss-iotc] UDP socket bound on port %u", sess->local_port);
     OBN_DEBUG("[oss-iotc] UID=%s client_random=0x%08x", sess->uid.c_str(), sess->client_random);
+
+    // Step 1b: ThroughTek master rendezvous (UDP :10240) on the SAME session
+    // socket/port. Registering the UID with the region masters is what makes the
+    // printer open its LAN DTLS session listener; without it the LAN handshake
+    // below is silently ignored. Best-effort: proceed to LAN search regardless
+    // (a reply also yields our reflexive addr + device P2P candidates).
+    if (!getenv("OBN_TUTK_SKIP_MASTER"))
+        master_send_lookups(sess);
 
     // Step 2: LAN search + DTLS handshake.
     // The epoch (e.g. 0x6a0) is client-generated; echoed by device in LAN_SEARCH_R3
@@ -2248,40 +2460,49 @@ OssSession* iotc_connect(const std::string& uid,
             bcast.sin_port = htons(p);
             send_lan_search3(sess->udp_sock, &bcast,
                              uid_up.c_str(), sess->client_random,
-                             partial_mac, (uint16_t)sess->dtls_epoch, false);
+                             partial_mac, (uint16_t)sess->dtls_epoch, false,
+                             sess->authkey);
             if (have_unicast) {
                 unicast.sin_port = htons(p);
                 send_lan_search3(sess->udp_sock, &unicast,
                                  uid_up.c_str(), sess->client_random,
-                                 partial_mac, (uint16_t)sess->dtls_epoch, false);
+                                 partial_mac, (uint16_t)sess->dtls_epoch, false,
+                                 sess->authkey);
             }
             OBN_DEBUG("[oss-iotc] LAN search -> port %u (epoch=0x%x)%s", p,
                       sess->dtls_epoch, have_unicast ? " (+unicast)" : "");
         }
 
-        // The first datagram back may be a stray/echo; try a few reads so a
-        // valid LAN_SEARCH_R3 isn't missed behind noise.
+        // Read datagrams until a LAN_SEARCH_R (msg [8..10] = 02 06 12) arrives.
+        // Interleaved master LOOKUP replies (msg 08 10 83) are parsed for the
+        // reflexive addr / P2P candidates and skipped; only the printer's
+        // LAN_SEARCH_R drives the directed handshake below.
         uint8_t resp[600];
         struct sockaddr_in src{};
         ssize_t n = -1;
-        for (int rx = 0; rx < 6; ++rx) {
+        for (int rx = 0; rx < 10; ++rx) {
             set_recv_timeout(sess->udp_sock, 3000);
-            n = tutk_udp_recv(sess->udp_sock, resp, sizeof(resp), &src, 3000);
-            if (n < 16) { n = -1; break; }
-            uint8_t peek[600];
-            memcpy(peek, resp, (size_t)n);
-            reverse_trans_code_partial(peek, (size_t)n);
-            if (peek[0] == 0x04 && peek[1] == 0x02) break;  // looks like IOTC
-            OBN_DEBUG("[oss-iotc] LAN rx: skipping non-IOTC datagram (%zd B)", n);
-            n = -1;
+            ssize_t m = tutk_udp_recv(sess->udp_sock, resp, sizeof(resp), &src, 3000);
+            if (m < 16) { n = -1; break; }
+            reverse_trans_code_partial(resp, (size_t)m);
+            if (resp[0] != 0x04 || resp[1] != 0x02) {
+                OBN_DEBUG("[oss-iotc] LAN rx: skipping non-IOTC datagram (%zd B)", m);
+                continue;
+            }
+            // Master LOOKUP reply (from :10240) — parse candidates, keep waiting.
+            if (resp[8] == 0x08 && resp[9] == 0x10 && resp[10] == 0x83) {
+                if (parse_master_reply(resp, (size_t)m, sess) && sess->have_reflexive) {
+                    char rf[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &sess->reflexive.sin_addr, rf, sizeof(rf));
+                    OBN_INFO("[oss-iotc] master reply: reflexive=%s:%u candidates=%zu",
+                             rf, ntohs(sess->reflexive.sin_port), sess->p2p_candidates.size());
+                }
+                continue;
+            }
+            n = m;   // LAN_SEARCH_R (or other printer session packet)
+            break;
         }
         if (n >= 16) {
-            reverse_trans_code_partial(resp, (size_t)n);
-            if (resp[0] != 0x04 || resp[1] != 0x02) {
-                OBN_WARN("[oss-iotc] LAN_SEARCH_R3: bad magic %02x%02x", resp[0], resp[1]);
-                sess->state = P2PState::QUERY_MASTER;
-                goto lan_search_done;
-            }
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &src.sin_addr, ip_str, sizeof(ip_str));
             {
