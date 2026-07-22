@@ -1171,8 +1171,16 @@ std::string Agent::camera_ticket_url_for(const std::string& dev_id)
     const std::string url = obn::cloud::api_host(cloud_region())
                           + "/v1/iot-service/api/user/ttcode";
     const std::string body = "{\"dev_id\":\"" + dev_id + "\"}";
-    auto resp = obn::http::post_json(url, body,
-                                     cloud_api_http_headers(false, true));
+    // The ttcode endpoint authorizes the printer's camera session and requires
+    // the same app-certification headers as create_task: an id naming the app
+    // cert (issuer:serial) and a raw PKCS#1 v1.5 signature over the current
+    // timestamp (replay-protected). Without them the cloud returns 403.
+    auto hdrs = cloud_api_http_headers(false, true);
+    const std::string cert_id  = obn::signing::app_certification_id();
+    const std::string sec_sign = obn::signing::device_security_sign();
+    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
+    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
+    auto resp = obn::http::post_json(url, body, hdrs);
     if (!resp.error.empty()) {
         OBN_INFO("camera_ticket: dev=%s transport: %s", dev_id.c_str(),
                  resp.error.c_str());
