@@ -929,14 +929,17 @@ static int iotc_dtls_openssl_connect(obn::net::socket_t sock,
     if (!sctx) { delete ctx; return -1; }
     SSL_CTX_set_min_proto_version(sctx, DTLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(sctx, DTLS1_2_VERSION);
-    SSL_CTX_set_security_level(sctx, 0);   // allow PSK / x25519 at any strength
+    SSL_CTX_set_security_level(sctx, 1);   // match genuine: excludes SHA-1 sigalgs
     SSL_CTX_set_verify(sctx, SSL_VERIFY_NONE, nullptr);
     // The genuine plugin sends a FULL OpenSSL-style ClientHello (~285-byte IOTC
     // packet) offering the standard suite list PLUS the ECDHE-PSK suites; the
     // printer selects ECDHE-PSK-CHACHA20-POLY1305 (0xCCAC). A single-cipher
     // ClientHello (187 bytes) is silently dropped by the printer, so offer the
     // broad list to match genuine's flight and carry the same extension set.
-    if (SSL_CTX_set_cipher_list(sctx, "DEFAULT:ECDHE-PSK:PSK:@SECLEVEL=0") != 1) {
+    // Security level 1 drops the legacy SHA-1 signature algorithms (rsa/dsa/
+    // ecdsa_sha1) so the signature_algorithms extension matches genuine exactly;
+    // the printer's DTLS parser rejects the extra entries with silence.
+    if (SSL_CTX_set_cipher_list(sctx, "DEFAULT:ECDHE-PSK:PSK") != 1) {
         OBN_ERROR("[dtls] cipher list not available");
         SSL_CTX_free(sctx); delete ctx; return -1;
     }
