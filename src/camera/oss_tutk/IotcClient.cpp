@@ -644,7 +644,7 @@ static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* d
 
     pkt[0] = 0x04; pkt[1] = 0x02;
     pkt[2] = 0x1c;
-    // pkt[3] = flags = 0
+    pkt[3] = 0x02;  // message-class flags (matches genuine session-search)
     pkt[4] = 0x48;  // payload_len = 72 LE
     // pkt[5..7] = 0
     pkt[8]  = 0x01; pkt[9]  = 0x06; pkt[10] = 0x21;
@@ -701,7 +701,10 @@ static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
 
     memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, session_token, 8);
-    // [48..51]: one capture shows 0x211e2619 — leave zero for now
+    // [48..51]: session-open tag carried by the genuine ctrl-0x33. The printer
+    // echoes it back (with byte[2] cleared) in its confirmation packet once the
+    // session is authorized.
+    pkt[48] = 0x21; pkt[49] = 0x1e; pkt[50] = 0x26; pkt[51] = 0x19;
 
     trans_code_partial(pkt, sizeof(pkt));
 
@@ -806,9 +809,12 @@ static int iotc_bio_read(BIO* b, char* out, int outlen)
     if (raw[0] != 0x04 || raw[1] != 0x02) { BIO_set_retry_read(b); return -1; }
     uint8_t ct = raw[28];
     if (ct != 20 && ct != 21 && ct != 22 && ct != 23) {
+        OBN_DEBUG("[dtls] bio_read: non-DTLS IOTC datagram (n=%zd type=%02x%02x%02x ct=0x%02x)",
+                  n, raw[8], raw[9], raw[10], ct);
         BIO_set_retry_read(b);
         return -1;
     }
+    OBN_DEBUG("[dtls] bio_read: DTLS record (n=%zd ct=0x%02x)", n, ct);
 
     size_t dtls_len = (size_t)n - 28;
     if (dtls_len > (size_t)outlen) dtls_len = (size_t)outlen;
@@ -2291,15 +2297,16 @@ OssSession* iotc_connect(const std::string& uid,
                              partial_mac, (uint16_t)sess->dtls_epoch, true);
             OBN_DEBUG("[oss-iotc] directed LAN_SEARCH3 -> %s:%u", ip_str, ntohs(src.sin_port));
 
-            // NOTE (verified 2026-07-22 against the H2S): the printer answers
-            // LAN discovery unconditionally, but its TUTK *data* listener only
-            // opens for a client the cloud has authorized via a current camera
-            // ticket (GET /v1/iot-service/api/user/ttcode -> uid/authkey/passwd).
-            // With an expired ticket the printer stays silent after the
-            // ClientHello (no ServerHello) — a byte-exact replay of the genuine
-            // ctrl-0x33 + ClientHello reproduces the same silence. Mint a fresh
-            // ticket (Agent::camera_ticket_url_for) before this path can reach
-            // ServerHello; the handshake itself below is stock OpenSSL DTLS.
+            // The printer answers LAN discovery (port 32761) unconditionally,
+            // but its TUTK session listener (the port discovery replies from,
+            // e.g. 36337) only opens a DTLS handshake for a client the cloud
+            // has authorized for this device. Without that authorization the
+            // printer silently drops the ctrl-0x33 and ClientHello and only
+            // re-answers LAN_SEARCH_R; a byte-exact replay of the genuine
+            // ctrl-0x33 + ClientHello behaves identically. The session must be
+            // authorized out-of-band (camera ticket via
+            // Agent::camera_ticket_url_for) before this path reaches ServerHello;
+            // the handshake itself below is stock OpenSSL DTLS.
             int dtls_rc = iotc_dtls_openssl_connect(
                 sess->udp_sock, &src,
                 sess->session_token,
