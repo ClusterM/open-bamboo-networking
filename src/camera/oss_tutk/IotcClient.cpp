@@ -611,19 +611,26 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
 }
 
 // ==========================================================================
-// LAN_SEARCH3 wire layout (88 bytes, scrambled with trans_code_partial):
-//   [0..15]  IOTC header: magic=0x0204, ver=0x1c, flags=0x00, payload_len=0x48,
-//            bytes[8..10]={0x01,0x06,0x21}
-//   [16..35] uid (20B, UPPERCASE)
-//   [36..39] connect_flag (uint32 LE = 0)
-//   [40..47] zeros (unknown fields)
-//   [48..51] = 0x00 [epoch_hi] [epoch_lo] 0x00   (first epoch occurrence)
+// LAN_SEARCH3 wire layout (88 bytes, scrambled with trans_code_partial).
+// WIRE-CONFIRMED against genuine plugin traffic to an H2S (fw 01.02.00.00),
+// captured + byte-diffed 2026-07-22. Deobfuscated genuine bytes:
+//   [0..3]   04 02 1c 02   magic=0x0204, ver=0x1c, flags=0x02
+//   [4..7]   48 00 00 00   payload_len=0x48 (72) LE
+//   [8..11]  01 06 21 00
+//   [12..15] 00 00 00 00
+//   [16..35] uid (20B, UPPERCASE)  e.g. "44WS26KA5VWVA4FY111A"
+//   [36..47] 00 (connect_flag + unknown, all zero)
+//   [48..51] 00 00 00 00
 //   [52..55] iotc_version (uint32 LE = 0x04030304)
-//   [56..59] client_random (uint32 LE)
-//   [60..63] partial_mac (uint32 LE)
+//   [56..59] client_random (uint32 LE)  — NOT validated by the printer
+//   [60..63] partial_mac  (uint32 LE)   — NOT validated by the printer
 //   [64]     search_type: 0x01=broadcast, 0x02=directed
-//   [65..66] [epoch_hi] [epoch_lo]   (second epoch occurrence)
-//   [67..87] zeros
+//   [65..66] 00 00        — MUST be zero (see note in send fn)
+//   [67..~73] 00, [~74..] authkey ASCII (optional; printer replies without it)
+// The printer's IOTC LAN listener is ALWAYS active (no cloud/ttcode
+// provisioning required to answer) and replies to :32761 from its session
+// port. A replay of a stale search (old client_random) still gets a reply,
+// confirming the search is UID-keyed, not session/authkey-keyed.
 //
 static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* dst,
                              const char* uid_up, uint32_t client_random,
@@ -641,8 +648,12 @@ static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* d
     // pkt[11..15] = 0
 
     memcpy(pkt + 16, uid_up, 20);
-    pkt[49] = (uint8_t)(epoch >> 8);  // epoch appears twice: [49..50] and [65..66]
-    pkt[50] = (uint8_t)(epoch     );
+    // Wire-confirmed layout (H2S): the LAN_SEARCH3 carries NO session epoch.
+    // Earlier RE assumed the printer echoes a client epoch here, but the
+    // genuine plugin leaves [48..51] and [65..66] zero, and the printer
+    // REFUSES to reply if bytes [65..66] are non-zero. The DTLS epoch is
+    // negotiated later in the DTLS handshake, not advertised in the search.
+    (void)epoch;
     uint32_t ver = htole32(0x04030304);
     memcpy(pkt + 52, &ver, 4);
     uint32_t cr_le = htole32(client_random);
@@ -650,8 +661,7 @@ static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* d
     uint32_t pm_le = htole32(partial_mac);
     memcpy(pkt + 60, &pm_le, 4);
     pkt[64] = directed ? 0x02 : 0x01;
-    pkt[65] = (uint8_t)(epoch >> 8);
-    pkt[66] = (uint8_t)(epoch     );
+    // pkt[65..66] MUST stay zero (see note above).
 
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0,
@@ -742,6 +752,21 @@ static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
 //
 // This implementation builds standard DTLS 1.2 handshake messages
 // using OpenSSL crypto primitives for X25519 ECDH and ChaCha20-Poly1305.
+//
+// WIRE NOTE (genuine H2S capture, 2026-07-22): the genuine plugin does NOT
+// send a minimal hand-rolled PSK ClientHello. It sends a FULL OpenSSL-style
+// DTLS 1.2 ClientHello (~285-byte IOTC packet) offering the standard cipher
+// list (ECDHE-ECDSA/RSA-GCM c02c/c030, ChaCha20 cca8/cca9, ...). The printer
+// answers ServerHello + ServerKeyExchange (named_curve 0x001d = x25519, 32-byte
+// ephemeral pubkey, ZERO-length signature → anonymous ECDHE, no server cert)
+// + ServerHelloDone, then CCS + Finished both ways. Authentication ("admin" +
+// passwd) happens at the AV-login layer INSIDE the established DTLS channel,
+// not in the DTLS handshake itself. To interoperate, this path should drive a
+// real OpenSSL DTLS_client handshake (anon-ECDHE, aNULL group enabled) over a
+// custom BIO that frames each DTLS record in the IOTC transport header +
+// trans_code_partial — no ThroughTek SDK is required; the crypto is standard.
+// The current minimal-ClientHello path reaches the printer (which now replies
+// to discovery) but the printer does not complete this reduced handshake.
 
 // DtlsSession is declared in IotcProtocol.hpp (moved to header so relay code
 // in OssAgoraSignaling.cpp can use it via RelayConn).
@@ -1900,9 +1925,16 @@ OssSession* iotc_connect(const std::string& uid,
         setsockopt(sess->udp_sock, SOL_SOCKET, SO_BROADCAST,
                    &bcast_on, sizeof(bcast_on));
 
-        // 32108 is the canonical TUTK/Kalay LAN-discovery UDP port; 32100/18604
-        // are alternates seen on some firmwares.
-        static const uint16_t kLanPorts[] = { 32108, 32100, 18604 };
+        // 32761 is the Bambu printer's IOTC LAN-discovery UDP listen port
+        // (wire-confirmed against H2S firmware 01.02.00.00: the printer answers
+        // a LAN_SEARCH3 sent to 32761 from its session port). 32108/32100/18604
+        // are generic TUTK/Kalay defaults kept as fallbacks for other firmwares.
+        // Override with OBN_TUTK_LAN_PORT if a model differs.
+        static uint16_t kLanPorts[] = { 32761, 32108, 32100, 18604 };
+        if (const char* pe = getenv("OBN_TUTK_LAN_PORT")) {
+            int pv = atoi(pe);
+            if (pv > 0 && pv < 65536) kLanPorts[0] = (uint16_t)pv;
+        }
 
         // Broadcast on the subnet directed broadcast if the caller pins the
         // printer's IP (OBN_TUTK_LAN_IP), else the global broadcast address.
