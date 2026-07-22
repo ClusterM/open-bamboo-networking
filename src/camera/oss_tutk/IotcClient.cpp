@@ -1900,23 +1900,59 @@ OssSession* iotc_connect(const std::string& uid,
         setsockopt(sess->udp_sock, SOL_SOCKET, SO_BROADCAST,
                    &bcast_on, sizeof(bcast_on));
 
-        static const uint16_t kLanPorts[] = { 18604, 32100 };
+        // 32108 is the canonical TUTK/Kalay LAN-discovery UDP port; 32100/18604
+        // are alternates seen on some firmwares.
+        static const uint16_t kLanPorts[] = { 32108, 32100, 18604 };
+
+        // Broadcast on the subnet directed broadcast if the caller pins the
+        // printer's IP (OBN_TUTK_LAN_IP), else the global broadcast address.
+        // A directed unicast to the pinned IP is also sent: on multi-homed
+        // hosts the OS may route 255.255.255.255 out the wrong interface, and
+        // the printer answers a unicast LAN_SEARCH3 the same as a broadcast.
+        const char* lan_ip_env = getenv("OBN_TUTK_LAN_IP");
         struct sockaddr_in bcast{};
         bcast.sin_family      = AF_INET;
         bcast.sin_addr.s_addr = INADDR_BROADCAST;
+
+        struct sockaddr_in unicast{};
+        bool have_unicast = false;
+        if (lan_ip_env && lan_ip_env[0]) {
+            unicast.sin_family = AF_INET;
+            if (inet_pton(AF_INET, lan_ip_env, &unicast.sin_addr) == 1)
+                have_unicast = true;
+        }
 
         for (uint16_t p : kLanPorts) {
             bcast.sin_port = htons(p);
             send_lan_search3(sess->udp_sock, &bcast,
                              uid_up.c_str(), sess->client_random,
                              partial_mac, (uint16_t)sess->dtls_epoch, false);
-            OBN_DEBUG("[oss-iotc] LAN search broadcast -> port %u (epoch=0x%x)", p, sess->dtls_epoch);
+            if (have_unicast) {
+                unicast.sin_port = htons(p);
+                send_lan_search3(sess->udp_sock, &unicast,
+                                 uid_up.c_str(), sess->client_random,
+                                 partial_mac, (uint16_t)sess->dtls_epoch, false);
+            }
+            OBN_DEBUG("[oss-iotc] LAN search -> port %u (epoch=0x%x)%s", p,
+                      sess->dtls_epoch, have_unicast ? " (+unicast)" : "");
         }
 
+        // The first datagram back may be a stray/echo; try a few reads so a
+        // valid LAN_SEARCH_R3 isn't missed behind noise.
         uint8_t resp[600];
         struct sockaddr_in src{};
-        set_recv_timeout(sess->udp_sock, 3000);
-        ssize_t n = tutk_udp_recv(sess->udp_sock, resp, sizeof(resp), &src, 3000);
+        ssize_t n = -1;
+        for (int rx = 0; rx < 6; ++rx) {
+            set_recv_timeout(sess->udp_sock, 3000);
+            n = tutk_udp_recv(sess->udp_sock, resp, sizeof(resp), &src, 3000);
+            if (n < 16) { n = -1; break; }
+            uint8_t peek[600];
+            memcpy(peek, resp, (size_t)n);
+            reverse_trans_code_partial(peek, (size_t)n);
+            if (peek[0] == 0x04 && peek[1] == 0x02) break;  // looks like IOTC
+            OBN_DEBUG("[oss-iotc] LAN rx: skipping non-IOTC datagram (%zd B)", n);
+            n = -1;
+        }
         if (n >= 16) {
             reverse_trans_code_partial(resp, (size_t)n);
             if (resp[0] != 0x04 || resp[1] != 0x02) {

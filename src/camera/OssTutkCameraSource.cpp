@@ -7,23 +7,41 @@
 namespace obn {
 namespace camera {
 
-// Simple query-string parameter extractor for bambu:///tutk?... URLs.
+// Query-string parameter extractor for bambu:///tutk?... URLs.
+//
+// Matches the key EXACTLY against each "&"-delimited "key=value" segment.
+// A substring search (the previous implementation) is unsafe here: the genuine
+// scheme carries both "authkey=" and no "key=", and find("key=") would grab the
+// value of "authkey=" instead of returning empty.
 static std::string tutk_url_param(const std::string& query,
                                    const std::string& key)
 {
-    const std::string needle = key + "=";
-    auto pos = query.find(needle);
-    if (pos == std::string::npos) return {};
-    pos += needle.size();
-    auto end = query.find('&', pos);
-    return (end == std::string::npos)
-        ? query.substr(pos)
-        : query.substr(pos, end - pos);
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t amp = query.find('&', pos);
+        size_t seg_end = (amp == std::string::npos) ? query.size() : amp;
+        size_t eq = query.find('=', pos);
+        if (eq != std::string::npos && eq < seg_end &&
+            eq - pos == key.size() && query.compare(pos, key.size(), key) == 0) {
+            return query.substr(eq + 1, seg_end - eq - 1);
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return {};
 }
 
 bool OssTutkCameraSource::parse_url_()
 {
-    // bambu:///tutk?uid=...&key=...
+    // Genuine H2S scheme (from a captured LAN-direct session):
+    //   bambu:///tutk?uid=<20-char-UID>&authkey=<...>&passwd=<...>&region=<cc>
+    //                &device=<serial>&net_ver=...&dev_ver=...&refresh_url=1&...
+    //
+    //   uid      — TUTK device UID (IOTC_Connect_ByUIDEx target)
+    //   authkey  — IOTC connect auth key (P2P/LAN precheck)
+    //   passwd   — AV-layer / DTLS-PSK password  (PSK = SHA256(passwd))
+    //   region   — master-server region for UID resolution
+    //   device   — printer serial
     const std::string scheme = "bambu://";
     if (url_.compare(0, scheme.size(), scheme) != 0) return false;
     auto q = url_.find('?');
@@ -31,8 +49,14 @@ bool OssTutkCameraSource::parse_url_()
     std::string query = url_.substr(q + 1);
 
     tutk_uid_ = tutk_url_param(query, "uid");
-    passwd_   = tutk_url_param(query, "key");
-    channel_  = tutk_url_param(query, "channel");
+    authkey_  = tutk_url_param(query, "authkey");
+    passwd_   = tutk_url_param(query, "passwd");
+    device_   = tutk_url_param(query, "device");
+
+    // Legacy fallback: older minted URLs used key=<passwd> and carried no
+    // authkey/passwd. Now that matching is exact, key= no longer clobbers
+    // authkey=, so this only fires for the genuine legacy form.
+    if (passwd_.empty()) passwd_ = tutk_url_param(query, "key");
 
     std::string region_str = tutk_url_param(query, "region");
     if (region_str == "cn")      area_code_ = 1;
@@ -46,7 +70,9 @@ bool OssTutkCameraSource::parse_url_()
     for (char& c : tutk_uid_)
         if (c >= 'a' && c <= 'z') c -= 0x20;
 
-    // If no relay channel provided, use the UID itself
+    // "channel" (relay subdomain) is not part of the genuine tutk scheme; the
+    // relay fallback uses the UID when none is supplied.
+    channel_ = tutk_url_param(query, "channel");
     if (channel_.empty()) channel_ = tutk_uid_;
 
     return true;
@@ -78,6 +104,7 @@ bool OssTutkCameraSource::open()
     p.channel     = channel_;
     p.dtls_passwd = passwd_;
     p.av_passwd   = passwd_;
+    p.authkey     = authkey_;   // IOTC connect auth key (LAN/P2P precheck)
     p.area_code   = area_code_;
     // app_id, token, uid are unused in the direct TUTK relay path
 

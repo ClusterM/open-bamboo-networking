@@ -844,6 +844,20 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(oss_sign_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME oss_sign COMMAND oss_sign_test)
 
+    # Hermetic test for OssTutkCameraSource::parse_url_() — the genuine tutk
+    # scheme (authkey=/passwd=) and exact-key matching (no key= substring bug).
+    add_executable(tutk_url_test tests/tutk_url_test.cpp
+        src/camera/OssTutkCameraSource.cpp
+        src/camera/oss_agora/OssAgoraSignaling.cpp
+        src/camera/oss_agora/OssAgoraEngine.cpp
+        src/camera/oss_tutk/IotcClient.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(tutk_url_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(tutk_url_test PRIVATE OBN_TESTING)
+    target_link_libraries(tutk_url_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME tutk_url COMMAND tutk_url_test)
+
 endif()
 
 # --------------------------------------------------------------------------
@@ -855,4 +869,9 @@ endif()
 # orca_slicer / Windows plugin build. Exclude it on Windows.
 if(NOT WIN32)
     add_subdirectory(tools/h2s_capture_video)
+    # tutk_lan_probe drives the LAN-direct TUTK pipeline against a real printer
+    # for diagnostics; built only when tests are enabled.
+    if(OBN_BUILD_TESTS)
+        add_subdirectory(tools/tutk_lan_probe)
+    endif()
 endif()

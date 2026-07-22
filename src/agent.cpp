@@ -1189,19 +1189,28 @@ std::string Agent::camera_ticket_url_for(const std::string& dev_id)
     std::string perr;
     auto root = obn::json::parse(resp.body, &perr);
     if (!root) return {};
-    const std::string uid    = root->find("ttcode").as_string();
-    const std::string key    = root->find("passwd").as_string();
-    const std::string region = root->find("region").as_string();
-    if (uid.empty() || key.empty()) {
+    // Genuine tutk URL scheme carries authkey and passwd as separate values.
+    // The cloud ttcode reply supplies uid (ttcode), authkey, passwd, region.
+    const std::string uid     = root->find("ttcode").as_string();
+    const std::string authkey = root->find("authkey").as_string();
+    const std::string passwd  = root->find("passwd").as_string();
+    const std::string region  = root->find("region").as_string();
+    if (uid.empty() || passwd.empty()) {
         OBN_INFO("camera_ticket: dev=%s reply carried no ttcode/passwd",
                  dev_id.c_str());
         return {};
     }
 
-    std::string u = "bambu:///tutk?uid=" + uid + "&key=" + key;
+    // Emit the genuine scheme: uid + authkey + passwd (+ region + device).
+    // OssTutkCameraSource::parse_url_() reads these exact keys.
+    std::string u = "bambu:///tutk?uid=" + uid;
+    if (!authkey.empty()) u += "&authkey=" + authkey;
+    u += "&passwd=" + passwd;
     if (!region.empty()) u += "&region=" + region;
-    OBN_INFO("camera_ticket: dev=%s minted tutk URL (region=%s)",
-             dev_id.c_str(), region.empty() ? "?" : region.c_str());
+    u += "&device=" + dev_id;
+    OBN_INFO("camera_ticket: dev=%s minted tutk URL (region=%s authkey=%s)",
+             dev_id.c_str(), region.empty() ? "?" : region.c_str(),
+             authkey.empty() ? "no" : "yes");
     return u;
 }
 
