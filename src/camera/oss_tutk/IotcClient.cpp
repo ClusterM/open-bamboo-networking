@@ -49,6 +49,12 @@
 #  define SHUT_RDWR SD_BOTH
 #endif
 
+#ifndef _WIN32
+#  include <ifaddrs.h>          // getifaddrs — enumerate interface subnet broadcasts
+#  include <net/if.h>           // IFF_BROADCAST / IFF_LOOPBACK
+#  include <netpacket/packet.h> // sockaddr_ll — read interface MAC
+#endif
+
 #include "IotcProtocol.hpp"
 
 #include <cerrno>
@@ -327,11 +333,64 @@ static bool resolve_master(const std::string& hostname, uint16_t port,
 // UDP socket helpers
 // ==========================================================================
 
+// Fetch the MAC address of the default-route interface (the one the OS uses to
+// reach off-link hosts). The genuine plugin embeds this MAC in the IOTC session
+// token — ClientRandomID high 16 = MAC[0..1], PartialMACAddr = MAC[2..5] — and
+// the printer validates it against the client's ARP-visible MAC, so a random
+// token is silently rejected. Returns false if no MAC could be resolved.
+#ifndef _WIN32
+static bool local_primary_mac(uint8_t mac_out[6])
+{
+    // Discover the primary local IP via a connected UDP socket (no packets sent).
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return false;
+    struct sockaddr_in probe{};
+    probe.sin_family = AF_INET;
+    probe.sin_port   = htons(53);
+    inet_pton(AF_INET, "8.8.8.8", &probe.sin_addr);
+    uint32_t local_ip = 0;
+    if (connect(s, (struct sockaddr*)&probe, sizeof(probe)) == 0) {
+        struct sockaddr_in la{}; socklen_t ll = sizeof(la);
+        if (getsockname(s, (struct sockaddr*)&la, &ll) == 0) local_ip = la.sin_addr.s_addr;
+    }
+    ::close(s);
+
+    struct ifaddrs* ifap = nullptr;
+    if (getifaddrs(&ifap) != 0) return false;
+    std::string ifname;
+    for (struct ifaddrs* ia = ifap; ia && local_ip; ia = ia->ifa_next) {
+        if (!ia->ifa_addr || ia->ifa_addr->sa_family != AF_INET) continue;
+        if (((struct sockaddr_in*)ia->ifa_addr)->sin_addr.s_addr == local_ip) {
+            ifname = ia->ifa_name ? ia->ifa_name : ""; break;
+        }
+    }
+    bool found = false;
+    for (struct ifaddrs* ia = ifap; ia; ia = ia->ifa_next) {
+        if (!ia->ifa_addr || ia->ifa_addr->sa_family != AF_PACKET) continue;
+        if (ia->ifa_flags & IFF_LOOPBACK) continue;
+        if (!ifname.empty() && ifname != (ia->ifa_name ? ia->ifa_name : "")) continue;
+        struct sockaddr_ll* sll = (struct sockaddr_ll*)ia->ifa_addr;
+        if (sll->sll_halen == 6) { memcpy(mac_out, sll->sll_addr, 6); found = true; break; }
+    }
+    freeifaddrs(ifap);
+    return found;
+}
+#endif
+
 // Mirrors IOTC_OpenUDP_P2PSocket; gP2PLocalUdpPort defaults to 0 (OS-assigned).
 static obn::net::socket_t open_udp_socket(uint16_t* bound_port_out)
 {
     obn::net::socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd == obn::net::kInvalid) return obn::net::kInvalid;
+
+    // Match the genuine plugin's socket options (IOTC_OpenUDP_P2PSocket sets
+    // these before bind): SO_REUSEADDR, SO_BROADCAST and 1 MB send/recv buffers.
+    const int one = 1;
+    const int buf = 1024000;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF,    &buf, sizeof(buf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF,    &buf, sizeof(buf));
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -1681,6 +1740,7 @@ struct OssSession {
     obn::net::socket_t udp_sock;  // UDP P2P socket
     uint16_t    local_port;      // bound local port
     uint32_t    client_random;
+    uint32_t    partial_mac;     // MAC[2..5], embedded in the session token
     uint32_t    dtls_epoch;      // client-generated epoch echoed in LAN_SEARCH_R3 (e.g. 0x6a0)
     uint8_t     session_token[8]; // client_random(4B) + partial_mac(4B)
 
@@ -2389,7 +2449,23 @@ OssSession* iotc_connect(const std::string& uid,
     sess->password      = password;
     sess->region        = region;
     sess->state         = P2PState::IDLE;
+    // The session token embeds the client's MAC (the printer validates it against
+    // the ARP-visible address): ClientRandomID = MAC[0..1]<<16 | rand16,
+    // PartialMACAddr = MAC[2..5]. Fall back to fully random if the MAC is
+    // unavailable (e.g. non-POSIX or no default route).
+    sess->partial_mac = rand32();
     sess->client_random = rand32();
+#ifndef _WIN32
+    {
+        uint8_t mac[6];
+        if (local_primary_mac(mac)) {
+            sess->client_random = ((uint32_t)mac[0] << 24) | ((uint32_t)mac[1] << 16)
+                                | (rand32() & 0xffff);
+            sess->partial_mac = ((uint32_t)mac[2] << 24) | ((uint32_t)mac[3] << 16)
+                              | ((uint32_t)mac[4] << 8)  |  (uint32_t)mac[5];
+        }
+    }
+#endif
 
     // Step 1: Open UDP socket
     sess->udp_sock = open_udp_socket(&sess->local_port);
@@ -2416,7 +2492,7 @@ OssSession* iotc_connect(const std::string& uid,
     sess->state = P2PState::LAN_SEARCH;
     {
         sess->dtls_epoch = rand32() & 0xffff;
-        uint32_t partial_mac = rand32();
+        uint32_t partial_mac = sess->partial_mac;
 
         // session_token = client_random(4B LE) || partial_mac(4B LE)
         uint32_t cr_le = htole32(sess->client_random);
@@ -2441,15 +2517,30 @@ OssSession* iotc_connect(const std::string& uid,
             if (pv > 0 && pv < 65536) kLanPorts[0] = (uint16_t)pv;
         }
 
-        // Broadcast on the subnet directed broadcast if the caller pins the
-        // printer's IP (OBN_TUTK_LAN_IP), else the global broadcast address.
-        // A directed unicast to the pinned IP is also sent: on multi-homed
-        // hosts the OS may route 255.255.255.255 out the wrong interface, and
-        // the printer answers a unicast LAN_SEARCH3 the same as a broadcast.
+        // The genuine plugin sends the LAN search to EACH interface's directed
+        // subnet broadcast (192.168.1.255, ...), not the limited 255.255.255.255
+        // address. The printer arms its DTLS listener on the subnet broadcast it
+        // receives; a limited broadcast may reach it (it still answers the
+        // search) without arming the session. Enumerate interface broadcast
+        // addresses and fall back to INADDR_BROADCAST only if none are found.
+        std::vector<uint32_t> bcast_addrs;
+        struct ifaddrs* ifap = nullptr;
+        if (getifaddrs(&ifap) == 0) {
+            for (struct ifaddrs* ia = ifap; ia; ia = ia->ifa_next) {
+                if (!ia->ifa_addr || ia->ifa_addr->sa_family != AF_INET) continue;
+                if (!(ia->ifa_flags & IFF_BROADCAST)) continue;
+                if (ia->ifa_flags & IFF_LOOPBACK) continue;
+                if (!ia->ifa_broadaddr) continue;
+                bcast_addrs.push_back(
+                    ((struct sockaddr_in*)ia->ifa_broadaddr)->sin_addr.s_addr);
+            }
+            freeifaddrs(ifap);
+        }
+        if (bcast_addrs.empty()) bcast_addrs.push_back(INADDR_BROADCAST);
+
         const char* lan_ip_env = getenv("OBN_TUTK_LAN_IP");
         struct sockaddr_in bcast{};
         bcast.sin_family      = AF_INET;
-        bcast.sin_addr.s_addr = INADDR_BROADCAST;
 
         struct sockaddr_in unicast{};
         bool have_unicast = false;
@@ -2460,11 +2551,14 @@ OssSession* iotc_connect(const std::string& uid,
         }
 
         for (uint16_t p : kLanPorts) {
-            bcast.sin_port = htons(p);
-            send_lan_search3(sess->udp_sock, &bcast,
-                             uid_up.c_str(), sess->client_random,
-                             partial_mac, (uint16_t)sess->dtls_epoch, false,
-                             sess->authkey);
+            for (uint32_t ba : bcast_addrs) {
+                bcast.sin_port        = htons(p);
+                bcast.sin_addr.s_addr = ba;
+                send_lan_search3(sess->udp_sock, &bcast,
+                                 uid_up.c_str(), sess->client_random,
+                                 partial_mac, (uint16_t)sess->dtls_epoch, false,
+                                 sess->authkey);
+            }
             if (have_unicast) {
                 unicast.sin_port = htons(p);
                 send_lan_search3(sess->udp_sock, &unicast,
