@@ -3345,13 +3345,34 @@ struct AvChannel {
     long     last_ping_ms;      // steady-clock ms of last keepalive ping sent
     uint16_t printer_win;       // last receive-window advertised by the printer's SACK
     uint16_t printer_token;     // latest reliable token advertised by the printer
-    uint32_t rx_data_count;     // data fragments received (drives proactive acks)
+    uint32_t rx_data_count;     // reliable data fragments received (feeds the ping ack counter)
 
-    // Video frame reassembly: fragments (1024-byte media chunks) accumulate here
-    // until a new frame boundary (fragment index 0) is seen.
-    std::vector<uint8_t> reasm;    // media bytes of the frame currently being assembled
-    int      reasm_frame_id;       // frame id (byte8 of the fragment header) currently accumulating
-    bool     reasm_have;           // reasm holds an in-progress frame
+    // Cumulative-ACK / keepalive state. The genuine client does NOT reply to
+    // every printer control frame; it pings on a timer, reporting a monotonic
+    // received-data counter as [ack_prev, ack_now]. Echoing acks per received
+    // SACK creates a SACK->ACK->SACK feedback storm that stalls the stream.
+    uint16_t ack_now;           // current cumulative received-data counter (0xffff = none yet)
+    uint16_t ack_prev;          // previous ping's ack_now (start of this ping's range)
+    uint16_t ping_ctr;          // outgoing ping counter (ping body [18..19])
+    long     last_ctrl_ms;      // steady-clock ms of last control frame we sent (pacing)
+    uint16_t rx_hi_relseq;      // highest printer reliable seq seen (gap detection)
+    bool     have_hi_relseq;    // rx_hi_relseq is valid
+    uint64_t lost_relseq;       // count of detected printer rel_seq gaps (measurement)
+    uint32_t rx_data_unique;    // unique (non-retransmitted) data fragments received
+
+    // Video frame reassembly. The printer fragments each H.264 access unit into
+    // ~1024-byte chunks tagged with (frame_id, frag_id) and RETRANSMITS lost
+    // chunks in a 0c08/0c09 variant. Fragments are collected per-frame keyed by
+    // frag_id (so an original and its retransmit dedup, and a retransmit fills a
+    // gap left by a lost original). The frame is emitted, in fragment order, only
+    // once it is complete (frags 0..last all present) — otherwise it is dropped,
+    // so a partial frame never reaches the decoder as bottom-of-frame smear.
+    int      asm_frame_id;                          // frame_id being assembled (-1 = none)
+    int      asm_last_frag;                         // last fragment index (from boundary marker; -1 unknown)
+    std::vector<std::vector<uint8_t>> asm_frags;    // indexed by frag_id
+    std::vector<char> asm_have;                     // asm_have[g] != 0 => frag g present
+    uint64_t frames_emitted;                        // complete frames delivered (measurement)
+    uint64_t frames_dropped;                        // incomplete frames dropped (measurement)
 };
 
 static AvChannel g_av_channels[kMaxAvChannels];
@@ -3374,9 +3395,20 @@ static void av_channel_reset(AvChannel& ch)
     ch.printer_win     = 50;
     ch.printer_token   = 0;
     ch.rx_data_count   = 0;
-    ch.reasm.clear();
-    ch.reasm_frame_id  = -1;
-    ch.reasm_have      = false;
+    ch.ack_now         = 0xffff;
+    ch.ack_prev        = 0xffff;
+    ch.ping_ctr        = 0;
+    ch.last_ctrl_ms    = 0;
+    ch.rx_hi_relseq    = 0;
+    ch.have_hi_relseq  = false;
+    ch.lost_relseq     = 0;
+    ch.rx_data_unique  = 0;
+    ch.asm_frame_id    = -1;
+    ch.asm_last_frag   = -1;
+    ch.asm_frags.clear();
+    ch.asm_have.clear();
+    ch.frames_emitted  = 0;
+    ch.frames_dropped  = 0;
 }
 
 static void av_channels_init()
@@ -3734,8 +3766,14 @@ static bool av_is_login_ack(const uint8_t* buf, size_t len)
     return len >= 20 && buf[0] == 0x00 && buf[1] == 0x21 && buf[16] == 0x24;
 }
 
-// Send a keepalive PING (type 0x09) — mirrors the genuine idle ping
-// (b8=b10=0xffff meaning "no specific ack").  Consumes one reliable sequence.
+// Send a keepalive PING (type 0x09). This is the genuine client's primary
+// flow-control carrier: it advertises the cumulative received-data range
+// [ack_prev, ack_now] plus a ping counter and a 16-bit ms timestamp. The
+// printer streams autonomously as long as it sees these periodic pings and is
+// NOT flooded with per-frame acks. Wire layout (24 bytes, from decrypted genuine):
+//   [0]=0x09 [1]=0x00 [2..3]=chan(0x000b) [4..5]=rel_seq
+//   [8..9]=ack_prev  [10..11]=ack_now  [12]=0x01
+//   [18..19]=ping_ctr  [20..21]=timestamp16
 static void av_send_ping(AvChannel& ch)
 {
     uint8_t p[24];
@@ -3743,16 +3781,22 @@ static void av_send_ping(AvChannel& ch)
     p[0] = 0x09; p[1] = 0x00;
     uint16_t chan = htole16(0x000b); memcpy(p + 2, &chan, 2);
     uint16_t seq  = htole16(ch.rel_tx_seq++); memcpy(p + 4, &seq, 2);
-    p[8] = 0xff; p[9] = 0xff; p[10] = 0xff; p[11] = 0xff; // ffffffff
+    uint16_t ap = htole16(ch.ack_prev); memcpy(p + 8,  &ap, 2);
+    uint16_t an = htole16(ch.ack_now);  memcpy(p + 10, &an, 2);
     p[12] = 0x01;                                          // matches genuine ping body
+    uint16_t pc = htole16(ch.ping_ctr++); memcpy(p + 18, &pc, 2);
+    uint16_t ts = htole16((uint16_t)(av_now_ms() & 0xffff)); memcpy(p + 20, &ts, 2);
+    ch.ack_prev = ch.ack_now;   // next ping's range starts where this one ended
     av_channel_write(&ch, p, sizeof(p));
-    ch.last_ping_ms = av_now_ms();
+    long now = av_now_ms();
+    ch.last_ping_ms = now;
+    ch.last_ctrl_ms = now;
 }
 
-// Send a data ACK (type 0x0a) echoing the printer's advertised SACK token.
-// The genuine client replies to each printer SACK (0x0b) with an ACK carrying
-// the same 16-bit token and window, which advances the printer's send window.
-static void av_send_ack(AvChannel& ch, uint16_t token, uint16_t win)
+// Send a data ACK (type 0x0a). Retained for the startup handshake / reference;
+// the steady-state stream relies on the periodic ping's cumulative-ack range,
+// not per-frame acks (which trigger a printer SACK storm).
+[[maybe_unused]] static void av_send_ack(AvChannel& ch, uint16_t token, uint16_t win)
 {
     uint8_t p[16];
     memset(p, 0, sizeof(p));
@@ -3765,18 +3809,26 @@ static void av_send_ack(AvChannel& ch, uint16_t token, uint16_t win)
     av_channel_write(&ch, p, sizeof(p));
 }
 
-// Send a SACK (type 0x0b) mirroring the genuine client's periodic receive
-// report (sub-channel 0x1f, echoing the printer's token).
-static void av_send_sack(AvChannel& ch, uint16_t token, uint16_t count)
+// Send a SACK (type 0x0b, sub-channel 0x1f) — the genuine client's cumulative
+// receive report. This is what advances the printer's send window and stops it
+// retransmitting: [10..11] and [12..13] carry the count of UNIQUE data fragments
+// received (equal when there is no hole). Wire layout (20 bytes, from decrypted
+// genuine OUT SACK):
+//   [0]=0x0b [2..3]=chan(0x000b) [4..5]=0 [6..7]=0x001f
+//   [8..9]=timestamp16  [10..11]=cum_recv  [12..13]=cum_recv
+static void av_send_sack(AvChannel& ch)
 {
     uint8_t p[20];
     memset(p, 0, sizeof(p));
     p[0] = 0x0b; p[1] = 0x00;
     uint16_t chan = htole16(0x000b); memcpy(p + 2, &chan, 2);
-    p[6] = 0x1f;                              // sub-channel 0x1f on our SACK
-    uint16_t tk = htole16(token);            memcpy(p + 8, &tk, 2);
-    uint16_t ct = htole16(count);            memcpy(p + 10, &ct, 2);
+    p[6] = 0x1f;                                       // sub-channel 0x1f
+    uint16_t ts = htole16((uint16_t)(av_now_ms() & 0xffff)); memcpy(p + 8, &ts, 2);
+    uint16_t cum = htole16((uint16_t)ch.rx_data_unique);
+    memcpy(p + 10, &cum, 2);
+    memcpy(p + 12, &cum, 2);
     av_channel_write(&ch, p, sizeof(p));
+    ch.last_ctrl_ms = av_now_ms();
 }
 
 int oss_av_login(int av_index, const char* account, const char* passwd,
@@ -3907,7 +3959,15 @@ extern "C" void avClientStop(int av_index)
     AvChannel& ch = g_av_channels[av_index];
     if (!ch.active) return;
 
-    OBN_DEBUG("[oss-av] avClientStop: av_index=%d", av_index);
+    OBN_DEBUG("[oss-av] avClientStop: av_index=%d rx_data=%u rel_seq_gaps=%llu",
+              av_index, ch.rx_data_count, (unsigned long long)ch.lost_relseq);
+    if (getenv("OBN_TUTK_TRACE"))
+        fprintf(stderr, "[tutk-av] STOP rx_data=%u rx_unique=%u frames_emitted=%llu "
+                "frames_dropped=%llu datagram_gaps=%llu\n",
+                ch.rx_data_count, ch.rx_data_unique,
+                (unsigned long long)ch.frames_emitted,
+                (unsigned long long)ch.frames_dropped,
+                (unsigned long long)ch.lost_relseq);
     ch.active = false;
     // Do NOT close the socket — OssSession may still need it for keepalives.
 }
@@ -4040,39 +4100,80 @@ extern "C" int avSendIOCtrl(int av_index, unsigned int type,
 //   5. Fills output parameters
 
 // Classify a plaintext AV-data frame (type 0x0c) and locate its H.264 media
-// chunk.  Returns true for a video fragment and fills media/frame/frag; false
-// for IOCtrl responses, pings, acks, or malformed input.
+// chunk. Returns true for a video fragment and fills media/frame/frag/is_last.
 //
-// Video fragment (normal, 36-byte header):
-//   [16]     = 0x05 (media sub-header marker)
-//   [24..25] = media length (uint16 LE), media at offset 36
-// Frame-boundary variant (56-byte header): [16..19] = 0c 00 00 00,
-//   media length at [44..45], media at offset 56.
-// Fragment/frame identity: frame index = buf[8], fragment index = buf[10];
-// a fragment index of 0 marks the first fragment of a new frame.
+// Two on-wire variants carry identical video sub-headers at different offsets:
+//   * Original fragment  (flags byte[1] == 0x00): sub-header at +8.
+//   * Retransmitted frag (flags byte[1] & 0x08, i.e. 0x08/0x09): the printer
+//     prepends an 8-byte ack/timestamp block, shifting the sub-header to +16.
+// Rejecting the retransmit variant (as the old code did) throws away the very
+// copies that would fill a gap left by a lost original — the cause of the
+// residual bottom-of-frame smear. Both are accepted here.
+//
+// Video sub-header (relative offset s = 8 or 16):
+//   [s..s+1] frame_id (uint16 LE)   [s+2] frag_id   [s+3] 0x14 media marker
+// Frame-boundary (last fragment) variant carries an extra 20-byte block
+// ([s+8..s+11] = 0c 00 00 00) that pushes the media start out by 20 bytes.
 static bool av_classify_video(const uint8_t* buf, size_t len,
                               const uint8_t** media, size_t* media_len,
-                              int* frame_id, int* frag_id)
+                              int* frame_id, int* frag_id, bool* is_last)
 {
-    if (len < 38 || buf[0] != 0x0c) return false;
+    if (len < 40 || buf[0] != 0x0c) return false;
 
-    // Video fragments carry byte[11] == 0x14 as their media-type marker; the
-    // 44-byte IOCtrl responses and other control frames do not.  The media
-    // occupies the remainder of the (record-sized) datagram after the header.
-    if (buf[11] != 0x14) return false;
+    size_t s = (buf[1] & 0x08) ? 16 : 8;    // retransmit variant shifts sub-header +8
+    if (len < s + 4) return false;
+    if (buf[s + 3] != 0x14) return false;    // media-type marker distinguishes video
 
-    // The frame-boundary variant prefixes an extra 20-byte block ([16..19]=12),
-    // pushing the media sub-header to +36 and the payload to +56.  Normal and
-    // partial fragments put the payload at +36.
-    size_t hdr = (buf[16] == 0x0c && buf[17] == 0x00 &&
-                  buf[18] == 0x00 && buf[19] == 0x00) ? 56 : 36;
+    // The final fragment of each transport group carries a 0c000000 marker and is
+    // a FRAME DESCRIPTOR, not H.264 payload — its ~1024 body bytes are metadata
+    // that desync the decoder if appended to the slice data. It is flagged as the
+    // last fragment (to close the group) but yields an empty media range.
+    bool boundary = (buf[s + 8] == 0x0c && buf[s + 9] == 0x00 &&
+                     buf[s + 10] == 0x00 && buf[s + 11] == 0x00);
+    if (is_last) *is_last = boundary;
+    *frame_id  = buf[s] | (buf[s + 1] << 8);
+    *frag_id   = buf[s + 2];
+    if (boundary) { *media = buf + len; *media_len = 0; return true; }
+
+    size_t hdr = s + 28;                     // orig: media@36, retransmit: media@44
     if (len <= hdr) return false;
-
     *media     = buf + hdr;
     *media_len = len - hdr;
-    *frame_id  = buf[8];
-    *frag_id   = buf[10];
     return true;
+}
+
+// Copy an assembled H.264 buffer into dst, dropping NAL units of type 0
+// (unspecified). The printer appends a 15-byte type-0 footer to slice-final
+// fragments as an end-of-picture marker; it is not valid bitstream and the
+// genuine client strips it. Returns the number of bytes written to dst.
+static size_t av_strip_type0(uint8_t* dst, size_t dst_cap,
+                             const uint8_t* src, size_t src_len)
+{
+    size_t out = 0, i = 0;
+    while (i < src_len) {
+        // locate next Annex-B start code at i (00 00 00 01)
+        if (i + 4 <= src_len && src[i]==0 && src[i+1]==0 && src[i+2]==0 && src[i+3]==1) {
+            size_t nal = i;
+            size_t j = i + 4;
+            while (j + 4 <= src_len &&
+                   !(src[j]==0 && src[j+1]==0 && src[j+2]==0 && src[j+3]==1)) ++j;
+            size_t end = (j + 4 <= src_len) ? j : src_len;
+            bool drop = (nal + 4 < src_len) && ((src[nal + 4] & 0x1f) == 0);
+            if (!drop) {
+                size_t take = end - nal;
+                if (out + take > dst_cap) take = dst_cap - out;
+                memcpy(dst + out, src + nal, take);
+                out += take;
+                if (out >= dst_cap) break;
+            }
+            i = end;
+        } else {
+            // leading bytes before first start code: copy through
+            if (out < dst_cap) dst[out++] = src[i];
+            ++i;
+        }
+    }
+    return out;
 }
 
 extern "C" int avRecvFrameData2(int av_index,
@@ -4101,11 +4202,15 @@ extern "C" int avRecvFrameData2(int av_index,
     // Deliver one fully reassembled frame per call.  A frame is complete when
     // the first fragment (frag_id 0) of the *next* frame arrives.
     const long enter_ms = av_now_ms();
-    for (int guard = 0; guard < 100000; ++guard) {
-        // Keepalive: the printer streams without per-frame acks but drops idle
-        // peers, so emit a ping roughly once a second.
-        if (av_now_ms() - ch.last_ping_ms > 800)
-            av_send_ping(ch);
+    for (int guard = 0; guard < 1000000; ++guard) {
+        // Keepalive/flow-control: the printer streams autonomously as long as it
+        // sees periodic pings carrying the cumulative received-data range. It
+        // does NOT need (and is destabilised by) a reply to every control frame.
+        // Genuine cadence is roughly one ping per second.
+        if (av_now_ms() - ch.last_ping_ms > 200) {
+            av_send_sack(ch);    // cumulative receive report (advances printer window)
+            av_send_ping(ch);    // keepalive + range ack + RTT timestamp
+        }
 
         ssize_t n = av_channel_read_plain(&ch, plain.data(), plain.size(), 1000);
         if (n == 0) {
@@ -4115,62 +4220,111 @@ extern "C" int avRecvFrameData2(int av_index,
         if (n < 0) return AV_ER_TIMEOUT;
 
         const uint8_t* media = nullptr; size_t mlen = 0; int fid = 0, frag = 0;
-        bool is_vid = av_classify_video(plain.data(), (size_t)n, &media, &mlen, &fid, &frag);
+        bool frag_is_last = false;
+        bool is_vid = av_classify_video(plain.data(), (size_t)n, &media, &mlen,
+                                        &fid, &frag, &frag_is_last);
+
+        // Track the printer's reliable send sequence to measure true loss. Data
+        // (0x0c), the printer's pings (0x09) and acks (0x0a) share one monotonic
+        // rel_seq stream at [4..5]; SACK (0x0b) is a separate sub-stream. A jump
+        // in this stream is a genuinely lost reliable packet.
+        {
+            const uint8_t* c = plain.data();
+            // The printer assigns a fresh rel_seq to every datagram INCLUDING
+            // retransmissions, so this stream has no gaps; it is a datagram
+            // counter, not a per-fragment identity. Retained only as a coarse
+            // link-health probe (jumps here would indicate a truly dropped datagram).
+            if (n >= 6 && (c[0] == 0x0c || c[0] == 0x09 || c[0] == 0x0a)) {
+                uint16_t rs = (uint16_t)(c[4] | (c[5] << 8));
+                if (ch.have_hi_relseq) {
+                    int16_t d = (int16_t)(rs - ch.rx_hi_relseq);
+                    if (d > 1) ch.lost_relseq += (uint16_t)(d - 1);
+                    if (d > 0) ch.rx_hi_relseq = rs;
+                } else {
+                    ch.rx_hi_relseq = rs; ch.have_hi_relseq = true;
+                }
+            }
+        }
         if (getenv("OBN_TUTK_TRACE")) {
             const uint8_t* c = plain.data();
             uint16_t rs = (n>=6)?(uint16_t)(c[4]|(c[5]<<8)):0;
-            fprintf(stderr, "[tutk-av] n=%zd type=%02x rs=%u video=%d fid=%d frag=%d mlen=%zu acc=%zu\n",
-                    n, c[0], rs, is_vid?1:0, fid, frag, mlen, ch.reasm.size());
+            fprintf(stderr, "[tutk-av] n=%zd type=%02x rs=%u video=%d fid=%d frag=%d mlen=%zu last=%d\n",
+                    n, c[0], rs, is_vid?1:0, fid, frag, mlen, frag_is_last?1:0);
         }
         if (!is_vid) {
-            // Reliable-transport control from the printer: reply so the printer
-            // advances its send window (otherwise it throttles to ~1 frame/2s).
+            // Reliable-transport control from the printer (ACK 0x0a / SACK 0x0b /
+            // PING 0x09). Absorb its advertised window but send NOTHING in reply:
+            // the periodic ping (top of loop) is the only control frame we emit.
+            // Replying to each SACK/ping here previously produced a
+            // SACK->ACK->SACK feedback storm (100+ SACK per data frame) that
+            // stalled the video stream to a trickle.
             const uint8_t* c = plain.data();
-            if (n >= 12 && (c[0] == 0x0a || c[0] == 0x0b)) {
-                uint16_t token = (uint16_t)(c[8] | (c[9] << 8));
-                uint16_t win   = (uint16_t)(c[10] | (c[11] << 8));
-                if (token != 0xffff) ch.printer_token = token;
+            if (n >= 12 && c[0] == 0x0a) {
+                uint16_t win = (uint16_t)(c[10] | (c[11] << 8));
                 if (win && win != 0xffff) ch.printer_win = win;
-                if (c[0] == 0x0b) {                  // SACK: ack + mirror
-                    av_send_ack(ch, ch.printer_token, ch.printer_win);
-                    av_send_sack(ch, ch.printer_token, ch.printer_win);
-                }
-            } else if (n >= 12 && c[0] == 0x09) {    // printer ping: reply
-                av_send_ping(ch);
             }
             continue;  // not video
         }
 
-        // Proactively acknowledge the video stream: the printer sends up to
-        // `printer_win` fragments then waits for an ack before continuing.
-        // Echo the printer's most-recently advertised token so it keeps its
-        // send window open (it advertises this in its frequent 0x0a frames).
-        if (++ch.rx_data_count % 8 == 0)
-            av_send_ack(ch, ch.printer_token, ch.printer_win);
+        ++ch.rx_data_count;   // every delivered fragment incl. retransmits (diagnostics)
 
-        (void)fid; (void)frag;
+        // ---- (frame_id, frag_id)-keyed reassembly with retransmit recovery ----
+        // A new frame_id means the previous frame is finished: emit it if every
+        // fragment 0..last arrived (originals + retransmits), else drop it. This
+        // guarantees emitted frames are complete and gap-free, and recovers a
+        // lost original from its later retransmit.
+        if (ch.asm_frame_id >= 0 && fid != ch.asm_frame_id) {
+            int last = ch.asm_last_frag;
+            bool complete = (last >= 0);
+            if (complete)
+                for (int g = 0; g <= last; ++g)
+                    if (g >= (int)ch.asm_have.size() || !ch.asm_have[g]) { complete = false; break; }
 
-        // Deliver complete H.264 access units.  The transport frame index does
-        // NOT map to video frames — one IDR spans many transport fragments —
-        // so split on Annex-B start codes: a fragment whose media begins with
-        // 00 00 00 01 starts a new NAL/access unit.  Fragments never begin
-        // mid-slice with a start code (emulation prevention), so the buffer
-        // accumulates one full access unit between boundaries with no loss.
-        bool au_start = (mlen >= 4 && media[0] == 0 && media[1] == 0 &&
-                         media[2] == 0 && media[3] == 1);
+            if (complete) {
+                static thread_local std::vector<uint8_t> scratch;
+                scratch.clear();
+                for (int g = 0; g <= last; ++g)
+                    scratch.insert(scratch.end(), ch.asm_frags[g].begin(), ch.asm_frags[g].end());
+                // Drop type-0 footer NALs while copying into the caller's buffer.
+                int copy_len = (int)av_strip_type0((uint8_t*)video_buf, (size_t)buf_size,
+                                                   scratch.data(), scratch.size());
+                size_t total = scratch.size();
+                unsigned emitted_id = (unsigned)ch.asm_frame_id;
+                ++ch.frames_emitted;
+                // Start the new frame with this fragment before returning.
+                ch.asm_frame_id  = fid;
+                ch.asm_last_frag = -1;
+                for (auto& v : ch.asm_frags) v.clear();
+                std::fill(ch.asm_have.begin(), ch.asm_have.end(), (char)0);
+                if ((int)ch.asm_frags.size() <= frag) { ch.asm_frags.resize(frag + 1); ch.asm_have.resize(frag + 1, 0); }
+                ch.asm_frags[frag].assign(media, media + mlen);
+                ch.asm_have[frag] = 1;
+                ch.ack_now = (uint16_t)(++ch.rx_data_unique);
+                if (frag_is_last) ch.asm_last_frag = frag;
 
-        if (au_start && !ch.reasm.empty()) {
-            int full     = (int)ch.reasm.size();
-            int copy_len = (int)std::min<size_t>((size_t)buf_size, ch.reasm.size());
-            memcpy(video_buf, ch.reasm.data(), (size_t)copy_len);
-            ch.reasm.assign(media, media + mlen);   // start next access unit
-            if (actual)      *actual      = copy_len;
-            if (frame_count) *frame_count = full;
-            if (timestamp)   *timestamp   = (unsigned)ch.reasm_frame_id++;
-            return ((uint32_t)buf_size < (uint32_t)full)
-                       ? AV_ER_INCOMPLETE_FRAME : copy_len;
+                if (actual)      *actual      = copy_len;
+                if (frame_count) *frame_count = (int)total;
+                if (timestamp)   *timestamp   = emitted_id;
+                return ((uint32_t)buf_size < (uint32_t)total)
+                           ? AV_ER_INCOMPLETE_FRAME : copy_len;
+            }
+            // Incomplete frame: drop it (no smear reaches the decoder).
+            ++ch.frames_dropped;
+            ch.asm_frame_id  = -1;
+            ch.asm_last_frag = -1;
+            for (auto& v : ch.asm_frags) v.clear();
+            std::fill(ch.asm_have.begin(), ch.asm_have.end(), (char)0);
         }
-        ch.reasm.insert(ch.reasm.end(), media, media + mlen);
+
+        // Accumulate this fragment into the current frame (dedup by frag_id).
+        if (ch.asm_frame_id < 0) ch.asm_frame_id = fid;
+        if ((int)ch.asm_frags.size() <= frag) { ch.asm_frags.resize(frag + 1); ch.asm_have.resize(frag + 1, 0); }
+        if (!ch.asm_have[frag]) {
+            ch.asm_frags[frag].assign(media, media + mlen);
+            ch.asm_have[frag] = 1;
+            ch.ack_now = (uint16_t)(++ch.rx_data_unique);
+        }
+        if (frag_is_last) ch.asm_last_frag = frag;
     }
     return AV_ER_TIMEOUT;
 }
