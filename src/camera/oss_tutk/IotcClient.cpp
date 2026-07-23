@@ -2531,11 +2531,12 @@ OssSession* iotc_connect(const std::string& uid,
     OBN_DEBUG("[oss-iotc] UID=%s client_random=0x%08x", sess->uid.c_str(), sess->client_random);
 
     // Step 1b: ThroughTek master rendezvous (UDP :10240) on the SAME session
-    // socket/port. Registering the UID with the region masters is what makes the
-    // printer open its LAN DTLS session listener; without it the LAN handshake
-    // below is silently ignored. Best-effort: proceed to LAN search regardless
-    // (a reply also yields our reflexive addr + device P2P candidates).
-    if (!getenv("OBN_TUTK_SKIP_MASTER"))
+    // socket/port. On the LAN path this is not required: the printer's DTLS
+    // listener is opened by the LAN_SEARCH3 byte-84 flag in the handshake
+    // below, not by any master registration — so the master is contacted only
+    // as an opt-in fallback for reaching a non-LAN device (P2P relay), where a
+    // reply also yields our reflexive addr + device P2P candidates.
+    if (getenv("OBN_TUTK_USE_MASTER"))
         master_send_lookups(sess);
 
     // Step 2: LAN search + DTLS handshake.
