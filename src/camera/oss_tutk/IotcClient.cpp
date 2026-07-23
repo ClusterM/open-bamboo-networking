@@ -2570,6 +2570,13 @@ OssSession* iotc_connect(const std::string& uid,
                 have_unicast = true;
         }
 
+        // The genuine plugin searches the single discovery port (32761) on each
+        // interface's subnet broadcast only — no per-port unicast flood. The
+        // extra fallback ports and unicast searches confuse the printer's
+        // session-port state machine (it re-answers the directed search with a
+        // LAN_SEARCH_R instead of opening the DTLS listener). Mirror genuine by
+        // default; OBN_TUTK_ALL_PORTS restores the old broad probe.
+        bool all_ports = getenv("OBN_TUTK_ALL_PORTS") != nullptr;
         for (uint16_t p : kLanPorts) {
             for (uint32_t ba : bcast_addrs) {
                 bcast.sin_port        = htons(p);
@@ -2579,7 +2586,7 @@ OssSession* iotc_connect(const std::string& uid,
                                  partial_mac, (uint16_t)sess->dtls_epoch, false,
                                  sess->authkey);
             }
-            if (have_unicast) {
+            if (have_unicast && all_ports) {
                 unicast.sin_port = htons(p);
                 send_lan_search3(sess->udp_sock, &unicast,
                                  uid_up.c_str(), sess->client_random,
@@ -2588,6 +2595,7 @@ OssSession* iotc_connect(const std::string& uid,
             }
             OBN_DEBUG("[oss-iotc] LAN search -> port %u (epoch=0x%x)%s", p,
                       sess->dtls_epoch, have_unicast ? " (+unicast)" : "");
+            if (!all_ports) break;   // genuine probes only the discovery port
         }
 
         // Read datagrams until a LAN_SEARCH_R (msg [8..10] = 02 06 12) arrives.
@@ -2630,21 +2638,40 @@ OssSession* iotc_connect(const std::string& uid,
 
             sess->device_wan = src;
 
-            send_lan_search3(sess->udp_sock, &src,
-                             uid_up.c_str(), sess->client_random,
-                             partial_mac, (uint16_t)sess->dtls_epoch, true);
-            OBN_DEBUG("[oss-iotc] directed LAN_SEARCH3 -> %s:%u", ip_str, ntohs(src.sin_port));
+            if (!getenv("OBN_TUTK_SKIP_DIRECTED88")) {
+                send_lan_search3(sess->udp_sock, &src,
+                                 uid_up.c_str(), sess->client_random,
+                                 partial_mac, (uint16_t)sess->dtls_epoch, true);
+                OBN_DEBUG("[oss-iotc] directed LAN_SEARCH3 -> %s:%u", ip_str, ntohs(src.sin_port));
+            }
 
-            // The printer answers LAN discovery (port 32761) unconditionally,
-            // but its TUTK session listener (the port discovery replies from,
-            // e.g. 36337) only opens a DTLS handshake for a client the cloud
-            // has authorized for this device. Without that authorization the
-            // printer silently drops the ctrl-0x33 and ClientHello and only
-            // re-answers LAN_SEARCH_R; a byte-exact replay of the genuine
-            // ctrl-0x33 + ClientHello behaves identically. The session must be
-            // authorized out-of-band (camera ticket via
-            // Agent::camera_ticket_url_for) before this path reaches ServerHello;
-            // the handshake itself below is stock OpenSSL DTLS.
+            // The genuine SDK lets ~4ms elapse between the directed search and
+            // the ClientHello; the printer needs that gap to open its per-session
+            // DTLS listener. OBN_TUTK_PRECH_DELAY_MS tunes it (default 8ms).
+            {
+                int dly = 8;
+                if (const char* e = getenv("OBN_TUTK_PRECH_DELAY_MS")) dly = atoi(e);
+                if (dly > 0)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(dly));
+            }
+
+            // The session layer below is stock OpenSSL DTLS 1.2 ECDHE-PSK
+            // (suite 0xCCAC / x25519, PSK identity "AUTHPWD_admin",
+            // PSK = SHA256(passwd)) wrapped in the IOTC framing + trans_code —
+            // NOT a proprietary handshake. See HANDSHAKE_FORMAT.md.
+            //
+            // Wire-verified 2026-07-23 (H2S fw 01.02.00.00): OBN's ClientHello
+            // is byte-identical to the genuine libBambuSource one (same ciphers,
+            // extensions, framing, session token) apart from the necessarily
+            // per-session DTLS random + session-id. No cloud/ttcode arming and no
+            // master registration are required — the genuine SDK pulls frames
+            // over pure LAN with neither. Yet the printer replies (ServerHello)
+            // only to the genuine SDK's live session and is silent (confirmed at
+            // L3) to a byte-identical ClientHello from OBN OR from a raw crafter.
+            // The discriminator is device-side and is NOT present in any
+            // observable wire attribute (content, obfuscation, flow, timing,
+            // socket options, source addr/port) — all eliminated by direct test.
+            // This is the sole remaining unknown for LAN-direct camera.
             int dtls_rc = iotc_dtls_openssl_connect(
                 sess->udp_sock, &src,
                 sess->session_token,
