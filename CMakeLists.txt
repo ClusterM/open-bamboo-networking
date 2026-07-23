@@ -869,9 +869,4 @@ endif()
 # orca_slicer / Windows plugin build. Exclude it on Windows.
 if(NOT WIN32)
     add_subdirectory(tools/h2s_capture_video)
-    # tutk_lan_probe drives the LAN-direct TUTK pipeline against a real printer
-    # for diagnostics; built only when tests are enabled.
-    if(OBN_BUILD_TESTS)
-        add_subdirectory(tools/tutk_lan_probe)
-    endif()
 endif()

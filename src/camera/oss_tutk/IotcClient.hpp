@@ -3,7 +3,7 @@
 //
 // Single source of truth for the handshake + AV entry points implemented in
 // IotcClient.cpp. Consumed by OssTutkCameraSource (the full plugin's camera
-// source) and tools/tutk_lan_probe.
+// source).
 //
 // Flow: iotc_connect() (UDP + LAN_SEARCH3 + DTLS-PSK) → oss_av_start()
 // (avClientStartEx + AV LOGIN + IPCAM_START) → avRecvFrameData2() to pull one

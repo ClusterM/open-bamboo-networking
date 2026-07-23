@@ -20,8 +20,7 @@ static uint64_t authkey_to_u64(const std::string& s)
     return v;
 }
 
-// Map the raw URL region string to the transport's TutkRegion (default US),
-// matching tutk_lan_probe's mapping exactly.
+// Map the raw URL region string to the transport's TutkRegion (default US).
 static bambu_net::oss_tutk::TutkRegion region_from_string(const std::string& r)
 {
     using bambu_net::oss_tutk::TutkRegion;
