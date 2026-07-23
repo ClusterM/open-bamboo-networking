@@ -622,7 +622,22 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
     if (dtls_len > 0)
         memcpy(pkt.data() + 28, dtls_data, dtls_len);
 
-    trans_code_partial(pkt.data(), std::min(total, (size_t)80));
+    // Genuine scrambles each DTLS packet by a PER-PACKET length, not a fixed 80:
+    //   scramble = min(80, floor((28 + dtls_handshake_fragment_length) / 16) * 16)
+    // For the ClientHello (fragment_length 232) this is 80; for the
+    // ClientKeyExchange (fragment_length 48) it is 64, which leaves the PSK
+    // identity tail ("dmin" of AUTHPWD_admin) at offset 64+ in plaintext. A fixed
+    // 80 corrupts that tail and the printer replies with a fatal
+    // unknown_psk_identity alert (desc 115). Verified byte-for-byte vs genuine.
+    size_t scramble = 80;
+    if (dtls_len >= 25 && dtls_data[0] == 0x16) {  // DTLS handshake record
+        uint32_t frag = ((uint32_t)dtls_data[22] << 16)
+                      | ((uint32_t)dtls_data[23] << 8)
+                      |  (uint32_t)dtls_data[24];        // fragment_length (rec+hs hdr = 13+9)
+        size_t s = ((size_t)(28 + frag) / 16) * 16;
+        if (s < scramble) scramble = s;
+    }
+    trans_code_partial(pkt.data(), std::min(total, scramble));
 
     ssize_t n = sendto(sock, pkt.data(), total, 0,
                        (const struct sockaddr*)dst, sizeof(*dst));
@@ -745,6 +760,13 @@ static int send_lan_search3(obn::net::socket_t sock, const struct sockaddr_in* d
         if (authkey) memcpy(pkt + 74, ak, 7);
         pkt[80] = (authkey ? ak[6] : 0x63);
         pkt[81] = 0x04; pkt[82] = 0x13; pkt[83] = 0x13;
+        // [84]: broadcast-search framing constant. The printer's session
+        // listener records the LAN-search's ClientRandomID for session
+        // acceptance ONLY when this byte is present; leaving it zero makes the
+        // printer answer the 200B discovery but silently drop the subsequent
+        // DTLS ClientHello. Wire-confirmed 0x31 for broadcast (directed uses
+        // 0x04); constant across genuine H2S captures.
+        pkt[84] = 0x31;
         pkt[85] = 0x0c; pkt[86] = 0x0c;
     }
 
@@ -854,7 +876,20 @@ static int iotc_bio_write(BIO* b, const char* data, int len)
     memcpy(pkt.data() + 20, c->token, 8);
     memcpy(pkt.data() + 28, data, (size_t)len);
 
-    trans_code_partial(pkt.data(), std::min(total, (size_t)80));
+    // Genuine scrambles each DTLS packet by a PER-PACKET length:
+    //   min(80, floor((28 + dtls_handshake_fragment_length) / 16) * 16)
+    // ClientHello (fragment_length 232) -> 80; ClientKeyExchange (48) -> 64, which
+    // keeps the PSK identity tail ("dmin" of AUTHPWD_admin) at offset 64+ plaintext.
+    // A fixed 80 corrupts it -> the printer returns unknown_psk_identity (desc 115).
+    size_t scramble = 80;
+    if (len >= 25 && (uint8_t)data[0] == 0x16) {  // DTLS handshake record
+        uint32_t frag = ((uint32_t)(uint8_t)data[22] << 16)
+                      | ((uint32_t)(uint8_t)data[23] << 8)
+                      |  (uint32_t)(uint8_t)data[24];   // fragment_length (rec+hs hdr 13+9)
+        size_t s = ((size_t)(28 + frag) / 16) * 16;
+        if (s < scramble) scramble = s;
+    }
+    trans_code_partial(pkt.data(), std::min(total, scramble));
 
     ssize_t n = sendto(c->sock, reinterpret_cast<const char*>(pkt.data()),
                        total, 0, (const struct sockaddr*)&c->peer, sizeof(c->peer));
