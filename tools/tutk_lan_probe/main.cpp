@@ -140,6 +140,12 @@ int main(int argc, char** argv)
     bool saw_sps = false, saw_pps = false;
     unsigned first_w = 0, first_h = 0;
 
+    FILE* dump = nullptr;
+    if (const char* dp = getenv("OBN_TUTK_DUMP")) {
+        dump = fopen(dp, "wb");
+        if (dump) printf("[probe] dumping H.264 frames to %s\n", dp);
+    }
+
     std::vector<char> buf(1u << 20);
     while (std::chrono::steady_clock::now() < deadline) {
         int actual = 0, fcount = 0, ioc = 0; unsigned ts = 0;
@@ -153,6 +159,7 @@ int main(int argc, char** argv)
         if (actual <= 0) continue;
         frames++;
         bytes += actual;
+        if (dump) fwrite(buf.data(), 1, (size_t)actual, dump);
         // Scan Annex-B NAL types in this frame.
         const uint8_t* p = (const uint8_t*)buf.data();
         for (int i = 0; i + 4 < actual; ++i) {
@@ -175,6 +182,8 @@ int main(int argc, char** argv)
            saw_pps ? "yes" : "no");
     printf("[probe] %s\n", frames > 0 ? "PULLED H.264 FRAMES" :
            "AV started but NO frames received");
+
+    if (dump) fclose(dump);
 
     avClientStop(av);
     iotc_close(sess);

@@ -387,10 +387,11 @@ static obn::net::socket_t open_udp_socket(uint16_t* bound_port_out)
     // these before bind): SO_REUSEADDR, SO_BROADCAST and 1 MB send/recv buffers.
     const int one = 1;
     const int buf = 1024000;
+    const int rbuf = 8 << 20;   // 8 MB — absorb the printer's video bursts
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF,    &buf, sizeof(buf));
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF,    &buf, sizeof(buf));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF,    &rbuf, sizeof(rbuf));
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -3337,20 +3338,51 @@ struct AvChannel {
     DtlsSession* dtls_sess;     // points into OssSession::dtls (not owned); null = plaintext
     bool         use_dtls;      // true when underlying socket carries DTLS ApplicationData
     uint8_t      session_token[8]; // IOTC session token for DTLS IOTC wrapper
+
+    // TUTK reliable-transport (RUDP) state carried inside DTLS ApplicationData.
+    uint16_t rel_tx_seq;        // outgoing reliable sequence (0x09/0x0a/0x0c control+data frames)
+    uint32_t login_token;       // incrementing 32-bit token echoed by the printer in the LOGIN ACK
+    long     last_ping_ms;      // steady-clock ms of last keepalive ping sent
+    uint16_t printer_win;       // last receive-window advertised by the printer's SACK
+    uint16_t printer_token;     // latest reliable token advertised by the printer
+    uint32_t rx_data_count;     // data fragments received (drives proactive acks)
+
+    // Video frame reassembly: fragments (1024-byte media chunks) accumulate here
+    // until a new frame boundary (fragment index 0) is seen.
+    std::vector<uint8_t> reasm;    // media bytes of the frame currently being assembled
+    int      reasm_frame_id;       // frame id (byte8 of the fragment header) currently accumulating
+    bool     reasm_have;           // reasm holds an in-progress frame
 };
 
 static AvChannel g_av_channels[kMaxAvChannels];
 static bool      g_av_channels_init = false;
 
+static void av_channel_reset(AvChannel& ch)
+{
+    ch.active          = false;
+    ch.sock_fd         = obn::net::kInvalid;
+    memset(&ch.peer, 0, sizeof(ch.peer));
+    ch.channel         = 0;
+    ch.tx_seq          = 0;
+    ch.rx_seq_expected = 0;
+    ch.dtls_sess       = nullptr;
+    ch.use_dtls        = false;
+    memset(ch.session_token, 0, sizeof(ch.session_token));
+    ch.rel_tx_seq      = 0;
+    ch.login_token     = 0;
+    ch.last_ping_ms    = 0;
+    ch.printer_win     = 50;
+    ch.printer_token   = 0;
+    ch.rx_data_count   = 0;
+    ch.reasm.clear();
+    ch.reasm_frame_id  = -1;
+    ch.reasm_have      = false;
+}
+
 static void av_channels_init()
 {
     if (g_av_channels_init) return;
-    memset(g_av_channels, 0, sizeof(g_av_channels));
-    for (auto& ch : g_av_channels) {
-        ch.sock_fd   = obn::net::kInvalid;
-        ch.dtls_sess = nullptr;
-        ch.use_dtls  = false;
-    }
+    for (auto& ch : g_av_channels) av_channel_reset(ch);
     g_av_channels_init = true;
 }
 
@@ -3599,10 +3631,9 @@ extern "C" int avClientStartEx(void* start_in_v, void* start_out_v)
     if (idx < 0) return AV_ER_EXCEED_MAX_CHANNEL;
 
     // Socket is filled later via oss_av_attach(); real TUTK wires it via the sid.
+    av_channel_reset(g_av_channels[idx]);
     g_av_channels[idx].active  = true;
     g_av_channels[idx].channel = in->channel;
-    g_av_channels[idx].tx_seq  = 0;
-    g_av_channels[idx].rx_seq_expected = 0;
     g_av_channels[idx].sock_fd = obn::net::kInvalid; // filled by caller via oss_av_attach()
 
     out->resend   = 0;
@@ -3633,7 +3664,168 @@ void oss_av_attach(int av_index, int sock_fd, const struct sockaddr_in* peer,
         memset(g_av_channels[av_index].session_token, 0, 8);
 }
 
+// ==========================================================================
+// TUTK AV mux protocol — wire format recovered from a decrypted genuine
+// LAN session (H2S printer).  Every frame below travels as the plaintext of
+// one DTLS ApplicationData record.
+//
+// Common 8-byte mux header:
+//   [0]    main type   (0x00 login, 0x0c AV data/IOCtrl, 0x09 ping, 0x0a ack)
+//   [1]    flags       (0x00; 0x20/0x21 mark login request/reply variants)
+//   [2..3] channel     (uint16 LE, 0x000b)
+//   [4..5] rel_seq     (uint16 LE reliable-transport sequence; 0 for login)
+//   [6..7] sub/ack     (uint16 LE; 0 on our data frames)
+//
+// LOGIN frame (570 bytes total):
+//   [0..15]   mux header (type 0x00) + 8 zero bytes
+//   [16..19]  0x22 0x02 <variant> 0x00   (0x22 = login request opcode)
+//   [20..23]  msg_token  (uint32 LE, incrementing; echoed in the LOGIN ACK)
+//   [24..280] account    (NUL-terminated, 257-byte field)
+//   [281..537] passwd    (NUL-terminated, 257-byte field)
+//   [538..569] video-parameter block (fixed constants below)
+//
+// The genuine client sends the login as two variants (flags 0x00/0x20,
+// variant byte 0x01/0x00) with consecutive tokens; the printer replies with a
+// type-0x00 flags-0x21 frame carrying opcode 0x24 and the echoed token.
+// ==========================================================================
+
+static constexpr size_t kAvLoginSize    = 570;
+static constexpr size_t kAvAccountField  = 257;  // account occupies [24..280]
+static constexpr size_t kAvLoginAcctOff   = 24;
+static constexpr size_t kAvLoginPwdOff     = 24 + kAvAccountField;      // 281
+static constexpr size_t kAvLoginParamOff   = 24 + 2 * kAvAccountField;  // 538
+
+// Fixed 32-byte video-parameter tail observed at offset 538 in the genuine
+// login (video profile/resolution request constants).
+static const uint8_t kAvLoginParamTail[32] = {
+    0x01,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0xfb,0x07,0x1f,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x03,0x00,0x00,0x00, 0x00,0x00,0x01,0x00, 0x00,0x00,0x00,0x00
+};
+
+static long av_now_ms()
+{
+    return (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Build one 570-byte LOGIN frame variant into out (must be >= 570 bytes).
+static void av_build_login(uint8_t* out, uint8_t flags, uint8_t variant,
+                           uint32_t token, const char* account,
+                           const char* passwd)
+{
+    memset(out, 0, kAvLoginSize);
+    out[0] = 0x00;                 // main type: login
+    out[1] = flags;                // 0x00 (variant 1) / 0x20 (variant 2)
+    uint16_t chan = htole16(0x000b);
+    memcpy(out + 2, &chan, 2);
+    out[16] = 0x22; out[17] = 0x02; out[18] = variant; out[19] = 0x00;
+    uint32_t tk = htole32(token);
+    memcpy(out + 20, &tk, 4);
+    size_t al = strnlen(account, kAvAccountField - 1);
+    size_t pl = strnlen(passwd,  kAvAccountField - 1);
+    memcpy(out + kAvLoginAcctOff, account, al);
+    memcpy(out + kAvLoginPwdOff,  passwd,  pl);
+    memcpy(out + kAvLoginParamOff, kAvLoginParamTail, sizeof(kAvLoginParamTail));
+}
+
+// True when buf is a printer LOGIN ACK (type 0x00, flags 0x21, opcode 0x24).
+static bool av_is_login_ack(const uint8_t* buf, size_t len)
+{
+    return len >= 20 && buf[0] == 0x00 && buf[1] == 0x21 && buf[16] == 0x24;
+}
+
+// Send a keepalive PING (type 0x09) — mirrors the genuine idle ping
+// (b8=b10=0xffff meaning "no specific ack").  Consumes one reliable sequence.
+static void av_send_ping(AvChannel& ch)
+{
+    uint8_t p[24];
+    memset(p, 0, sizeof(p));
+    p[0] = 0x09; p[1] = 0x00;
+    uint16_t chan = htole16(0x000b); memcpy(p + 2, &chan, 2);
+    uint16_t seq  = htole16(ch.rel_tx_seq++); memcpy(p + 4, &seq, 2);
+    p[8] = 0xff; p[9] = 0xff; p[10] = 0xff; p[11] = 0xff; // ffffffff
+    p[12] = 0x01;                                          // matches genuine ping body
+    av_channel_write(&ch, p, sizeof(p));
+    ch.last_ping_ms = av_now_ms();
+}
+
+// Send a data ACK (type 0x0a) echoing the printer's advertised SACK token.
+// The genuine client replies to each printer SACK (0x0b) with an ACK carrying
+// the same 16-bit token and window, which advances the printer's send window.
+static void av_send_ack(AvChannel& ch, uint16_t token, uint16_t win)
+{
+    uint8_t p[16];
+    memset(p, 0, sizeof(p));
+    p[0] = 0x0a; p[1] = 0x08;
+    uint16_t chan = htole16(0x000b); memcpy(p + 2, &chan, 2);
+    uint16_t seq  = htole16(ch.rel_tx_seq++); memcpy(p + 4, &seq, 2);
+    uint16_t tk   = htole16(token);           memcpy(p + 8, &tk, 2);
+    uint16_t wn   = htole16(win);             memcpy(p + 10, &wn, 2);
+    p[12] = 0x01;
+    av_channel_write(&ch, p, sizeof(p));
+}
+
+// Send a SACK (type 0x0b) mirroring the genuine client's periodic receive
+// report (sub-channel 0x1f, echoing the printer's token).
+static void av_send_sack(AvChannel& ch, uint16_t token, uint16_t count)
+{
+    uint8_t p[20];
+    memset(p, 0, sizeof(p));
+    p[0] = 0x0b; p[1] = 0x00;
+    uint16_t chan = htole16(0x000b); memcpy(p + 2, &chan, 2);
+    p[6] = 0x1f;                              // sub-channel 0x1f on our SACK
+    uint16_t tk = htole16(token);            memcpy(p + 8, &tk, 2);
+    uint16_t ct = htole16(count);            memcpy(p + 10, &ct, 2);
+    av_channel_write(&ch, p, sizeof(p));
+}
+
 int oss_av_login(int av_index, const char* account, const char* passwd,
+                 int timeout_ms)
+{
+    if (av_index < 0 || av_index >= kMaxAvChannels) return AV_ER_INVALID_SID;
+    AvChannel& ch = g_av_channels[av_index];
+    if (!ch.active || ch.sock_fd == obn::net::kInvalid) return AV_ER_INVALID_SID;
+
+    if (!account) account = "admin";
+    if (!passwd)  passwd  = "888888";
+
+    // Seed the login token from the low bits of the steady clock so repeated
+    // sessions don't collide; the exact value is echoed back by the printer.
+    if (ch.login_token == 0)
+        ch.login_token = (uint32_t)(av_now_ms() & 0x00ffffff) | 0x09000000;
+
+    uint8_t v1[kAvLoginSize], v2[kAvLoginSize];
+    av_build_login(v1, 0x00, 0x01, ch.login_token,     account, passwd);
+    av_build_login(v2, 0x20, 0x00, ch.login_token + 1, account, passwd);
+
+    // Send both variants, then wait for the LOGIN ACK; retransmit on timeout.
+    for (int round = 0; round < 4; ++round) {
+        if (av_channel_write(&ch, v1, kAvLoginSize) < 0 ||
+            av_channel_write(&ch, v2, kAvLoginSize) < 0) {
+            OBN_ERROR("[oss-av] LOGIN send failed: %s", strerror(errno));
+            return AV_ER_SESSION_CLOSE_BY_REMOTE;
+        }
+
+        uint8_t rbuf[2048];
+        long deadline = av_now_ms() + (timeout_ms > 0 ? timeout_ms : 3000) / 4;
+        while (av_now_ms() < deadline) {
+            ssize_t n = av_channel_read_plain(&ch, rbuf, sizeof(rbuf), 400);
+            if (n <= 0) continue;
+            if (av_is_login_ack(rbuf, (size_t)n)) {
+                OBN_DEBUG("[oss-av] LOGIN accepted by printer (av_index=%d)", av_index);
+                return 0;
+            }
+            // Ignore other traffic (pings, ioctrl responses) while waiting.
+        }
+        OBN_DEBUG("[oss-av] LOGIN ACK not seen (round %d) — retransmitting", round);
+    }
+
+    OBN_WARN("[oss-av] LOGIN: no ACK from printer after retries");
+    return AV_ER_TIMEOUT;
+}
+
+// Legacy 16-byte-header login (unused; kept for reference / non-DTLS paths).
+int oss_av_login_legacy(int av_index, const char* account, const char* passwd,
                  int timeout_ms)
 {
     if (av_index < 0 || av_index >= kMaxAvChannels) return AV_ER_INVALID_SID;
@@ -3754,6 +3946,18 @@ extern "C" void avClientStop(int av_index)
 //
 // This matches the "TUTK IOCtrl" format documented in the TUTK AV API guide.
 
+// Genuine IOCtrl (type-0x0c) wire format, recovered from the decrypted LAN
+// session.  IPCAM_START (48 bytes, stream 0):
+//   [0..3]   0c 00 0b 00              mux header (AV-data channel)
+//   [4..5]   rel_seq (uint16 LE)
+//   [6..15]  zero
+//   [16..19] 0x00007000 | (stream<<16)   IOCtrl group/flags (0x7000, +stream)
+//   [20..23] 0x00000001
+//   [24..27] inner length = 4 (ioctrl_type) + data_len   (= 12 for IPCAM_START)
+//   [28..31] stream index
+//   [32..35] zero
+//   [36..39] ioctrl_type (uint32 LE, 0x000001ff = IPCAM_START stream 0)
+//   [40..]   ioctrl data (8 zero bytes for IPCAM_START)
 extern "C" int avSendIOCtrl(int av_index, unsigned int type,
                              char* buf, int len)
 {
@@ -3762,29 +3966,37 @@ extern "C" int avSendIOCtrl(int av_index, unsigned int type,
     AvChannel& ch = g_av_channels[av_index];
     if (!ch.active || ch.sock_fd == obn::net::kInvalid) return AV_ER_INVALID_SID;
 
-    uint32_t body_len  = 8 + (uint32_t)len;
-    uint32_t frame_len = (uint32_t)sizeof(AvFrameHeader) + body_len;
+    // IPCAM_START/STOP carry an 8-byte channel struct even when the caller
+    // passes no explicit data.
+    uint32_t data_len = (len > 0) ? (uint32_t)len : 8;
+    uint32_t stream   = ((type & 0xff00) >> 8);          // 0x01ff->1, 0x02ff->2
+    if (stream > 0) stream -= 1;                          // 0-based stream index
 
-    std::vector<uint8_t> pkt(frame_len, 0);
-    auto* hdr = reinterpret_cast<AvFrameHeader*>(pkt.data());
+    std::vector<uint8_t> pkt(36 + data_len, 0);
+    pkt[0] = 0x0c; pkt[1] = 0x00;
+    uint16_t chan = htole16(0x000b); memcpy(&pkt[2], &chan, 2);
+    uint16_t seq  = htole16(ch.rel_tx_seq++); memcpy(&pkt[4], &seq, 2);
 
-    fill_av_header(hdr, kFrameSubtypeCtrl, kFrameDirClientToP,
-                   body_len, ch.tx_seq++);
-
-    uint8_t* body = pkt.data() + sizeof(AvFrameHeader);
-    uint32_t ioctrl_type = htole32(type);
-    uint32_t data_len    = htole32((uint32_t)len);
-    memcpy(body + 0, &ioctrl_type, 4);
-    memcpy(body + 4, &data_len,    4);
+    uint32_t group = htole32(0x00007000u | (stream << 16));
+    uint32_t one   = htole32(1u);
+    uint32_t inner = htole32(4u + data_len);
+    uint32_t sidx  = htole32(stream);
+    uint32_t ioc   = htole32(type);
+    memcpy(&pkt[16], &group, 4);
+    memcpy(&pkt[20], &one,   4);
+    memcpy(&pkt[24], &inner, 4);
+    memcpy(&pkt[28], &sidx,  4);
+    // [32..35] stay zero; ioctrl_type sits at offset 36.
+    memcpy(&pkt[36], &ioc, 4);
     if (len > 0 && buf)
-        memcpy(body + 8, buf, (size_t)len);
+        memcpy(&pkt[40], buf, (size_t)std::min<uint32_t>((uint32_t)len, data_len));
 
-    if (av_channel_write(&ch, pkt.data(), frame_len) < 0) {
+    if (av_channel_write(&ch, pkt.data(), pkt.size()) < 0) {
         OBN_ERROR("[oss-av] avSendIOCtrl type=0x%x send failed: %s", type, strerror(errno));
         return AV_ER_SESSION_CLOSE_BY_REMOTE;
     }
 
-    OBN_DEBUG("[oss-av] avSendIOCtrl type=0x%04x len=%d sent", type, len);
+    OBN_DEBUG("[oss-av] avSendIOCtrl type=0x%04x stream=%u len=%d sent", type, stream, len);
     return 0;
 }
 
@@ -3827,6 +4039,42 @@ extern "C" int avSendIOCtrl(int av_index, unsigned int type,
 //   4. If it is an IOCtrl frame: copies payload to ioctrl_buf
 //   5. Fills output parameters
 
+// Classify a plaintext AV-data frame (type 0x0c) and locate its H.264 media
+// chunk.  Returns true for a video fragment and fills media/frame/frag; false
+// for IOCtrl responses, pings, acks, or malformed input.
+//
+// Video fragment (normal, 36-byte header):
+//   [16]     = 0x05 (media sub-header marker)
+//   [24..25] = media length (uint16 LE), media at offset 36
+// Frame-boundary variant (56-byte header): [16..19] = 0c 00 00 00,
+//   media length at [44..45], media at offset 56.
+// Fragment/frame identity: frame index = buf[8], fragment index = buf[10];
+// a fragment index of 0 marks the first fragment of a new frame.
+static bool av_classify_video(const uint8_t* buf, size_t len,
+                              const uint8_t** media, size_t* media_len,
+                              int* frame_id, int* frag_id)
+{
+    if (len < 38 || buf[0] != 0x0c) return false;
+
+    // Video fragments carry byte[11] == 0x14 as their media-type marker; the
+    // 44-byte IOCtrl responses and other control frames do not.  The media
+    // occupies the remainder of the (record-sized) datagram after the header.
+    if (buf[11] != 0x14) return false;
+
+    // The frame-boundary variant prefixes an extra 20-byte block ([16..19]=12),
+    // pushing the media sub-header to +36 and the payload to +56.  Normal and
+    // partial fragments put the payload at +36.
+    size_t hdr = (buf[16] == 0x0c && buf[17] == 0x00 &&
+                  buf[18] == 0x00 && buf[19] == 0x00) ? 56 : 36;
+    if (len <= hdr) return false;
+
+    *media     = buf + hdr;
+    *media_len = len - hdr;
+    *frame_id  = buf[8];
+    *frag_id   = buf[10];
+    return true;
+}
+
 extern "C" int avRecvFrameData2(int av_index,
                                  char* video_buf,
                                  int buf_size,
@@ -3837,6 +4085,7 @@ extern "C" int avRecvFrameData2(int av_index,
                                  unsigned int* timestamp,
                                  int* ioctrl_count)
 {
+    (void)ioctrl_buf; (void)ioctrl_size;
     if (actual)       *actual       = 0;
     if (frame_count)  *frame_count  = 0;
     if (timestamp)    *timestamp    = 0;
@@ -3845,103 +4094,85 @@ extern "C" int avRecvFrameData2(int av_index,
     if (av_index < 0 || av_index >= kMaxAvChannels) return AV_ER_INVALID_SID;
     AvChannel& ch = g_av_channels[av_index];
     if (!ch.active || ch.sock_fd == obn::net::kInvalid) return AV_ER_INVALID_SID;
-
-    const int kRecvTimeoutMs = 1000;
-    set_recv_timeout(ch.sock_fd, kRecvTimeoutMs);
-
-    static constexpr size_t kRawBufSize = (1u << 20) + 64;  // IOTC hdr + DTLS record + tag
-    static constexpr size_t kPktBufSize = 1u << 20;
-    std::vector<uint8_t> raw_buf(kRawBufSize);
-    std::vector<uint8_t> pkt_buf(kPktBufSize);
-
-    const uint8_t* frame_data = nullptr;
-    size_t         frame_len  = 0;
-
-    static constexpr int kMaxRetries = 32;
-    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-        if (ch.use_dtls && ch.dtls_sess && ch.dtls_sess->ssl) {
-            // OpenSSL DTLS: read one ApplicationData plaintext record.
-            ssize_t pn = dtls_ssl_read(ch.dtls_sess, pkt_buf.data(),
-                                       pkt_buf.size(), kRecvTimeoutMs);
-            if (pn == 0) return AV_ER_TIMEOUT;
-            if (pn < 0)  return AV_ER_SESSION_CLOSE_BY_REMOTE;
-            frame_data = pkt_buf.data();
-            frame_len  = (size_t)pn;
-            if (frame_len >= sizeof(AvFrameHeader) && is_av_frame_header(frame_data))
-                break;
-            frame_data = nullptr;
-            continue;
-        }
-
-        ssize_t n = recv(ch.sock_fd, raw_buf.data(), raw_buf.size(), 0);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
-                return AV_ER_TIMEOUT;
-            return AV_ER_SESSION_CLOSE_BY_REMOTE;
-        }
-
-        if (ch.use_dtls && ch.dtls_sess) {
-            // Decrypt DTLS ApplicationData record
-            int pn = dtls_decrypt_one(ch.dtls_sess,
-                                       raw_buf.data(), (size_t)n,
-                                       pkt_buf.data(), pkt_buf.size());
-            if (pn == 0) continue;  // non-AppData (keepalive etc.) or AEAD failure
-            if (pn < 0) continue;
-            frame_data = pkt_buf.data();
-            frame_len  = (size_t)pn;
-        } else {
-            if ((size_t)n < sizeof(AvFrameHeader)) continue;
-            frame_data = raw_buf.data();
-            frame_len  = (size_t)n;
-        }
-
-        if (frame_len >= sizeof(AvFrameHeader) && is_av_frame_header(frame_data))
-            break;  // got a valid AV frame
-
-        frame_data = nullptr;  // TUTK keepalive or control packet — skip
-    }
-
-    if (!frame_data) return AV_ER_TIMEOUT;
-
-    const auto* hdr = reinterpret_cast<const AvFrameHeader*>(frame_data);
-    uint32_t magic       = le32toh(hdr->magic);
-    uint32_t payload_len = le32toh(hdr->payload_len);
-    uint32_t seq         = le32toh(hdr->sequence);
-    uint8_t  sub_type    = (magic >> 16) & 0xff;
-
-    if (payload_len > (uint32_t)(frame_len - sizeof(AvFrameHeader)))
-        return AV_ER_INCOMPLETE_FRAME;
-
-    const uint8_t* payload = frame_data + sizeof(AvFrameHeader);
-
-    if (sub_type == kFrameSubtypeCtrl) {
-        // IOCtrl body: [0..3] type LE, [4..7] data_len LE, [8..] data
-        if (payload_len >= 8 && ioctrl_buf && ioctrl_size > 0) {
-            uint32_t data_len;
-            memcpy(&data_len, payload + 4, 4);
-            data_len = le32toh(data_len);
-
-            int copy_len = (int)std::min((uint32_t)ioctrl_size, data_len);
-            if (copy_len > 0 && payload_len >= 8 + data_len)
-                memcpy(ioctrl_buf, payload + 8, (size_t)copy_len);
-            if (ioctrl_count) *ioctrl_count = copy_len;
-        }
-        return 0;
-    }
-
     if (!video_buf || buf_size <= 0) return AV_ER_EXCEED_MAX_SIZE;
 
-    int copy_len = (int)std::min((uint32_t)buf_size, payload_len);
-    memcpy(video_buf, payload, (size_t)copy_len);
+    static thread_local std::vector<uint8_t> plain(1u << 20);
 
-    if (actual)      *actual      = copy_len;
-    if (frame_count) *frame_count = (int)payload_len; // expected = total available
-    if (timestamp)   *timestamp   = seq;  // sequence used as timestamp proxy
+    // Deliver one fully reassembled frame per call.  A frame is complete when
+    // the first fragment (frag_id 0) of the *next* frame arrives.
+    const long enter_ms = av_now_ms();
+    for (int guard = 0; guard < 100000; ++guard) {
+        // Keepalive: the printer streams without per-frame acks but drops idle
+        // peers, so emit a ping roughly once a second.
+        if (av_now_ms() - ch.last_ping_ms > 800)
+            av_send_ping(ch);
 
-    if ((uint32_t)buf_size < payload_len)
-        return AV_ER_INCOMPLETE_FRAME;  // buffer too small for full frame
+        ssize_t n = av_channel_read_plain(&ch, plain.data(), plain.size(), 1000);
+        if (n == 0) {
+            if (av_now_ms() - enter_ms > 2000) return AV_ER_TIMEOUT;
+            continue;
+        }
+        if (n < 0) return AV_ER_TIMEOUT;
 
-    return copy_len;
+        const uint8_t* media = nullptr; size_t mlen = 0; int fid = 0, frag = 0;
+        bool is_vid = av_classify_video(plain.data(), (size_t)n, &media, &mlen, &fid, &frag);
+        if (getenv("OBN_TUTK_TRACE")) {
+            const uint8_t* c = plain.data();
+            uint16_t rs = (n>=6)?(uint16_t)(c[4]|(c[5]<<8)):0;
+            fprintf(stderr, "[tutk-av] n=%zd type=%02x rs=%u video=%d fid=%d frag=%d mlen=%zu acc=%zu\n",
+                    n, c[0], rs, is_vid?1:0, fid, frag, mlen, ch.reasm.size());
+        }
+        if (!is_vid) {
+            // Reliable-transport control from the printer: reply so the printer
+            // advances its send window (otherwise it throttles to ~1 frame/2s).
+            const uint8_t* c = plain.data();
+            if (n >= 12 && (c[0] == 0x0a || c[0] == 0x0b)) {
+                uint16_t token = (uint16_t)(c[8] | (c[9] << 8));
+                uint16_t win   = (uint16_t)(c[10] | (c[11] << 8));
+                if (token != 0xffff) ch.printer_token = token;
+                if (win && win != 0xffff) ch.printer_win = win;
+                if (c[0] == 0x0b) {                  // SACK: ack + mirror
+                    av_send_ack(ch, ch.printer_token, ch.printer_win);
+                    av_send_sack(ch, ch.printer_token, ch.printer_win);
+                }
+            } else if (n >= 12 && c[0] == 0x09) {    // printer ping: reply
+                av_send_ping(ch);
+            }
+            continue;  // not video
+        }
+
+        // Proactively acknowledge the video stream: the printer sends up to
+        // `printer_win` fragments then waits for an ack before continuing.
+        // Echo the printer's most-recently advertised token so it keeps its
+        // send window open (it advertises this in its frequent 0x0a frames).
+        if (++ch.rx_data_count % 8 == 0)
+            av_send_ack(ch, ch.printer_token, ch.printer_win);
+
+        (void)fid; (void)frag;
+
+        // Deliver complete H.264 access units.  The transport frame index does
+        // NOT map to video frames — one IDR spans many transport fragments —
+        // so split on Annex-B start codes: a fragment whose media begins with
+        // 00 00 00 01 starts a new NAL/access unit.  Fragments never begin
+        // mid-slice with a start code (emulation prevention), so the buffer
+        // accumulates one full access unit between boundaries with no loss.
+        bool au_start = (mlen >= 4 && media[0] == 0 && media[1] == 0 &&
+                         media[2] == 0 && media[3] == 1);
+
+        if (au_start && !ch.reasm.empty()) {
+            int full     = (int)ch.reasm.size();
+            int copy_len = (int)std::min<size_t>((size_t)buf_size, ch.reasm.size());
+            memcpy(video_buf, ch.reasm.data(), (size_t)copy_len);
+            ch.reasm.assign(media, media + mlen);   // start next access unit
+            if (actual)      *actual      = copy_len;
+            if (frame_count) *frame_count = full;
+            if (timestamp)   *timestamp   = (unsigned)ch.reasm_frame_id++;
+            return ((uint32_t)buf_size < (uint32_t)full)
+                       ? AV_ER_INCOMPLETE_FRAME : copy_len;
+        }
+        ch.reasm.insert(ch.reasm.end(), media, media + mlen);
+    }
+    return AV_ER_TIMEOUT;
 }
 
 // oss_av_attach → oss_av_login → IPCAM_START in one call.
@@ -3974,6 +4205,12 @@ int oss_av_start(OssSession* sess, int channel,
         avClientStop(idx);
         return rc;
     }
+
+    // Establish the reliable channel with two idle pings (rel_seq 0,1) so the
+    // IPCAM_START lands at rel_seq 2 — the same ordering the genuine client
+    // uses right after the LOGIN ACK.
+    av_send_ping(g_av_channels[idx]);
+    av_send_ping(g_av_channels[idx]);
 
     rc = avSendIOCtrl(idx, IOTYPE_USER_IPCAM_START, nullptr, 0);
     if (rc < 0) {

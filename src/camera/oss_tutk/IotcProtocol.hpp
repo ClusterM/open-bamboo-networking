@@ -352,8 +352,10 @@ static constexpr uint8_t  kFrameSubtypeCtrl    = 0x02;
 static constexpr uint8_t  kFrameDirClientToP   = 0x01;
 static constexpr uint8_t  kFrameDirPrinterToC  = 0x00;
 
-static constexpr uint32_t IOTYPE_USER_IPCAM_START = 0xFF01;
-static constexpr uint32_t IOTYPE_USER_IPCAM_STOP  = 0xFF02;
+// IOCtrl types as they appear on the wire (uint32 LE bytes ff 01 / ff 02),
+// recovered from a decrypted genuine LAN session.
+static constexpr uint32_t IOTYPE_USER_IPCAM_START = 0x01FF;
+static constexpr uint32_t IOTYPE_USER_IPCAM_STOP  = 0x02FF;
 
 // --------------------------------------------------------------------------
 // TUTK message types (from IOTC_Handler_MSG_* function names)
