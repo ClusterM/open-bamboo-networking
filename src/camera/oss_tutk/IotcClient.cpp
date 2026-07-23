@@ -622,22 +622,12 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
     if (dtls_len > 0)
         memcpy(pkt.data() + 28, dtls_data, dtls_len);
 
-    // Genuine scrambles each DTLS packet by a PER-PACKET length, not a fixed 80:
-    //   scramble = min(80, floor((28 + dtls_handshake_fragment_length) / 16) * 16)
-    // For the ClientHello (fragment_length 232) this is 80; for the
-    // ClientKeyExchange (fragment_length 48) it is 64, which leaves the PSK
-    // identity tail ("dmin" of AUTHPWD_admin) at offset 64+ in plaintext. A fixed
-    // 80 corrupts that tail and the printer replies with a fatal
-    // unknown_psk_identity alert (desc 115). Verified byte-for-byte vs genuine.
-    size_t scramble = 80;
-    if (dtls_len >= 25 && dtls_data[0] == 0x16) {  // DTLS handshake record
-        uint32_t frag = ((uint32_t)dtls_data[22] << 16)
-                      | ((uint32_t)dtls_data[23] << 8)
-                      |  (uint32_t)dtls_data[24];        // fragment_length (rec+hs hdr = 13+9)
-        size_t s = ((size_t)(28 + frag) / 16) * 16;
-        if (s < scramble) scramble = s;
-    }
-    trans_code_partial(pkt.data(), std::min(total, scramble));
+    // Genuine SDK scrambles exactly the first 64 bytes of every DTLS datagram,
+    // regardless of DTLS record type (0x16 handshake / 0x14 CCS / 0x17 app-data)
+    // or epoch; the AEAD ciphertext body past byte 64 rides plaintext. Confirmed
+    // by gdb on libBambuSource TransCodePartial (rcx=64 for every DTLS send;
+    // whole-datagram scramble is used only for LAN_SEARCH control frames).
+    trans_code_partial(pkt.data(), std::min(total, (size_t)64));
 
     ssize_t n = sendto(sock, pkt.data(), total, 0,
                        (const struct sockaddr*)dst, sizeof(*dst));
@@ -661,7 +651,9 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
                           (struct sockaddr*)&src, &src_len);
     if (n < 28) return -1;
 
-    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+    // Genuine descrambles exactly the first 64 bytes of every DTLS datagram
+    // (all record types / epochs); the AEAD body past byte 64 stays plaintext.
+    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)64));
 
     if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
 
@@ -876,20 +868,11 @@ static int iotc_bio_write(BIO* b, const char* data, int len)
     memcpy(pkt.data() + 20, c->token, 8);
     memcpy(pkt.data() + 28, data, (size_t)len);
 
-    // Genuine scrambles each DTLS packet by a PER-PACKET length:
-    //   min(80, floor((28 + dtls_handshake_fragment_length) / 16) * 16)
-    // ClientHello (fragment_length 232) -> 80; ClientKeyExchange (48) -> 64, which
-    // keeps the PSK identity tail ("dmin" of AUTHPWD_admin) at offset 64+ plaintext.
-    // A fixed 80 corrupts it -> the printer returns unknown_psk_identity (desc 115).
-    size_t scramble = 80;
-    if (len >= 25 && (uint8_t)data[0] == 0x16) {  // DTLS handshake record
-        uint32_t frag = ((uint32_t)(uint8_t)data[22] << 16)
-                      | ((uint32_t)(uint8_t)data[23] << 8)
-                      |  (uint32_t)(uint8_t)data[24];   // fragment_length (rec+hs hdr 13+9)
-        size_t s = ((size_t)(28 + frag) / 16) * 16;
-        if (s < scramble) scramble = s;
-    }
-    trans_code_partial(pkt.data(), std::min(total, scramble));
+    // Genuine SDK scrambles exactly the first 64 bytes of every DTLS datagram,
+    // regardless of DTLS record type (0x16 handshake / 0x14 CCS / 0x17 app-data)
+    // or epoch; the AEAD ciphertext body past byte 64 rides plaintext. Confirmed
+    // by gdb on libBambuSource TransCodePartial (rcx=64 for every DTLS send).
+    trans_code_partial(pkt.data(), std::min(total, (size_t)64));
 
     ssize_t n = sendto(c->sock, reinterpret_cast<const char*>(pkt.data()),
                        total, 0, (const struct sockaddr*)&c->peer, sizeof(c->peer));
@@ -919,7 +902,9 @@ static int iotc_bio_read(BIO* b, char* out, int outlen)
     }
     if (n < 28) { BIO_set_retry_read(b); return -1; }
 
-    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+    // Genuine descrambles exactly the first 64 bytes of every DTLS datagram
+    // (all record types / epochs); the AEAD body past byte 64 stays plaintext.
+    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)64));
 
     // Only forward genuine DTLS datagrams to OpenSSL; skip IOTC control echoes
     // (LAN_SEARCH_R, ctrl 0x33) that share the transport but carry no record.
