@@ -33,6 +33,7 @@
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
 #include "obn/http_client.hpp"
+#include "obn/identity_headers.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_job.hpp"
@@ -221,42 +222,21 @@ std::string to_bool(bool v) { return v ? "true" : "false"; }
 // HTTP plumbing
 // ---------------------------------------------------------------
 
-// Compile-time OS identity for X-BBL-OS-Type. The MakerWorld POST /my/task
-// endpoint validates this against the OS the content was uploaded from and
-// rejects a mismatch with HTTP 403, so it must reflect the real platform
-// (an earlier hard-coded "linux" broke Windows/macOS cloud prints).
-constexpr const char* kOsType =
-#if defined(_WIN32)
-    "windows";
-#elif defined(__APPLE__)
-    "macos";
-#else
-    "linux";
-#endif
-
-// Shared X-BBL headers captured from the stock plugin. Cloudflare
-// in front of api.bambulab.com is lenient about missing X-BBL
-// fields, but POST /my/task enforces two by VALUE: X-BBL-Client-Name
-// (must be "BambuStudio" to access the uploaded content) and
-// X-BBL-OS-Type (must match the uploader's OS). See config::client_name.
+// Full stock X-BBL identity block for the print-pipeline endpoints. Delegates
+// to the shared helper so the header set, values, casing and wire order match
+// the closed-source plugin exactly (Cloudflare fingerprints the request). POST
+// /my/task enforces two by VALUE: X-BBL-Client-Name (must be "BambuStudio" to
+// reach the uploaded content) and X-BBL-OS-Type (must match the uploader's OS).
+// identity_headers() defaults the name to "BambuStudio" (overridable via
+// config::client_name / BBL_CLIENT_NAME) and detects the OS type, so both hold.
+// POST /my/task and POST /project require X-BBL-Client-ID; GET stages erase
+// Content-Type at the call site.
 std::map<std::string, std::string> bbl_headers(const std::string& access_token,
                                                const std::string& user_id)
 {
-    const auto& cfg_client_name = obn::config::current().client_name;
-    std::map<std::string, std::string> h;
-    h["Authorization"]        = "Bearer " + access_token;
-    h["Content-Type"]         = "application/json";
-    h["Accept"]               = "application/json";
-    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
-                                                        : cfg_client_name;
-    h["X-BBL-Client-Type"]    = "slicer";
-    h["X-BBL-OS-Type"]        = kOsType;
-    h["X-BBL-Agent-OS-Type"]  = kOsType;
-    h["X-BBL-Language"]       = "en-US";
-    h["X-BBL-Executable-info"]= "{}";
-    if (!user_id.empty())
-        h["X-BBL-Client-ID"] = "slicer:" + user_id + ":obn0";
-    return h;
+    return obn::bbl::identity_headers(access_token, user_id,
+                                      /*include_client_id*/true,
+                                      /*with_content_type*/true);
 }
 
 bool status_ok(long code) { return code >= 200 && code < 300; }
@@ -524,6 +504,18 @@ int get_upload_url(const std::string& api, const std::string& token,
     return 0;
 }
 
+// Studio fetches the user's cloud print settings mid-pipeline (after the
+// first project PATCH, before the second presigned URL). The response tunes
+// client-side print prefs; we fetch it for wire parity and ignore the body 
+// -- a failur is non-fatal to the print.
+void fetch_my_setting(const std::string& api, const std::string& token,
+                      const std::string& user_id)
+{
+    auto hdrs = bbl_headers(token, user_id);   // CID + Content-Type retained
+    auto resp = obn::http::get_json(api + "/v1/user-service/my/setting", hdrs);
+    OBN_DEBUG("cloud_print: GET /my/setting http=%ld", resp.status_code);
+}
+
 // The body of POST /my/task is the single biggest surface we have to
 // mimic from Studio. The MITM baseline is ~30 fields; most of them
 // map 1:1 to PrintParams. Anything we can't sensibly provide (custom
@@ -789,6 +781,11 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: compute real md5
 
     std::string project_url; // ftp://… or S3 https — registered via PATCH
+
+    // Stock plugin fetches user print settings here, before the upload
+    // branch. Wire-parity only; response is unused and a failure is
+    // non-fatal.
+    fetch_my_setting(api, token, uid);
 
     if (use_lan_channel) {
         // ---------------------------------------------------------

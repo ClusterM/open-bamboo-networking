@@ -121,11 +121,22 @@ Response perform(const Request& req)
         return resp;
     }
 
+    // Stock bambu_network_agent wire order for the identity headers.
+    // Anything else (Studio extras, non-cloud requests) follows in
+    // map order. Names match Agent::cloud_api_http_headers().
+    static const char* const kBblHeaderOrder[] = {
+        "User-Agent",         "X-BBL-Client-ID",    "X-BBL-Client-Name",
+        "X-BBL-Client-Type",  "X-BBL-Client-Version", "X-BBL-Device-ID",
+        "X-BBL-Language",     "X-BBL-OS-Type",      "X-BBL-OS-Version",
+        "X-BBL-Agent-Version","X-BBL-Executable-info", "X-BBL-Agent-OS-Type",
+        "X-BBL-Executable-Env", "accept",           "Authorization",
+        "Content-Type",
+    };
     curl_slist* hdrs = nullptr;
     bool        have_ua = false;
     bool        have_accept = false;
     bool        have_ct = false;
-    for (const auto& [k, v] : req.headers) {
+    auto append = [&](const std::string& k, const std::string& v) {
         // libcurl idiom: "Header:" (no value, no space) removes an
         // internally-added header such as Content-Type or Expect.
         // "Header: value" sends the header normally.
@@ -136,6 +147,17 @@ Response perform(const Request& req)
         if (lk == "user-agent")   have_ua = true;
         if (lk == "accept")       have_accept = true;
         if (lk == "content-type") have_ct = true;
+    };
+    auto is_ordered = [&](const std::string& k) {
+        for (const char* name : kBblHeaderOrder) if (k == name) return true;
+        return false;
+    };
+    for (const char* name : kBblHeaderOrder) {
+        auto it = req.headers.find(name);
+        if (it != req.headers.end()) append(it->first, it->second);
+    }
+    for (const auto& [k, v] : req.headers) {
+        if (!is_ordered(k)) append(k, v);
     }
     if (!have_ua) {
         std::string kv = "User-Agent: " + default_user_agent();

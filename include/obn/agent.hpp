@@ -405,7 +405,11 @@ public:
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
-    std::map<std::string, std::string> cloud_api_http_headers() const;
+    // Genuine cloud-API request headers (identity block, ordered by
+    // http::perform). include_client_id / with_content_type select the
+    // per-call variation the stock agent uses (see agent.cpp).
+    std::map<std::string, std::string> cloud_api_http_headers(
+        bool include_client_id = true, bool with_content_type = true) const;
 
     // ------------------------------------------------------------------
     // User preset cache (bambu_network_get_setting_list2 -> get_user_presets).
