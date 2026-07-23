@@ -973,10 +973,22 @@ static unsigned int iotc_psk_client_cb(SSL* ssl, const char* /*hint*/,
     if (id.size() + 1 > max_identity_len) return 0;
     memcpy(identity, id.c_str(), id.size() + 1);
 
+    // PSK = SHA256(passwd), but the genuine TUTK SDK copies the digest into a
+    // 32-byte PSK buffer with C-string semantics: it stops at the first 0x00
+    // byte of the hash and leaves the remainder zero, while still reporting a
+    // 32-byte PSK length. The printer derives its key material the same way, so
+    // the two ECDHE-PSK premasters only agree if OBN truncates identically.
+    // Verified by live gdb of libBambuSource's kdf_tls1_prf_derive: for
+    // passwd "b9096f", SHA256 = ec1700 9e29...; the PSK actually fed to the PRF
+    // is ec17 followed by 30 zero bytes, and reproduces the genuine master_secret
+    // exactly under the standard EMS ECDHE-PSK schedule.
     uint8_t h[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const uint8_t*>(c->passwd.data()), c->passwd.size(), h);
     if (max_psk_len < sizeof(h)) return 0;
-    memcpy(psk, h, sizeof(h));
+    size_t used = 0;
+    while (used < sizeof(h) && h[used] != 0x00) ++used;   // strlen over the digest
+    memset(psk, 0, sizeof(h));
+    memcpy(psk, h, used);
     return (unsigned int)sizeof(h);
 }
 
