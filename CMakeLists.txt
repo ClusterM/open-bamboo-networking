@@ -270,6 +270,12 @@ add_library(bambu_networking SHARED
     src/abi_http.cpp
     src/abi_filament.cpp
     src/abi_camera.cpp
+    src/camera.cpp
+    src/camera/oss_agora/OssAgoraEngine.cpp
+    src/camera/oss_agora/OssAgoraBambuSource.cpp
+    src/camera/AgoraUrl.cpp
+    src/camera/JpegCameraSource.cpp
+    src/camera/CameraSourceFactory.cpp
     src/abi_makerworld.cpp
     src/abi_track.cpp
     src/abi_ft.cpp
@@ -305,7 +311,13 @@ add_library(bambu_networking SHARED
     src/tls_dial.cpp
 )
 
-target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
+target_sources(bambu_networking PRIVATE
+    src/camera/oss_agora/OssAgoraSignaling.cpp
+    src/camera/oss_tutk/IotcClient.cpp
+    src/camera/OssTutkCameraSource.cpp
+)
+
+target_include_directories(bambu_networking PRIVATE include src ${OBN_GENERATED_DIR})
 set(_obn_git_compile_defs "")
 if(OBN_GIT_COMMIT)
     list(APPEND _obn_git_compile_defs OBN_GIT_COMMIT="${OBN_GIT_COMMIT}")
@@ -706,6 +718,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
+        src/camera.cpp
+        src/camera/AgoraUrl.cpp
+        src/camera/CameraSourceFactory.cpp
+        src/camera/JpegCameraSource.cpp
+        src/camera/oss_agora/OssAgoraBambuSource.cpp
+        src/camera/oss_agora/OssAgoraEngine.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -727,6 +745,11 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/tls_dial.cpp
         src/tunnel_local.cpp
         src/tunnel_upload.cpp)
+    target_sources(lan_live_test PRIVATE
+        src/camera/OssTutkCameraSource.cpp
+        src/camera/oss_agora/OssAgoraSignaling.cpp
+        src/camera/oss_tutk/IotcClient.cpp
+    )
     target_include_directories(lan_live_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
@@ -763,6 +786,15 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_executable(cloud_print_test tests/cloud_print_test.cpp
         src/agent.cpp
         src/auth.cpp
+        src/camera.cpp
+        src/camera/AgoraUrl.cpp
+        src/camera/CameraSourceFactory.cpp
+        src/camera/JpegCameraSource.cpp
+        src/camera/oss_agora/OssAgoraBambuSource.cpp
+        src/camera/oss_agora/OssAgoraEngine.cpp
+        src/camera/OssTutkCameraSource.cpp
+        src/camera/oss_agora/OssAgoraSignaling.cpp
+        src/camera/oss_tutk/IotcClient.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -812,4 +844,29 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(oss_sign_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME oss_sign COMMAND oss_sign_test)
 
+    # Hermetic test for OssTutkCameraSource::parse_url_() — the genuine tutk
+    # scheme (authkey=/passwd=) and exact-key matching (no key= substring bug).
+    add_executable(tutk_url_test tests/tutk_url_test.cpp
+        src/camera/OssTutkCameraSource.cpp
+        src/camera/oss_agora/OssAgoraSignaling.cpp
+        src/camera/oss_agora/OssAgoraEngine.cpp
+        src/camera/oss_tutk/IotcClient.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(tutk_url_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(tutk_url_test PRIVATE OBN_TESTING)
+    target_link_libraries(tutk_url_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME tutk_url COMMAND tutk_url_test)
+
+endif()
+
+# --------------------------------------------------------------------------
+# tools
+# --------------------------------------------------------------------------
+
+# h2s_capture_video is a POSIX-only standalone diagnostic tool (uses
+# <sys/wait.h>, <unistd.h>, fork/exec, etc.) and is not part of the
+# orca_slicer / Windows plugin build. Exclude it on Windows.
+if(NOT WIN32)
+    add_subdirectory(tools/h2s_capture_video)
 endif()

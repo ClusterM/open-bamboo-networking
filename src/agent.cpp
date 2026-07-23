@@ -1,4 +1,5 @@
 #include "obn/agent.hpp"
+#include "obn/identity_headers.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -10,12 +11,14 @@
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
+#include "obn/camera.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
+#include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
@@ -276,9 +279,11 @@ int Agent::disconnect_printer()
         }
     }
 
+    std::string dev_id_snap;
     std::unique_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (lan_session_) dev_id_snap = lan_session_->dev_id();
         session = std::move(lan_session_);
     }
     if (session) {
@@ -288,7 +293,45 @@ int Agent::disconnect_printer()
         std::lock_guard<std::mutex> lk(mu_);
         app_cert_install_sent_.erase(session->dev_id());
     }
+    if (!dev_id_snap.empty()) stop_camera(dev_id_snap);
     return BAMBU_NETWORK_SUCCESS;
+}
+
+void Agent::maybe_setup_camera(const std::string& dev_id)
+{
+    // Already started — idempotent.
+    if (!obn::camera::get_url(dev_id).empty()) return;
+
+    std::string ip, access_code, model;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto ip_it = lan_ip_by_dev_.find(dev_id);
+        if (ip_it == lan_ip_by_dev_.end()) return; // not a LAN printer we know
+        ip = ip_it->second;
+        auto ac_it = lan_access_code_by_dev_.find(dev_id);
+        if (ac_it != lan_access_code_by_dev_.end()) access_code = ac_it->second;
+        auto m_it = dev_model_by_id_.find(dev_id);
+        if (m_it != dev_model_by_id_.end()) model = m_it->second;
+    }
+
+    obn::camera::CameraSpec spec;
+    spec.dev_id      = dev_id;
+    spec.model       = model;
+    spec.lan_ip      = ip;
+    spec.access_code = access_code;
+    // A cloud camera ticket turns this into a real remote stream (TUTK);
+    // without one the factory falls back to the JPEG/LAN sources.
+    spec.camera_url  = camera_ticket_url_for(dev_id);
+    std::string url = obn::camera::start_camera(spec);
+    if (url.empty())
+        OBN_DEBUG("camera: no source for %s (model='%s')", dev_id.c_str(), model.c_str());
+    else
+        OBN_INFO("camera: %s → %s", dev_id.c_str(), url.c_str());
+}
+
+void Agent::stop_camera(const std::string& dev_id)
+{
+    obn::camera::stop_camera(dev_id);
 }
 
 bool Agent::ensure_lan_session(const std::string& dev_id,
@@ -1117,6 +1160,66 @@ void Agent::note_device_access_code(const std::string& dev_id,
     // The access code is the second half of the LAN credential pair; if the IP
     // (from SSDP) is already known for the selected printer, bring LAN up now.
     autostart_lan_if_selected(dev_id);
+}
+
+std::string Agent::camera_ticket_url_for(const std::string& dev_id)
+{
+    if (dev_id.empty()) return {};
+    auto s = user_session_snapshot();
+    if (s.access_token.empty()) return {};
+
+    const std::string url = obn::cloud::api_host(cloud_region())
+                          + "/v1/iot-service/api/user/ttcode";
+    const std::string body = "{\"dev_id\":\"" + dev_id + "\"}";
+    // The ttcode endpoint authorizes the printer's camera session and requires
+    // the same app-certification headers as create_task: an id naming the app
+    // cert (issuer:serial) and a raw PKCS#1 v1.5 signature over the current
+    // timestamp (replay-protected). Without them the cloud returns 403.
+    auto hdrs = cloud_api_http_headers(false, true);
+    const std::string cert_id  = obn::signing::app_certification_id();
+    const std::string sec_sign = obn::signing::device_security_sign();
+    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
+    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
+    auto resp = obn::http::post_json(url, body, hdrs);
+    if (!resp.error.empty()) {
+        OBN_INFO("camera_ticket: dev=%s transport: %s", dev_id.c_str(),
+                 resp.error.c_str());
+        return {};
+    }
+    if (resp.status_code != 200) {
+        // 403 is the normal answer for printers the cloud does not hand a
+        // camera ticket for; log it once at info and fall back to the LAN URL.
+        OBN_INFO("camera_ticket: dev=%s HTTP %ld", dev_id.c_str(),
+                 resp.status_code);
+        return {};
+    }
+
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root) return {};
+    // Genuine tutk URL scheme carries authkey and passwd as separate values.
+    // The cloud ttcode reply supplies uid (ttcode), authkey, passwd, region.
+    const std::string uid     = root->find("ttcode").as_string();
+    const std::string authkey = root->find("authkey").as_string();
+    const std::string passwd  = root->find("passwd").as_string();
+    const std::string region  = root->find("region").as_string();
+    if (uid.empty() || passwd.empty()) {
+        OBN_INFO("camera_ticket: dev=%s reply carried no ttcode/passwd",
+                 dev_id.c_str());
+        return {};
+    }
+
+    // Emit the genuine scheme: uid + authkey + passwd (+ region + device).
+    // OssTutkCameraSource::parse_url_() reads these exact keys.
+    std::string u = "bambu:///tutk?uid=" + uid;
+    if (!authkey.empty()) u += "&authkey=" + authkey;
+    u += "&passwd=" + passwd;
+    if (!region.empty()) u += "&region=" + region;
+    u += "&device=" + dev_id;
+    OBN_INFO("camera_ticket: dev=%s minted tutk URL (region=%s authkey=%s)",
+             dev_id.c_str(), region.empty() ? "?" : region.c_str(),
+             authkey.empty() ? "no" : "yes");
+    return u;
 }
 
 std::string Agent::camera_url_for(const std::string& dev_id)
@@ -1953,7 +2056,8 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     if (!root) return;
     std::string ip = trim_ip_string(root->find("dev_ip").as_string());
     if (ip.empty()) return;
-    const std::string dev_id = root->find("dev_id").as_string();
+    const std::string dev_id   = root->find("dev_id").as_string();
+    const std::string dev_type = root->find("dev_type").as_string();
     if (!dev_id.empty()) {
         obn::lan_tls::registry_put_ip_serial(ip, dev_id);
         // SSDP is the only place a cloud-only session learns the printer's
@@ -1967,6 +2071,8 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
         std::lock_guard<std::mutex> lk(mu_);
         ssdp_json_by_ip_[ip] = json;
         if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
+        if (!dev_id.empty() && !dev_type.empty())
+            dev_model_by_id_[dev_id] = dev_type;
     }
     // SSDP just supplied (or refreshed) the LAN IP; if the access code for the
     // selected printer is already known, this completes the credential pair and
@@ -2070,18 +2176,33 @@ std::string Agent::device_display_name_for_ip(const std::string& dev_ip) const
     return root->find("dev_name").as_string();
 }
 
-std::map<std::string, std::string> Agent::cloud_api_http_headers() const
+std::map<std::string, std::string>
+Agent::cloud_api_http_headers(bool include_client_id, bool with_content_type) const
 {
-    std::map<std::string, std::string> h;
     obn::auth::Session                 s;
+    std::map<std::string, std::string> extra;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        s = auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
-        for (const auto& kv : extra_http_headers_) h[kv.first] = kv.second;
+        s     = auth_store_ ? auth_store_->snapshot() : obn::auth::Session{};
+        extra = extra_http_headers_;
     }
-    if (!s.access_token.empty()) h["Authorization"] = "Bearer " + s.access_token;
-    h["Accept"]        = "application/json";
-    h["Content-Type"]  = "application/json";
+    // Shared identity-header builder (http::perform emits them in stock order);
+    // then overlay Studio's set_extra_http_header values -- extras add new
+    // headers, the identity block wins on conflicts (matches the stock plugin).
+    // Exception: with OBN_ALLOW_VERSION_OVERRIDES set, the host slicer's own
+    // version headers win instead, so its real versions are presented.
+    auto h = obn::bbl::identity_headers(s.access_token, s.user_id,
+                                        include_client_id, with_content_type);
+    const bool allow_ver = obn::versions::allow_overrides();
+    auto is_version_header = [](std::string k) {
+        for (char& c : k) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return k == "x-bbl-client-version" || k == "x-bbl-agent-version" ||
+               k == "user-agent";
+    };
+    for (const auto& kv : extra) {
+        if (!h.count(kv.first)) { h[kv.first] = kv.second; continue; }
+        if (allow_ver && is_version_header(kv.first)) h[kv.first] = kv.second;
+    }
     return h;
 }
 
