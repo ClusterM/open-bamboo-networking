@@ -6,6 +6,7 @@ add_executable(tutk_lan_probe
 )
 target_include_directories(tutk_lan_probe PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
     ${OBN_GENERATED_DIR}
 )
 target_link_libraries(tutk_lan_probe PRIVATE OpenSSL::SSL OpenSSL::Crypto pthread)

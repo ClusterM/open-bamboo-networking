@@ -22,27 +22,7 @@
 #include <thread>
 #include <vector>
 
-namespace bambu_net {
-namespace oss_tutk {
-
-enum class TutkRegion : int { Global = 0, CN = 1, EU = 2, US = 3, Asia = 4 };
-
-struct OssSession;  // opaque
-
-OssSession* iotc_connect(const std::string& uid, uint64_t authkey,
-                         const std::string& password, TutkRegion region);
-void iotc_close(OssSession* sess);
-int  oss_av_start(OssSession* sess, int channel,
-                  const char* account, const char* password);
-
-} // namespace oss_tutk
-} // namespace bambu_net
-
-extern "C" int avRecvFrameData2(int av_index, char* video_buf, int buf_size,
-                                int* actual, int* frame_count, char* ioctrl_buf,
-                                int ioctrl_size, unsigned int* timestamp,
-                                int* ioctrl_count);
-extern "C" void avClientStop(int av_index);
+#include "camera/oss_tutk/IotcClient.hpp"  // iotc_connect / oss_av_start / avRecvFrameData2
 
 using namespace bambu_net::oss_tutk;
 

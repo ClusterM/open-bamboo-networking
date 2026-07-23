@@ -1,11 +1,35 @@
 #include "OssTutkCameraSource.hpp"
+#include "oss_tutk/IotcClient.hpp"   // iotc_connect / oss_av_start / avRecvFrameData2
 #include "obn/log.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <thread>
+#include <vector>
 
 namespace obn {
 namespace camera {
+
+// First up-to-8 bytes of the authkey string, little-endian null-padded
+// (matches IotcConnectCfg { authkey_lo, authkey_hi }).
+static uint64_t authkey_to_u64(const std::string& s)
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < s.size() && i < 8; ++i)
+        v |= static_cast<uint64_t>(static_cast<uint8_t>(s[i])) << (8 * i);
+    return v;
+}
+
+// Map the raw URL region string to the transport's TutkRegion (default US),
+// matching tutk_lan_probe's mapping exactly.
+static bambu_net::oss_tutk::TutkRegion region_from_string(const std::string& r)
+{
+    using bambu_net::oss_tutk::TutkRegion;
+    if (r == "cn")   return TutkRegion::CN;
+    if (r == "eu")   return TutkRegion::EU;
+    if (r == "asia") return TutkRegion::Asia;
+    return TutkRegion::US;
+}
 
 // Query-string parameter extractor for bambu:///tutk?... URLs.
 //
@@ -58,11 +82,11 @@ bool OssTutkCameraSource::parse_url_()
     // authkey=, so this only fires for the genuine legacy form.
     if (passwd_.empty()) passwd_ = tutk_url_param(query, "key");
 
-    std::string region_str = tutk_url_param(query, "region");
-    if (region_str == "cn")      area_code_ = 1;
-    else if (region_str == "eu") area_code_ = 4;
-    else if (region_str == "us") area_code_ = 2;
-    else                         area_code_ = 0xFFFFFFFF;
+    region_str_ = tutk_url_param(query, "region");
+    if (region_str_ == "cn")      area_code_ = 1;
+    else if (region_str_ == "eu") area_code_ = 4;
+    else if (region_str_ == "us") area_code_ = 2;
+    else                          area_code_ = 0xFFFFFFFF;
 
     if (tutk_uid_.empty() || passwd_.empty()) return false;
 
@@ -95,43 +119,88 @@ bool OssTutkCameraSource::open()
         return false;
     }
 
-    OBN_INFO("camera: TUTK open uid=%.20s channel=%.20s",
-             tutk_uid_.c_str(), channel_.c_str());
+    OBN_INFO("camera: TUTK open uid=%.20s region=%s",
+             tutk_uid_.c_str(), region_str_.c_str());
 
-    using namespace bambu_net::camera::oss_agora;
-    AgoraJoinParams p;
-    p.tutk_uid    = tutk_uid_;
-    p.channel     = channel_;
-    p.dtls_passwd = passwd_;
-    p.av_passwd   = passwd_;
-    p.authkey     = authkey_;   // IOTC connect auth key (LAN/P2P precheck)
-    p.area_code   = area_code_;
-    // app_id, token, uid are unused in the direct TUTK relay path
-
-    int rc = signaling_.join(p, [this](const uint8_t* data, int len,
-                                        int64_t pts_us, bool key) {
-        OssVideoFrame f;
-        f.data.assign(data, data + len);
-        f.pts_us      = pts_us;
-        f.is_keyframe = key;
-        queue_.push(std::move(f));
-    });
-
-    if (rc != 0) {
-        OBN_WARN("camera: TUTK signaling join failed for uid=%.20s",
+    // 1. LAN-direct session: UDP + LAN_SEARCH3 + DTLS-PSK.
+    session_ = bambu_net::oss_tutk::iotc_connect(
+        tutk_uid_, authkey_to_u64(authkey_), passwd_,
+        region_from_string(region_str_));
+    if (!session_) {
+        OBN_WARN("camera: TUTK iotc_connect failed for uid=%.20s",
                  tutk_uid_.c_str());
         return false;
     }
 
+    // 2. AV channel: avClientStartEx + AV LOGIN + IPCAM_START.
+    av_index_ = bambu_net::oss_tutk::oss_av_start(session_, 0, "admin",
+                                                  passwd_.c_str());
+    if (av_index_ < 0) {
+        OBN_WARN("camera: TUTK oss_av_start failed rc=%d uid=%.20s",
+                 av_index_, tutk_uid_.c_str());
+        bambu_net::oss_tutk::iotc_close(session_);
+        session_ = nullptr;
+        return false;
+    }
+
+    // 3. Reader thread pulls reassembled H.264 frames into queue_.
+    running_.store(true);
     open_.store(true);
-    OBN_INFO("camera: TUTK source open uid=%.20s", tutk_uid_.c_str());
+    reader_thread_ = std::thread(&OssTutkCameraSource::read_frames_, this);
+
+    OBN_INFO("camera: TUTK source open uid=%.20s av_index=%d",
+             tutk_uid_.c_str(), av_index_);
     return true;
+}
+
+void OssTutkCameraSource::read_frames_()
+{
+    // IDR frames can exceed 100KB; use a generous buffer like the probe.
+    std::vector<char> buf(1u << 20);
+    while (running_.load()) {
+        int actual = 0, fcount = 0, ioc = 0;
+        unsigned ts = 0;
+        int rc = avRecvFrameData2(av_index_, buf.data(),
+                                  static_cast<int>(buf.size()),
+                                  &actual, &fcount, nullptr, 0, &ts, &ioc);
+        if (rc == -20012 /*AV_ER_TIMEOUT*/) continue;
+        if (rc < 0 && rc != -20014 /*AV_ER_INCOMPLETE_FRAME*/) {
+            OBN_WARN("camera: TUTK avRecvFrameData2 rc=%d — stream ended", rc);
+            break;
+        }
+        if (actual <= 0) continue;
+
+        // A frame is a keyframe if it carries an SPS (nal type 7) or IDR
+        // (nal type 5) Annex-B NAL unit.
+        bool key = false;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.data());
+        for (int i = 0; i + 4 < actual; ++i) {
+            if (p[i] == 0 && p[i+1] == 0 && p[i+2] == 0 && p[i+3] == 1) {
+                uint8_t nt = p[i+4] & 0x1f;
+                if (nt == 7 || nt == 5) { key = true; break; }
+                i += 4;
+            }
+        }
+
+        bambu_net::camera::oss_agora::OssVideoFrame f;
+        f.data.assign(buf.data(), buf.data() + actual);
+        f.pts_us      = static_cast<int64_t>(ts) * 1000;  // ts is milliseconds
+        f.is_keyframe = key;
+        queue_.push(std::move(f));
+    }
 }
 
 void OssTutkCameraSource::close()
 {
     if (!open_.exchange(false)) return;
-    signaling_.leave();
+    running_.store(false);
+    if (av_index_ >= 0) avClientStop(av_index_);
+    if (reader_thread_.joinable()) reader_thread_.join();
+    if (session_) {
+        bambu_net::oss_tutk::iotc_close(session_);
+        session_ = nullptr;
+    }
+    av_index_ = -1;
     OBN_INFO("camera: TUTK source closed uid=%.20s", tutk_uid_.c_str());
 }
 
@@ -165,7 +234,7 @@ OssTutkCameraSource::next_frame(int timeout_ms)
 bambu_net::camera::ICameraSource::StreamInfo OssTutkCameraSource::info() const
 {
     StreamInfo si;
-    si.width  = 1920;
+    si.width  = 1680;
     si.height = 1080;
     si.fps    = 30;
     si.codec  = Codec::H264_AnnexB;

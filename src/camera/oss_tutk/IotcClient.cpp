@@ -688,7 +688,7 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
 //   [4..7]   48 00 00 00   payload_len=0x48 (72) LE
 //   [8..11]  01 06 21 00
 //   [12..15] 00 00 00 00
-//   [16..35] uid (20B, UPPERCASE)  e.g. "44WS26KA5VWVA4FY111A"
+//   [16..35] uid (20B, UPPERCASE)  — the printer's TUTK UID
 //   [36..47] 00 (connect_flag + unknown, all zero)
 //   [48..51] 00 00 00 00
 //   [52..55] iotc_version (uint32 LE = 0x04030304)
@@ -979,10 +979,10 @@ static unsigned int iotc_psk_client_cb(SSL* ssl, const char* /*hint*/,
     // byte of the hash and leaves the remainder zero, while still reporting a
     // 32-byte PSK length. The printer derives its key material the same way, so
     // the two ECDHE-PSK premasters only agree if OBN truncates identically.
-    // Verified by live gdb of libBambuSource's kdf_tls1_prf_derive: for
-    // passwd "b9096f", SHA256 = ec1700 9e29...; the PSK actually fed to the PRF
-    // is ec17 followed by 30 zero bytes, and reproduces the genuine master_secret
-    // exactly under the standard EMS ECDHE-PSK schedule.
+    // Verified against libBambuSource's kdf_tls1_prf_derive: e.g. a passwd whose
+    // SHA-256 begins AB CD 00 ...  yields a PSK of AB CD followed by 30 zero
+    // bytes, and reproduces the genuine master_secret exactly under the standard
+    // EMS ECDHE-PSK schedule.
     uint8_t h[SHA256_DIGEST_LENGTH];
     SHA256(reinterpret_cast<const uint8_t*>(c->passwd.data()), c->passwd.size(), h);
     if (max_psk_len < sizeof(h)) return 0;

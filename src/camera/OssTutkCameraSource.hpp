@@ -6,23 +6,27 @@
 //                [&device=<serial>][&net_ver=...][&dev_ver=...]
 // Legacy form (older minted URLs): bambu:///tutk?uid=...&key=<ACCESS_CODE>
 //
-// Uses OssAgoraSignaling (which implements the full TUTK relay + DTLS + AV
-// protocol). Frames (H.264 Annex-B) are pushed into an OssFrameQueue and
-// pulled by next_frame() via a polling loop.
-//
-// NOTE: TUTK NAT punch-through is partially stubbed in IotcClient.cpp;
-// the relay path (iotcplatform.com UDP relay with DTLS) works.
+// Uses the clean-room TUTK LAN-direct transport (IotcClient.cpp): iotc_connect
+// (UDP + LAN_SEARCH3 + DTLS-PSK) → oss_av_start (AV login + IPCAM_START) → a
+// reader thread pulling one H.264 Annex-B frame per avRecvFrameData2 call.
+// Frames are pushed into an OssFrameQueue and pulled by next_frame().
 
 #pragma once
 
 #include "ICameraSource.hpp"
 #include "oss_agora/OssAgoraEngine.hpp"     // OssFrameQueue, OssVideoFrame
-#include "oss_agora/OssAgoraSignaling.hpp"  // OssAgoraSignaling, AgoraJoinParams
 
 #include <atomic>
 #include <chrono>
 #include <optional>
 #include <string>
+#include <thread>
+
+namespace bambu_net {
+namespace oss_tutk {
+struct OssSession;  // clean-room TUTK session (IotcClient.hpp)
+}  // namespace oss_tutk
+}  // namespace bambu_net
 
 namespace obn {
 namespace camera {
@@ -63,6 +67,7 @@ public:
 
 private:
     bool parse_url_();
+    void read_frames_();      // reader thread body
 
     std::string  url_;
     std::string  tutk_uid_;   // 20-char uppercase UID
@@ -70,11 +75,15 @@ private:
     std::string  passwd_;     // dtls_passwd + av_passwd (PSK = SHA256(passwd))
     std::string  authkey_;    // IOTC connect auth key (LAN/P2P precheck)
     std::string  device_;     // printer serial (informational)
+    std::string  region_str_; // raw region param ("us"/"cn"/"eu"/"asia")
     uint32_t     area_code_ = 0xFFFFFFFF;
 
-    bambu_net::camera::oss_agora::OssAgoraSignaling signaling_;
-    bambu_net::camera::oss_agora::OssFrameQueue     queue_;
-    std::atomic<bool>                                open_{false};
+    bambu_net::oss_tutk::OssSession*             session_ = nullptr;
+    int                                          av_index_ = -1;
+    bambu_net::camera::oss_agora::OssFrameQueue  queue_;
+    std::atomic<bool>                            open_{false};
+    std::atomic<bool>                            running_{false};
+    std::thread                                  reader_thread_;
 };
 
 }  // namespace camera
