@@ -1,6 +1,6 @@
 # STATUS — ABI coverage of `open-bamboo-networking`
 
-This document tracks how each symbol listed in [NETWORK_PLUGIN.md § 6](NETWORK_PLUGIN.md#6-the-full-c-abi-contract) is handled by this open-source plugin. Top-level `##` headings group related surfaces; **subsection numbers (`### 6._n_`) match the same §6._n_ titles in the reference** so you can jump between the two documents. Everything that talks to Bambu’s cloud over **HTTPS** (and the closely related **cloud MQTT** session in §6.3) is rolled into one block, **Cloud & HTTP APIs**, with subsections below it.
+This document tracks how each symbol listed in [research § 6](research/06-abi-intro.md#6-the-full-c-abi-contract) is handled by this open-source plugin. Top-level `##` headings group related surfaces; **subsection numbers (`### 6._n_`) match the same §6._n_ titles in the reference** so you can jump between the two documents. Everything that talks to Bambu’s cloud over **HTTPS** (and the closely related **cloud MQTT** session in §6.3) is rolled into one block, **Cloud & HTTP APIs**, with subsections below it.
 
 ## Legend
 
@@ -48,7 +48,7 @@ Source: [src/abi_meta.cpp](src/abi_meta.cpp), [src/abi_lifecycle.cpp](src/abi_li
 | `bambu_network_destroy_agent` | ✅ | Deletes the agent instance. |
 | `bambu_network_init_log` | ✅ | No-op here: log sinks are configured inside `create_agent`, before the first log line. |
 | `bambu_network_set_config_dir` | ✅ | Stored on the agent; used for auth cache, device-cert snapshots, and `<config_dir>/obn.env` (IPC to `libBambuSource`). Also publishes `OBN_CONFIG_DIR` in the process environment. |
-| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder (synced to env + `obn.env` as `OBN_LAN_TLS_CA_FILE`); **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see NETWORK_PLUGIN.md §6.1.1). |
+| `bambu_network_set_cert_file` | ✅ | Studio passes `resources/cert/` + `slicer_base64.cer` (ABI). LAN uses **`printer.cer`** from that folder (synced to env + `obn.env` as `OBN_LAN_TLS_CA_FILE`); **`slicer_base64.cer`** is stored for Windows cloud MQTT only (see research/06.01-lifecycle.md §6.1.1). |
 | `bambu_network_set_country_code` | ✅ | Stored; drives cloud region selection (`api_host`, `web_host`). |
 | `bambu_network_start` | ✅ | Starts worker threads. If a cached session is present the plugin also kicks off `connect_cloud()` here — the stock call chain normally goes through `EVT_USER_LOGIN_HANDLE`, but that cascade can silently stall for cached sign-ins; starting from `start()` guarantees cloud MQTT gets initiated. |
 
@@ -78,7 +78,7 @@ Source: [src/abi_callbacks.cpp](src/abi_callbacks.cpp). All entries are thin `st
 
 ## Cloud & HTTP APIs
 
-Subsections use the same **§6._n_** numbers as [NETWORK_PLUGIN.md § 6](NETWORK_PLUGIN.md#6-the-full-c-abi-contract). **§6.3** is cloud **MQTT** (TLS to the broker), not REST on `api.bambulab.*`, but it shares the same logged-in session, region, and callback wiring as the HTTPS calls below.
+Subsections use the same **§6._n_** numbers as [research § 6](research/06-abi-intro.md#6-the-full-c-abi-contract). **§6.3** is cloud **MQTT** (TLS to the broker), not REST on `api.bambulab.*`, but it shares the same logged-in session, region, and callback wiring as the HTTPS calls below.
 
 ### 6.3. Cloud — connection and subscriptions
 
@@ -98,7 +98,7 @@ Source: [src/abi_cloud.cpp](src/abi_cloud.cpp).
 
 #### LAN-priority report subscription (defer-close + failback)
 
-Stock Studio's `DeviceSubscribeManager` prefers LAN telemetry and leaves the cloud `device/<id>/report` topic unsubscribed while LAN is alive (see [NETWORK_PLUGIN.md §6.3](NETWORK_PLUGIN.md#63-cloud--connection-and-subscriptions)). Since our plugin keeps both MQTT sessions up, it reproduces that policy itself rather than double-delivering reports over both transports. The FSM lives in [src/agent.cpp](src/agent.cpp):
+Stock Studio's `DeviceSubscribeManager` prefers LAN telemetry and leaves the cloud `device/<id>/report` topic unsubscribed while LAN is alive (see [research/06.03-cloud-mqtt.md §6.3](research/06.03-cloud-mqtt.md#63-cloud--connection-and-subscriptions)). Since our plugin keeps both MQTT sessions up, it reproduces that policy itself rather than double-delivering reports over both transports. The FSM lives in [src/agent.cpp](src/agent.cpp):
 
 - **Prefer LAN on first local report.** `maybe_prefer_lan_subscription(dev_id)` (called from `notify_local_message`) records `last_lan_report_[dev_id]` and, on the *first* LAN report for a device, inserts it into `lan_report_priority_` and issues `cloud_del_subscribe({dev_id})` — a **defer-close** of the cloud report leg (the cloud MQTT socket stays connected, just unsubscribed from that device's reports). It also starts the watchdog.
 - **Silence watchdog.** `lan_watchdog_loop()` wakes every `kLanWatchdogTick` (2 s); if a device in `lan_report_priority_` has produced no LAN report for longer than `kLanSilenceFailback` (6 s) it triggers failback.
@@ -194,7 +194,7 @@ Source: [src/abi_http.cpp](src/abi_http.cpp).
 
 ### 6.15. Filament Manager (cloud spool catalogue)
 
-Source: [src/abi_filament.cpp](src/abi_filament.cpp), [src/cloud_filament.cpp](src/cloud_filament.cpp). All five endpoints are fully reverse-engineered from a MITM dump of the stock `02.06.01.50` plugin (see [NETWORK_PLUGIN.md § 6.15](NETWORK_PLUGIN.md#615-filament-manager-cloud-spool-catalogue)).
+Source: [src/abi_filament.cpp](src/abi_filament.cpp), [src/cloud_filament.cpp](src/cloud_filament.cpp). All five endpoints are fully reverse-engineered from a MITM dump of the stock `02.06.01.50` plugin (see [research § 6.15](research/06.15-filament.md#615-filament-manager-cloud-spool-catalogue)).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
@@ -223,7 +223,7 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 
 Studio only calls `connect_printer` for LAN-mode devices, so a cloud-paired printer would otherwise never get a LAN MQTT session — yet the LAN-priority subscription (§6.3) and the LAN-first print path (§6.8) both need one. The plugin therefore brings the session up proactively whenever it knows the IP and access code. Implemented in [src/agent.cpp](src/agent.cpp):
 
-- **`ensure_lan_session(dev_id, ip_hint, code_hint)`** — idempotent session opener. Fast-paths to `true` when already connected to `dev_id`; otherwise resolves the IP / access code from the hints or the cached `dev_id → {dev_ip, access_code}` maps (SSDP IP + cloud `dev_access_code`, per [NETWORK_PLUGIN.md §6.4.1](NETWORK_PLUGIN.md#641-where-the-lan-credentials-come-from-incl-cloud-paired-printers)), calls `connect_printer`, and polls up to 3 s for the MQTT `CONNACK`. Returns `false` (caller degrades gracefully) when credentials are missing or the broker never accepts.
+- **`ensure_lan_session(dev_id, ip_hint, code_hint)`** — idempotent session opener. Fast-paths to `true` when already connected to `dev_id`; otherwise resolves the IP / access code from the hints or the cached `dev_id → {dev_ip, access_code}` maps (SSDP IP + cloud `dev_access_code`, per [research/06.04-lan.md §6.4.1](research/06.04-lan.md#641-where-the-lan-credentials-come-from-incl-cloud-paired-printers)), calls `connect_printer`, and polls up to 3 s for the MQTT `CONNACK`. Returns `false` (caller degrades gracefully) when credentials are missing or the broker never accepts.
 - **`autostart_lan_if_selected(dev_id)`** — spawns a detached thread that calls `ensure_lan_session` for the currently `user_selected_machine_` when its IP and code are known, guarded by `lan_autostart_inflight_` against duplicate attempts. Hooked into the three points where new credentials/selection become known:
   - `note_device_access_code` (a fresh access code arrived),
   - `set_user_selected_machine` (the user switched active printer),
@@ -231,7 +231,7 @@ Studio only calls `connect_printer` for LAN-mode devices, so a cloud-paired prin
 
 ### 6.4.1. LAN TLS verification (MQTT, FTPS, RTSPS, MJPEG)
 
-Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp), [NETWORK_PLUGIN.md §6.1.1](NETWORK_PLUGIN.md#611-certificate-files-set_cert_file).
+Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](include/obn/lan_tls_env.hpp), [research/06.01-lifecycle.md §6.1.1](research/06.01-lifecycle.md#611-certificate-files-set_cert_file).
 
 | Aspect | Status | Notes |
 | --- | :--: | --- |
@@ -248,12 +248,12 @@ Source: [src/lan_tls.cpp](src/lan_tls.cpp), [include/obn/lan_tls_env.hpp](includ
 
 ## 6.8. Submitting a print job
 
-Source: [src/abi_print.cpp](src/abi_print.cpp). **Studio-side orchestration** (which entry point is chosen when, preflight, callbacks): [NETWORK_PLUGIN.md §6.8.0](NETWORK_PLUGIN.md#680-end-to-end-print-flows-studio-side-orchestration).
+Source: [src/abi_print.cpp](src/abi_print.cpp). **Studio-side orchestration** (which entry point is chosen when, preflight, callbacks): [research/06.08.0-print-flows.md §6.8.0](research/06.08.0-print-flows.md#680-end-to-end-print-flows-studio-side-orchestration).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_start_print` | ⚠️ | **Cloud print (`use_lan_channel=false`).** Config 3mf → S3 (history/preview) + main `.3mf` → S3 + project PATCH with S3 URL + `POST /my/task` `mode=cloud_file`. Cloud dispatches the print; OBN **does not** publish MQTT `project_file` (would double-fire / `0500_4004`). Prerequisites: **`slicer_key.pem`** + **`client_name = BambuStudio`**. Refused entirely when `cloud_print=lan_only`. See [NETWORK_PLUGIN.md §6.8.1.1](NETWORK_PLUGIN.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
-| `bambu_network_start_local_print_with_record` | ⚠️ | Default (`cloud_print=cloud_only`): **LAN delivery via cloud job** — config→S3; main via **FTPS**; PATCH `ftp://`; `/my/task` `mode=lan_file`. With `try_lan_first` / `lan_only`: remapped to **`run_local_print_job`** (honest LAN); fail → `<0` so Studio may call `start_print` (allowed only for `try_lan_first`). Stock still dual-uploads and prefers S3 ([NETWORK_PLUGIN.md §6.8.1.2](NETWORK_PLUGIN.md#6812-stock-print-transports-ftps-vs-brtc-wire-confirmed-p2s-2026-07)). |
+| `bambu_network_start_print` | ⚠️ | **Cloud print (`use_lan_channel=false`).** Config 3mf → S3 (history/preview) + main `.3mf` → S3 + project PATCH with S3 URL + `POST /my/task` `mode=cloud_file`. Cloud dispatches the print; OBN **does not** publish MQTT `project_file` (would double-fire / `0500_4004`). Prerequisites: **`slicer_key.pem`** + **`client_name = BambuStudio`**. Refused entirely when `cloud_print=lan_only`. See [research/06.08.1-cloud-upload.md §6.8.1.1](research/06.08.1-cloud-upload.md#6811-cloud-print-authorization-obn-findings-on-hardware-2026-07). |
+| `bambu_network_start_local_print_with_record` | ⚠️ | Default (`cloud_print=cloud_only`): **LAN delivery via cloud job** — config→S3; main via **FTPS**; PATCH `ftp://`; `/my/task` `mode=lan_file`. With `try_lan_first` / `lan_only`: remapped to **`run_local_print_job`** (honest LAN); fail → `<0` so Studio may call `start_print` (allowed only for `try_lan_first`). Stock still dual-uploads and prefers S3 ([research/06.08.1-cloud-upload.md §6.8.1.2](research/06.08.1-cloud-upload.md#6812-stock-print-transports-ftps-vs-brtc-wire-confirmed-p2s-2026-07)). |
 | `bambu_network_start_send_gcode_to_sdcard` | ✅ | FTPS STOR; destination name = `project_name`. On current Studio mostly `"verify_job"` probe; P2S model upload uses `ft_*` (§6.14.2) |
 | `bambu_network_start_local_print` | ✅ | LAN-only: `:6000` emmc upload + `brtc://emmc/` MQTT when `try_emmc_print`; else FTPS + `ftp://` (N7). |
 | `bambu_network_start_sdcard_print` | ✨ | Stock hits a signed cloud REST endpoint. This plugin publishes `{"print":{"command":"project_file", "url":"file:///<path>", …}}` directly on LAN MQTT for a file already resident on the printer. No cloud task record is produced. |
@@ -280,14 +280,14 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 
 | Gap | Open plugin | Stock / notes |
 | --- | --- | --- |
-| Cloud print pipeline | `cloud_print.cpp`: shared config→S3; **cloud** = main→S3 + PATCH https; **LAN+record** = main→FTPS + PATCH `ftp://`; both finish with `/my/task` cloud dispatch (no plugin MQTT). Needs `slicer_key.pem` + `client_name = BambuStudio` | Stock `_with_record` still dual-uploads (FTPS + S3) and leaves the S3 URL winning — OBN keeps LAN local on purpose (§6.8.1.2). Extra cloud-start `project_file` fields (`job_id`/`job_type`/`design_id`) still unemitted — see [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format) |
+| Cloud print pipeline | `cloud_print.cpp`: shared config→S3; **cloud** = main→S3 + PATCH https; **LAN+record** = main→FTPS + PATCH `ftp://`; both finish with `/my/task` cloud dispatch (no plugin MQTT). Needs `slicer_key.pem` + `client_name = BambuStudio` | Stock `_with_record` still dual-uploads (FTPS + S3) and leaves the S3 URL winning — OBN keeps LAN local on purpose (§6.8.1.2). Extra cloud-start `project_file` fields (`job_id`/`job_type`/`design_id`) still unemitted — see [research/06.08.2-project-file.md §6.8.2](research/06.08.2-project-file.md#682-the-mqtt-project_file-command-wire-format) |
 | Cover cache after brtc print | FTPS `RETR` from `/cache/` | May need `:6000` or emmc path once prints land in model cache |
 
-Wire-format reference for `project_file` field semantics and URL schemes: [NETWORK_PLUGIN.md §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format). Cloud REST step list observed on stock (MITM): [NETWORK_PLUGIN.md §6.8.1](NETWORK_PLUGIN.md#681-cloud-upload-flow-stock-plugin-mitm).
+Wire-format reference for `project_file` field semantics and URL schemes: [research/06.08.2-project-file.md §6.8.2](research/06.08.2-project-file.md#682-the-mqtt-project_file-command-wire-format). Cloud REST step list observed on stock (MITM): [research/06.08.1-cloud-upload.md §6.8.1](research/06.08.1-cloud-upload.md#681-cloud-upload-flow-stock-plugin-mitm).
 
-`project_file` wire format covers everything the firmware actually parses: `sequence_id`, `command`, `param`, `project_id`, `profile_id`, `task_id`, `subtask_id`, `subtask_name`, `file`, `url`, `md5`, `bed_type`, `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams`, `ams_mapping`, `ams_mapping2`, `nozzle_mapping` (multi-extruder only), `auto_bed_leveling`, `nozzle_offset_cali`, `extrude_cali_manual_mode`, `cfg`, `extrude_cali_flag`. **As of the cross-ABI [`tools/plugin_runner`](tools/plugin_runner/README.md) matrix the LAN `project_file` payload we generate is byte-identical (only `sequence_id` differs, by design — it's a wall-clock counter) to what the stock libbambu_networking.so emits for the same `PrintParams`** across `02.05.00` -> `02.06.01` and the variants we tried (default, AMS on, timelapse off, alternate bed types, PA cali manual mode, auto-flow-cali) **on the FTPS + `ftp://` path (N7-class)**. P2S/brtc paths use `brtc://emmc/` URLs per §6.8.2. `cfg` is a string-encoded bitmask we drive from `task_timelapse_use_internal` (bit 2 = use internal storage); other bits emit `0` in every captured stock frame so far. `extrude_cali_flag` is the wire mirror of `auto_flow_cali` (1/0) — confirmed the same way. `ams_mapping2` is emitted unconditionally as `[]` when AMS isn't in use, mirroring stock. Legacy FTPS uploads land in the **FTPS root** (not `/cache/`). `print.md5` is computed locally from the file because Studio leaves `params.ftp_file_md5` empty. We deliberately omit the stock plugin's `header` / `url_enc` envelope (RSA-signed and RSA-OAEP-encrypted with a per-install device cert key) — Developer Mode disables signature verification, which is our supported deployment. See [NETWORK_PLUGIN §6.8.2](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format) for the full per-field reference and the full cross-ABI / per-overlay matrix.
+`project_file` wire format covers everything the firmware actually parses: `sequence_id`, `command`, `param`, `project_id`, `profile_id`, `task_id`, `subtask_id`, `subtask_name`, `file`, `url`, `md5`, `bed_type`, `bed_leveling`, `flow_cali`, `vibration_cali`, `layer_inspect`, `timelapse`, `use_ams`, `ams_mapping`, `ams_mapping2`, `nozzle_mapping` (multi-extruder only), `auto_bed_leveling`, `nozzle_offset_cali`, `extrude_cali_manual_mode`, `cfg`, `extrude_cali_flag`. **As of the cross-ABI [`tools/plugin_runner`](tools/plugin_runner/README.md) matrix the LAN `project_file` payload we generate is byte-identical (only `sequence_id` differs, by design — it's a wall-clock counter) to what the stock libbambu_networking.so emits for the same `PrintParams`** across `02.05.00` -> `02.06.01` and the variants we tried (default, AMS on, timelapse off, alternate bed types, PA cali manual mode, auto-flow-cali) **on the FTPS + `ftp://` path (N7-class)**. P2S/brtc paths use `brtc://emmc/` URLs per §6.8.2. `cfg` is a string-encoded bitmask we drive from `task_timelapse_use_internal` (bit 2 = use internal storage); other bits emit `0` in every captured stock frame so far. `extrude_cali_flag` is the wire mirror of `auto_flow_cali` (1/0) — confirmed the same way. `ams_mapping2` is emitted unconditionally as `[]` when AMS isn't in use, mirroring stock. Legacy FTPS uploads land in the **FTPS root** (not `/cache/`). `print.md5` is computed locally from the file because Studio leaves `params.ftp_file_md5` empty. We deliberately omit the stock plugin's `header` / `url_enc` envelope (RSA-signed and RSA-OAEP-encrypted with a per-install device cert key) — Developer Mode disables signature verification, which is our supported deployment. See [research §6.8.2](research/06.08.2-project-file.md#682-the-mqtt-project_file-command-wire-format) for the full per-field reference and the full cross-ABI / per-overlay matrix.
 
-**Device-cert field encryption is centralized in the MQTT signing path.** The `EncryptField` primitive (`obn::signing::rsa_pkcs1v15_encrypt_b64`, blockwise RSA-PKCS#1 v1.5 → base64) lives in [`src/signing.cpp`](src/signing.cpp). `maybe_sign(payload, device_pub)` now applies it to any outbound `{"print":…}` before signing, so the signature covers exactly what goes on the wire: it adds `url_enc` **and drops the cleartext `url`** (`project_file`), and for `gcode_line` adds `param_enc` **and drops the cleartext `param`**. Both match the stock on-wire form verified on P2S 2026-07 (a secured printer refuses `gcode_line` that still carries a cleartext `param`, and a captured stock `project_file` carries only `url_enc`). The `_enc` transforms are idempotent (the cleartext field is dropped even if the `_enc` field was pre-built) and degrade to cleartext when no device key is cached (keeping the pure-LAN plaintext ftp:// path working). The device public key is fetched per-publish from `cert_store` at the two `Agent` send sites; `cloud_print.cpp` still sources the key (via `app_cert_install` / TLS-leaf) and hard-fails the cloud channel when it is unavailable. Algorithm: [NETWORK_PLUGIN §6.8.2 `EncryptField`](NETWORK_PLUGIN.md#682-the-mqtt-project_file-command-wire-format).
+**Device-cert field encryption is centralized in the MQTT signing path.** The `EncryptField` primitive (`obn::signing::rsa_pkcs1v15_encrypt_b64`, blockwise RSA-PKCS#1 v1.5 → base64) lives in [`src/signing.cpp`](src/signing.cpp). `maybe_sign(payload, device_pub)` now applies it to any outbound `{"print":…}` before signing, so the signature covers exactly what goes on the wire: it adds `url_enc` **and drops the cleartext `url`** (`project_file`), and for `gcode_line` adds `param_enc` **and drops the cleartext `param`**. Both match the stock on-wire form verified on P2S 2026-07 (a secured printer refuses `gcode_line` that still carries a cleartext `param`, and a captured stock `project_file` carries only `url_enc`). The `_enc` transforms are idempotent (the cleartext field is dropped even if the `_enc` field was pre-built) and degrade to cleartext when no device key is cached (keeping the pure-LAN plaintext ftp:// path working). The device public key is fetched per-publish from `cert_store` at the two `Agent` send sites; `cloud_print.cpp` still sources the key (via `app_cert_install` / TLS-leaf) and hard-fails the cloud channel when it is unavailable. Algorithm: [research §6.8.2 `EncryptField`](research/06.08.2-project-file.md#682-the-mqtt-project_file-command-wire-format).
 
 ---
 
@@ -314,12 +314,12 @@ Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). MakerWorld has no open
 | `bambu_network_get_design_staffpick` | ❌ | Callback receives `{"list":[],"total":0}`. Studio renders an empty staff-pick carousel. |
 | `bambu_network_start_publish` | ❌ | Returns `ERR_INVALID_RESULT`; publishing to MakerWorld is not supported. |
 | `bambu_network_get_model_publish_url` | ❌ | Returns `https://makerworld.com/` as a safe default; stock serves the per-account upload endpoint. |
-| `bambu_network_get_subtask` | ❌ | **Stub only.** Stock fetches MakerWorld model/design metadata for the cloud `task_id` and fills `BBLModelTask` (`design_id`, `instance_id`, `model_id`, `model_name`, `profile_name`, …). OBN just echoes the caller-owned pointer through the callback unchanged — enough to avoid leaking the `new`'d object and to clear `request_model_info_flag`, but **no cloud fetch** happens. Without `design_id`/`instance_id` the in-print profile label and post-print MakerWorld rating UI stay disabled. See [NETWORK_PLUGIN.md §6.12](NETWORK_PLUGIN.md#612-makerworld--mall). |
+| `bambu_network_get_subtask` | ❌ | **Stub only.** Stock fetches MakerWorld model/design metadata for the cloud `task_id` and fills `BBLModelTask` (`design_id`, `instance_id`, `model_id`, `model_name`, `profile_name`, …). OBN just echoes the caller-owned pointer through the callback unchanged — enough to avoid leaking the `new`'d object and to clear `request_model_info_flag`, but **no cloud fetch** happens. Without `design_id`/`instance_id` the in-print profile label and post-print MakerWorld rating UI stay disabled. See [research/06.12-makerworld.md §6.12](research/06.12-makerworld.md#612-makerworld--mall). |
 | `bambu_network_get_model_mall_home_url` | ❌ | Returns `https://makerworld.com/` as a safe default. |
 | `bambu_network_get_model_mall_detail_url` | ❌ | Returns `https://makerworld.com/models/<id>` as a safe default. |
 | `bambu_network_put_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`; no rating submission backend. |
 | `bambu_network_get_oss_config` | ✅ | `GET /v1/user-service/my/ossconfig?useType=1` (fallback `.../s3config?useType=1`) with the session Bearer; the server JSON (endpoint / accessKeyId / accessKeySecret / securityToken / bucketName / cdnUrl) is returned verbatim to Studio. Needs a live cloud account to verify. |
-| `bambu_network_put_rating_picture_oss` | ✅ | Client-side signed object-storage `PUT`: AWS SigV4 (`AWS4-HMAC-SHA256`) for S3-style endpoints, Aliyun OSS V1 (`Authorization: OSS <AKID>:<sig>` + `x-oss-security-token`) for `aliyuncs.com`. [`src/oss_sign.cpp`](src/oss_sign.cpp) implements both from scratch: the crypto primitives (`sha256_hex`, `hmac_sha256`, `hmac_sha1`, `base64`, `hex_lower`, `aws_sigv4_signing_key`), the header builders (`aws_sigv4_put_headers` / `aliyun_oss_put_headers`), credential `parse_config`, and host-based scheme selection (`is_aliyun`). Primitives are pinned to FIPS/RFC/AWS published vectors in [`tests/oss_sign_test.cpp`](tests/oss_sign_test.cpp). Step-by-step algorithms: [NETWORK_PLUGIN.md §6.12](NETWORK_PLUGIN.md#612-makerworld--mall). Object-key convention marked verify-on-hardware; fails closed. |
+| `bambu_network_put_rating_picture_oss` | ✅ | Client-side signed object-storage `PUT`: AWS SigV4 (`AWS4-HMAC-SHA256`) for S3-style endpoints, Aliyun OSS V1 (`Authorization: OSS <AKID>:<sig>` + `x-oss-security-token`) for `aliyuncs.com`. [`src/oss_sign.cpp`](src/oss_sign.cpp) implements both from scratch: the crypto primitives (`sha256_hex`, `hmac_sha256`, `hmac_sha1`, `base64`, `hex_lower`, `aws_sigv4_signing_key`), the header builders (`aws_sigv4_put_headers` / `aliyun_oss_put_headers`), credential `parse_config`, and host-based scheme selection (`is_aliyun`). Primitives are pinned to FIPS/RFC/AWS published vectors in [`tests/oss_sign_test.cpp`](tests/oss_sign_test.cpp). Step-by-step algorithms: [research/06.12-makerworld.md §6.12](research/06.12-makerworld.md#612-makerworld--mall). Object-key convention marked verify-on-hardware; fails closed. |
 | `bambu_network_get_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`. |
 | `bambu_network_get_mw_user_preference` | ❌ | Callback receives `{"recommendStatus":0}`. The exact field name and type are load-bearing: Studio's JSON-to-int conversion throws through a queued lambda on a `null` here and aborts the process via `wxApp::OnUnhandledException`. |
 | `bambu_network_get_mw_user_4ulist` | ❌ | Callback receives `{"list":[],"total":0}`. |
@@ -381,8 +381,8 @@ Statuses below reflect stock-parity behaviour: LAN `ft_*` over **native TLS :600
 Stock `libbambu_networking.so` serves LAN `ft_*` over **TLS :6000** with the same BambuTunnelLocal framing as Device → Files (§7.5.1.1). Our plugin implements the same path, shared with LAN print upload via [`tunnel_upload.cpp`](src/tunnel_upload.cpp):
 
 - `cmd_type=7` → wire `REQUEST_MEDIA_ABILITY` (`0x0007`); firmware reply mapped to a JSON array for Studio (may include `"emmc"` on P2S).
-- `cmd_type=5` → wire chunked `FILE_UPLOAD` (`0x0005`) — see §6.14.2 below and [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026) for the wire format.
-- `cmd_type=4` → wire `FILE_DOWNLOAD` (`0x0004`) for **Printer Preview** (`mem:/26` JPEG) — see §6.14.4 and [NETWORK_PLUGIN.md §6.14.4](NETWORK_PLUGIN.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview).
+- `cmd_type=5` → wire chunked `FILE_UPLOAD` (`0x0005`) — see §6.14.2 below and [research/06.14-file-transfer.md §6.14.2](research/06.14-file-transfer.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026) for the wire format.
+- `cmd_type=4` → wire `FILE_DOWNLOAD` (`0x0004`) for **Printer Preview** (`mem:/26` JPEG) — see §6.14.4 and [research/06.14-file-transfer.md §6.14.4](research/06.14-file-transfer.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview).
 
 **Scope:** TUTK/cloud `ft_*` URLs remain `FT_EIO`. Legacy printers without `:6000` rely on Studio's `SendJob` → `start_send_gcode_to_sdcard` (FTPS).
 
@@ -396,13 +396,13 @@ Source: [src/tunnel_upload.cpp](src/tunnel_upload.cpp), [src/abi_ft.cpp](src/abi
 | Legacy one-shot upload builder | ⚠️ | `build_file_upload_abi()` in `tunnel_local.hpp` — **not used in production**; P2S rejects multi-MiB one-shot frames (`-9203` / reset). Kept for [tests/tunnel_local_test.cpp](tests/tunnel_local_test.cpp) and REPL experiments only |
 | `cmd_type=4` mem download | ✅ | Printer Preview (`MediaPlayCtrl` → `DownloadMemFile("mem:/26")`); wire verified on P2S May 2026 — see §6.14.4 |
 | Stale reply handling on reused tunnel | ✅ | `drain_pending_wire_json()` before upload init; `recv_wire_json(…, want_cmdtype, want_seq)` skips belated delete/ability replies |
-| Proactive `FILE_DEL` before upload | ❌ (removed) | Early versions deleted the dest name first — caused `-9203` / false success on reused tunnels; wire doc: [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#do-not-send-proactive-file_del-cmdtype-3) |
+| Proactive `FILE_DEL` before upload | ❌ (removed) | Early versions deleted the dest name first — caused `-9203` / false success on reused tunnels; wire doc: [research/06.14-file-transfer.md §6.14.2](research/06.14-file-transfer.md#do-not-send-proactive-file_del-cmdtype-3) |
 
 **Send loop (P2S).** `Session::send_abi_json_with_binary(…, poll_rx_after_send=false)` for every chunk; one blocking `recv_wire_json(…, cmdtype=5, sequence=N)` after the last chunk. Per-chunk `SSL_read` or post-send poll mid-pipeline was the root cause of `-9203` on large jobs.
 
 **Progress.** `msg_cb({"progress":N})` from **bytes written** (`offset / total`), not per-chunk wire ACKs. Final recv uses a generous socket timeout (~120 s) after a large pipelined send.
 
-Wire-format reference: [NETWORK_PLUGIN.md §6.14.2](NETWORK_PLUGIN.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026).
+Wire-format reference: [research/06.14-file-transfer.md §6.14.2](research/06.14-file-transfer.md#6142-p2s-file_upload-cmdtype-5--chunked-pipeline-may-2026).
 
 ### 6.14.4. `cmd_type=4` mem download (Printer Preview)
 
@@ -424,7 +424,7 @@ Source: [src/tunnel_upload.cpp](src/tunnel_upload.cpp) (`run_download`), [src/ab
 
 **Logging.** At `OBN_LOG_LEVEL=info`, each printer reply is logged as `tunnel_upload: download frame=N … wire=…`; success logs JPEG magic bytes.
 
-Wire reference: [NETWORK_PLUGIN.md §6.14.4](NETWORK_PLUGIN.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview). Manual probe: `python3 tools/bambu6000_repl.py <ip> <code>` → `/download mem:/26 out.jpg`.
+Wire reference: [research/06.14-file-transfer.md §6.14.4](research/06.14-file-transfer.md#6144-p2s-file_download-cmdtype-4--mem-preview-printer-preview). Manual probe: `python3 tools/bambu6000_repl.py <ip> <code>` → `/download mem:/26 out.jpg`.
 
 ### 6.14.3. `start_send_gcode_to_sdcard` (open plugin)
 
@@ -432,17 +432,17 @@ Source: [src/print_job.cpp](src/print_job.cpp) (`run_send_gcode_to_sdcard`).
 
 | Piece | Status | Notes |
 | --- | :--: | --- |
-| FTPS upload, dest name = `project_name` | ✅ | [`dest_name_for_send_gcode`](src/print_job_naming.cpp) — verified vs stock: [NETWORK_PLUGIN.md §6.14.3](../NETWORK_PLUGIN.md#6143-start_send_gcode_to_sdcard-ftps-upload-no-print) ([`tools/probe_remote_naming.sh`](../tools/probe_remote_naming.sh)); unit tests: [`tests/remote_name_test.cpp`](../tests/remote_name_test.cpp) |
+| FTPS upload, dest name = `project_name` | ✅ | [`dest_name_for_send_gcode`](src/print_job_naming.cpp) — verified vs stock: [research/06.14-file-transfer.md §6.14.3](research/06.14-file-transfer.md#6143-start_send_gcode_to_sdcard-ftps-upload-no-print) ([`tools/probe_remote_naming.sh`](../tools/probe_remote_naming.sh)); unit tests: [`tests/remote_name_test.cpp`](../tests/remote_name_test.cpp) |
 | Main `.3mf` via `ft_*` `:6000` | ✅ | Send to Printer on brtc hardware — Studio does not use this ABI for the model |
 | FTPS legacy full upload | ✅ | Studio `SendJob` when `!is_support_brtc` → `start_send_gcode_to_sdcard` |
 
-Wire / Studio caller reference: [NETWORK_PLUGIN.md §6.14.3](NETWORK_PLUGIN.md#6143-start_send_gcode_to_sdcard-ftps-upload-no-print).
+Wire / Studio caller reference: [research/06.14-file-transfer.md §6.14.3](research/06.14-file-transfer.md#6143-start_send_gcode_to_sdcard-ftps-upload-no-print).
 
 ---
 
 ## `libBambuSource.so` (second library)
 
-Bambu Studio loads two cooperating shared objects from `<data_dir>/plugins/`: `libbambu_networking.{so,dll}` (everything above this section) and **`libBambuSource.{so,dll}`** (Windows: `BambuSource.dll`), a separate artefact with its own loader, its own symbol prefix (`Bambu_*`), and its own per-platform back-ends. It serves the camera **live view** and the on-printer **file browser**. See [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) for the full reverse-engineered contract.
+Bambu Studio loads two cooperating shared objects from `<data_dir>/plugins/`: `libbambu_networking.{so,dll}` (everything above this section) and **`libBambuSource.{so,dll}`** (Windows: `BambuSource.dll`), a separate artefact with its own loader, its own symbol prefix (`Bambu_*`), and its own per-platform back-ends. It serves the camera **live view** and the on-printer **file browser**. See [research § 7](research/07-bambusource.md#7-the-libbambusource-library) for the full reverse-engineered contract.
 
 Source: [stubs/BambuSource.cpp](stubs/BambuSource.cpp), [stubs/rtsp_client.cpp](stubs/rtsp_client.cpp), [stubs/rtsp_passthrough.cpp](stubs/rtsp_passthrough.cpp), [stubs/tls_socket.cpp](stubs/tls_socket.cpp), [src/lan_tls.cpp](src/lan_tls.cpp), [stubs/dshow_filter.cpp](stubs/dshow_filter.cpp) (Windows-only).
 
@@ -477,7 +477,7 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 
 ### PrinterFileSystem (MediaFilePanel)
 
-Studio opens TLS **:6000** via `libBambuSource.so`, runs `Bambu_StartStreamEx(CTRL_TYPE)`, then exchanges framed CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) — same as stock ([NETWORK_PLUGIN.md §7.5.1](NETWORK_PLUGIN.md#751-where-the-printer-side-bytes-actually-come-from)).
+Studio opens TLS **:6000** via `libBambuSource.so`, runs `Bambu_StartStreamEx(CTRL_TYPE)`, then exchanges framed CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) — same as stock ([research/07-bambusource.md §7.5.1](research/07-bambusource.md#751-where-the-printer-side-bytes-actually-come-from)).
 
 **Default (open plugin, May 2026):** `start_native_ctrl_handshake()` keeps the socket open and **forwards** each Studio JSON request to firmware (`native_ctrl_send_worker`). Thumbnails use stock **`SUB_FILE`**: e.g. `req.paths=["/foo.gcode.3mf#thumbnail"]` → firmware returns PNG bytes; no client-side ZIP parse.
 
@@ -552,15 +552,15 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 
 | Reference | Location |
 | --- | --- |
-| ABI contract (canonical function list) | [NETWORK_PLUGIN.md § 6](NETWORK_PLUGIN.md#6-the-full-c-abi-contract) |
-| Studio print-start orchestration (`PrintJob`, callbacks, scenarios) | [NETWORK_PLUGIN.md § 6.8.0](NETWORK_PLUGIN.md#680-end-to-end-print-flows-studio-side-orchestration) |
-| Common cloud HTTPS transport (hosts, bearer, response envelopes) | [NETWORK_PLUGIN.md § 6.10.1](NETWORK_PLUGIN.md#6101-common-cloud-transport) |
-| Filament Manager REST shapes (MITM) | [NETWORK_PLUGIN.md § 6.15](NETWORK_PLUGIN.md#615-filament-manager-cloud-spool-catalogue) |
-| `libBambuSource` C ABI, camera URL formats, CTRL bridge | [NETWORK_PLUGIN.md § 7](NETWORK_PLUGIN.md#7-the-libbambusource-library) |
+| ABI contract (canonical function list) | [research § 6](research/06-abi-intro.md#6-the-full-c-abi-contract) |
+| Studio print-start orchestration (`PrintJob`, callbacks, scenarios) | [research § 6.8.0](research/06.08.0-print-flows.md#680-end-to-end-print-flows-studio-side-orchestration) |
+| Common cloud HTTPS transport (hosts, bearer, response envelopes) | [research § 6.10.1](research/06.10-http.md#6101-common-cloud-transport) |
+| Filament Manager REST shapes (MITM) | [research § 6.15](research/06.15-filament.md#615-filament-manager-cloud-spool-catalogue) |
+| `libBambuSource` C ABI, camera URL formats, CTRL bridge | [research § 7](research/07-bambusource.md#7-the-libbambusource-library) |
 | `ft_*` native :6000 | [STATUS.md § 6.14.1](STATUS.md#6141-native-6000-wire) |
 | `ft_*` chunked upload + `start_send_gcode_to_sdcard` | [STATUS.md § 6.14.2–6.14.3](STATUS.md#6142-chunked-6000-upload-open-plugin) |
 | PrinterFileSystem / Device → Files (CTRL → FTPS, `ipcam.file`) | [STATUS.md — PrinterFileSystem (MediaFilePanel)](STATUS.md#printerfilesystem-mediafilepanel) |
-| FTPS dialect quirks (used by `libBambuSource` CTRL bridge and by `ft_*`) | [NETWORK_PLUGIN.md § 7.6.3](NETWORK_PLUGIN.md#763-ftps-dialect-quirks) |
+| FTPS dialect quirks (used by `libBambuSource` CTRL bridge and by `ft_*`) | [research § 7.6.3](research/07-bambusource.md#763-ftps-dialect-quirks) |
 | LAN TLS verification & IPC | [STATUS.md § 6.4.1](STATUS.md#641-lan-tls-verification-mqtt-ftps-rtsps-mjpeg) |
 | Windows: MSVC `setvbuf`, wxURI `bambu://` slashes, DirectShow `Paused` vs `Running`, Win32 env IPC | [STATUS.md — Windows-specific footguns](STATUS.md#windows-specific-footguns) |
 | Feature-level status tables (per-model) | [README.md](README.md) |

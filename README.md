@@ -95,7 +95,7 @@ else is reverse-engineered from MITM captures of the stock plugin.
 Everything we have been able to establish about how the stock network
 plugin is integrated, validated, and invoked — including the full C ABI
 and related wire behaviour — is collected in
-[NETWORK_PLUGIN.md](NETWORK_PLUGIN.md).
+[research/INDEX.md](research/INDEX.md).
 
 Please note:
 
@@ -241,7 +241,7 @@ difference is what happens inside.
 
 #### File browser (Device → Files)
 
-**Default (stock parity):** `libBambuSource.so` opens TLS **:6000**, runs the BambuTunnelLocal handshake (`StartStreamEx` / `mtype` 12291), then **forwards** Studio's CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) to printer firmware — same wire as stock. See [NETWORK_PLUGIN.md §7.5.1](NETWORK_PLUGIN.md#751-where-the-printer-side-bytes-actually-come-from).
+**Default (stock parity):** `libBambuSource.so` opens TLS **:6000**, runs the BambuTunnelLocal handshake (`StartStreamEx` / `mtype` 12291), then **forwards** Studio's CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) to printer firmware — same wire as stock. See [research/07-bambusource.md §7.5.1](research/07-bambusource.md#751-where-the-printer-side-bytes-actually-come-from).
 
 **3MF model thumbnails in the browser:** Studio sends **`SUB_FILE`** (`cmdtype=2`). Typical shapes:
 - `req.paths`: `["/path/model.gcode.3mf#thumbnail"]` — firmware returns `Metadata/plate_N.png` bytes (or sidecar `.jpg` for timelapses).

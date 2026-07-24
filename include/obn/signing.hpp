@@ -73,7 +73,7 @@ std::string slicer_crl_pem();
 // True when slicer_cert.pem + slicer_crl.pem are present and parse as X.509
 // (config paths or config_dir defaults). Expiry / CRL nextUpdate / revocation
 // are logged as warnings but do not block — firmware accepts expired official
-// CRLs (see NETWORK_PLUGIN.md). Gates fire-and-forget app_cert_install
+// CRLs (see ../../research/INDEX.md). Gates fire-and-forget app_cert_install
 // (no private key needed).
 bool slicer_app_cert_usable();
 

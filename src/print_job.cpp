@@ -381,8 +381,9 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     // Stock plugin parity: `ams_mapping2` is emitted **unconditionally**
     // — even when AMS isn't in use the field appears as an empty array
     // (`"ams_mapping2": []`). Confirmed via `tools/plugin_runner` against
-    // the stock libbambu_networking.so on N7 (see NETWORK_PLUGIN.md
-    // §6.8.2 "Per-PrintParams-field mapping" matrix). We feed it
+    // the stock libbambu_networking.so on N7 (see
+    // ../research/06.08.2-project-file.md §6.8.2 "Per-PrintParams-field
+    // mapping" matrix). We feed it
     // verbatim from `params.ams_mapping2` (a JSON-array string from
     // SelectMachineDialog::get_ams_mapping_result), defaulting to `[]`
     // when the caller didn't populate it.
@@ -412,7 +413,7 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     // Driven by `task_timelapse_use_internal` (added to PrintParams in
     // ABI 02.05.03). All other bits stay 0 in every captured stock
     // frame; if more flags surface later, OR them into `cfg_bits` here.
-    // See NETWORK_PLUGIN.md §6.8.2.
+    // See ../research/06.08.2-project-file.md §6.8.2.
     //
     // Wire-level parity: the cross-ABI `tools/plugin_runner` matrix
     // (02.05.00 -> 02.06.01) showed the stock plugin emits `cfg` in
@@ -433,7 +434,7 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     // flipped the field from 0 to 1 across both 02.05.00 and 02.06.01).
     // Studio populates this from the user's "Flow dynamics calibration"
     // dropdown; the firmware uses it to short-circuit redundant PA
-    // cali runs. See NETWORK_PLUGIN.md §6.8.2.
+    // cali runs. See ../research/06.08.2-project-file.md §6.8.2.
     os << ",\"extrude_cali_flag\":" << p.auto_flow_cali;
 
     os << "}}";
@@ -497,7 +498,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     // matched no observed traffic; we keep `ftp_folder` honored
     // verbatim so a downstream caller can still target a specific
     // directory if needed (e.g. `"sdcard/"` for printers whose
-    // firmware insists on it). See NETWORK_PLUGIN.md §6.8.2.
+    // firmware insists on it). See ../research/06.08.2-project-file.md §6.8.2.
     std::string remote_folder = params.ftp_folder;
     if (!remote_folder.empty() && remote_folder.back() != '/') remote_folder += '/';
     if (!remote_folder.empty() && remote_folder.front() == '/') remote_folder.erase(0, 1);

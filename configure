@@ -210,7 +210,7 @@ if [ -z "$PREFIX" ]; then
             fi
             ;;
         Darwin)
-            # wx StandardPaths user data dir on macOS (see NETWORK_PLUGIN.md).
+            # wx StandardPaths user data dir on macOS (see research/INDEX.md).
             PREFIX="$client_mac_dir"
             ;;
     esac

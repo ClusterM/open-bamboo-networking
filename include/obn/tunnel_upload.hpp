@@ -86,7 +86,7 @@ public:
     // cmd_type=7 media ability; returns JSON array string on success.
     UploadOutcome query_media_ability();
 
-    // cmd_type=4 FILE_DOWNLOAD (mem:/N printer preview). See NETWORK_PLUGIN.md §6.14.4.
+    // cmd_type=4 FILE_DOWNLOAD (mem:/N printer preview). See ../../research/06.14-file-transfer.md §6.14.4.
     DownloadOutcome download(const DownloadRequest& req, DownloadCallbacks cb = {});
 
     // LIST_INFO + SUB_FILE tile thumbnail (Device → Storage → Model wire path).

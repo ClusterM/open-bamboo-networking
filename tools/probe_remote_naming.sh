@@ -2,7 +2,7 @@
 # Probe stock (or open) libbambu_networking.so remote STOR naming for
 # start_send_gcode_to_sdcard vs start_local_print.
 #
-# Documented: NETWORK_PLUGIN.md §6.14.3
+# Documented: ../research/06.14-file-transfer.md §6.14.3
 # Driver:     tools/plugin_runner.sh (tools/plugin_runner/README.md)
 #
 # Prefer send_gcode_to_sdcard while the printer is busy printing — it

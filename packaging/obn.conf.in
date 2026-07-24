@@ -22,11 +22,13 @@ bambusource_log_stderr = 1
 bambusource_log_to_file = 0
 bambusource_log_file =
 
+
 # --- LAN TLS --------------------------------------------------------
 #
 # Skip TLS certificate verification for LAN MQTT/FTPS connections.
 
 lan_tls_skip_verify = 0
+
 
 # --- Print behavior -------------------------------------------------
 #
@@ -35,6 +37,7 @@ lan_tls_skip_verify = 0
 # that toggle to internal storage, so this avoids switching it every time.
 
 force_timelapse_external = 0
+
 
 # --- File transfer --------------------------------------------------
 #
@@ -46,6 +49,7 @@ force_timelapse_external = 0
 
 force_ftps = 0
 
+
 # --- Device panel camera preview ------------------------------------
 #
 # When live view is off, Studio polls a static JPEG snapshot from the
@@ -56,6 +60,7 @@ force_ftps = 0
 
 disable_camera_preview = 0
 
+
 # --- MQTT connection persistence -------------------------------------
 #
 # Keep the MQTT connection alive across the slicer's internal
@@ -65,6 +70,7 @@ disable_camera_preview = 0
 # MQTT session slots (A1 Mini, P1S, etc.).
 
 mqtt_keep_connection = 1
+
 
 # --- MQTT push_status patches ---------------------------------------
 #

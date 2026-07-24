@@ -108,7 +108,7 @@ int main()
     }
 
     // Ask the printer to send its full state snapshot. This is the same
-    // payload Studio uses (see NETWORK_PLUGIN.md / OpenBambuAPI/mqtt.md).
+    // payload Studio uses (see ../research/INDEX.md / OpenBambuAPI/mqtt.md).
     const std::string pushall =
         R"({"pushing":{"sequence_id":"0","command":"pushall"}})";
     rc = agent.send_message_to_printer(serial, pushall, /*qos=*/0);

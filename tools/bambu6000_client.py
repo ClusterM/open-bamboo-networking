@@ -464,7 +464,7 @@ class LocalCtrlSession:
 
         mem: scheme paths (e.g. ``mem:/26``) must use ``{"path": ...}``
         with the full scheme URI, not ``{"file": ...}`` — see
-        NETWORK_PLUGIN.md §6.14.4 and issue #52.
+        ../research/06.14-file-transfer.md §6.14.4 and issue #52.
         """
         if entry.path.startswith("/") or entry.path.startswith("mem:"):
             return {"path": entry.path, "offset": 0}
