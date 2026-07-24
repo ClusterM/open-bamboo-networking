@@ -467,6 +467,9 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
     if (http_code) *http_code = 0;
     if (http_body) http_body->clear();
 
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_SUCCESS;
+
     // Synthetic-subtask short-circuit. notify_local_message rewrites
     // zero ids in LAN push_status frames to "lan-<fnv>"; Studio then
     // calls us here to resolve that id. We hand back a minimal
@@ -474,8 +477,7 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
     // context.plates[0].thumbnail.url pointing at our local
     // cover_server, which in turn serves the PNG extracted from the
     // printer's /cache/<name>.3mf.
-    auto* a = as_agent(agent);
-    if (a) {
+    {
         obn::Agent::SubtaskCoverInfo info;
         if (a->lookup_synthetic_subtask(subtask_id, &info) &&
             !info.url.empty()) {
@@ -514,7 +516,52 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
             return BAMBU_NETWORK_SUCCESS;
         }
     }
-    (void)subtask_id;
+
+    // Real cloud task / subtask id (Device panel cover while a cloud-
+    // recorded print is running). Stock:
+    //   GET /v1/iot-service/api/user/task/<id>
+    // Response is forwarded verbatim — Studio reads
+    // context.plates[<i>].thumbnail.url (+ content.info.plate_idx).
+    // Not gated on block_cloud: this is a read of an already-created
+    // task record (cover URL), not cloud MQTT / print upload.
+    if (subtask_id.empty() || subtask_id == "0" ||
+        subtask_id.rfind("lan-", 0) == 0) {
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        OBN_WARN("get_subtask_info: no access token (id=%s)",
+                 subtask_id.c_str());
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/iot-service/api/user/task/"
+        + obn::http::url_encode(subtask_id);
+    auto hdrs = a->cloud_api_http_headers();
+    OBN_INFO("get_subtask_info: cloud id=%s", subtask_id.c_str());
+    auto resp = obn::http::get_json(url, hdrs);
+    if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
+
+    if (!resp.error.empty()) {
+        OBN_WARN("get_subtask_info: transport: %s", resp.error.c_str());
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    if (resp.status_code != 200) {
+        OBN_WARN("get_subtask_info: HTTP %ld body=%s",
+                 resp.status_code,
+                 resp.body.size() > 200
+                     ? (resp.body.substr(0, 200) + "...").c_str()
+                     : resp.body.c_str());
+        if (http_body) *http_body = resp.body;
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    OBN_INFO("get_subtask_info: ok id=%s bytes=%zu",
+             subtask_id.c_str(), resp.body.size());
+    if (task_json) *task_json = resp.body;
+    if (http_body) *http_body = std::move(resp.body);
     return BAMBU_NETWORK_SUCCESS;
 }
 
