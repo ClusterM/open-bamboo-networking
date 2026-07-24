@@ -1,4 +1,5 @@
 #include "obn/cloud_auth.hpp"
+#include "obn/identity_headers.hpp"
 
 #include "obn/config.hpp"
 #include "obn/http_client.hpp"
@@ -73,7 +74,11 @@ AuthResult login_with_ticket(const std::string& region,
     // Studio will re-open the login dialog.
     std::string url  = api_host(region) + "/v1/user-service/user/ticket/" + ticket;
     std::string body = std::string("{\"ticket\":") + obn::json::escape(ticket) + "}";
-    auto resp = obn::http::post_json(url, body);
+    // Pre-auth: send the stock identity block (correct User-Agent, X-BBL-* set)
+    // but no Authorization/X-BBL-Client-ID (we have no token or user id yet).
+    auto resp = obn::http::post_json(url, body,
+        obn::bbl::identity_headers(/*token*/std::string{}, /*uid*/std::string{},
+                                   /*include_client_id*/false, /*with_content_type*/true));
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
     if (!resp.error.empty()) {
@@ -100,8 +105,11 @@ AuthResult refresh_token(const std::string& region,
     // community docs (`/v1/user-service/user/refreshtoken` or
     // `/v1/user-service/user/refresh-token`). We try the more common
     // dash-less form; if it 404s we'll iterate later.
+    // Pre-auth refresh: stock identity block, no Authorization/X-BBL-Client-ID.
     auto resp = obn::http::post_json(api_host(region) + "/v1/user-service/user/refreshtoken",
-                                     refresh_body(refresh));
+                                     refresh_body(refresh),
+        obn::bbl::identity_headers(/*token*/std::string{}, /*uid*/std::string{},
+                                   /*include_client_id*/false, /*with_content_type*/true));
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
     if (!resp.error.empty()) {
@@ -124,9 +132,11 @@ ProfileResult get_profile(const std::string& region,
                           const std::string& access_token)
 {
     ProfileResult r;
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + access_token},
-    };
+    // Full stock identity block (ordered by http::perform). No X-BBL-Client-ID:
+    // this runs before we know the user id (it is what fetches it).
+    auto hdrs = obn::bbl::identity_headers(access_token, /*user_id*/std::string{},
+                                           /*include_client_id*/false,
+                                           /*with_content_type*/true);
     auto resp = obn::http::get_json(api_host(region) + "/v1/user-service/my/profile", hdrs);
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
@@ -185,9 +195,11 @@ DeviceCertResult fetch_device_cert(const std::string& region,
         + "/cert?aes256="
         + encoded_key
         + "&ver=1";
-    std::map<std::string, std::string> hdrs{
-        {"Authorization", "Bearer " + access_token},
-    };
+    // Full stock identity block (ordered by http::perform). Genuine get_app_cert
+    // sends neither X-BBL-Client-ID nor Content-Type.
+    auto hdrs = obn::bbl::identity_headers(access_token, /*user_id*/std::string{},
+                                           /*include_client_id*/false,
+                                           /*with_content_type*/false);
     auto resp = obn::http::get_json(url, hdrs);
     r.http_status = resp.status_code;
     r.raw_body    = resp.body;
