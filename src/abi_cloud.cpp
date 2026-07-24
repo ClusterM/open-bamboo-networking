@@ -36,7 +36,7 @@ OBN_ABI int bambu_network_refresh_connection(void* agent)
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     if (obn::config::current().block_cloud) return BAMBU_NETWORK_SUCCESS;
-    OBN_DEBUG("bambu_network_refresh_connection");
+    OBN_TRACE("bambu_network_refresh_connection");
     return a->cloud_refresh();
 }
 

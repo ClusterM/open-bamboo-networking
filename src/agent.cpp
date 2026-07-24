@@ -1770,7 +1770,7 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
         //          CloudSession::configure_mtls(cert_path, key_path) method.
         // `application_token` derivation is not yet confirmed; see
         // obn::cloud::fetch_device_cert() comment in cloud_auth.hpp.
-        OBN_DEBUG("install_device_cert dev=%s lan_only=0: mTLS cert wiring pending (see cloud::fetch_device_cert)", dev_id.c_str());
+        OBN_TRACE("install_device_cert dev=%s lan_only=0: mTLS cert wiring pending (see cloud::fetch_device_cert)", dev_id.c_str());
         return;
     }
 

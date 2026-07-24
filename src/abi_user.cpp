@@ -137,7 +137,7 @@ std::string build_session_cmd(const obn::Agent* a, bool logout)
 OBN_ABI std::string bambu_network_build_login_cmd(void* agent)
 {
     auto r = build_session_cmd(as_agent(agent), /*logout=*/false);
-    OBN_DEBUG("build_login_cmd -> len=%zu", r.size());
+    OBN_TRACE("build_login_cmd -> len=%zu", r.size());
     return r;
 }
 

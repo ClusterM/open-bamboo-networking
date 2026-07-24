@@ -440,7 +440,7 @@ void Client::s_on_message(::mosquitto* /*m*/, void* obj, const ::mosquitto_messa
 {
     auto* self = static_cast<Client*>(obj);
     if (!self || !msg) return;
-    OBN_DEBUG("mqtt msg topic=%s bytes=%d qos=%d", msg->topic, msg->payloadlen, msg->qos);
+    OBN_TRACE("mqtt msg topic=%s bytes=%d qos=%d", msg->topic, msg->payloadlen, msg->qos);
     if (msg->payload && msg->payloadlen > 0) {
         OBN_TRACE("mqtt msg payload=%.*s",
             msg->payloadlen, static_cast<const char*>(msg->payload));
