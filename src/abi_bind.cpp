@@ -103,6 +103,12 @@ OBN_ABI int bambu_network_modify_printer_name(void*       agent,
     return obn::cloud_bind::modify_printer_name(a, dev_id, dev_name);
 }
 
+// Intentional stub. Studio ba049f6a2 calls this when logged in
+// (privacy / improvement policy / Helio consent) with the full JSON
+// body for POST /v1/user-service/user/consent; return value is ignored
+// and app_config already stores the local choice. When logged out,
+// Studio POSTs the same body itself (GUI_App::report_consent). We do
+// not forward consent telemetry to Bambu — see research/06.10-http.md.
 OBN_ABI int bambu_network_report_consent(void* /*agent*/, std::string expand)
 {
     OBN_DEBUG("report_consent %s", expand.c_str());

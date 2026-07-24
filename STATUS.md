@@ -147,7 +147,7 @@ Source: [src/abi_bind.cpp](src/abi_bind.cpp).
 | `bambu_network_unbind` | ✅ | Cloud unbind call. |
 | `bambu_network_request_bind_ticket` | ✅ | WebView SSO ticket: `GET /user-service/user/ticket` then **`POST /user-service/my/ticket/<T>`** to bind the code to the session (required — mint alone leaves MakerWorld with an empty `token` cookie / sign-in page). Used for Print History detail, MakerWorld, bind WebViews. |
 | `bambu_network_query_bind_status` | ✅ | Cloud bind-status query. |
-| `bambu_network_report_consent` | ❌ | No-op (returns `SUCCESS`). No consent-collection endpoint is exposed by this plugin. |
+| `bambu_network_report_consent` | ❌ | Intentional no-op (`SUCCESS`). Studio **does** call this when logged in ([`ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b): privacy / improvement policy / Helio TOU) with body for `POST /v1/user-service/user/consent`; return value ignored; local dialogs still persist via `app_config`. Not implemented: privacy-preserving (no consent telemetry to Bambu); logged-out Studio already POSTs itself. See `research/06.10-http.md`. |
 
 ### 6.7. Printer selection and metadata
 
