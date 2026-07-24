@@ -66,6 +66,8 @@ static int test_create_template()
     CHECK(content.find("cloud_global_api_host = https://api.bambulab.com")
           != std::string::npos);
     CHECK(content.find("block_cloud = 1") != std::string::npos);
+    CHECK(content.find("cloud_print = cloud_only") != std::string::npos);
+    CHECK(content.find("cloud_hide_history = 0") != std::string::npos);
 
     write_conf(dir, "log_level = warn\n");
     (void)obn::config::load_or_create(dir.string());
@@ -153,6 +155,8 @@ static int test_new_keys()
                "lan_tls_skip_verify = yes\n"
                "cloud_mqtt_port = 1883\n"
                "block_cloud = false\n"
+               "cloud_print = try_lan_first\n"
+               "cloud_hide_history = 1\n"
                "force_timelapse_external = 1\n"
                "force_ftps = 1\n"
                "disable_camera_preview = 1\n"
@@ -169,6 +173,8 @@ static int test_new_keys()
     CHECK(cfg.lan_tls_skip_verify == true);
     CHECK(cfg.cloud_mqtt_port == 1883);
     CHECK(cfg.block_cloud == false);
+    CHECK(cfg.cloud_print == obn::config::CloudPrintMode::TryLanFirst);
+    CHECK(cfg.cloud_hide_history == true);
     CHECK(cfg.force_timelapse_external == true);
     CHECK(cfg.force_ftps == true);
     CHECK(cfg.disable_camera_preview == true);
@@ -192,6 +198,8 @@ static int test_new_keys_defaults()
     CHECK(cfg.lan_tls_skip_verify == false);
     CHECK(cfg.cloud_mqtt_port == 8883);
     CHECK(cfg.block_cloud == true);
+    CHECK(cfg.cloud_print == obn::config::CloudPrintMode::CloudOnly);
+    CHECK(cfg.cloud_hide_history == false);
     CHECK(cfg.force_timelapse_external == false);
     CHECK(cfg.force_ftps == false);
     CHECK(cfg.disable_camera_preview == false);
@@ -250,6 +258,17 @@ int main()
     if (test_new_keys_defaults() != 0) return 1;
     if (test_load_if_exists() != 0) return 1;
     if (test_cloud_mqtt_port_bounds() != 0) return 1;
+
+    {
+        const fs::path dir = make_temp_dir();
+        write_conf(dir, "cloud_print = lan_only\n");
+        CHECK(obn::config::load_or_create(dir.string()).cloud_print
+              == obn::config::CloudPrintMode::LanOnly);
+        write_conf(dir, "cloud_print = not_a_mode\n");
+        CHECK(obn::config::load_or_create(dir.string()).cloud_print
+              == obn::config::CloudPrintMode::CloudOnly);
+    }
+
     std::cout << "config_test: ok\n";
     return 0;
 }

@@ -22,32 +22,6 @@ bambusource_log_stderr = 1
 bambusource_log_to_file = 0
 bambusource_log_file =
 
-# --- Cloud endpoints (Global) --------------------------------------
-#
-# Used when country_code is not CN.
-
-cloud_global_api_host = https://api.bambulab.com
-cloud_global_web_host = https://bambulab.com
-cloud_global_mqtt_host = us.mqtt.bambulab.com
-
-# --- Cloud endpoints (CN) ------------------------------------------
-#
-# Used when country_code is CN.
-
-cloud_cn_api_host = https://api.bambulab.cn
-cloud_cn_web_host = https://bambulab.cn
-cloud_cn_mqtt_host = cn.mqtt.bambulab.com
-
-cloud_mqtt_port = 8883
-
-# --- Cloud access ---------------------------------------------------
-#
-# Block background cloud MQTT/REST connections, cloud print upload
-# (3mf -> Bambu S3), and cloud topic subscriptions.
-# Auth, preset sync, and bind/unbind are still allowed.
-
-block_cloud = 1
-
 # --- LAN TLS --------------------------------------------------------
 #
 # Skip TLS certificate verification for LAN MQTT/FTPS connections.
@@ -89,45 +63,8 @@ disable_camera_preview = 0
 # Useful for Orca Slicer, which reconnects to the printer after
 # every print, causing a 5-30s delay on printers with limited
 # MQTT session slots (A1 Mini, P1S, etc.).
-# Useful for Orca Slicer.
 
 mqtt_keep_connection = 1
-
-# --- Signing / cloud auth -------------------------------------------
-#
-# Path to the slicer RSA private key (PEM) used for MQTT payload signing
-# and cloud REST request authentication.
-# If empty, looks for slicer_key.pem in this config directory.
-
-slicer_key_pem =
-
-# Slicer certificate ID registered on the Bambu backend.
-# If empty, reads slicer_cert_id.txt from this config directory.
-
-slicer_cert_id =
-
-# Path to the app certificate chain (PEM) sent to the printer via the
-# security.app_cert_install MQTT command (new authorization-control system).
-# If empty, looks for slicer_cert.pem in this config directory.
-
-slicer_cert_pem =
-
-# Path to the app certificate revocation list (PEM CRL) sent alongside the
-# app certificate in security.app_cert_install.
-# If empty, looks for slicer_crl.pem in this config directory.
-
-slicer_crl_pem =
-
-# Value sent in the X-BBL-Client-Name HTTP header on cloud REST calls.
-# The MakerWorld "POST /my/task" endpoint authorizes access to uploaded
-# print content ONLY for the stock client name "BambuStudio".
-
-client_name = OpenBambooNetworking
-
-# Path to the login session persistence file.
-# If empty, uses session.json in this config directory.
-
-session_path =
 
 # --- MQTT push_status patches ---------------------------------------
 #
@@ -172,3 +109,105 @@ patch_mqtt_ipcam_file = 0
 # be slow or unreliable (e.g. on P2S) — enable only if you need the tab.
 
 patch_mqtt_internal_storage = 0
+
+
+# --- Cloud ----------------------------------------------------------
+#
+# Everything below talks to Bambu Lab's online services (login, status,
+# print history, and sending a print through the cloud). Change these
+# only if you understand the trade-offs for privacy and reliability.
+#
+# !!! WARNING !!!
+#
+# Full cloud operation with a secured printer also REQUIRES you to
+# supply your own slicer_cert_id, slicer_key_pem, slicer_cert_pem, and
+# slicer_crl_pem (see below). These are private credentials; this
+# project does not distribute them. You must obtain them yourself, and
+# you alone are responsible for ensuring that your use of them complies
+# with applicable terms and law.
+
+# Fully blocks talking to Bambu's cloud (live status, subscriptions,
+# cloud printing / uploading print files), except login, syncing
+# presets, and binding/unbinding a printer, which still work.
+# If you want cloud printing or any of the cloud_print modes below,
+# set this to 0 first.
+
+block_cloud = 1
+
+# Slicer certificate ID registered on the Bambu backend.
+# If empty, reads slicer_cert_id.txt from this config directory.
+
+slicer_cert_id =
+
+# Path to the slicer RSA private key (PEM) used for MQTT payload signing
+# and cloud REST request authentication.
+# If empty, looks for slicer_key.pem in this config directory.
+
+slicer_key_pem =
+
+# Path to the app certificate chain (PEM) sent to the printer via the
+# security.app_cert_install MQTT command (new authorization-control system).
+# If empty, looks for slicer_cert.pem in this config directory.
+
+slicer_cert_pem =
+
+# Path to the app certificate revocation list (PEM CRL) sent alongside the
+# app certificate in security.app_cert_install.
+# If empty, looks for slicer_crl.pem in this config directory.
+
+slicer_crl_pem =
+
+# Name this plugin sends as the client identity on cloud API calls.
+# Starting a cloud print / print history record is only accepted by
+# Bambu when this matches the official slicer name "BambuStudio".
+# The honest default below will be rejected for those print APIs until
+# you change it.
+
+client_name = OpenBambooNetworking
+
+# How a print is sent when the slicer wants to use the cloud / "print
+# with record" path (typical for a printer that is linked to your
+# Bambu account). This does not change pure LAN-only printers.
+#
+#   cloud_only     — Default. The slicer first tries to put the model on
+#                    the printer over your local network (LAN). If that
+#                    fails, the full model is uploaded to the cloud instead.
+#                    Either way the cloud is required for print history /
+#                    reporting and to start the job — without a working
+#                    cloud connection, printing will not work.
+#
+#   try_lan_first  — Prefer a fully private local send (same as when the
+#                    printer is in LAN-only mode): put the file on the
+#                    printer over your home/LAN network and start the print
+#                    there, without uploading the full model to Bambu. If
+#                    that fails (printer offline on LAN, wrong access code,
+#                    upload error, …), the slicer is allowed to fall back
+#                    to a normal cloud print (full model uploaded to Bambu).
+#
+#   lan_only       — Fully analogous to the printer being in LAN-only mode:
+#                    always send and start the print locally. Never fall
+#                    back to uploading the full model to the cloud. If the
+#                    local send fails, the print simply fails.
+
+cloud_print = cloud_only
+
+# Hide cloud print history on the Bambu Studio home page (return an
+# empty task list). Useful with true LAN print modes (try_lan_first /
+# lan_only above), which do not write a cloud history entry — otherwise
+# the home page still shows older cloud jobs and looks inconsistent.
+
+cloud_hide_history = 0
+
+# Server addresses (Global region — used when country is not China).
+
+cloud_global_api_host = https://api.bambulab.com
+cloud_global_web_host = https://bambulab.com
+cloud_global_mqtt_host = us.mqtt.bambulab.com
+
+# Server addresses (China region).
+
+cloud_cn_api_host = https://api.bambulab.cn
+cloud_cn_web_host = https://bambulab.cn
+cloud_cn_mqtt_host = cn.mqtt.bambulab.com
+
+cloud_mqtt_port = 8883

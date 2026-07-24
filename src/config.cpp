@@ -1,5 +1,6 @@
 #include "obn/config.hpp"
 #include "obn/lan_tls.hpp"
+#include "obn/log.hpp"
 #include "obn_conf_default.h"
 
 #include <algorithm>
@@ -81,6 +82,21 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
         if (p > 0 && p <= 65535) out.cloud_mqtt_port = p;
     }
     else if (key == "block_cloud")              out.block_cloud = truthy(val);
+    else if (key == "cloud_hide_history")       out.cloud_hide_history = truthy(val);
+    else if (key == "cloud_print") {
+        const std::string v = to_lower(val);
+        if (v == "cloud_only")
+            out.cloud_print = CloudPrintMode::CloudOnly;
+        else if (v == "try_lan_first")
+            out.cloud_print = CloudPrintMode::TryLanFirst;
+        else if (v == "lan_only")
+            out.cloud_print = CloudPrintMode::LanOnly;
+        else {
+            OBN_WARN("config: unknown cloud_print='%s', using cloud_only",
+                     val.c_str());
+            out.cloud_print = CloudPrintMode::CloudOnly;
+        }
+    }
     else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
     else if (key == "force_ftps")                out.force_ftps = truthy(val);
     else if (key == "disable_camera_preview")      out.disable_camera_preview = truthy(val);

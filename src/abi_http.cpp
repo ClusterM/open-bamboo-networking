@@ -260,11 +260,14 @@ OBN_ABI int bambu_network_get_user_tasks(void* agent,
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
-    // Cloud-only MakerWorld history. Under block_cloud return an empty but
-    // well-formed envelope so Studio's TaskManager / WebView parsers stay
-    // happy instead of treating a transport error as a hard failure.
-    if (obn::config::current().block_cloud) {
-        OBN_DEBUG("get_user_tasks: blocked by block_cloud");
+    // Cloud-only MakerWorld history. Under block_cloud or cloud_hide_history
+    // return an empty but well-formed envelope so Studio's TaskManager /
+    // WebView parsers stay happy instead of treating a transport error as
+    // a hard failure.
+    const auto& cfg = obn::config::current();
+    if (cfg.block_cloud || cfg.cloud_hide_history) {
+        OBN_DEBUG("get_user_tasks: empty (%s)",
+                  cfg.block_cloud ? "block_cloud" : "cloud_hide_history");
         if (http_body) *http_body = R"({"total":0,"hits":[]})";
         return BAMBU_NETWORK_SUCCESS;
     }
