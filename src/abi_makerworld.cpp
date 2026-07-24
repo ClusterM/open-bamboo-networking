@@ -11,27 +11,43 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/http_client.hpp"
+#include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/oss_sign.hpp"
 
-// Forward declaration only: BBLModelTask is defined in Bambu Studio's
-// DeviceManager.hpp. We never dereference the pointer; we just need the type
-// name to match Studio's std::function<void(BBLModelTask*)> template
-// instantiation exactly. Getting the template parameter wrong is NOT merely
-// a style issue - std::function's type-erased invoker expects arguments at
-// specific offsets/layouts, and a mismatched instantiation silently
-// reinterprets (e.g.) an int as a pointer, which is how PID 459153 died
-// with SIGBUS inside StatusPanel::update_model_info.
-class BBLModelTask;
+// Layout must match BambuStudio ProjectTask.hpp::BBLModelTask (non-virtual:
+// 4 ints + 4 strings). Studio allocates; we only fill fields. The type name
+// must also match Studio's std::function<void(BBLModelTask*)> instantiation
+// exactly — a mismatched template parameter caused SIGBUS in
+// StatusPanel::update_model_info (wrong invoker / argument layout).
+class BBLModelTask {
+public:
+    int         job_id      = 0;
+    int         design_id   = 0;
+    int         profile_id  = 0;
+    int         instance_id = 0;
+    std::string task_id;
+    std::string model_id;
+    std::string model_name;
+    std::string profile_name;
+};
 
 using obn::as_agent;
 
-// MakerWorld / model mall / OSS: no open specification exists. Most of
-// these return success with empty payloads so Studio's UI degrades
-// gracefully instead of crashing. The OSS credential/upload leg
-// (get_oss_config + put_rating_picture_oss) is implemented per issue #49.
+// MakerWorld / model mall / OSS. Wire confirmed via stock MITM
+// (plugin_runner --action mw_probe) + research/06.12-makerworld.md.
+// Dead ABIs (staffpick / publish / home_url) stay stubs — Studio GUI
+// no longer calls them (ba049f6a2).
 
 namespace {
+
+// MakerWorld site host (not the REST api host). Mirrors Studio
+// GUI_App::get_model_http_url for US / CN production.
+std::string makerworld_host(const std::string& region)
+{
+    if (region == "CN") return "https://makerworld.com.cn/";
+    return "https://makerworld.com/";
+}
 
 // Split "https://host/..." into (host, scheme+host base). Returns false
 // when the endpoint has no recognisable scheme.
@@ -100,18 +116,66 @@ OBN_ABI int bambu_network_get_model_publish_url(void* /*agent*/, std::string* ur
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_subtask(void*          /*agent*/,
-                                      BBLModelTask*  task,
+// Stock: GET /v1/user-service/my/task/<task_id> (Bearer). Distinct from
+// get_subtask_info (iot-service). Not gated on block_cloud — read of an
+// already-created cloud task record (same rationale as cover fetch).
+OBN_ABI int bambu_network_get_subtask(void* agent,
+                                      BBLModelTask* task,
                                       std::function<void(BBLModelTask*)> cb)
 {
-    // ABI-safe stub: Studio passes a heap BBLModelTask with only task_id set
-    // and expects us to cloud-fetch MakerWorld model/design metadata
-    // (design_id, instance_id, model_id, model_name, profile_name, …) then
-    // hand the enriched object back through cb. Stock does a real REST lookup;
-    // we don't — we just echo the pointer so Studio doesn't leak it and
-    // request_model_info_flag clears. MakerWorld profile/rating UI stays off.
-    OBN_DEBUG("get_subtask task=%p cb=%d -> echo", (void*)task, cb ? 1 : 0);
-    if (task && cb) cb(task);
+    auto echo = [&]() {
+        if (task && cb) cb(task);
+        return BAMBU_NETWORK_SUCCESS;
+    };
+    if (!task) return BAMBU_NETWORK_SUCCESS;
+
+    const std::string& tid = task->task_id;
+    if (tid.empty() || tid == "0" || tid.rfind("lan-", 0) == 0) {
+        OBN_DEBUG("get_subtask: skip synthetic/empty id=%s", tid.c_str());
+        return echo();
+    }
+
+    auto* a = as_agent(agent);
+    if (!a) return echo();
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        OBN_WARN("get_subtask: no access token (id=%s)", tid.c_str());
+        return echo();
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/user-service/my/task/"
+        + obn::http::url_encode(tid);
+    auto hdrs = a->cloud_api_http_headers();
+    OBN_INFO("get_subtask: cloud id=%s", tid.c_str());
+    auto resp = obn::http::get_json(url, hdrs);
+    if (!resp.error.empty() || resp.status_code != 200) {
+        OBN_WARN("get_subtask: HTTP %ld err=%s",
+                 resp.status_code, resp.error.c_str());
+        return echo();
+    }
+
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root) {
+        OBN_WARN("get_subtask: JSON parse: %s", perr.c_str());
+        return echo();
+    }
+    // Map MakerWorld camelCase → BBLModelTask (see research/06.12).
+    task->job_id      = static_cast<int>(root->find("id").as_int(0));
+    task->design_id   = static_cast<int>(root->find("designId").as_int(0));
+    task->instance_id = static_cast<int>(root->find("instanceId").as_int(0));
+    task->profile_id  = static_cast<int>(root->find("profileId").as_int(0));
+    {
+        auto v = root->find("modelId");
+        if (v.is_string()) task->model_id = v.as_string();
+        else if (v.is_number()) task->model_id = std::to_string(v.as_int());
+    }
+    task->model_name   = root->find("designTitle").as_string();
+    task->profile_name = root->find("title").as_string();
+    OBN_INFO("get_subtask: ok id=%s design=%d instance=%d",
+             tid.c_str(), task->design_id, task->instance_id);
+    if (cb) cb(task);
     return BAMBU_NETWORK_SUCCESS;
 }
 
@@ -121,24 +185,76 @@ OBN_ABI int bambu_network_get_model_mall_home_url(void* /*agent*/, std::string* 
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_model_mall_detail_url(void* /*agent*/,
+// StatusPanel::market_model_scoring_page expects a URL containing
+// "/models/<design_id>" then rewrites to …/u/<uid>/rating…. Stock returns
+// a short-lived SSO ticket path; absolute regional models URL is enough
+// for the rewrite + browser launch.
+OBN_ABI int bambu_network_get_model_mall_detail_url(void* agent,
                                                     std::string* url,
                                                     std::string  id)
 {
-    if (url) *url = std::string("https://makerworld.com/models/") + id;
+    if (!url) return BAMBU_NETWORK_SUCCESS;
+    std::string region = "US";
+    if (auto* a = as_agent(agent)) region = a->cloud_region();
+    *url = makerworld_host(region) + "models/" + id;
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_put_model_mall_rating(void* /*agent*/,
-                                                int /*rating_id*/, int /*score*/,
-                                                std::string /*content*/,
-                                                std::vector<std::string> /*images*/,
+// Stock: PUT /v1/comment-service/rating/<rating_id>
+// body {"content":"...","images":[...],"score":N}
+OBN_ABI int bambu_network_put_model_mall_rating(void* agent,
+                                                int rating_id, int score,
+                                                std::string content,
+                                                std::vector<std::string> images,
                                                 unsigned int& http_code,
                                                 std::string&  http_error)
 {
     http_code = 0;
     http_error.clear();
-    return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    if (rating_id <= 0) return BAMBU_NETWORK_ERR_GET_RATING_ID_FAILED;
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        http_error = "not logged in";
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+
+    using obn::json::Value;
+    using obn::json::Object;
+    using obn::json::Array;
+    Array imgs;
+    for (const auto& im : images) imgs.push_back(Value(im));
+    Object body{
+        {"content", Value(std::move(content))},
+        {"images",  Value(std::move(imgs))},
+        {"score",   Value(static_cast<double>(score))},
+    };
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/comment-service/rating/"
+        + std::to_string(rating_id);
+    obn::http::Request req;
+    req.method  = obn::http::Method::PUT;
+    req.url     = url;
+    req.headers = a->cloud_api_http_headers();
+    req.body    = Value(std::move(body)).dump();
+    OBN_INFO("put_model_mall_rating: id=%d score=%d images=%zu",
+             rating_id, score, images.size());
+    auto resp = obn::http::perform(req);
+    http_code = static_cast<unsigned int>(resp.status_code);
+    if (!resp.error.empty()) {
+        http_error = resp.error;
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    if (resp.status_code < 200 || resp.status_code >= 300) {
+        http_error = resp.body.empty()
+            ? ("HTTP " + std::to_string(resp.status_code))
+            : resp.body;
+        OBN_WARN("put_model_mall_rating: HTTP %ld", resp.status_code);
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    return BAMBU_NETWORK_SUCCESS;
 }
 
 // Fetch the STS-scoped object-storage credentials Studio then feeds back
@@ -281,8 +397,10 @@ OBN_ABI int bambu_network_put_rating_picture_oss(void* agent,
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_model_mall_rating(void* /*agent*/,
-                                                int /*job_id*/,
+// Stock: GET /v1/comment-service/rating/inst/<instance_id>
+// Studio passes instance_id (misnamed job_id). 404 when no rating yet.
+OBN_ABI int bambu_network_get_model_mall_rating(void* agent,
+                                                int job_id,
                                                 std::string&  rating_result,
                                                 unsigned int& http_code,
                                                 std::string&  http_error)
@@ -290,29 +408,106 @@ OBN_ABI int bambu_network_get_model_mall_rating(void* /*agent*/,
     rating_result.clear();
     http_code = 0;
     http_error.clear();
-    return BAMBU_NETWORK_ERR_INVALID_RESULT;
-}
 
-OBN_ABI int bambu_network_get_mw_user_preference(void* /*agent*/,
-                                                 std::function<void(std::string)> cb)
-{
-    // CRITICAL: Studio expects a JSON with a numeric `recommendStatus`
-    // field. It reads it as `int nRecommendStatus = jPrefer["recommendStatus"]`
-    // inside a CallAfter lambda (WebViewDialog.cpp, SendDesignStaffpick).
-    // If the field is missing, nlohmann::json converts null -> int and
-    // throws type_error, which propagates out of the queued lambda
-    // (past Studio's outer try/catch) and aborts the whole process via
-    // wxApp::OnUnhandledException. We answer with 0 so Studio takes the
-    // "default staff pick" branch and never looks at a null.
-    if (cb) cb("{\"recommendStatus\":0}");
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (job_id <= 0) return BAMBU_NETWORK_ERR_INVALID_RESULT;
+
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        http_error = "not logged in";
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/comment-service/rating/inst/"
+        + std::to_string(job_id);
+    auto hdrs = a->cloud_api_http_headers();
+    OBN_INFO("get_model_mall_rating: instance_id=%d", job_id);
+    auto resp = obn::http::get_json(url, hdrs);
+    http_code = static_cast<unsigned int>(resp.status_code);
+    if (!resp.error.empty()) {
+        http_error = resp.error;
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    if (resp.status_code != 200) {
+        http_error = resp.body.empty()
+            ? ("HTTP " + std::to_string(resp.status_code))
+            : resp.body;
+        return BAMBU_NETWORK_ERR_INVALID_RESULT;
+    }
+    rating_result = std::move(resp.body);
     return BAMBU_NETWORK_SUCCESS;
 }
 
-OBN_ABI int bambu_network_get_mw_user_4ulist(void* /*agent*/,
-                                             int /*seed*/, int /*limit*/,
+// Stock: GET /v1/design-user-service/my/preference
+// Body includes numeric recommendStatus (1|3 → For-You). On failure keep
+// the crash-safe stub — missing/null recommendStatus aborts Studio.
+OBN_ABI int bambu_network_get_mw_user_preference(void* agent,
+                                                 std::function<void(std::string)> cb)
+{
+    const char* k_safe = "{\"recommendStatus\":0}";
+    auto* a = as_agent(agent);
+    if (!a || !cb) {
+        if (cb) cb(k_safe);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        cb(k_safe);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/design-user-service/my/preference";
+    auto resp = obn::http::get_json(url, a->cloud_api_http_headers());
+    if (!resp.error.empty() || resp.status_code != 200 || resp.body.empty()) {
+        OBN_WARN("get_mw_user_preference: HTTP %ld — using safe stub",
+                 resp.status_code);
+        cb(k_safe);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root || !root->find("recommendStatus").is_number()) {
+        OBN_WARN("get_mw_user_preference: missing recommendStatus — stub");
+        cb(k_safe);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    cb(resp.body);
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+// Stock: GET /v1/design-service/my/design/recommend?seed=&limit=
+// Response {hits, seed, surplus}; Studio injects command before postMessage.
+OBN_ABI int bambu_network_get_mw_user_4ulist(void* agent,
+                                             int seed, int limit,
                                              std::function<void(std::string)> cb)
 {
-    if (cb) cb("{\"list\":[],\"total\":0}");
+    const char* k_empty = "{\"hits\":[],\"seed\":0,\"surplus\":0}";
+    auto* a = as_agent(agent);
+    if (!a || !cb) {
+        if (cb) cb(k_empty);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    auto s = a->user_session_snapshot();
+    if (s.access_token.empty()) {
+        cb(k_empty);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    if (limit <= 0) limit = 10;
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+        + "/v1/design-service/my/design/recommend?seed="
+        + std::to_string(seed) + "&limit=" + std::to_string(limit);
+    auto resp = obn::http::get_json(url, a->cloud_api_http_headers());
+    if (!resp.error.empty() || resp.status_code != 200 || resp.body.empty()) {
+        OBN_WARN("get_mw_user_4ulist: HTTP %ld — empty list",
+                 resp.status_code);
+        cb(k_empty);
+        return BAMBU_NETWORK_SUCCESS;
+    }
+    cb(resp.body);
     return BAMBU_NETWORK_SUCCESS;
 }
 

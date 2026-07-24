@@ -128,8 +128,8 @@ struct CliArgs {
     // obn.auth.json — see load_user_info_blob()).
     std::string user_info;
 
-    // --action http_probe: cloud task / message metadata probes. No
-    // printer connection. Defaults match a recent MITM sample.
+    // --action http_probe / mw_probe: cloud probes. No printer.
+    // Defaults match a recent MITM sample (my/task 1114566547).
     std::string task_id      = "1114566547";
     std::string project_id;   // empty OK; stock may still answer
     std::string profile_id   = "894049654";
@@ -137,6 +137,16 @@ struct CliArgs {
     int         msg_type     = 0;
     int         msg_after    = 0;
     int         msg_limit    = 20;
+    // mw_probe: MakerWorld rating / For-You. instance_id from my/task.
+    int         instance_id  = 390100;
+    std::string design_id    = "478834";
+    int         mw_seed      = 0;
+    int         mw_limit     = 10;
+    // put_model_mall_rating is skipped unless --mw-put-rating is set
+    // (avoids writing junk ratings during MITM discovery).
+    bool        mw_put_rating = false;
+    int         rating_id     = 0;
+    int         rating_score  = 5;
 
     // For wire-format reverse-engineering: after a print action
     // finishes (Finished or ERROR latched), publish
@@ -201,8 +211,15 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--plate-index N] [--msg-type N] [--msg-after N]
                      [--msg-limit N] [--country US]
 
+       plugin_runner --action mw_probe --plugin-path PATH
+                     --user-info @session.json [--data-dir DIR]
+                     [--task-id ID] [--instance-id N] [--design-id ID]
+                     [--mw-seed N] [--mw-limit N] [--mw-put-rating]
+                     [--rating-id N] [--rating-score N] [--country US]
+
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
                 | local_print_with_record | send_raw | none | http_probe
+                | mw_probe
 
   none: skip the print dispatch entirely. Useful for diagnostics: just
   init + connect_printer, then sit for --timeout seconds dumping every
@@ -219,6 +236,11 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   get_task_plate_index / get_slice_info and emit JSON events. Run under
   HTTPS_PROXY + mitmproxy to capture stock cloud URLs. --user-info may
   be a Studio {"data":{"token":…}} envelope or OBN obn.auth.json.
+
+  mw_probe: no printer. change_user then call get_subtask /
+  get_model_mall_detail_url / get_model_mall_rating /
+  get_mw_user_preference / get_mw_user_4ulist (put_model_mall_rating
+  only with --mw-put-rating). Use under MITM to capture MakerWorld URLs.
 
 Driven from tools/plugin_runner.sh; see tools/plugin_runner/README.md.
 )", stderr);
@@ -269,6 +291,13 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--msg-type")          c.msg_type = std::stoi(require(a, ++i, f));
         else if (f == "--msg-after")         c.msg_after = std::stoi(require(a, ++i, f));
         else if (f == "--msg-limit")         c.msg_limit = std::stoi(require(a, ++i, f));
+        else if (f == "--instance-id")       c.instance_id = std::stoi(require(a, ++i, f));
+        else if (f == "--design-id")         c.design_id = require(a, ++i, f);
+        else if (f == "--mw-seed")           c.mw_seed = std::stoi(require(a, ++i, f));
+        else if (f == "--mw-limit")          c.mw_limit = std::stoi(require(a, ++i, f));
+        else if (f == "--mw-put-rating")     c.mw_put_rating = true;
+        else if (f == "--rating-id")         c.rating_id = std::stoi(require(a, ++i, f));
+        else if (f == "--rating-score")      c.rating_score = std::stoi(require(a, ++i, f));
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--fast-exit")         c.fast_exit = true;
         else if (f == "--no-fast-exit")      c.fast_exit = false;
@@ -290,18 +319,18 @@ CliArgs parse_cli(int argc, char** argv)
         return c;
     }
     // params_json is only mandatory for actions that consume PrintParams.
-    // send_raw / none / http_probe can run without it.
-    const bool http_probe = (c.action == "http_probe");
-    bool needs_params = (c.action != "send_raw" && c.action != "none" && !http_probe);
+    // send_raw / none / http_probe / mw_probe can run without it.
+    const bool cloud_probe = (c.action == "http_probe" || c.action == "mw_probe");
+    bool needs_params = (c.action != "send_raw" && c.action != "none" && !cloud_probe);
     if (c.plugin_path.empty()) {
         std::fprintf(stderr, "plugin_runner: --plugin-path is required\n");
         usage(64);
     }
-    if (!http_probe) {
+    if (!cloud_probe) {
         if (c.dev_id.empty() || c.dev_ip.empty() || c.access_code.empty()) {
             std::fprintf(stderr, "plugin_runner: --dev-id, --dev-ip and "
                                  "--access-code are all required (except "
-                                 "for --action http_probe)\n");
+                                 "for --action http_probe|mw_probe)\n");
             usage(64);
         }
     }
@@ -314,9 +343,9 @@ CliArgs parse_cli(int argc, char** argv)
         std::fprintf(stderr, "plugin_runner: --action send_raw requires --raw-json PATH\n");
         usage(64);
     }
-    if (http_probe && c.user_info.empty()) {
-        std::fprintf(stderr, "plugin_runner: --action http_probe requires "
-                             "--user-info JSON|@path\n");
+    if (cloud_probe && c.user_info.empty()) {
+        std::fprintf(stderr, "plugin_runner: --action %s requires "
+                             "--user-info JSON|@path\n", c.action.c_str());
         usage(64);
     }
     return c;
@@ -782,11 +811,13 @@ try {
         {"is_logged_in", logged},
     });
 
-    const bool http_probe = (args.action == "http_probe");
+    const bool http_probe  = (args.action == "http_probe");
+    const bool mw_probe    = (args.action == "mw_probe");
+    const bool cloud_probe = http_probe || mw_probe;
 
-    // Step 6.5–7.5: LAN bring-up. Skipped for http_probe (cloud HTTP
-    // only — no printer required).
-    if (!http_probe) {
+    // Step 6.5–7.5: LAN bring-up. Skipped for cloud probes (HTTP only —
+    // no printer required).
+    if (!cloud_probe) {
     // bind_detect — the LAN HTTP /info ping Studio runs before
     // connect_printer (sLocalBindFunc in GUI_App.cpp:8242). The stock
     // plugin needs detectResult cached so its MQTT layer knows whether
@@ -917,12 +948,12 @@ try {
         //      path inside stock plugins can take ~3-5s on first call.
         std::this_thread::sleep_for(std::chrono::milliseconds(3500));
     }
-    } // !http_probe
+    } // !cloud_probe
 
     // Step 8: load PrintParams from JSON, then back-fill the LAN-required
     // fields from the CLI so the user doesn't have to encode the printer
     // identity in every experiment.json. Skipped for actions that don't
-    // consume a PrintParams (send_raw, none, http_probe).
+    // consume a PrintParams (send_raw, none, http_probe, mw_probe).
     BBL::PrintParams params{};
     if (!args.params_json.empty()) {
         std::vector<std::string> warns;
@@ -1043,6 +1074,158 @@ try {
         // Brief settle so any async HTTP callbacks finish under MITM.
         std::this_thread::sleep_for(std::chrono::seconds(2));
         emit_event("http_probe_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return 0;
+    } else if (args.action == "mw_probe") {
+        auto trunc = [](const std::string& s, size_t n = 600) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n) + "...";
+        };
+        emit_event("mw_probe_begin", {
+            {"task_id", args.task_id},
+            {"instance_id", args.instance_id},
+            {"design_id", args.design_id},
+            {"mw_seed", args.mw_seed},
+            {"mw_limit", args.mw_limit},
+            {"have_get_subtask", exports.get_subtask != nullptr},
+            {"have_detail_url", exports.get_model_mall_detail_url != nullptr},
+            {"have_get_rating", exports.get_model_mall_rating != nullptr},
+            {"have_put_rating", exports.put_model_mall_rating != nullptr},
+            {"have_preference", exports.get_mw_user_preference != nullptr},
+            {"have_4ulist", exports.get_mw_user_4ulist != nullptr},
+        });
+
+        if (exports.get_subtask) {
+            pr::ProbeBBLModelTask task;
+            task.task_id = args.task_id;
+            bool cb_fired = false;
+            int rc = exports.get_subtask(
+                agent, &task,
+                [&](pr::ProbeBBLModelTask* t) {
+                    cb_fired = true;
+                    if (!t) return;
+                    emit_event("get_subtask_cb", {
+                        {"job_id", t->job_id},
+                        {"design_id", t->design_id},
+                        {"profile_id", t->profile_id},
+                        {"instance_id", t->instance_id},
+                        {"task_id", t->task_id},
+                        {"model_id", t->model_id},
+                        {"model_name", t->model_name},
+                        {"profile_name", t->profile_name},
+                    });
+                });
+            // Async callbacks may fire after return; settle briefly.
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            emit_event("get_subtask", {
+                {"rc", rc}, {"cb_fired", cb_fired},
+                {"job_id", task.job_id},
+                {"design_id", task.design_id},
+                {"instance_id", task.instance_id},
+                {"model_id", task.model_id},
+                {"model_name", task.model_name},
+                {"profile_name", task.profile_name},
+            });
+            if (task.instance_id > 0)
+                args.instance_id = task.instance_id;
+            if (task.design_id > 0)
+                args.design_id = std::to_string(task.design_id);
+        } else {
+            emit_event("get_subtask", { {"missing", true} });
+        }
+
+        if (exports.get_model_mall_detail_url) {
+            std::string url;
+            int rc = exports.get_model_mall_detail_url(agent, &url, args.design_id);
+            emit_event("get_model_mall_detail_url", {
+                {"rc", rc}, {"design_id", args.design_id}, {"url", url},
+            });
+        } else {
+            emit_event("get_model_mall_detail_url", { {"missing", true} });
+        }
+
+        if (exports.get_model_mall_rating) {
+            std::string rating_result;
+            unsigned http_code = 0;
+            std::string http_error;
+            int rc = exports.get_model_mall_rating(
+                agent, args.instance_id, rating_result, http_code, http_error);
+            emit_event("get_model_mall_rating", {
+                {"rc", rc},
+                {"instance_id", args.instance_id},
+                {"http_code", http_code},
+                {"http_error", http_error},
+                {"body_bytes", rating_result.size()},
+                {"body", trunc(rating_result)},
+            });
+            // Prefer rating id from body for optional put.
+            try {
+                auto j = json::parse(rating_result);
+                if (j.contains("id") && j["id"].is_number() && args.rating_id == 0)
+                    args.rating_id = j["id"].get<int>();
+            } catch (...) {}
+        } else {
+            emit_event("get_model_mall_rating", { {"missing", true} });
+        }
+
+        if (exports.get_mw_user_preference) {
+            std::string body;
+            int rc = exports.get_mw_user_preference(
+                agent, [&](std::string b) { body = std::move(b); });
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            emit_event("get_mw_user_preference", {
+                {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        } else {
+            emit_event("get_mw_user_preference", { {"missing", true} });
+        }
+
+        if (exports.get_mw_user_4ulist) {
+            std::string body;
+            int rc = exports.get_mw_user_4ulist(
+                agent, args.mw_seed, args.mw_limit,
+                [&](std::string b) { body = std::move(b); });
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            emit_event("get_mw_user_4ulist", {
+                {"rc", rc}, {"seed", args.mw_seed}, {"limit", args.mw_limit},
+                {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        } else {
+            emit_event("get_mw_user_4ulist", { {"missing", true} });
+        }
+
+        if (args.mw_put_rating && exports.put_model_mall_rating) {
+            unsigned http_code = 0;
+            std::string http_error;
+            std::vector<std::string> images;
+            int rc = exports.put_model_mall_rating(
+                agent, args.rating_id, args.rating_score,
+                "obn mw_probe", images, http_code, http_error);
+            emit_event("put_model_mall_rating", {
+                {"rc", rc}, {"rating_id", args.rating_id},
+                {"score", args.rating_score},
+                {"http_code", http_code}, {"http_error", http_error},
+            });
+        } else {
+            emit_event("put_model_mall_rating", {
+                {"skipped", !args.mw_put_rating},
+                {"missing", exports.put_model_mall_rating == nullptr},
+            });
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        emit_event("mw_probe_done", json::object());
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });

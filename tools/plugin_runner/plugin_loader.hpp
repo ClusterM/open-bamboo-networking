@@ -1,7 +1,9 @@
 #ifndef OBN_PLUGIN_RUNNER_PLUGIN_LOADER_HPP
 #define OBN_PLUGIN_RUNNER_PLUGIN_LOADER_HPP
 
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "obn/bambu_networking.hpp"
 
@@ -69,6 +71,35 @@ using func_get_task_plate_index    = int (*)(void* agent, std::string task_id, i
 using func_get_slice_info          = int (*)(void* agent, std::string project_id,
                                              std::string profile_id, int plate_index,
                                              std::string* slice_json);
+
+// MakerWorld probes (--action mw_probe). BBLModelTask layout must match
+// Studio ProjectTask.hpp (non-virtual: 4 ints + 4 strings).
+struct ProbeBBLModelTask {
+    int         job_id      = 0;
+    int         design_id   = 0;
+    int         profile_id  = 0;
+    int         instance_id = 0;
+    std::string task_id;
+    std::string model_id;
+    std::string model_name;
+    std::string profile_name;
+};
+using func_get_subtask = int (*)(void* agent, ProbeBBLModelTask* task,
+                                 std::function<void(ProbeBBLModelTask*)> cb);
+using func_get_model_mall_detail_url = int (*)(void* agent, std::string* url, std::string id);
+using func_get_model_mall_rating = int (*)(void* agent, int job_id,
+                                           std::string& rating_result,
+                                           unsigned int& http_code,
+                                           std::string& http_error);
+using func_put_model_mall_rating = int (*)(void* agent, int rating_id, int score,
+                                           std::string content,
+                                           std::vector<std::string> images,
+                                           unsigned int& http_code,
+                                           std::string& http_error);
+using func_get_mw_user_preference = int (*)(void* agent,
+                                            std::function<void(std::string)> cb);
+using func_get_mw_user_4ulist = int (*)(void* agent, int seed, int limit,
+                                        std::function<void(std::string)> cb);
 
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
@@ -157,6 +188,14 @@ struct PluginExports {
     func_check_user_task_report  check_user_task_report  = nullptr;
     func_get_task_plate_index    get_task_plate_index    = nullptr;
     func_get_slice_info          get_slice_info          = nullptr;
+
+    // Optional MakerWorld probes (--action mw_probe).
+    func_get_subtask                 get_subtask                 = nullptr;
+    func_get_model_mall_detail_url   get_model_mall_detail_url   = nullptr;
+    func_get_model_mall_rating       get_model_mall_rating       = nullptr;
+    func_put_model_mall_rating       put_model_mall_rating       = nullptr;
+    func_get_mw_user_preference      get_mw_user_preference      = nullptr;
+    func_get_mw_user_4ulist          get_mw_user_4ulist          = nullptr;
 };
 
 // Loads `so_path`, resolves all entry points listed above. Throws

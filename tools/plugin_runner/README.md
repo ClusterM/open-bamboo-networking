@@ -62,16 +62,16 @@ per ABI). Plugin downloads are cached in
 ```
 --params-json FILE        BBL::PrintParams JSON (see §4 for the schema)
                           required for the print actions; ignored for
-                          send_raw / none / http_probe
+                          send_raw / none / http_probe / mw_probe
 --action ACTION           send_gcode_to_sdcard | local_print
                           | sdcard_print | local_print_with_record
-                          | send_raw | none | http_probe
+                          | send_raw | none | http_probe | mw_probe
 --gcode-3mf PATH          path to the *.gcode.3mf file Studio would have
                           generated; used as `filename` and `ftp_file`
                           fallbacks if your params JSON omits them
---dev-id ID               printer serial     (required except http_probe)
---dev-ip IP               printer LAN IP     (required except http_probe)
---access-code CODE        printer LAN access code (required except http_probe)
+--dev-id ID               printer serial     (required except http_probe|mw_probe)
+--dev-ip IP               printer LAN IP     (required except http_probe|mw_probe)
+--access-code CODE        printer LAN access code (required except http_probe|mw_probe)
 --country US              countries influence routing in some plugins
 --use-ssl-mqtt 0|1        default 1; matches Studio's LAN flow
 --cert-file PATH          override slicer_base64.cer location (best-effort)
@@ -84,7 +84,8 @@ per ABI). Plugin downloads are cached in
 --keep-tmpdir             leave the per-run /tmp/obn-plugin-runner-* alone
 --fast-exit               flush logs then `_Exit(0)` instead of letting
                           destroy_agent drain its worker pool. Default ON
-                          for `--action none` / `http_probe`, OFF otherwise.
+                          for `--action none` / `http_probe` / `mw_probe`,
+                          OFF otherwise.
                           Stock plugins keep boost::asio / mqtt-cpp threads
                           alive past destroy_agent so a graceful shutdown
                           blocks ~60s; fast exit lets the kernel reap the
@@ -94,7 +95,7 @@ per ABI). Plugin downloads are cached in
 --user-info JSON|@FILE    change_user payload. Studio
                           `{"data":{"token":…,"user":{…}}}` envelope, or
                           OBN `obn.auth.json` (auto-converted). Required
-                          for `http_probe`.
+                          for `http_probe` / `mw_probe`.
 
 # --action send_raw flags
 --raw-json FILE                JSON payload to publish verbatim       (required)
@@ -105,18 +106,27 @@ per ABI). Plugin downloads are cached in
 --raw-repeat N                 publish the payload N times (default 1)
 --raw-repeat-interval-s S      gap between repeats (default 5)
 
-# --action http_probe flags (no printer; cloud HTTP only)
---task-id ID                   id for get_task_plate_index (default 1114566547)
+# --action http_probe / mw_probe flags (no printer; cloud HTTP only)
+--task-id ID                   get_task_plate_index / get_subtask (default 1114566547)
 --project-id ID                for get_slice_info
 --profile-id ID                for get_slice_info (default 894049654)
 --plate-index N                for get_slice_info (default 1)
 --msg-type / --msg-after / --msg-limit
                                args for get_my_message (defaults 0 / 0 / 20)
+--instance-id N                get_model_mall_rating (default 390100)
+--design-id ID                 get_model_mall_detail_url (default 478834)
+--mw-seed / --mw-limit         get_mw_user_4ulist (defaults 0 / 10)
+--mw-put-rating                also call put_model_mall_rating (off by default)
+--rating-id / --rating-score   for optional put
 ```
 
 `http_probe` calls `get_studio_info_url`, `get_my_message`, `check_user_task_report`,
-`get_task_plate_index`, and `get_slice_info` after `change_user`. Capture stock
-HTTPS under mitmproxy:
+`get_task_plate_index`, and `get_slice_info` after `change_user`.
+
+`mw_probe` calls `get_subtask`, `get_model_mall_detail_url`, `get_model_mall_rating`,
+`get_mw_user_preference`, `get_mw_user_4ulist` (and optionally `put_model_mall_rating`).
+
+Capture stock HTTPS under mitmproxy:
 
 ```bash
 HTTPS_PROXY=http://127.0.0.1:8888 HTTP_PROXY=http://127.0.0.1:8888 \
@@ -124,10 +134,10 @@ CURL_CA_BUNDLE=$HOME/.mitmproxy/mitmproxy-ca-cert.pem \
 SSL_CERT_FILE=$HOME/.mitmproxy/mitmproxy-ca-cert.pem \
 ./tools/plugin_runner.sh --abi 02.08.01 \
   --plugin-path ~/.config/BambuStudio/plugins/libbambu_networking.so \
-  --action http_probe \
+  --action mw_probe \
   --user-info @$HOME/.config/BambuStudio/obn.auth.json \
   --data-dir $HOME/.config/BambuStudio \
-  --task-id 1114566547 --profile-id 894049654 --plate-index 1
+  --task-id 1114566547 --instance-id 390100
 ```
 
 If the stock plugin ignores `HTTPS_PROXY`, use `SSLKEYLOGFILE` + Wireshark

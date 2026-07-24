@@ -147,6 +147,19 @@ PluginExports load(const std::string& so_path)
     out.get_slice_info = resolve<func_get_slice_info>(
         out.dl_handle, "bambu_network_get_slice_info");
 
+    out.get_subtask = resolve<func_get_subtask>(
+        out.dl_handle, "bambu_network_get_subtask");
+    out.get_model_mall_detail_url = resolve<func_get_model_mall_detail_url>(
+        out.dl_handle, "bambu_network_get_model_mall_detail_url");
+    out.get_model_mall_rating = resolve<func_get_model_mall_rating>(
+        out.dl_handle, "bambu_network_get_model_mall_rating");
+    out.put_model_mall_rating = resolve<func_put_model_mall_rating>(
+        out.dl_handle, "bambu_network_put_model_mall_rating");
+    out.get_mw_user_preference = resolve<func_get_mw_user_preference>(
+        out.dl_handle, "bambu_network_get_mw_user_preference");
+    out.get_mw_user_4ulist = resolve<func_get_mw_user_4ulist>(
+        out.dl_handle, "bambu_network_get_mw_user_4ulist");
+
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }
     }

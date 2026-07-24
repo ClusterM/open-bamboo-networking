@@ -307,22 +307,22 @@ This `bambu_networking.so` group only covers the **cloud / TUTK** camera URL acc
 
 ## 6.12. MakerWorld / Mall
 
-Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). MakerWorld has no open specification; this group degrades Studio's Mall UI gracefully rather than implementing any of the proprietary endpoints.
+Source: [src/abi_makerworld.cpp](src/abi_makerworld.cpp). Call sites pinned to [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b). Wire: [research/06.12-makerworld.md](research/06.12-makerworld.md); stock MITM via `plugin_runner --action mw_probe` (`~/bambu_sniff/stock_mw_probe.mitm`).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_design_staffpick` | ❌ | Callback receives `{"list":[],"total":0}`. Studio renders an empty staff-pick carousel. |
-| `bambu_network_start_publish` | ❌ | Returns `ERR_INVALID_RESULT`; publishing to MakerWorld is not supported. |
-| `bambu_network_get_model_publish_url` | ❌ | Returns `https://makerworld.com/` as a safe default; stock serves the per-account upload endpoint. |
-| `bambu_network_get_subtask` | ❌ | **Stub only.** Stock fetches MakerWorld model/design metadata for the cloud `task_id` and fills `BBLModelTask` (`design_id`, `instance_id`, `model_id`, `model_name`, `profile_name`, …). OBN just echoes the caller-owned pointer through the callback unchanged — enough to avoid leaking the `new`'d object and to clear `request_model_info_flag`, but **no cloud fetch** happens. Without `design_id`/`instance_id` the in-print profile label and post-print MakerWorld rating UI stay disabled. See [research/06.12-makerworld.md §6.12](research/06.12-makerworld.md#612-makerworld--mall). |
-| `bambu_network_get_model_mall_home_url` | ❌ | Returns `https://makerworld.com/` as a safe default. |
-| `bambu_network_get_model_mall_detail_url` | ❌ | Returns `https://makerworld.com/models/<id>` as a safe default. |
-| `bambu_network_put_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`; no rating submission backend. |
+| `bambu_network_get_design_staffpick` | ❌ | **Dead for plugin** — Studio WebView fetches `design-service/design/staffpick` itself. Stub `{"list":[],"total":0}`. |
+| `bambu_network_start_publish` | ❌ | **No GUI call site.** Returns `ERR_INVALID_RESULT`. |
+| `bambu_network_get_model_publish_url` | ❌ | **No GUI call site.** Returns `https://makerworld.com/`. |
+| `bambu_network_get_subtask` | ✅ | `GET /v1/user-service/my/task/<id>` → fills `BBLModelTask` (`designId`/`instanceId`/`profileId`/`modelId`/`designTitle`/`title`). Distinct from `get_subtask_info` (iot-service). Confirmed MITM stock `02.08.01.53` (`mw_probe`). |
+| `bambu_network_get_model_mall_home_url` | ❌ | **No GUI call site.** Returns `https://makerworld.com/`. |
+| `bambu_network_get_model_mall_detail_url` | ✅ | `{makerworld.com\|.cn}/models/<id>` (region from `cloud_region`). Used by `market_model_scoring_page` rewrite. |
+| `bambu_network_put_model_mall_rating` | ✅ | `PUT /v1/comment-service/rating/<rating_id>` body `{content,images,score}`. Confirmed MITM `mw_probe`. |
 | `bambu_network_get_oss_config` | ✅ | `GET /v1/user-service/my/ossconfig?useType=1` (fallback `.../s3config?useType=1`) with the session Bearer; the server JSON (endpoint / accessKeyId / accessKeySecret / securityToken / bucketName / cdnUrl) is returned verbatim to Studio. Needs a live cloud account to verify. |
 | `bambu_network_put_rating_picture_oss` | ✅ | Client-side signed object-storage `PUT`: AWS SigV4 (`AWS4-HMAC-SHA256`) for S3-style endpoints, Aliyun OSS V1 (`Authorization: OSS <AKID>:<sig>` + `x-oss-security-token`) for `aliyuncs.com`. [`src/oss_sign.cpp`](src/oss_sign.cpp) implements both from scratch: the crypto primitives (`sha256_hex`, `hmac_sha256`, `hmac_sha1`, `base64`, `hex_lower`, `aws_sigv4_signing_key`), the header builders (`aws_sigv4_put_headers` / `aliyun_oss_put_headers`), credential `parse_config`, and host-based scheme selection (`is_aliyun`). Primitives are pinned to FIPS/RFC/AWS published vectors in [`tests/oss_sign_test.cpp`](tests/oss_sign_test.cpp). Step-by-step algorithms: [research/06.12-makerworld.md §6.12](research/06.12-makerworld.md#612-makerworld--mall). Object-key convention marked verify-on-hardware; fails closed. |
-| `bambu_network_get_model_mall_rating` | ❌ | Returns `ERR_INVALID_RESULT`. |
-| `bambu_network_get_mw_user_preference` | ❌ | Callback receives `{"recommendStatus":0}`. The exact field name and type are load-bearing: Studio's JSON-to-int conversion throws through a queued lambda on a `null` here and aborts the process via `wxApp::OnUnhandledException`. |
-| `bambu_network_get_mw_user_4ulist` | ❌ | Callback receives `{"list":[],"total":0}`. |
+| `bambu_network_get_model_mall_rating` | ✅ | `GET /v1/comment-service/rating/inst/<instance_id>` (arg is `instance_id`). 404 → error when no rating. Confirmed MITM `mw_probe`. |
+| `bambu_network_get_mw_user_preference` | ✅ | `GET /v1/design-user-service/my/preference`; requires numeric `recommendStatus` (fallback stub `0` on failure). Confirmed MITM `mw_probe`. |
+| `bambu_network_get_mw_user_4ulist` | ✅ | `GET /v1/design-service/my/design/recommend?seed=&limit=` → `{hits,seed,surplus}`. Confirmed MITM `mw_probe`. |
 
 ### ABI-compat shims
 
