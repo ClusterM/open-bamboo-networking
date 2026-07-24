@@ -182,15 +182,15 @@ Source: [src/abi_http.cpp](src/abi_http.cpp).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_studio_info_url` | ❌ | Returns an empty string — no Studio-side "news" banner is served. |
+| `bambu_network_get_studio_info_url` | ❌ | Returns empty string. **No GUI call site in [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b)** (legacy `GUI_App` / `PresetUpdater` only; still `dlsym`'d). Stock returns `https://api.bambulab.com/v1/iot-service/api/slicer/resource` (no HTTP). Probe: `plugin_runner --action http_probe`. |
 | `bambu_network_set_extra_http_header` | ✅ | Stored on the agent and applied to every outbound HTTPS request. |
-| `bambu_network_get_my_message` | ❌ | Returns `SUCCESS` with empty body; Studio shows an empty inbox. |
-| `bambu_network_check_user_task_report` | ❌ | Returns `SUCCESS` with `task_id=0, printable=false`. |
+| `bambu_network_get_my_message` | ❌ | Empty body / success. **No GUI call site in [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b).** Stock: `GET /v1/user-service/my/messages/type=&after=&limit=` (404 on prod in probe — path uses `/` not `?`). |
+| `bambu_network_check_user_task_report` | ❌ | `task_id=0, printable=false`. **No GUI call site in [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b).** Stock probe: no dedicated HTTPS when idle; returned `task_id=-1`, `printable=true`. |
 | `bambu_network_get_user_print_info` | ✅ | Fetches `GET /v1/iot-service/api/user/print?force=true` **first** (`src/abi_http.cpp`), which already returns Studio-native field names (`dev_name`, `dev_online`, `dev_access_code`) so no remap is needed; falls back to `GET /v1/iot-service/api/user/bind` (with the `name`→`dev_name` / `online`→`dev_online` / `print_status`→`task_status` remap) only when `/user/print` yields nothing. Implicitly subscribes to `device/<id>/report` for each returned device (matching stock push-delivery behaviour), skipping the subscribe when `block_cloud` is set. Cross-validated in [issue #49](https://github.com/ClusterM/open-bambu-networking/issues/49). |
 | `bambu_network_get_user_tasks` | ✅ | `GET /v1/user-service/my/tasks?limit=&offset=&status=[&deviceId=]` — response `{total,hits:[…]}` forwarded verbatim to Studio's TaskManager / Print History WebView. Confirmed against MITM of stock `02.08.01.51`. Empty envelope under `block_cloud` or `cloud_hide_history=1`. |
-| `bambu_network_get_task_plate_index` | ❌ | Returns `SUCCESS` with `plate_index=-1`. |
-| `bambu_network_get_subtask_info` | ✅ | **Cloud id:** `GET /v1/iot-service/api/user/task/<id>` (Bearer), body forwarded verbatim — Studio reads `context.plates[].thumbnail.url`. Runs even under `block_cloud` (task-cover read, not MQTT/print). **LAN zero ids:** synthetic `lan-<fnv>` on `push_status` → loopback `thumbnail.url` via `cover_cache` **SUB_FILE on TLS :6000**. Confirmed MITM stock `02.08.01.53`. |
-| `bambu_network_get_slice_info` | ❌ | Returns `SUCCESS` with empty body. |
+| `bambu_network_get_task_plate_index` | ❌ | `plate_index=-1`. **No GUI call site in [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b)** (legacy `update_slice_info`). Stock: same `GET …/user/task/<id>` as `get_subtask_info`, returns plate from `content.info.plate_idx`. |
+| `bambu_network_get_subtask_info` | ✅ | **Cloud id:** `GET /v1/iot-service/api/user/task/<id>` (Bearer), body forwarded verbatim — Studio reads `context.plates[].thumbnail.url` (+ `prediction`/`weight`/`filaments`). Runs even under `block_cloud`. **LAN zero ids:** synthetic `lan-<fnv>` → loopback cover via `cover_cache` **SUB_FILE on :6000**. Confirmed MITM stock `02.08.01.53`. |
+| `bambu_network_get_slice_info` | ❌ | Empty body. **No GUI call site in [BambuStudio `ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b)** (replaced by `get_subtask_info`). Stock: `GET …/user/project/<project_id>?profile_id=` — needs a real project id; empty/`model_id` probes 405/422. |
 
 ### 6.15. Filament Manager (cloud spool catalogue)
 

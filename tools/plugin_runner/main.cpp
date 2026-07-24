@@ -124,7 +124,19 @@ struct CliArgs {
     // @path/to/file) to fake a cloud login session — useful when a
     // plugin gates privileged MQTT publishes (project_file, etc.) on
     // is_user_login() returning true.
+    // Required for --action http_probe (Studio envelope or OBN
+    // obn.auth.json — see load_user_info_blob()).
     std::string user_info;
+
+    // --action http_probe: cloud task / message metadata probes. No
+    // printer connection. Defaults match a recent MITM sample.
+    std::string task_id      = "1114566547";
+    std::string project_id;   // empty OK; stock may still answer
+    std::string profile_id   = "894049654";
+    int         plate_index  = 1;
+    int         msg_type     = 0;
+    int         msg_after    = 0;
+    int         msg_limit    = 20;
 
     // For wire-format reverse-engineering: after a print action
     // finishes (Finished or ERROR latched), publish
@@ -183,8 +195,14 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
 
        plugin_runner --download-only --abi MM.mm.pp [--cache-dir DIR] [--force]
 
+       plugin_runner --action http_probe --plugin-path PATH
+                     --user-info @session.json [--data-dir DIR]
+                     [--task-id ID] [--project-id ID] [--profile-id ID]
+                     [--plate-index N] [--msg-type N] [--msg-after N]
+                     [--msg-limit N] [--country US]
+
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
-                | local_print_with_record | send_raw | none
+                | local_print_with_record | send_raw | none | http_probe
 
   none: skip the print dispatch entirely. Useful for diagnostics: just
   init + connect_printer, then sit for --timeout seconds dumping every
@@ -195,6 +213,12 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   engineering printer commands: hand-craft a payload, observe the reply
   arrive over local_message during --raw-settle seconds, iterate.
   --params-json is not required for this action.
+
+  http_probe: no printer. change_user(--user-info) then call
+  get_studio_info_url / get_my_message / check_user_task_report /
+  get_task_plate_index / get_slice_info and emit JSON events. Run under
+  HTTPS_PROXY + mitmproxy to capture stock cloud URLs. --user-info may
+  be a Studio {"data":{"token":…}} envelope or OBN obn.auth.json.
 
 Driven from tools/plugin_runner.sh; see tools/plugin_runner/README.md.
 )", stderr);
@@ -238,6 +262,13 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--keep-tmpdir")       c.keep_tmpdir = true;
         else if (f == "--data-dir")          c.data_dir = require(a, ++i, f);
         else if (f == "--user-info")         c.user_info = require(a, ++i, f);
+        else if (f == "--task-id")           c.task_id = require(a, ++i, f);
+        else if (f == "--project-id")        c.project_id = require(a, ++i, f);
+        else if (f == "--profile-id")        c.profile_id = require(a, ++i, f);
+        else if (f == "--plate-index")       c.plate_index = std::stoi(require(a, ++i, f));
+        else if (f == "--msg-type")          c.msg_type = std::stoi(require(a, ++i, f));
+        else if (f == "--msg-after")         c.msg_after = std::stoi(require(a, ++i, f));
+        else if (f == "--msg-limit")         c.msg_limit = std::stoi(require(a, ++i, f));
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--fast-exit")         c.fast_exit = true;
         else if (f == "--no-fast-exit")      c.fast_exit = false;
@@ -259,13 +290,20 @@ CliArgs parse_cli(int argc, char** argv)
         return c;
     }
     // params_json is only mandatory for actions that consume PrintParams.
-    // send_raw / none can run without it.
-    bool needs_params = (c.action != "send_raw" && c.action != "none");
-    if (c.plugin_path.empty() ||
-        c.dev_id.empty()      || c.dev_ip.empty()      || c.access_code.empty()) {
-        std::fprintf(stderr, "plugin_runner: --plugin-path, --dev-id, --dev-ip "
-                             "and --access-code are all required\n");
+    // send_raw / none / http_probe can run without it.
+    const bool http_probe = (c.action == "http_probe");
+    bool needs_params = (c.action != "send_raw" && c.action != "none" && !http_probe);
+    if (c.plugin_path.empty()) {
+        std::fprintf(stderr, "plugin_runner: --plugin-path is required\n");
         usage(64);
+    }
+    if (!http_probe) {
+        if (c.dev_id.empty() || c.dev_ip.empty() || c.access_code.empty()) {
+            std::fprintf(stderr, "plugin_runner: --dev-id, --dev-ip and "
+                                 "--access-code are all required (except "
+                                 "for --action http_probe)\n");
+            usage(64);
+        }
     }
     if (needs_params && c.params_json.empty()) {
         std::fprintf(stderr, "plugin_runner: --params-json is required for action '%s'\n",
@@ -274,6 +312,11 @@ CliArgs parse_cli(int argc, char** argv)
     }
     if (c.action == "send_raw" && c.raw_json.empty()) {
         std::fprintf(stderr, "plugin_runner: --action send_raw requires --raw-json PATH\n");
+        usage(64);
+    }
+    if (http_probe && c.user_info.empty()) {
+        std::fprintf(stderr, "plugin_runner: --action http_probe requires "
+                             "--user-info JSON|@path\n");
         usage(64);
     }
     return c;
@@ -684,19 +727,52 @@ try {
 
     // Step 6: prime the plugin's user session. Empty string mirrors
     // Studio's first-frame "no logged-in user" state. A non-empty
-    // --user-info value is forwarded verbatim — pass a minimal
-    // {"user_id":"default_user","token":"…"} to convince the plugin
-    // that a cloud session is active (some builds gate the privileged
-    // MQTT publishes on is_user_login()).
-    std::string user_blob = args.user_info;
-    if (!user_blob.empty() && user_blob.front() == '@') {
-        std::ifstream uf(user_blob.substr(1));
-        if (!uf) {
-            emit_text("fatal", "cannot open --user-info file: " + user_blob.substr(1));
-            return 66;
+    // --user-info value is forwarded as a Studio change_user envelope
+    // (or converted from OBN obn.auth.json — see below).
+    auto load_user_info_blob = [](const std::string& raw) -> std::string {
+        std::string text = raw;
+        if (!text.empty() && text.front() == '@') {
+            std::ifstream uf(text.substr(1));
+            if (!uf) {
+                throw std::runtime_error("cannot open --user-info file: " +
+                                         text.substr(1));
+            }
+            std::stringstream uss; uss << uf.rdbuf();
+            text = uss.str();
         }
-        std::stringstream uss; uss << uf.rdbuf();
-        user_blob = uss.str();
+        if (text.empty()) return text;
+        // OBN on-disk session → Studio HttpServer envelope so stock
+        // plugins accept change_user the same way Studio's localhost
+        // login callback does.
+        try {
+            auto j = json::parse(text);
+            if (j.contains("access_token") && !j.contains("data")) {
+                json env;
+                env["data"]["token"] = j.value("access_token", "");
+                env["data"]["refresh_token"] = j.value("refresh_token", "");
+                env["data"]["expires_in"] = "31536000";
+                env["data"]["refresh_expires_in"] = "31536000";
+                json user;
+                user["uid"] = j.value("user_id", "");
+                user["name"] = j.value("user_name", "");
+                user["account"] = j.value("account", "");
+                user["avatar"] = j.value("avatar", "");
+                user["nickname"] = j.value("nick_name", "");
+                env["data"]["user"] = user;
+                return env.dump();
+            }
+        } catch (...) {
+            // Fall through — stock may accept the raw blob as-is.
+        }
+        return text;
+    };
+
+    std::string user_blob;
+    try {
+        user_blob = load_user_info_blob(args.user_info);
+    } catch (const std::exception& e) {
+        emit_text("fatal", e.what());
+        return 66;
     }
     int rc_user = exports.change_user(agent, user_blob);
     bool logged = exports.is_user_login ? exports.is_user_login(agent) : false;
@@ -706,7 +782,12 @@ try {
         {"is_logged_in", logged},
     });
 
-    // Step 6.5: bind_detect — the LAN HTTP /info ping Studio runs before
+    const bool http_probe = (args.action == "http_probe");
+
+    // Step 6.5–7.5: LAN bring-up. Skipped for http_probe (cloud HTTP
+    // only — no printer required).
+    if (!http_probe) {
+    // bind_detect — the LAN HTTP /info ping Studio runs before
     // connect_printer (sLocalBindFunc in GUI_App.cpp:8242). The stock
     // plugin needs detectResult cached so its MQTT layer knows whether
     // it's talking to a LAN/cloud/farm device. Skipping it makes the
@@ -836,11 +917,12 @@ try {
         //      path inside stock plugins can take ~3-5s on first call.
         std::this_thread::sleep_for(std::chrono::milliseconds(3500));
     }
+    } // !http_probe
 
     // Step 8: load PrintParams from JSON, then back-fill the LAN-required
     // fields from the CLI so the user doesn't have to encode the printer
     // identity in every experiment.json. Skipped for actions that don't
-    // consume a PrintParams (send_raw, none).
+    // consume a PrintParams (send_raw, none, http_probe).
     BBL::PrintParams params{};
     if (!args.params_json.empty()) {
         std::vector<std::string> warns;
@@ -880,7 +962,101 @@ try {
 
     // Step 9: dispatch the requested action.
     int rc_action = -1;
-    if (args.action == "none") {
+    if (args.action == "http_probe") {
+        auto trunc = [](const std::string& s, size_t n = 400) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n) + "...";
+        };
+        emit_event("http_probe_begin", {
+            {"task_id", args.task_id},
+            {"project_id", args.project_id},
+            {"profile_id", args.profile_id},
+            {"plate_index", args.plate_index},
+            {"msg_type", args.msg_type},
+            {"msg_after", args.msg_after},
+            {"msg_limit", args.msg_limit},
+            {"have_studio_info_url", exports.get_studio_info_url != nullptr},
+            {"have_my_message", exports.get_my_message != nullptr},
+            {"have_task_report", exports.check_user_task_report != nullptr},
+            {"have_plate_index", exports.get_task_plate_index != nullptr},
+            {"have_slice_info", exports.get_slice_info != nullptr},
+        });
+
+        if (exports.get_studio_info_url) {
+            std::string url = exports.get_studio_info_url(agent);
+            emit_event("get_studio_info_url", { {"url", url} });
+        } else {
+            emit_event("get_studio_info_url", { {"missing", true} });
+        }
+
+        if (exports.get_my_message) {
+            unsigned http_code = 0;
+            std::string http_body;
+            int rc = exports.get_my_message(agent, args.msg_type, args.msg_after,
+                                           args.msg_limit, &http_code, &http_body);
+            emit_event("get_my_message", {
+                {"rc", rc}, {"http_code", http_code},
+                {"body_bytes", http_body.size()},
+                {"body", trunc(http_body)},
+            });
+        } else {
+            emit_event("get_my_message", { {"missing", true} });
+        }
+
+        if (exports.check_user_task_report) {
+            int task_id = -1;
+            bool printable = false;
+            int rc = exports.check_user_task_report(agent, &task_id, &printable);
+            emit_event("check_user_task_report", {
+                {"rc", rc}, {"task_id", task_id}, {"printable", printable},
+            });
+        } else {
+            emit_event("check_user_task_report", { {"missing", true} });
+        }
+
+        if (exports.get_task_plate_index) {
+            int plate = -999;
+            int rc = exports.get_task_plate_index(agent, args.task_id, &plate);
+            emit_event("get_task_plate_index", {
+                {"rc", rc}, {"task_id", args.task_id}, {"plate_index", plate},
+            });
+        } else {
+            emit_event("get_task_plate_index", { {"missing", true} });
+        }
+
+        if (exports.get_slice_info) {
+            std::string slice_json;
+            int rc = exports.get_slice_info(agent, args.project_id, args.profile_id,
+                                            args.plate_index, &slice_json);
+            emit_event("get_slice_info", {
+                {"rc", rc},
+                {"project_id", args.project_id},
+                {"profile_id", args.profile_id},
+                {"plate_index", args.plate_index},
+                {"body_bytes", slice_json.size()},
+                {"body", trunc(slice_json)},
+            });
+        } else {
+            emit_event("get_slice_info", { {"missing", true} });
+        }
+
+        // Brief settle so any async HTTP callbacks finish under MITM.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        emit_event("http_probe_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return 0;
+    } else if (args.action == "none") {
         emit_text("info", "action=none — sleeping for --timeout seconds and "
                           "logging callbacks; no print dispatch");
         std::this_thread::sleep_for(std::chrono::seconds(args.timeout_s));

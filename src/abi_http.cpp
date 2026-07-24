@@ -15,6 +15,14 @@
 
 using obn::as_agent;
 
+// Stub: BambuStudio ba049f6a2 still dlsym's this but has no GUI call
+// site. Early trees (GUI_App / PresetUpdater) used the return as a base
+// URL for news/banner / updater query strings; those callers were removed.
+// Stock 02.08.01 returns
+//   https://api.bambulab.com/v1/iot-service/api/slicer/resource
+// with no outbound HTTP (string accessor only). Empty here disables the
+// panel if an old Studio build ever calls us.
+// See research/06.10-http.md; probe: plugin_runner --action http_probe.
 OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
 OBN_ABI std::string bambu_network_get_studio_info_url(void* /*agent*/)
 {
@@ -32,6 +40,14 @@ OBN_ABI int bambu_network_set_extra_http_header(void* agent,
     return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 }
 
+// Stub: Message Centre inbox. ABI present since 497be311d; no GUI
+// caller through BambuStudio ba049f6a2 (NetworkAgent wrappers only).
+// Stock 02.08.01 issues
+//   GET /v1/user-service/my/messages/type=<t>&after=<a>&limit=<n>
+// (path uses '/' before the param list, not '?'); prod returned 404
+// for type=0 in our probe. Empty body + http_code=0 keeps the bell
+// clear if something ever calls us.
+// See research/06.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_my_message(void* /*agent*/,
                                          int /*type*/, int /*after*/, int /*limit*/,
                                          unsigned int* http_code, std::string* http_body)
@@ -41,6 +57,12 @@ OBN_ABI int bambu_network_get_my_message(void* /*agent*/,
     return BAMBU_NETWORK_SUCCESS;
 }
 
+// Stub: "rate this print" prompt gate (*task_id==0 => nothing to show).
+// NetworkAgent wrappers only — no GUI call site through BambuStudio
+// ba049f6a2. Stock probe (logged-in, idle): no dedicated HTTPS; returned
+// task_id=-1, printable=true. We return task_id=0 / printable=false
+// so Studio never pops a report dialog.
+// See research/06.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_check_user_task_report(void* /*agent*/, int* task_id, bool* printable)
 {
     if (task_id)   *task_id = 0;
@@ -450,6 +472,14 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
     return BAMBU_NETWORK_SUCCESS;
 }
 
+// Stub: legacy plate lookup for DeviceManager::update_slice_info when
+// plate_idx < 0. Gone by BambuStudio ba049f6a2 — plate now comes from
+// push_status / get_subtask_info (content.info.plate_idx). Stock uses
+// the same wire as get_subtask_info:
+//   GET /v1/iot-service/api/user/task/<id>
+// and fills *plate_index from content.info.plate_idx. Implement there
+// if a fork still needs this; -1 means "unknown plate".
+// See research/06.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_task_plate_index(void* /*agent*/,
                                                std::string /*task_id*/, int* plate_index)
 {
@@ -565,6 +595,13 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
     return BAMBU_NETWORK_SUCCESS;
 }
 
+// Stub: legacy slice summary (prediction / weight / thumbnail.url /
+// filaments[]) after get_task_plate_index. Replaced by get_subtask_info
+// (98a7a10ce / 16cee3299); those fields now live in context.plates[].
+// No GUI call site through BambuStudio ba049f6a2. Stock wire was
+//   GET /v1/iot-service/api/user/project/<project_id>?profile_id=
+// (plate_index not in the URL). Empty body is fine for current Studio.
+// See research/06.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_slice_info(void* /*agent*/,
                                          std::string /*project_id*/,
                                          std::string /*profile_id*/,

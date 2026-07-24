@@ -136,6 +136,17 @@ PluginExports load(const std::string& so_path)
     out.start_local_print_with_record = resolve<func_start_local_print_with_record>(
         out.dl_handle, "bambu_network_start_local_print_with_record");
 
+    out.get_studio_info_url = resolve<func_get_studio_info_url>(
+        out.dl_handle, "bambu_network_get_studio_info_url");
+    out.get_my_message = resolve<func_get_my_message>(
+        out.dl_handle, "bambu_network_get_my_message");
+    out.check_user_task_report = resolve<func_check_user_task_report>(
+        out.dl_handle, "bambu_network_check_user_task_report");
+    out.get_task_plate_index = resolve<func_get_task_plate_index>(
+        out.dl_handle, "bambu_network_get_task_plate_index");
+    out.get_slice_info = resolve<func_get_slice_info>(
+        out.dl_handle, "bambu_network_get_slice_info");
+
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }
     }

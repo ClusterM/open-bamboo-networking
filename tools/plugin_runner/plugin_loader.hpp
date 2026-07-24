@@ -58,6 +58,18 @@ using func_start_local_print             = int (*)(void* agent, BBL::PrintParams
 using func_start_sdcard_print            = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn);
 using func_start_local_print_with_record = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn, BBL::OnWaitFn wait_fn);
 
+// Cloud HTTP probes (optional — present on modern stock plugins; used by
+// --action http_probe). BambuStudio ba049f6a2 still dlsym's these even
+// when the GUI no longer calls them.
+using func_get_studio_info_url     = std::string (*)(void* agent);
+using func_get_my_message          = int (*)(void* agent, int type, int after, int limit,
+                                             unsigned int* http_code, std::string* http_body);
+using func_check_user_task_report  = int (*)(void* agent, int* task_id, bool* printable);
+using func_get_task_plate_index    = int (*)(void* agent, std::string task_id, int* plate_index);
+using func_get_slice_info          = int (*)(void* agent, std::string project_id,
+                                             std::string profile_id, int plate_index,
+                                             std::string* slice_json);
+
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
 // without crashing on older plugins.
@@ -138,6 +150,13 @@ struct PluginExports {
     func_start_local_print             start_local_print             = nullptr;
     func_start_sdcard_print            start_sdcard_print            = nullptr;
     func_start_local_print_with_record start_local_print_with_record = nullptr;
+
+    // Optional HTTP / task metadata probes (--action http_probe).
+    func_get_studio_info_url     get_studio_info_url     = nullptr;
+    func_get_my_message          get_my_message          = nullptr;
+    func_check_user_task_report  check_user_task_report  = nullptr;
+    func_get_task_plate_index    get_task_plate_index    = nullptr;
+    func_get_slice_info          get_slice_info          = nullptr;
 };
 
 // Loads `so_path`, resolves all entry points listed above. Throws
