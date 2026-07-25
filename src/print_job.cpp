@@ -22,6 +22,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
 #include "obn/ftps.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/log.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/tunnel_upload.hpp"
@@ -295,6 +296,8 @@ int ftp_upload(const BBL::PrintParams&    p,
     obn::ftps::ConnectConfig cfg;
     cfg.host     = p.dev_ip;
     cfg.port     = p.use_ssl_for_ftp ? 990 : 21;
+    if (const char* fp = obn::lan_tls::env_var_get(obn::lan_tls::kEnvFtpPort);
+        fp && *fp) cfg.port = std::atoi(fp);   // test-only port override
     cfg.username = p.username.empty() ? std::string{"bblp"} : p.username;
     cfg.password = p.password;
     cfg.ca_file              = ca_file;

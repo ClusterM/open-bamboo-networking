@@ -1,0 +1,45 @@
+{
+  "schema": "obn-wire-flow/v1",
+  "meta": {
+    "os": "linux",
+    "network_plugin_version": "02.07.00.50",
+    "slicer_client_version": "02.07.00.55",
+    "channel": "lan",
+    "printer_model": "h2d",
+    "flow": "ssdp_discovery",
+    "command": "ssdp_notify",
+    "source": "BambuStudio",
+    "protocol": "ssdp"
+  },
+  "driver": {
+    "packet": "NOTIFY * HTTP/1.1\r\nHost: 239.255.255.250:1990\r\nServer: UPnP/1.0\r\nLocation: 192.168.1.2\r\nNT: urn:bambulab-com:device:3dprinter:1\r\nNTS: ssdp:alive\r\nUSN: 090000000000002\r\nCache-Control: max-age=1800\r\nDevModel.bambu.com: O1D\r\nDevName.bambu.com: Bambu H2D\r\nDevConnect.bambu.com: cloud\r\nDevBind.bambu.com: occupied\r\nDevseclink.bambu.com: secure\r\nDevInf.bambu.com: wlan0\r\nDevVersion.bambu.com: 01.03.00.00\r\nDevCap.bambu.com: 1\r\n\r\n",
+    "expect": {
+      "dev_id": "090000000000002",
+      "dev_name": "Bambu H2D",
+      "dev_ip": "192.168.1.2",
+      "dev_type": "O1D",
+      "dev_signal": "",
+      "connect_type": "cloud",
+      "bind_state": "occupied",
+      "sec_link": "secure",
+      "ssdp_version": "01.03.00.00",
+      "connection_name": "wlan0"
+    }
+  },
+  "steps": [
+    {
+      "seq": 1,
+      "id": "ssdp_notify",
+      "protocol": "ssdp",
+      "channel_only": "lan",
+      "request": {
+        "host": "239.255.255.250:1990",
+        "transport": "udp:2021",
+        "op": "NOTIFY ssdp:alive"
+      },
+      "expect": {
+        "device_info": "{dev_name,dev_id,dev_ip,dev_type,dev_signal,connect_type,bind_state,sec_link,ssdp_version,connection_name}"
+      }
+    }
+  ]
+}

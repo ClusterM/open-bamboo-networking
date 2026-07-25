@@ -822,6 +822,8 @@ std::string ensure_ftp(Tunnel* t)
     obn::ftps::ConnectConfig cfg;
     cfg.host     = t->url.host;
     cfg.port     = 990;
+    if (const char* fp = obn::lan_tls::env_var_get(obn::lan_tls::kEnvFtpPort);
+        fp && *fp) cfg.port = std::atoi(fp);   // test-only port override (matches print_job.cpp)
     cfg.username = t->url.user.empty() ? "bblp" : t->url.user;
     cfg.password = t->url.passwd;
     if (!obn::lan_tls::skip_verify_from_env()) {

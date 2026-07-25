@@ -1,0 +1,39 @@
+{
+  "schema": "obn-wire-flow/v1",
+  "meta": {
+    "os": "linux",
+    "network_plugin_version": "02.07.00.50",
+    "slicer_client_version": "02.07.00.55",
+    "channel": "cloud_lan",
+    "printer_model": "h2d",
+    "flow": "device_command",
+    "command": "set_bed_temp",
+    "source": "BambuStudio"
+  },
+  "driver": {
+    "dev_id": "090000000000002",
+    "access_code": "1234abcd",
+    "signed": true,
+    "command_json": "{\"print\":{\"command\":\"set_bed_temp\",\"temp\":40,\"sequence_id\":\"20092\"}}"
+  },
+  "steps": [
+    {
+      "seq": 1,
+      "id": "publish",
+      "protocol": "mqtt",
+      "channel_only": "cloud_lan",
+      "request": {
+        "topic": "device/{{device_id}}/request",
+        "signed": true,
+        "payload_json": {
+          "print": {
+            "command": "set_bed_temp",
+            "temp": 40,
+            "sequence_id": "20092"
+          }
+        }
+      },
+      "expect": {}
+    }
+  ]
+}

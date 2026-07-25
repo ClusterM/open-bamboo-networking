@@ -257,7 +257,9 @@ endif()
 # zlib is shared between BambuSource (FTPS fallback: client-side ZIP
 # extract for file-browser thumbnails) and other zlib users in the tree.
 
-add_library(bambu_networking SHARED
+# Core library sources, shared by the bambu_networking .so and the
+# wire-compliance test (which needs the internal obn:: symbols directly).
+set(OBN_CORE_SOURCES
     src/abi_meta.cpp
     src/abi_lifecycle.cpp
     src/abi_callbacks.cpp
@@ -305,6 +307,8 @@ add_library(bambu_networking SHARED
     src/tunnel_upload.cpp
     src/tls_dial.cpp
 )
+
+add_library(bambu_networking SHARED ${OBN_CORE_SOURCES})
 
 target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
 set(_obn_git_compile_defs "")
@@ -826,5 +830,44 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(lan_bind_tcp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME lan_bind_tcp COMMAND lan_bind_tcp_test)
+    # ----------------------------------------------------------------------
+    # Wire-compliance: run the OSS against the golden fixtures in
+    # tests/wire-fixtures/ (embedded mock of api.bambulab.com) and assert the
+    # emitted HTTP matches the genuine plugin's contract. One ctest per fixture.
+    # ----------------------------------------------------------------------
+    find_package(Threads REQUIRED)
+    add_executable(wire_compliance_test tests/wire_compliance_test.cpp ${OBN_CORE_SOURCES})
+    target_include_directories(wire_compliance_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(wire_compliance_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        OBN_PROJECT_VERSION_STRING="${OBN_PROJECT_VERSION_STRING}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+        OBN_TESTING   # exposes cloud_print::test_build_task_body
+        # dlopen the real shipped libBambuSource.so for the CTRL-channel test.
+        OBN_BAMBUSOURCE_SO="$<TARGET_FILE:BambuSource>")
+    add_dependencies(wire_compliance_test BambuSource)
+    target_link_libraries(wire_compliance_test PRIVATE
+        obn_mosquitto_iface obn_curl_iface
+        OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB Threads::Threads ${CMAKE_DL_LIBS})
+    file(GLOB_RECURSE OBN_WIRE_FIXTURES
+         ${CMAKE_CURRENT_SOURCE_DIR}/tests/wire-fixtures/*/flow.json)
+    foreach(_fx ${OBN_WIRE_FIXTURES})
+        file(RELATIVE_PATH _rel ${CMAKE_CURRENT_SOURCE_DIR}/tests/wire-fixtures ${_fx})
+        string(REPLACE "/flow.json" "" _rel ${_rel})
+        string(REPLACE "/" "_" _name ${_rel})
+        add_test(NAME wire_${_name} COMMAND wire_compliance_test ${_fx})
+        set_tests_properties(wire_${_name} PROPERTIES SKIP_RETURN_CODE 77)
+    endforeach()
+
+    # CLI tool: send a (signed) device command to a real printer through the OSS.
+    add_executable(obn_send_command tools/obn_send_command.cpp ${OBN_CORE_SOURCES})
+    target_include_directories(obn_send_command PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(obn_send_command PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        OBN_PROJECT_VERSION_STRING="${OBN_PROJECT_VERSION_STRING}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(obn_send_command PRIVATE
+        obn_mosquitto_iface obn_curl_iface
+        OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB Threads::Threads)
 
 endif()

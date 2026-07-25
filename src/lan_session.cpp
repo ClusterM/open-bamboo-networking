@@ -1,6 +1,7 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/lan_tls.hpp"
+#include "obn/lan_tls_env.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -121,6 +122,8 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     mqtt::ConnectConfig cfg;
     cfg.host                = dev_ip_;
     cfg.port                = use_ssl_ ? 8883 : 1883;
+    if (const char* mp = obn::lan_tls::env_var_get(obn::lan_tls::kEnvMqttPort);
+        mp && *mp) cfg.port = std::atoi(mp);   // test-only port override
     cfg.username            = username_;
     cfg.password            = password_;
     cfg.use_tls             = use_ssl_;

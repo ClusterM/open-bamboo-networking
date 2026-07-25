@@ -29,6 +29,11 @@ inline constexpr const char* kEnvSkipVerify   = "OBN_SKIP_TLS_VERIFY";
 // Read by libBambuSource (separate config singleton); set from obn.conf in
 // propagate_cross_so_env().
 inline constexpr const char* kEnvForceFtps    = "OBN_FORCE_FTPS";
+// Test-only: override the LAN FTP / MQTT ports so an in-process mock can bind a
+// non-privileged loopback port instead of the printer's 990/8883. Ignored when
+// unset (production always uses the standard ports).
+inline constexpr const char* kEnvFtpPort      = "OBN_LAN_FTP_PORT";
+inline constexpr const char* kEnvMqttPort     = "OBN_LAN_MQTT_PORT";
 inline constexpr const char* kEnvDisableCameraPreview = "OBN_DISABLE_CAMERA_PREVIEW";
 inline constexpr const char* kEnvSerialWaitMs = "OBN_LAN_TLS_SERIAL_WAIT_MS";
 // BambuSource logging — propagated from obn.conf by the main plugin.

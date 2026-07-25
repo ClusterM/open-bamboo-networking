@@ -1,0 +1,132 @@
+{
+  "schema": "obn-wire-flow/v1",
+  "meta": {
+    "os": "linux",
+    "network_plugin_version": "02.07.00.50",
+    "slicer_client_version": "02.07.00.55",
+    "channel": "cloud",
+    "printer_model": "account",
+    "flow": "login",
+    "source": "BambuStudio"
+  },
+  "identity_block": {
+    "order": [
+      "Host",
+      "User-Agent",
+      "X-BBL-Client-Name",
+      "X-BBL-Client-Type",
+      "X-BBL-Client-Version",
+      "X-BBL-Device-ID",
+      "X-BBL-Language",
+      "X-BBL-OS-Type",
+      "X-BBL-OS-Version",
+      "X-BBL-Agent-Version",
+      "X-BBL-Executable-info",
+      "X-BBL-Agent-OS-Type",
+      "X-BBL-Executable-Env",
+      "accept",
+      "Authorization",
+      "Content-Type"
+    ],
+    "values": {
+      "Host": "api.bambulab.com",
+      "User-Agent": "bambu_network_agent/02.07.00.50",
+      "X-BBL-Client-Name": "BambuStudio",
+      "X-BBL-Client-Type": "slicer",
+      "X-BBL-Client-Version": "02.07.00.55",
+      "X-BBL-Device-ID": "<dynamic:install-uuid>",
+      "X-BBL-Language": "en-US",
+      "X-BBL-OS-Type": "linux",
+      "X-BBL-OS-Version": "5.15.0",
+      "X-BBL-Agent-Version": "02.07.00.50",
+      "X-BBL-Executable-info": "{}",
+      "X-BBL-Agent-OS-Type": "linux",
+      "X-BBL-Executable-Env": "false",
+      "accept": "application/json",
+      "Authorization": "<dynamic:Bearer access_token>",
+      "Content-Type": "application/json"
+    }
+  },
+  "vars": {
+    "login_ticket": {
+      "kind": "generated",
+      "example": "AJR7H7"
+    },
+    "access_token": {
+      "kind": "from_response",
+      "step": "exchange_ticket",
+      "json": "$.accessToken",
+      "example": "<opaque, ~144 chars>"
+    },
+    "refresh_token": {
+      "kind": "from_response",
+      "step": "exchange_ticket",
+      "json": "$.refreshToken",
+      "example": "<opaque, ~144 chars>"
+    },
+    "expires_in": {
+      "kind": "from_response",
+      "step": "exchange_ticket",
+      "json": "$.expiresIn",
+      "example": 31536000
+    },
+    "user_id": {
+      "kind": "from_response",
+      "step": "get_profile",
+      "json": "$.uidStr",
+      "example": "1234567890"
+    }
+  },
+  "steps": [
+    {
+      "seq": 1,
+      "id": "exchange_ticket",
+      "protocol": "http",
+      "request": {
+        "method": "POST",
+        "host": "api.bambulab.com",
+        "path": "/v1/user-service/user/ticket/{{login_ticket}}",
+        "headers": {
+          "block": true,
+          "client_id": false,
+          "content_type": true,
+          "authorization": false
+        },
+        "body_json": {
+          "ticket": "{{login_ticket}}"
+        }
+      },
+      "expect": {
+        "status": 200
+      },
+      "captures": {
+        "access_token": "$.accessToken",
+        "refresh_token": "$.refreshToken",
+        "expires_in": "$.expiresIn",
+        "refresh_expires_in": "$.refreshExpiresIn"
+      }
+    },
+    {
+      "seq": 2,
+      "id": "get_profile",
+      "protocol": "http",
+      "request": {
+        "method": "GET",
+        "host": "api.bambulab.com",
+        "path": "/v1/user-service/my/profile",
+        "headers": {
+          "block": true,
+          "client_id": false,
+          "content_type": true,
+          "authorization": true
+        }
+      },
+      "expect": {
+        "status": 200
+      },
+      "captures": {
+        "user_id": "$.uidStr"
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "schema": "obn-wire-flow/v1",
+  "meta": {
+    "os": "linux",
+    "network_plugin_version": "02.07.00.50",
+    "slicer_client_version": "02.07.00.55",
+    "channel": "cloud_lan",
+    "printer_model": "h2s",
+    "flow": "ctrl_storage_list",
+    "command": "list_info",
+    "source": "BambuStudio"
+  },
+  "driver": {
+    "dev_id": "090000000000001",
+    "access_code": "1234abcd",
+    "listing": "-rwxr-xr-x    1 1002     1002       825312 Jul 14 09:38 3DBenchy.gcode.3mf\r\n-rwxr-xr-x    1 1002     1002       961941 Jul 12 12:51 BENCHY.gcode.3mf\r\n-rwxr-xr-x    1 1002     1002        71521 Jul 03 12:21 Hinge.gcode.3mf\r\ndrwxr-xr-x    2 1002     1002       131072 Jul 07 18:32 timelapse\r\n-rwxr-xr-x    1 1002     1002      5464778 Feb 24 19:44 video_2026-02-24_20-28-57.mp4\r\n",
+    "expect_files": [
+      {
+        "name": "3DBenchy.gcode.3mf",
+        "size": 825312
+      },
+      {
+        "name": "BENCHY.gcode.3mf",
+        "size": 961941
+      },
+      {
+        "name": "Hinge.gcode.3mf",
+        "size": 71521
+      }
+    ]
+  },
+  "steps": [
+    {
+      "seq": 1,
+      "id": "ctrl_open",
+      "protocol": "tls",
+      "channel_only": "cloud_lan",
+      "request": {
+        "host": "{{device_id}}:6000",
+        "tls": "native-6000",
+        "op": "handshake",
+        "frames": "LOGIN(magic 0x0101013F, user+access_code) -> login-ack(0x0001013F); SETUP(0x0102013F, ctrl json) -> setup-reply(mtype 12291, result 0)"
+      },
+      "expect": {
+        "reply": "session Ready (ctrl_mode)"
+      }
+    },
+    {
+      "seq": 2,
+      "id": "ctrl_list_info",
+      "protocol": "ftp",
+      "channel_only": "cloud_lan",
+      "request": {
+        "cmdtype": 1,
+        "sequence": 1,
+        "req": {
+          "type": "model",
+          "storage": ""
+        },
+        "served_over": "FTPS LIST (force_ftps bridge)"
+      },
+      "expect": {
+        "reply": "{cmdtype:1,sequence:1,result:0,reply:{file_lists:[{name,path,size,time,date}]}}"
+      }
+    }
+  ]
+}
