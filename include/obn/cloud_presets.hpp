@@ -1,7 +1,7 @@
 #pragma once
 
 // User-preset synchronisation against Bambu's cloud "slicer setting"
-// endpoint. This is section 6.9 of ../../research/06.09-presets.md.
+// endpoint. This is section 7.9 of ../../research/08.09-presets.md.
 //
 // The stock plugin treats the cloud only as a metadata store: it lists
 // { setting_id, name, update_time, ... } and relies on matching files

@@ -1,0 +1,52 @@
+## 15. Map of key source locations
+
+Studio citations are permalinks into [bambulab/BambuStudio](https://github.com/bambulab/BambuStudio) at `12f17b06f4f537f9c03162d08bb70cf733c42839` (2026-07-26). Orca-only paths use [SoftFever/OrcaSlicer](https://github.com/SoftFever/OrcaSlicer) at `11fdb472d6193312bc6c78b7703ad2c1222502b7`.
+
+| Topic | File:lines |
+|-------|------------|
+| Timelapse storage preflight (`ipcam_get_media_info`) | [DeviceManager.cpp:2145](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceManager.cpp#L2145), [DeviceManager.cpp:3628](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceManager.cpp#L3628) |
+| PA calibration commands (`extrusion_cali_*`, `flowrate_*`) | [DeviceManager.cpp:1759-2094](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceManager.cpp#L1759-L2094), [DevCalib.cpp:45-324](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceCore/DevCalib.cpp#L45-L324) |
+| AMS MQTT commands (`ams_*`, `print_option`) | [DeviceManager.cpp:1615-1842](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceManager.cpp#L1615-L1842), [DevFilaSystemCtrl.cpp:11-57](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceCore/DevFilaSystemCtrl.cpp#L11-L57) |
+| AMS status / tray indexing | [DevFilaSystem.cpp:340-382](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceCore/DevFilaSystem.cpp#L340-L382), [DevFilaSystem.cpp:522-561](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceCore/DevFilaSystem.cpp#L522-L561) |
+| `PACalibResult` / `FlowRatioCalibResult` schemas | [Calib.hpp:114-181](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/libslic3r/Calib.hpp#L114-L181), [DevCalib.cpp:56-80](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DeviceCore/DevCalib.cpp#L56-L80) |
+| Resolution of all 100+ symbols | [NetworkAgent.cpp:285-394](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L285-L394) |
+| API typedefs | [NetworkAgent.hpp:10-123](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.hpp#L10-L123) |
+| Name constants | [bambu_networking.hpp:105-107](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L105-L107) |
+| Error codes | [bambu_networking.hpp:14-101](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L14-L101) |
+| Print-job stage enum + `PrintParams` | [bambu_networking.hpp:152-250](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L152-L250) |
+| Studio print orchestration (decision tree) | [PrintJob.cpp:149-681](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/PrintJob.cpp#L149-L681) |
+| Upload-only job (`SendJob`) | [SendJob.cpp:111-392](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/SendJob.cpp#L111-L392) |
+| Select-machine dialog → `PrintJob` | [SelectMachine.cpp:3013-3241](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/SelectMachine.cpp#L3013-L3241) |
+| Send-to-Printer dialog → `ft_*` | [SendToPrinter.cpp:1746-2025](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/SendToPrinter.cpp#L1746-L2025) |
+| `NetworkAgent` wrappers for `start_*` | [NetworkAgent.cpp:1158-1195](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L1158-L1195) |
+| Data structures | [bambu_networking.hpp:187-250](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L187-L250) |
+| `InitFTModule` / `UnloadFTModule` | [FileTransferUtils.hpp:239-253](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/FileTransferUtils.hpp#L239-L253) |
+| `ft_*` symbol resolution | [FileTransferUtils.cpp:12-40](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/FileTransferUtils.cpp#L12-L40) |
+| Signature verification | [CertificateVerify.cpp:291-300](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/CertificateVerify.cpp#L291-L300) |
+| Signature bypass | `app_config → ignore_module_cert`; [GUI_App.cpp:3639](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3639) |
+| Request URL | [GUI_App.cpp:1569-1595](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1569-L1595) |
+| Plugin download | [GUI_App.cpp:1597-1785](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1597-L1785) |
+| Extraction / installation | [GUI_App.cpp:1787-1936](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1787-L1936) |
+| Version check | [GUI_App.cpp:2006-2022](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L2006-L2022) |
+| Restart networking | [GUI_App.cpp:1938-1942](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1938-L1942) |
+| Removal | [GUI_App.cpp:1983-2004](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1983-L2004) |
+| OTA copy-in | [GUI_App.cpp:3575-3635](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3575-L3635) |
+| Agent initialization | [GUI_App.cpp:3637-3756](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3637-L3756) |
+| OTA `sync_plugins` | [PresetUpdater.cpp:1165-1253](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L1165-L1253) |
+| `sync_resources` (shared engine) | [PresetUpdater.cpp:561-737](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L561-L737) |
+| OTA cache validation | [PresetUpdater.cpp:1131-1163](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L1131-L1163) |
+| UI install job | [UpgradeNetworkJob.cpp:16-146](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp#L16-L146) |
+| "Downloading Bambu Network Plug-in" dialog | [DownloadProgressDialog.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DownloadProgressDialog.cpp) |
+| `libBambuSource` C ABI | [BambuTunnel.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/BambuTunnel.h) |
+| `libBambuSource` loader | [PrinterFileSystem.cpp:1840-1879](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.cpp#L1840-L1879) |
+| `libBambuSource` `dlopen`/`LoadLibrary` | [NetworkAgent.cpp:529-580](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L529-L580) |
+| Camera URL formats | [MediaPlayCtrl.cpp:444-455](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaPlayCtrl.cpp#L444-L455), [MediaPlayCtrl.cpp:742-760](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaPlayCtrl.cpp#L742-L760) |
+| File-browser CTRL command set | [PrinterFileSystem.h:32-72](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.h#L32-L72) |
+| File-browser CTRL JSON envelope | [PrinterFileSystem.cpp:1439-1478](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.cpp#L1439-L1478) |
+| Linux camera back-end (gstbambusrc — Orca / legacy Studio) | [gstbambusrc.c](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/gstbambusrc.c), [gstbambusrc.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/gstbambusrc.h) |
+| Windows / Linux camera widget — current Studio (FFmpeg, C ABI) | [wxMediaCtrl3.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl3.cpp), [wxMediaCtrl3.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl3.h), [AVVideoDecoder.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/AVVideoDecoder.cpp), [AVVideoDecoder.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/AVVideoDecoder.h) |
+| Windows camera back-end (DirectShow CLSID — Orca / legacy Studio only) | [wxMediaCtrl2.cpp:55-138](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.cpp#L55-L138) |
+| macOS camera (`BambuPlayer` Objective-C class) | [wxMediaCtrl2.mm:245-289](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.mm#L245-L289), [BambuPlayer.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/BambuPlayer/BambuPlayer.h) |
+
+---
+

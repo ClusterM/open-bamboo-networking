@@ -6,27 +6,27 @@ Key players:
 
 | Role | Source |
 |------|--------|
-| C ABI declarations (`dlsym` typedefs) | `src/slic3r/Utils/NetworkAgent.hpp` |
-| Symbol resolver and method wrappers | `src/slic3r/Utils/NetworkAgent.cpp` |
-| Shared protocol structures / constants | `src/slic3r/Utils/bambu_networking.hpp` |
-| `ft_*` File Transfer ABI | `src/slic3r/Utils/FileTransferUtils.{hpp,cpp}` |
-| Module signature verification | `src/slic3r/Utils/CertificateVerify.{hpp,cpp}` |
-| Lifecycle (URL, download, install, version) | `src/slic3r/GUI/GUI_App.cpp` |
-| OTA synchronization | `src/slic3r/Utils/PresetUpdater.cpp` |
-| UI job "download & install" | `src/slic3r/GUI/Jobs/UpgradeNetworkJob.{hpp,cpp}` |
-| **`libBambuSource` C ABI** (`Bambu_*`) | `src/slic3r/GUI/Printer/BambuTunnel.h` |
-| **`libBambuSource` loader / shim** | `src/slic3r/GUI/Printer/PrinterFileSystem.cpp` (`StaticBambuLib`) |
-| **GStreamer source element (Linux only)** | `src/slic3r/GUI/Printer/gstbambusrc.{c,h}` |
-| **macOS native player wrapper** | `src/slic3r/GUI/wxMediaCtrl2.mm`, `src/slic3r/GUI/BambuPlayer/BambuPlayer.h` |
-| **Linux wxMediaCtrl shim (gstbambusrc registration)** | `src/slic3r/GUI/wxMediaCtrl2.{cpp,h}` (`__LINUX__` branch) |
-| **Windows / Linux camera widget — Studio (current)** | `src/slic3r/GUI/wxMediaCtrl3.{cpp,h}` (BambuStudio commit `94d91be60`, June 2024). Drives `Bambu_*` C ABI directly + decodes via `AVVideoDecoder` (FFmpeg). |
-| **Windows / Linux camera widget — Orca (and pre-`94d91be6` Studio)** | `src/slic3r/GUI/wxMediaCtrl2.{cpp,h}` Windows branch. Drives wxWidgets DirectShow backend → `bambu:` URL scheme → CLSID `{233E64FB-…}` source filter |
-| **Camera UI panel** | `src/slic3r/GUI/MediaPlayCtrl.{cpp,h}` |
-| **File browser UI / CTRL protocol consumer** | `src/slic3r/GUI/Printer/PrinterFileSystem.{cpp,h}`, `src/slic3r/GUI/MediaFilePanel.{cpp,h}` |
+| C ABI declarations (`dlsym` typedefs) | [NetworkAgent.hpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.hpp) |
+| Symbol resolver and method wrappers | [NetworkAgent.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp) |
+| Shared protocol structures / constants | [bambu_networking.hpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp) |
+| `ft_*` File Transfer ABI | [FileTransferUtils.hpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/FileTransferUtils.hpp), [FileTransferUtils.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/FileTransferUtils.cpp) |
+| Module signature verification | [CertificateVerify.hpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/CertificateVerify.hpp), [CertificateVerify.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/CertificateVerify.cpp) |
+| Lifecycle (URL, download, install, version) | [GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) |
+| OTA synchronization | [PresetUpdater.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp) |
+| UI job "download & install" | [UpgradeNetworkJob.hpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/UpgradeNetworkJob.hpp), [UpgradeNetworkJob.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp) |
+| **`libBambuSource` C ABI** (`Bambu_*`) | [BambuTunnel.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/BambuTunnel.h) |
+| **`libBambuSource` loader / shim** | [PrinterFileSystem.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.cpp) (`StaticBambuLib`) |
+| **GStreamer source element (Linux only)** | [gstbambusrc.c](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/gstbambusrc.c), [gstbambusrc.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/gstbambusrc.h) |
+| **macOS native player wrapper** | [wxMediaCtrl2.mm](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.mm), [BambuPlayer.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/BambuPlayer/BambuPlayer.h) |
+| **Linux wxMediaCtrl shim (gstbambusrc registration)** | [wxMediaCtrl2.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.cpp), [wxMediaCtrl2.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.h) (`__LINUX__` branch) |
+| **Windows / Linux camera widget — Studio (current)** | [wxMediaCtrl3.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl3.cpp), [wxMediaCtrl3.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl3.h) (BambuStudio commit `94d91be60`, June 2024). Drives `Bambu_*` C ABI directly + decodes via `AVVideoDecoder` (FFmpeg). |
+| **Windows / Linux camera widget — Orca (and pre-`94d91be6` Studio)** | [wxMediaCtrl2.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.cpp), [wxMediaCtrl2.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/wxMediaCtrl2.h) Windows branch. Drives wxWidgets DirectShow backend → `bambu:` URL scheme → CLSID `{233E64FB-…}` source filter |
+| **Camera UI panel** | [MediaPlayCtrl.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaPlayCtrl.cpp), [MediaPlayCtrl.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaPlayCtrl.h) |
+| **File browser UI / CTRL protocol consumer** | [PrinterFileSystem.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.cpp), [PrinterFileSystem.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Printer/PrinterFileSystem.h), [MediaFilePanel.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaFilePanel.cpp), [MediaFilePanel.h](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/MediaFilePanel.h) |
 
-> Note: the code occasionally refers to two further libraries, **`BambuSource`** and **`live555`**. These are the camera/player and the RTSP stack; they are fetched and installed through the exact same mechanism and live next to the main library. The "Network Plugin" contract proper is `bambu_networking`, but a usable Studio installation ALSO needs a working `libBambuSource` for the camera live view *and* the printer file browser. The `libBambuSource` ABI is its own beast (different symbol prefix `Bambu_*`, different loader, per-platform back-ends) — it is documented separately in **§7**.
+> Note: the code occasionally refers to two further libraries, **`BambuSource`** and **`live555`**. These are the camera/player and the RTSP stack; they are fetched and installed through the exact same mechanism and live next to the main library. The "Network Plugin" contract proper is `bambu_networking`, but a usable Studio installation ALSO needs a working `libBambuSource` for the camera live view *and* the printer file browser. The `libBambuSource` ABI is its own beast (different symbol prefix `Bambu_*`, different loader, per-platform back-ends) — it is documented separately in **§9**. How the plugin reaches a printer on the wire (SSDP, MQTT, FTPS, `:6000`, RTSP, cloud REST) is mapped in **§6**.
 
-The current Studio version pinned in sources (tag `v02.06.00.51`) is `SLIC3R_VERSION = "02.06.00.51"` (`version.inc`); the expected agent version is `BAMBU_NETWORK_AGENT_VERSION = "02.06.00.50"` (`src/slic3r/Utils/bambu_networking.hpp:100`).
+The current Studio version pinned in sources (tag `v02.06.00.51`) is `SLIC3R_VERSION = "02.06.00.51"` (`version.inc`); the expected agent version is `BAMBU_NETWORK_AGENT_VERSION = "02.06.00.50"` ([bambu_networking.hpp:107](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L107)).
 
 ---
 

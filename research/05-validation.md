@@ -4,7 +4,9 @@
 
 The main check is that the first **8 characters** of the version string match, i.e. `MAJOR.MINOR.PATCH` without the build suffix:
 
-```1982:1998:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:2006-2022](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L2006-L2022)
+
+```cpp
 bool GUI_App::check_networking_version()
 {
     std::string network_ver = Slic3r::NetworkAgent::get_version();
@@ -26,7 +28,9 @@ For `SLIC3R_VERSION = "02.06.00.51"` the plugin must return **a string starting 
 
 The plugin exposes its version through the symbol `bambu_network_get_version` (`func_get_version` typed as `std::string(*)(void)`). See `NetworkAgent::get_version`:
 
-```583:603:src/slic3r/Utils/NetworkAgent.cpp
+Source: [NetworkAgent.cpp:582-603](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L582-L603)
+
+```cpp
 std::string NetworkAgent::get_version()
 {
     bool consistent = true;
@@ -49,7 +53,9 @@ A separate consistency check is `bambu_network_check_debug_consistent(bool is_de
 
 Before calling `LoadLibrary`/`dlopen` Studio compares the module's publisher with Studio's own publisher:
 
-```190:267:src/slic3r/Utils/NetworkAgent.cpp
+Source: [NetworkAgent.cpp:214-272](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L214-L272)
+
+```cpp
     std::optional<SignerSummary> self_cert_summary, module_cert_summary;
     if (validate_cert) self_cert_summary = SummarizeSelf();
     ...
@@ -68,7 +74,9 @@ Before calling `LoadLibrary`/`dlopen` Studio compares the module's publisher wit
 
 `IsSamePublisher`:
 
-```294:300:src/slic3r/Utils/CertificateVerify.cpp
+Source: [CertificateVerify.cpp:294-300](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/CertificateVerify.cpp#L294-L300)
+
+```cpp
 bool IsSamePublisher(const SignerSummary& a, const SignerSummary& b)
 {
     if (!a.team_id.empty() && a.team_id == b.team_id) return true;   // macOS TeamID
@@ -82,7 +90,9 @@ bool IsSamePublisher(const SignerSummary& a, const SignerSummary& b)
 - **macOS**: the comparison uses the `team_id` (Developer ID).
 - **Linux**: `SummarizeSelf` / `SummarizeModule` **always return `std::nullopt`** — see:
 
-```289:291:src/slic3r/Utils/CertificateVerify.cpp
+Source: [CertificateVerify.cpp:291-291](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/CertificateVerify.cpp#L291-L291)
+
+```cpp
 #else
     std::optional<SignerSummary> SummarizeSelf() { return std::nullopt; }
     std::optional<SignerSummary> SummarizeModule(const std::string&) { return std::nullopt; }
@@ -95,7 +105,9 @@ Therefore on Linux `if (self_cert_summary)` is false and Studio takes the "load 
 
 `AppConfig` exposes a flag **`ignore_module_cert`**, which is forwarded to the `validate_cert` parameter:
 
-```3423:3423:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:3639](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3639)
+
+```cpp
     int load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(false, !app_config->get_bool("ignore_module_cert"));
 ```
 
@@ -103,7 +115,7 @@ Setting `ignore_module_cert = 1` in `BambuStudio.conf` disables the publisher ch
 
 ### 5.4. What "plugin installed" looks like to Studio
 
-- A boolean **`installed_networking`** key in `app_config` (section `app`) — set to `"1"` after a successful `install_plugin` (`src/slic3r/GUI/GUI_App.cpp:1906-1909`). This flag drives the "show install/update dialog" logic.
+- A boolean **`installed_networking`** key in `app_config` (section `app`) — set to `"1"` after a successful `install_plugin` ([GUI_App.cpp:1906-1909](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1906-L1909)). This flag drives the "show install/update dialog" logic.
 - The actual "the plugin works" check is this chain:
   1. `LoadLibrary`/`dlopen` returns non-null;
   2. `bambu_network_check_debug_consistent` returns `true` for the appropriate build flavor;
@@ -112,9 +124,9 @@ Setting `ignore_module_cert = 1` in `BambuStudio.conf` disables the publisher ch
 
 ### 5.5. Archive integrity (MD5/SHA)
 
-**Not checked.** There is no hash verification of the ZIP anywhere in `download_plugin` / `install_plugin` / `sync_resources` (`src/slic3r/GUI/GUI_App.cpp`, `src/slic3r/Utils/PresetUpdater.cpp`). The only defense-in-depth measure is the binary's own signature.
+**Not checked.** There is no hash verification of the ZIP anywhere in `download_plugin` / `install_plugin` / `sync_resources` ([GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp), [PresetUpdater.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp)). The only defense-in-depth measure is the binary's own signature.
 
-Error codes of the form `BAMBU_NETWORK_ERR_CHECK_MD5_FAILED` (see `src/slic3r/Utils/bambu_networking.hpp:29, 54, 70`) belong to MD5 checks **inside the plugin** during print-job uploads, not to verification of the plugin itself.
+Error codes of the form `BAMBU_NETWORK_ERR_CHECK_MD5_FAILED` (see `[bambu_networking.hpp:29](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L29), 54, 70`) belong to MD5 checks **inside the plugin** during print-job uploads, not to verification of the plugin itself.
 
 ---
 

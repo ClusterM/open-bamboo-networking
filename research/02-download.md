@@ -4,7 +4,9 @@
 
 The URL is built by `GUI_App::get_http_url` based on the `country_code` stored in `app_config`:
 
-```1469:1505:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:1569-1595](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1569-L1595)
+
+```cpp
 std::string GUI_App::get_http_url(std::string country_code, std::string path)
 {
     std::string url;
@@ -34,7 +36,9 @@ The resulting base is `https://api.bambulab.com/v1/iot-service/api/slicer/resour
 
 `GUI_App::get_plugin_url` assembles the query parameter `slicer/plugins/cloud=<ver>`:
 
-```1545:1556:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:1569-1595](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1569-L1595)
+
+```cpp
 std::string GUI_App::get_plugin_url(std::string name, std::string country_code)
 {
     std::string url = get_http_url(country_code);
@@ -55,7 +59,7 @@ GET https://api.bambulab.com/v1/iot-service/api/slicer/resource?slicer/plugins/c
 
 ### 2.3. Response format (JSON manifest)
 
-The response is parsed in `GUI_App::download_plugin` (see `src/slic3r/GUI/GUI_App.cpp` around lines 1617–1649). The expected shape:
+The response is parsed in `GUI_App::download_plugin` (see [GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) around lines 1617–1649). The expected shape:
 
 ```json
 {
@@ -76,14 +80,16 @@ Studio consumes only `version`, `description`, `url` and `force_update`. `url` p
 
 ### 2.4. Special HTTP headers
 
-- **`X-BBL-OS-Type`** is temporarily set to `"windows_arm"` when downloading the plugin on Windows ARM64 and restored to `"windows"` after the request: `src/slic3r/GUI/GUI_App.cpp` 1597–1605, 1665–1672 and `src/slic3r/Utils/PresetUpdater.cpp` 1209–1237.
+- **`X-BBL-OS-Type`** is temporarily set to `"windows_arm"` when downloading the plugin on Windows ARM64 and restored to `"windows"` after the request: [GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) 1597–1605, 1665–1672 and [PresetUpdater.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp) 1209–1237.
 - All other "sticky" headers (User-Agent etc.) are registered through `Slic3r::Http::set_extra_headers` and forwarded into the plugin via `bambu_network_set_extra_http_header`.
 
 ### 2.5. Background synchronization (OTA)
 
 `PresetUpdater::priv::sync_plugins` hits the same HTTP API, but its purpose is to populate the OTA cache rather than install the plugin immediately:
 
-```1165:1253:src/slic3r/Utils/PresetUpdater.cpp
+Source: [PresetUpdater.cpp:1165-1253](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L1165-L1253)
+
+```cpp
 void PresetUpdater::priv::sync_plugins(std::string http_url, std::string plugin_version)
 {
     ...
@@ -107,7 +113,9 @@ void PresetUpdater::priv::sync_plugins(std::string http_url, std::string plugin_
 
 `sync_resources` builds the final URL like this:
 
-```581:583:src/slic3r/Utils/PresetUpdater.cpp
+Source: [PresetUpdater.cpp:581-583](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L581-L583)
+
+```cpp
     std::string url = http_url;
     url += query_params;
     Slic3r::Http http = Slic3r::Http::get(url);
@@ -117,10 +125,10 @@ i.e. identically to `get_plugin_url`.
 
 ### 2.6. Download entry points
 
-- **Background**: `GUI_App::on_init` → `CallAfter` → `preset_updater->sync(http_url, lang, network_ver, ...)` (`src/slic3r/GUI/GUI_App.cpp` 1333–1340).
-- **"Download Bambu Network Plug-in" dialog**: `GUI_App::updating_bambu_networking()` (line 1975) → `DownloadProgressDialog` → `UpgradeNetworkJob::process()` (`src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp` 48–130).
-- **Manual trigger from the WebView**: event `begin_network_plugin_download` (`src/slic3r/GUI/GUI_App.cpp` ~4078–4090) and `ShowDownNetPluginDlg`.
-- User-facing wiki article shown on failure: `https://wiki.bambulab.com/en/software/bambu-studio/failed-to-get-network-plugin` (`src/slic3r/GUI/DownloadProgressDialog.cpp` 32–33).
+- **Background**: `GUI_App::on_init` → `CallAfter` → `preset_updater->sync(http_url, lang, network_ver, ...)` ([GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) 1333–1340).
+- **"Download Bambu Network Plug-in" dialog**: `GUI_App::updating_bambu_networking()` ([GUI_App.cpp:1999](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1999)) → `DownloadProgressDialog` → `UpgradeNetworkJob::process()` ([UpgradeNetworkJob.cpp:48-132](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp#L48-L132)).
+- **Manual trigger from the WebView**: event `begin_network_plugin_download` ([GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) ~4078–4090) and `ShowDownNetPluginDlg`.
+- User-facing wiki article shown on failure: `https://wiki.bambulab.com/en/software/bambu-studio/failed-to-get-network-plugin` ([DownloadProgressDialog.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/DownloadProgressDialog.cpp) 32–33).
 
 ---
 

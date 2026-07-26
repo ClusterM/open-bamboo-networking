@@ -3,7 +3,7 @@
 // Shared cloud bookkeeping for both ABI entry points, then a delivery
 // fork that intentionally diverges from current stock hybrid behaviour
 // (stock uploads the main .3mf to S3 even on "LAN+record" and the
-// printer re-downloads it — see ../research/06.08.1-cloud-upload.md §6.8.1.2):
+// printer re-downloads it — see ../research/11.02-cloud-upload.md §11.2.2):
 //
 //   [A]  POST   /v1/iot-service/api/user/project
 //   [B]  PUT    <presigned>                                       config 3mf

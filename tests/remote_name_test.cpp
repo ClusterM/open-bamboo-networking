@@ -1,5 +1,5 @@
 // Unit tests for pick_remote_name / dest_name_for_send_gcode.
-// Ground-truth table: ../research/06.14-file-transfer.md §6.14.3 "Stock plugin verification".
+// Ground-truth table: ../research/08.14-file-transfer.md §8.14.3 "Stock plugin verification".
 
 #include "obn/print_job.hpp"
 

@@ -20,7 +20,9 @@ On Linux `<data_dir>` is usually `~/.config/BambuStudio/` (wxWidgets XDG path), 
 
 The path is computed in `NetworkAgent::initialize_network_module`:
 
-```183:245:src/slic3r/Utils/NetworkAgent.cpp
+Source: [NetworkAgent.cpp:214-272](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L214-L272)
+
+```cpp
     auto plugin_folder = data_dir_path / "plugins";
     if (using_backup) plugin_folder = plugin_folder/"backup";
     ...
@@ -38,13 +40,15 @@ The path is computed in `NetworkAgent::initialize_network_module`:
 #endif
 ```
 
-The constant `BAMBU_NETWORK_LIBRARY = "bambu_networking"` lives in `src/slic3r/Utils/bambu_networking.hpp:97`.
+The constant `BAMBU_NETWORK_LIBRARY = "bambu_networking"` lives in [bambu_networking.hpp:105](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/bambu_networking.hpp#L105).
 
 ### 3.2. Backup copy
 
 After a successful unpack `install_plugin` copies every top-level file from `<data_dir>/plugins/` into **`<data_dir>/plugins/backup/`**. If at startup the primary plugin fails to load or is version-incompatible, Studio makes a second attempt with `using_backup=true` — the path then becomes `<data_dir>/plugins/backup/`:
 
-```1874:1905:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:1787-1936](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1787-L1936)
+
+```cpp
     fs::path dir_path(plugin_folder);
     if (fs::exists(dir_path) && fs::is_directory(dir_path)) {
         ...
@@ -60,13 +64,15 @@ After a successful unpack `install_plugin` copies every top-level file from `<da
     }
 ```
 
-The retry logic is in `GUI_App::on_init_network` (`src/slic3r/GUI/GUI_App.cpp` 3421–3459).
+The retry logic is in `GUI_App::on_init_network` ([GUI_App.cpp:3637-3756](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3637-L3756)).
 
 ### 3.3. OTA cache (staging)
 
 All background downloads land in **`<data_dir>/ota/plugins/`** (the constant `PLUGINS_SUBPATH` defined at `PresetUpdater.cpp:57`). That folder is expected to contain **all three** libraries plus a JSON manifest:
 
-```1137:1160:src/slic3r/Utils/PresetUpdater.cpp
+Source: [PresetUpdater.cpp:1131-1163](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L1131-L1163)
+
+```cpp
     network_library = cache_folder.string() + "/bambu_networking.dll";      // or .dylib / .so
     player_library  = cache_folder.string() + "/BambuSource.dll";
     live555_library = cache_folder.string() + "/live555.dll";
@@ -87,7 +93,9 @@ If any of the files is missing, the cache is considered incomplete.
 
 The JSON is produced by `sync_resources` after unpacking the archive:
 
-```712:723:src/slic3r/Utils/PresetUpdater.cpp
+Source: [PresetUpdater.cpp:712-723](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/PresetUpdater.cpp#L712-L723)
+
+```cpp
     json j;
     j["version"]     = resource_update->second.version;
     j["description"] = resource_update->second.description;
@@ -109,17 +117,19 @@ Minimal valid file:
 
 ### 3.5. The "download -> install" flow
 
-1. `UpgradeNetworkJob` (with `name="plugins"` and `package_name="networking_plugins.zip"`, `src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp:19-20`) calls:
+1. `UpgradeNetworkJob` (with `name="plugins"` and `package_name="networking_plugins.zip"`, [UpgradeNetworkJob.cpp:19-20](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/Jobs/UpgradeNetworkJob.cpp#L19-L20)) calls:
    - `GUI_App::download_plugin("plugins", "networking_plugins.zip", ...)` — drops the ZIP into `temp_directory_path()/networking_plugins.zip` (a parallel branch in `WebDownPluginDlg` / `GuideFrame` uses the name `network_plugin.zip`).
    - `GUI_App::install_plugin("plugins", "networking_plugins.zip", ...)` — extracts the archive into **`<data_dir>/plugins/`** while preserving its internal directory hierarchy.
-2. On success a flag is written: `app_config["app"]["installed_networking"] = "1"` (`src/slic3r/GUI/GUI_App.cpp` 1906–1909).
-3. `restart_networking()` (`src/slic3r/GUI/GUI_App.cpp` 1914–1957) restarts the agent: it calls `on_init_network(try_backup=true)`, resets `StaticBambuLib`, re-registers callbacks and kicks off discovery.
+2. On success a flag is written: `app_config["app"]["installed_networking"] = "1"` ([GUI_App.cpp](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp) 1906–1909).
+3. `restart_networking()` ([GUI_App.cpp:1938-1942](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1938-L1942)) restarts the agent: it calls `on_init_network(try_backup=true)`, resets `StaticBambuLib`, re-registers callbacks and kicks off discovery.
 
 ### 3.6. Applying OTA at startup
 
 If `update_network_plugin == "true"`, on the next launch — **before** network initialization — Studio copies the freshly downloaded libraries in:
 
-```3359:3418:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:3575-3635](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L3575-L3635)
+
+```cpp
 void GUI_App::copy_network_if_available()
 {
     if (app_config->get("update_network_plugin") != "true") return;
@@ -149,7 +159,9 @@ Note: only **top-level files whose extension matches the library extension** are
 
 `GUI_App::remove_old_networking_plugins` wipes the **whole** `<data_dir>/plugins/` tree:
 
-```1959:1973:src/slic3r/GUI/GUI_App.cpp
+Source: [GUI_App.cpp:1983-2004](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/GUI/GUI_App.cpp#L1983-L2004)
+
+```cpp
 void GUI_App::remove_old_networking_plugins()
 {
     auto plugin_folder = data_dir_path / "plugins";

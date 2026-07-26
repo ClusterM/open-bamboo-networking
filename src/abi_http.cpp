@@ -22,7 +22,7 @@ using obn::as_agent;
 //   https://api.bambulab.com/v1/iot-service/api/slicer/resource
 // with no outbound HTTP (string accessor only). Empty here disables the
 // panel if an old Studio build ever calls us.
-// See research/06.10-http.md; probe: plugin_runner --action http_probe.
+// See research/08.10-http.md; probe: plugin_runner --action http_probe.
 OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_BEGIN
 OBN_ABI std::string bambu_network_get_studio_info_url(void* /*agent*/)
 {
@@ -47,7 +47,7 @@ OBN_ABI int bambu_network_set_extra_http_header(void* agent,
 // (path uses '/' before the param list, not '?'); prod returned 404
 // for type=0 in our probe. Empty body + http_code=0 keeps the bell
 // clear if something ever calls us.
-// See research/06.10-http.md; probe: plugin_runner --action http_probe.
+// See research/08.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_my_message(void* /*agent*/,
                                          int /*type*/, int /*after*/, int /*limit*/,
                                          unsigned int* http_code, std::string* http_body)
@@ -62,7 +62,7 @@ OBN_ABI int bambu_network_get_my_message(void* /*agent*/,
 // ba049f6a2. Stock probe (logged-in, idle): no dedicated HTTPS; returned
 // task_id=-1, printable=true. We return task_id=0 / printable=false
 // so Studio never pops a report dialog.
-// See research/06.10-http.md; probe: plugin_runner --action http_probe.
+// See research/08.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_check_user_task_report(void* /*agent*/, int* task_id, bool* printable)
 {
     if (task_id)   *task_id = 0;
@@ -479,7 +479,7 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
 //   GET /v1/iot-service/api/user/task/<id>
 // and fills *plate_index from content.info.plate_idx. Implement there
 // if a fork still needs this; -1 means "unknown plate".
-// See research/06.10-http.md; probe: plugin_runner --action http_probe.
+// See research/08.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_task_plate_index(void* /*agent*/,
                                                std::string /*task_id*/, int* plate_index)
 {
@@ -601,7 +601,7 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
 // No GUI call site through BambuStudio ba049f6a2. Stock wire was
 //   GET /v1/iot-service/api/user/project/<project_id>?profile_id=
 // (plate_index not in the URL). Empty body is fine for current Studio.
-// See research/06.10-http.md; probe: plugin_runner --action http_probe.
+// See research/08.10-http.md; probe: plugin_runner --action http_probe.
 OBN_ABI int bambu_network_get_slice_info(void* /*agent*/,
                                          std::string /*project_id*/,
                                          std::string /*profile_id*/,

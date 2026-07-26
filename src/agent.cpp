@@ -1757,22 +1757,10 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     // (seen in the field: TCP SYN/ACK fine, ClientHello goes nowhere). To
     // keep the UI responsive we offload that to a detached worker and
     // back off on failure.
-    if (!lan_only) {
-        // Cloud / hybrid mode: call cloud::fetch_device_cert() to get the
-        // mTLS client cert and AES-encrypted private key. To complete the
-        // implementation:
-        //   1. Generate a random 32-byte AES key and base64url-encode it.
-        //   2. Call cloud::fetch_device_cert(region, access_token,
-        //          application_token, aes256_key).
-        //   3. AES-256-CBC decrypt DeviceCertResult::key with the raw key.
-        //   4. Write the cert and decrypted key to files in config_dir.
-        //   5. Reconfigure CloudSession with the cert+key paths via a new
-        //          CloudSession::configure_mtls(cert_path, key_path) method.
-        // `application_token` derivation is not yet confirmed; see
-        // obn::cloud::fetch_device_cert() comment in cloud_auth.hpp.
-        OBN_TRACE("install_device_cert dev=%s lan_only=0: mTLS cert wiring pending (see cloud::fetch_device_cert)", dev_id.c_str());
-        return;
-    }
+    // lan_only is part of the Studio ABI; OBN always treats this call as a
+    // LAN TLS leaf TOFU snapshot when a LAN session exists. Shared app-cert
+    // material (signing / app_cert_install) is unrelated — see request_app_cert_install.
+    (void)lan_only;
 
     // Fast-path checks (success-cache, in-flight, cooldown, matching LAN
     // session). All of them are cheap and must never block.

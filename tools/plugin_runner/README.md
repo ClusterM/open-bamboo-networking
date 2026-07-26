@@ -79,7 +79,7 @@ per ABI). Plugin downloads are cached in
 --connect-settle-ms MS    *cap* on the wait for set_on_local_connect_fn
                           (status=ConnectStatusOk) before the publish
                           channel is considered ready. Default 800; bump
-                          to 15000+ on slow handshakes (see §7).
+                          to 15000+ on slow handshakes (see §9).
 --log-out PATH            also mirror every JSON event line to this file
 --keep-tmpdir             leave the per-run /tmp/obn-plugin-runner-* alone
 --fast-exit               flush logs then `_Exit(0)` instead of letting
@@ -308,7 +308,7 @@ channel).
 If your action still fails with `-4030` *after* `kickstart_pushall
 rc=0`, the publish channel was healthy at action time — the failure
 is happening **inside the plugin's print state machine**, not in the
-MQTT layer. Use `--action send_raw` (§8) to bisect which payload the
+MQTT layer. Use `--action send_raw` (§10) to bisect which payload the
 printer actually rejects.
 
 ## 8. Raw publish (`--action send_raw`)

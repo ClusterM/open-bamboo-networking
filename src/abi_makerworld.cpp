@@ -35,7 +35,7 @@ public:
 using obn::as_agent;
 
 // MakerWorld / model mall / OSS. Wire confirmed via stock MITM
-// (plugin_runner --action mw_probe) + research/06.12-makerworld.md.
+// (plugin_runner --action mw_probe) + research/08.12-makerworld.md.
 // Dead ABIs (staffpick / publish / home_url) stay stubs — Studio GUI
 // no longer calls them (ba049f6a2).
 
@@ -161,7 +161,7 @@ OBN_ABI int bambu_network_get_subtask(void* agent,
         OBN_WARN("get_subtask: JSON parse: %s", perr.c_str());
         return echo();
     }
-    // Map MakerWorld camelCase → BBLModelTask (see research/06.12).
+    // Map MakerWorld camelCase → BBLModelTask (see research/07.12).
     task->job_id      = static_cast<int>(root->find("id").as_int(0));
     task->design_id   = static_cast<int>(root->find("designId").as_int(0));
     task->instance_id = static_cast<int>(root->find("instanceId").as_int(0));
