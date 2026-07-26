@@ -243,17 +243,21 @@ std::map<std::string, std::string> bbl_headers(const std::string& access_token,
                                                const std::string& user_id)
 {
     const auto& cfg_client_name = obn::config::current().client_name;
+    const std::string client_name = cfg_client_name.empty() ? "BambuStudio" : cfg_client_name;
     std::map<std::string, std::string> h;
     h["Authorization"]        = "Bearer " + access_token;
     h["Content-Type"]         = "application/json";
     h["Accept"]               = "application/json";
-    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
-                                                        : cfg_client_name;
+    h["X-BBL-Client-Name"]    = client_name;
     h["X-BBL-Client-Type"]    = "slicer";
     h["X-BBL-OS-Type"]        = kOsType;
     h["X-BBL-Agent-OS-Type"]  = kOsType;
     h["X-BBL-Language"]       = "en-US";
-    h["X-BBL-Executable-info"]= "{}";
+    std::string exec_info = "{}";
+    if (std::string(kOsType) == "win" || std::string(kOsType) == "windows") {
+        exec_info = "{\"name\":\"" + client_name + "\",\"version\":\"02.07.01.62\",\"os\":\"windows\"}";
+    }
+    h["X-BBL-Executable-info"] = exec_info;
     if (!user_id.empty())
         h["X-BBL-Client-ID"] = "slicer:" + user_id + ":obn0";
     return h;
