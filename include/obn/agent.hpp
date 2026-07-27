@@ -559,6 +559,11 @@ private:
     // Reverse of the lan_tls ip->serial registry: last known LAN IP per
     // dev_id (SSDP / connect_printer). Used by camera_url_for().
     std::unordered_map<std::string, std::string> lan_ip_by_dev_;
+    // Printer model code per dev_id, taken from the SSDP "dev_type" field
+    // (e.g. "N2S", "C11", "A1"). maybe_setup_camera() feeds it to
+    // is_jpeg_model() to choose between the LAN MJPEG source and the
+    // cloud relay sources.
+    std::unordered_map<std::string, std::string> dev_model_by_id_;
     // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
     // from push_status ipcam.rtsp_url by harvest_media_caps().
     std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;

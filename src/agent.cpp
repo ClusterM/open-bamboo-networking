@@ -323,9 +323,9 @@ void Agent::stop_camera(const std::string& dev_id)
     obn::camera::stop_camera(dev_id);
 }
 
-int Agent::send_message_to_printer(const std::string& dev_id,
-                                   const std::string& json_str,
-                                   int                qos)
+bool Agent::ensure_lan_session(const std::string& dev_id,
+                               const std::string& ip_hint,
+                               const std::string& code_hint)
 {
     if (dev_id.empty()) return false;
 
@@ -1983,10 +1983,14 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
         // failed even though certs/<serial>.pem exists on disk.
         publish_peer_cert_pin(ip, dev_id);
     }
+    const std::string dev_type = root->find("dev_type").as_string();
     {
         std::lock_guard<std::mutex> lk(mu_);
         ssdp_json_by_ip_[ip] = json;
         if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
+        // SSDP carries the model code the camera source selection needs.
+        if (!dev_id.empty() && !dev_type.empty())
+            dev_model_by_id_[dev_id] = dev_type;
     }
     // SSDP just supplied (or refreshed) the LAN IP; if the access code for the
     // selected printer is already known, this completes the credential pair and
