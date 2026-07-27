@@ -7,13 +7,21 @@
 namespace obn {
 namespace camera {
 
-// Simple query-string parameter extractor for bambu:///tutk?... URLs.
+// Query-string parameter extractor for bambu:///tutk?... URLs.
+// The key is matched only at a parameter boundary (query start or immediately
+// after '&') so a short key cannot match inside a longer parameter name
+// (e.g. "key" must not match the "key=" inside "authkey=").
 static std::string tutk_url_param(const std::string& query,
                                    const std::string& key)
 {
     const std::string needle = key + "=";
-    auto pos = query.find(needle);
-    if (pos == std::string::npos) return {};
+    size_t pos = 0;
+    for (;;) {
+        pos = query.find(needle, pos);
+        if (pos == std::string::npos) return {};
+        if (pos == 0 || query[pos - 1] == '&') break;
+        pos += 1;
+    }
     pos += needle.size();
     auto end = query.find('&', pos);
     return (end == std::string::npos)
@@ -23,7 +31,7 @@ static std::string tutk_url_param(const std::string& query,
 
 bool OssTutkCameraSource::parse_url_()
 {
-    // bambu:///tutk?uid=...&key=...
+    // bambu:///tutk?uid=...&authkey=...&passwd=...&region=...
     const std::string scheme = "bambu://";
     if (url_.compare(0, scheme.size(), scheme) != 0) return false;
     auto q = url_.find('?');
@@ -31,7 +39,8 @@ bool OssTutkCameraSource::parse_url_()
     std::string query = url_.substr(q + 1);
 
     tutk_uid_ = tutk_url_param(query, "uid");
-    passwd_   = tutk_url_param(query, "key");
+    // DTLS/AV password is carried in the "passwd" parameter.
+    passwd_   = tutk_url_param(query, "passwd");
     channel_  = tutk_url_param(query, "channel");
 
     std::string region_str = tutk_url_param(query, "region");
