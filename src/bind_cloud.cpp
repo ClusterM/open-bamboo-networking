@@ -3,8 +3,10 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/cloud_auth.hpp"
+#include "obn/config.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/lan_bind_tcp.hpp"
 #include "obn/log.hpp"
 
 #include <map>
@@ -19,33 +21,36 @@ std::string api_base(Agent* a)
 }
 
 obn::http::Response http_patch(const std::string& url,
-                                const std::string& body,
-                                const std::map<std::string, std::string>& hdrs)
+                               const std::string& body,
+                               const std::map<std::string, std::string>& hdrs)
 {
     obn::http::Request r;
-    r.method = obn::http::Method::PATCH;
-    r.url    = url;
-    r.body   = body;
+    r.method  = obn::http::Method::PATCH;
+    r.url     = url;
+    r.body    = body;
     r.headers = hdrs;
     return obn::http::perform(r);
 }
 
-obn::http::Response http_delete(const std::string& url,
-                                 const std::map<std::string, std::string>& hdrs)
+obn::http::Response http_delete_json(
+    const std::string& url,
+    const std::string& body,
+    const std::map<std::string, std::string>& hdrs)
 {
     obn::http::Request r;
-    r.method = obn::http::Method::DEL;
-    r.url    = url;
+    r.method  = obn::http::Method::DEL;
+    r.url     = url;
+    r.body    = body;
     r.headers = hdrs;
     return obn::http::perform(r);
 }
 
-void emit(BBL::OnUpdateStatusFn& fn, BBL::BindJobStage st, int code, const std::string& msg)
+void emit(BBL::OnUpdateStatusFn& fn, BBL::BindJobStage st, int code,
+          const std::string& msg)
 {
     if (fn) fn(static_cast<int>(st), code, msg);
 }
 
-// Stock cloud responses usually carry message=="success" and code:null or 0.
 bool http_json_success(const std::string& body, long http_status)
 {
     if (http_status < 200 || http_status >= 300) return false;
@@ -57,8 +62,8 @@ bool http_json_success(const std::string& body, long http_status)
     const auto c = root->find("code");
     if (!c.is_null() && c.is_number() && c.as_int() == 0) return true;
     if (!c.is_null() && c.is_string() && c.as_string() == "0") return true;
-    // Some endpoints return { "devices": [...] } without message.
     if (!root->find("devices").is_null()) return true;
+    if (!root->find("deviceId").as_string().empty()) return true;
     return false;
 }
 
@@ -67,12 +72,19 @@ std::string extract_ticket_from_json(const std::string& body)
     std::string perr;
     auto root = obn::json::parse(body, &perr);
     if (!root) return {};
-    // Common shapes: {"ticket":"..."} {"data":{"ticket":"..."}}
     std::string t = root->find("ticket").as_string();
     if (!t.empty()) return t;
     t = root->find("data.ticket").as_string();
     if (!t.empty()) return t;
     return root->find("data.bind_ticket").as_string();
+}
+
+void fire_http_error(Agent* agent, long status, const std::string& body)
+{
+    if (!agent) return;
+    if (status >= 200 && status < 300) return;
+    if (status <= 0) return;
+    agent->notify_http_error(static_cast<unsigned int>(status), body);
 }
 
 } // namespace
@@ -86,28 +98,26 @@ int ping_bind(Agent* agent, const std::string& ping_code)
         return BAMBU_NETWORK_ERR_BIND_FAILED;
     }
 
-    const std::string base = api_base(agent) + "/v1/iot-service/api/user/bind";
-    // The slicer plugin tries a handful of payload shapes; the cloud keeps
-    // changing field names between regions/firmware generations.
-    const char* keys[] = {"ping", "pin_code", "bind_pin", "code", "bind_code"};
-    for (const char* k : keys) {
-        std::ostringstream body;
-        body << "{\"" << k << "\":" << obn::json::escape(ping_code) << "}";
-        auto resp = obn::http::post_json(base, body.str(), hdrs);
-        OBN_INFO("ping_bind try key=%s http=%ld body.len=%zu",
-                 k,
-                 resp.status_code,
-                 resp.body.size());
-        if (!resp.error.empty()) continue;
-        if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
-    }
-    OBN_WARN("ping_bind: all payload variants failed");
+    // Stock: POST /v1/user-service/my/pincode/<PIN> body {"pincode":"<PIN>"}
+    const std::string url = api_base(agent) + "/v1/user-service/my/pincode/" +
+                            obn::http::url_encode(ping_code);
+    const std::string body =
+        std::string("{\"pincode\":") + obn::json::escape(ping_code) + "}";
+    auto resp = obn::http::post_json(url, body, hdrs);
+    OBN_INFO("ping_bind POST my/pincode/%s http=%ld body.len=%zu",
+             ping_code.c_str(),
+             resp.status_code,
+             resp.body.size());
+    fire_http_error(agent, resp.status_code, resp.body);
+    if (!resp.error.empty()) return BAMBU_NETWORK_ERR_BIND_FAILED;
+    if (http_json_success(resp.body, resp.status_code))
+        return BAMBU_NETWORK_SUCCESS;
     return BAMBU_NETWORK_ERR_BIND_FAILED;
 }
 
 int bind_lan_to_account(Agent* agent,
                         const std::string& dev_ip,
-                        const std::string& dev_id,
+                        const std::string& /*dev_id*/,
                         const std::string& /*sec_link*/,
                         const std::string& timezone,
                         bool               improved,
@@ -123,21 +133,6 @@ int bind_lan_to_account(Agent* agent,
         return BAMBU_NETWORK_ERR_BIND_FAILED;
     }
 
-    std::string access = agent->lan_access_code_for(dev_id);
-    if (access.empty()) {
-        emit(update_fn,
-             BBL::LoginStageFinished,
-             BAMBU_NETWORK_ERR_BIND_FAILED,
-             "no LAN access code — connect to this printer once (Device tab) "
-             "so the plugin can cache the access code, then retry Bind.");
-        return BAMBU_NETWORK_ERR_BIND_FAILED;
-    }
-
-    emit(update_fn, BBL::LoginStageLogin, 0, {});
-
-    std::string dev_name = agent->device_display_name_for_ip(dev_ip);
-    if (dev_name.empty()) dev_name = "Printer";
-
     auto hdrs = agent->cloud_api_http_headers();
     if (hdrs.find("Authorization") == hdrs.end()) {
         emit(update_fn, BBL::LoginStageFinished, BAMBU_NETWORK_ERR_BIND_FAILED,
@@ -145,40 +140,55 @@ int bind_lan_to_account(Agent* agent,
         return BAMBU_NETWORK_ERR_BIND_FAILED;
     }
 
+    emit(update_fn, BBL::LoginStageLogin, 0, {});
     emit(update_fn, BBL::LoginStageWaitForLogin, 0, {});
     emit(update_fn, BBL::LoginStageGetIdentify, 0, {});
     emit(update_fn, BBL::LoginStageWaitAuth, 0, {});
 
-    std::ostringstream os;
-    os << '{'
-       << "\"device_id\":" << obn::json::escape(dev_id) << ','
-       << "\"device_name\":" << obn::json::escape(dev_name) << ','
-       << "\"bind_code\":" << obn::json::escape(access) << ','
-       << "\"timezone\":" << obn::json::escape(timezone) << ','
-       << "\"notice\":" << (improved ? "true" : "false") << '}';
+    const std::string region = agent->cloud_region();
+    const std::string country = agent->country_code();
+    std::string fail_info;
+    int fail_err = 0;
 
-    const std::string url = api_base(agent) + "/v1/iot-service/api/user/bind";
-    auto resp             = obn::http::post_json(url, os.str(), hdrs);
+    auto cloud_fn = [&](const std::string& ticket) -> int {
+        // Stock device-ticket path: GET then POST my/ticket/<T>
+        const std::string ticket_url = api_base(agent) +
+                                       "/v1/user-service/my/ticket/" +
+                                       obn::http::url_encode(ticket);
+        auto getr = obn::http::get_json(ticket_url, hdrs);
+        OBN_INFO("bind GET my/ticket/%s http=%ld", ticket.c_str(),
+                 getr.status_code);
+        fire_http_error(agent, getr.status_code, getr.body);
+        if (!getr.error.empty() || getr.status_code < 200 ||
+            getr.status_code >= 300) {
+            return BAMBU_NETWORK_ERR_BIND_GET_CLOUD_TICKET_TIMEOUT;
+        }
 
-    OBN_INFO("bind_lan_to_account POST /user/bind http=%ld err=%s body=%s",
-             resp.status_code,
-             resp.error.c_str(),
-             obn::log::redact(resp.body, 400).c_str());
+        const std::string post_body =
+            std::string("{\"ticket\":") + obn::json::escape(ticket) + "}";
+        auto postr = obn::http::post_json(ticket_url, post_body, hdrs);
+        OBN_INFO("bind POST my/ticket/%s http=%ld", ticket.c_str(),
+                 postr.status_code);
+        fire_http_error(agent, postr.status_code, postr.body);
+        if (!postr.error.empty() || postr.status_code < 200 ||
+            postr.status_code >= 300) {
+            return BAMBU_NETWORK_ERR_BIND_POST_TICKET_TO_CLOUD_FAILED;
+        }
+        return BAMBU_NETWORK_SUCCESS;
+    };
 
-    if (!resp.error.empty()) {
-        emit(update_fn,
-             BBL::LoginStageFinished,
-             BAMBU_NETWORK_ERR_BIND_SOCKET_CONNECT_FAILED,
-             resp.error);
-        return BAMBU_NETWORK_ERR_BIND_SOCKET_CONNECT_FAILED;
-    }
+    int rc = obn::lan_bind_tcp::login_bind_session(
+        dev_ip, timezone, improved, region, country, cloud_fn, fail_info,
+        &fail_err);
 
-    if (!http_json_success(resp.body, resp.status_code)) {
-        emit(update_fn,
-             BBL::LoginStageFinished,
-             BAMBU_NETWORK_ERR_BIND_POST_TICKET_TO_CLOUD_FAILED,
-             resp.body);
-        return BAMBU_NETWORK_ERR_BIND_POST_TICKET_TO_CLOUD_FAILED;
+    if (rc != BAMBU_NETWORK_SUCCESS) {
+        std::string info = fail_info;
+        if (rc == BAMBU_NETWORK_ERR_BIND_ECODE_LOGIN_REPORT_FAILED &&
+            fail_err != 0) {
+            info = std::to_string(fail_err);
+        }
+        emit(update_fn, BBL::LoginStageFinished, rc, info);
+        return rc;
     }
 
     emit(update_fn, BBL::LoginStageFinished, 0, {});
@@ -194,49 +204,30 @@ int query_bind_status(Agent* agent,
     if (!agent->user_logged_in()) return BAMBU_NETWORK_ERR_QUERY_BIND_INFO_FAILED;
 
     auto hdrs = agent->cloud_api_http_headers();
-    const std::string url = api_base(agent) + "/v1/iot-service/api/user/bind";
-    auto resp             = obn::http::get_json(url, hdrs);
-
-    if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
-    if (resp.error.empty() && resp.status_code >= 200 && resp.status_code < 300) {
-        // Studio expects { "bind_list": [ { "dev_id","user_id","user_name" } ] }
-        std::string perr;
-        auto root = obn::json::parse(resp.body, &perr);
-        obn::auth::Session s = agent->user_session_snapshot();
-        std::ostringstream out;
-        out << "{\"bind_list\":[";
-        bool first = true;
-        if (root) {
-            auto devices_v = root->find("devices");
-            const auto& devices = devices_v.as_array();
-            for (const std::string& qdev : query_list) {
-                for (const auto& dv : devices) {
-                    obn::json::Value idv = dv.find("dev_id");
-                    if (idv.as_string() != qdev) continue;
-                    if (!first) out << ',';
-                    first = false;
-                    out << '{'
-                        << "\"dev_id\":" << obn::json::escape(qdev) << ','
-                        << "\"user_id\":" << obn::json::escape(s.user_id)
-                        << ','
-                        << "\"user_name\":"
-                        << obn::json::escape(
-                               !s.nick_name.empty() ? s.nick_name : s.user_name)
-                        << '}';
-                    break;
-                }
-            }
-        }
-        out << "]}";
-        if (http_body) *http_body = out.str();
-        return BAMBU_NETWORK_SUCCESS;
+    std::string url =
+        api_base(agent) + "/v1/iot-service/api/user/bind_list?dev_ids=";
+    for (size_t i = 0; i < query_list.size(); ++i) {
+        if (i) url += ',';
+        url += obn::http::url_encode(query_list[i]);
     }
 
+    auto resp = obn::http::get_json(url, hdrs);
+    OBN_INFO("query_bind_status GET bind_list http=%ld body.len=%zu",
+             resp.status_code, resp.body.size());
+
+    if (http_code) *http_code = static_cast<unsigned int>(resp.status_code);
     if (http_body) *http_body = resp.body;
-    return BAMBU_NETWORK_ERR_QUERY_BIND_INFO_FAILED;
+
+    // Stock probe returns 0 even on HTTP 502 when the transport completed.
+    if (!resp.error.empty()) {
+        return BAMBU_NETWORK_ERR_QUERY_BIND_INFO_FAILED;
+    }
+    fire_http_error(agent, resp.status_code, resp.body);
+    return BAMBU_NETWORK_SUCCESS;
 }
 
-int modify_printer_name(Agent* agent, const std::string& dev_id, const std::string& dev_name)
+int modify_printer_name(Agent* agent, const std::string& dev_id,
+                        const std::string& dev_name)
 {
     if (!agent || !agent->user_logged_in())
         return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
@@ -250,6 +241,7 @@ int modify_printer_name(Agent* agent, const std::string& dev_id, const std::stri
         api_base(agent) + "/v1/iot-service/api/user/device/info";
     auto resp = http_patch(url, body.str(), hdrs);
     OBN_INFO("modify_printer_name PATCH device/info http=%ld", resp.status_code);
+    fire_http_error(agent, resp.status_code, resp.body);
     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
     return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
@@ -258,12 +250,16 @@ int modify_printer_name(Agent* agent, const std::string& dev_id, const std::stri
 int unbind_device(Agent* agent, const std::string& dev_id)
 {
     if (!agent || !agent->user_logged_in()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
-    auto              hdrs = agent->cloud_api_http_headers();
-    const std::string url  = api_base(agent) +
-                            "/v1/iot-service/api/user/bind?dev_id=" +
-                            obn::http::url_encode(dev_id);
-    auto resp = http_delete(url, hdrs);
+    auto hdrs = agent->cloud_api_http_headers();
+    // Stock: DELETE /v1/iot-service/api/user/bind body {"dev_id","force":false}
+    const std::string url = api_base(agent) + "/v1/iot-service/api/user/bind";
+    std::ostringstream body;
+    body << '{'
+         << "\"dev_id\":" << obn::json::escape(dev_id) << ','
+         << "\"force\":false}";
+    auto resp = http_delete_json(url, body.str(), hdrs);
     OBN_INFO("unbind DELETE /user/bind http=%ld", resp.status_code);
+    fire_http_error(agent, resp.status_code, resp.body);
     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
     return BAMBU_NETWORK_ERR_UNBIND_FAILED;
@@ -276,19 +272,11 @@ int request_web_sso_ticket(Agent* agent, std::string* ticket)
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
     auto hdrs = agent->cloud_api_http_headers();
 
-    // Stock WebView SSO (Print History detail, MakerWorld, bind):
-    //   1) GET  /v1/user-service/user/ticket
-    //      -> {"ticket":"ABV5MR","pincode":"ABV5MR"}
-    //   2) POST /v1/user-service/my/ticket/<T>  body {"ticket":"<T>"}
-    //      binds that short code to the Bearer session
-    //   3) browser opens makerworld.com/api/sign-in/ticket?...&ticket=<T>
-    //      which Set-Cookie: token=<access> and redirects to the target page
-    // Skipping step 2 leaves the ticket unbound: MakerWorld sets an empty
-    // token cookie and the WebView lands on the sign-in page.
     const std::string mint_url =
         api_base(agent) + "/v1/user-service/user/ticket";
     auto mint = obn::http::get_json(mint_url, hdrs);
     OBN_DEBUG("request_web_sso_ticket GET user/ticket -> %ld", mint.status_code);
+    fire_http_error(agent, mint.status_code, mint.body);
     if (!mint.error.empty() || mint.status_code < 200 || mint.status_code >= 300)
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
     std::string t = extract_ticket_from_json(mint.body);
@@ -301,6 +289,7 @@ int request_web_sso_ticket(Agent* agent, std::string* ticket)
     auto bind = obn::http::post_json(bind_url, bind_body.str(), hdrs);
     OBN_DEBUG("request_web_sso_ticket POST my/ticket/%s -> %ld",
               t.c_str(), bind.status_code);
+    fire_http_error(agent, bind.status_code, bind.body);
     if (!bind.error.empty() || bind.status_code < 200 || bind.status_code >= 300)
         return BAMBU_NETWORK_ERR_INVALID_RESULT;
 

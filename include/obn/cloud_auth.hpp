@@ -68,7 +68,10 @@ std::string web_host(const std::string& region);
 AuthResult login_with_ticket(const std::string& region,
                              const std::string& ticket);
 
+// Stock: POST …/user/refreshtoken with Authorization: Bearer <access>
+// and body {"refreshToken":"<refresh>"}.
 AuthResult refresh_token(const std::string& region,
+                         const std::string& access_token,
                          const std::string& refresh_token);
 
 ProfileResult get_profile(const std::string& region,
@@ -76,8 +79,9 @@ ProfileResult get_profile(const std::string& region,
 
 // Cloud session revoke for `bambu_network_user_logout(..., request=true)`.
 // Stock: POST /v1/user-service/my/logout with Bearer + body
-// `{"refreshtoken":"<optional>"}` (lowercase key). Returns true on
-// HTTP 2xx or when there is nothing to revoke (empty access_token).
+// `{"refreshtoken":""}` (lowercase key; empty string even when a refresh
+// token is cached). Returns true on HTTP 2xx or when there is nothing to
+// revoke (empty access_token).
 bool logout(const std::string& region,
             const std::string& access_token,
             const std::string& refresh_token);

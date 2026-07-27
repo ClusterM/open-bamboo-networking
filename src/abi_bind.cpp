@@ -5,8 +5,8 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/bind_cloud.hpp"
+#include "obn/lan_bind_tcp.hpp"
 #include "obn/log.hpp"
-#include "obn/ssdp.hpp"
 
 using obn::as_agent;
 
@@ -26,9 +26,11 @@ OBN_ABI int bambu_network_bind_detect(void*       agent,
     auto* a = as_agent(agent);
     if (!a) return -1;
     OBN_INFO("bind_detect dev_ip=%s sec_link=%s", dev_ip.c_str(), sec_link.c_str());
-    // Starts the UDP :2021 listener if needed, then passively waits for a
-    // matching NOTIFY (see ssdp::kBindDetectWaitMs).
-    return a->lookup_bind_detect(dev_ip, detect, obn::ssdp::kBindDetectWaitMs);
+    (void)a;
+    (void)sec_link;
+    // Stock: plaintext TCP dev_ip:3000 framed login.command=detect
+    // (research/08.06-bind.md). SSDP NOTIFY is a separate channel.
+    return obn::lan_bind_tcp::detect(dev_ip, detect);
 }
 
 OBN_ABI int bambu_network_bind(void*       agent,

@@ -64,7 +64,7 @@ Source: [src/abi_callbacks.cpp](src/abi_callbacks.cpp). All entries are thin `st
 | `bambu_network_set_on_user_login_fn` | ✅ | Fired on sign-in / sign-out transitions. |
 | `bambu_network_set_on_printer_connected_fn` | ✅ | Fired when the LAN MQTT broker accepts a connection. |
 | `bambu_network_set_on_server_connected_fn` | ✅ | Fired when the cloud MQTT broker accepts a connection. |
-| `bambu_network_set_on_http_error_fn` | ✅ | Fired on unexpected HTTP status codes from cloud REST calls. |
+| `bambu_network_set_on_http_error_fn` | ✅ | Fired on non-2xx cloud REST from bind stack (`ping_bind` / `bind` / `unbind` / `query_bind_status` / ticket helpers); body clipped to 1024. |
 | `bambu_network_set_get_country_code_fn` | ✅ | Pulled by the agent whenever a cloud request needs the current region. |
 | `bambu_network_set_on_subscribe_failure_fn` | ✅ | Fired when an MQTT topic subscription is rejected. |
 | `bambu_network_set_on_message_fn` | ✅ | Cloud-side push frames. |
@@ -121,9 +121,9 @@ Source: [src/abi_user.cpp](src/abi_user.cpp).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_change_user` | ✅ | Empty / `{}` user_info clears the session (Studio's logout path); otherwise parses the envelope and applies it. |
+| `bambu_network_change_user` | ✅ | Empty / `{}` are no-ops (session unchanged). Non-empty user_info parses the login envelope and applies it. Logout is `user_logout` only. |
 | `bambu_network_is_user_login` | ✅ | Polled on every sidebar repaint; returns the current session state. |
-| `bambu_network_user_logout` | ✅ | Clears the agent session. When `request=true`, also `POST /v1/user-service/my/logout` (Bearer + `{"refreshtoken":…}`) before the local clear. |
+| `bambu_network_user_logout` | ✅ | Clears the agent session. When `request=true`, also `POST /v1/user-service/my/logout` (Bearer + `{"refreshtoken":""}`) before the local clear. |
 | `bambu_network_get_user_id` | ✅ | Returned from the agent's session snapshot. |
 | `bambu_network_get_user_name` | ✅ | Returned from the agent's session snapshot. |
 | `bambu_network_get_user_avatar` | ✅ | Returned from the agent's session snapshot. |
@@ -141,12 +141,12 @@ Source: [src/abi_bind.cpp](src/abi_bind.cpp).
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_ping_bind` | ✅ | Cloud `/iot-service/api/ping-bind` call. |
-| `bambu_network_bind_detect` | ✅ | Passively waits up to 5.5 s (`ssdp::kBindDetectWaitMs`) for an SSDP NOTIFY on UDP 2021 (printers broadcast every 5 s). |
-| `bambu_network_bind` | ✅ | LAN → cloud bind flow; reports progress through `OnUpdateStatusFn`. |
-| `bambu_network_unbind` | ✅ | Cloud unbind call. |
+| `bambu_network_ping_bind` | ✅ | Wire-aligned: `POST /v1/user-service/my/pincode/<PIN>` body `{"pincode":"<PIN>"}`. |
+| `bambu_network_bind_detect` | ✅ | Wire-aligned: plaintext TCP `dev_ip:3000`, frame `A5 A5 \| u16le \| JSON \| A7 A7`, `login.command=detect` → `detectResult` fields. |
+| `bambu_network_bind` | ✅ | Wire-aligned account bind: TCP `:3000` `login` (+ timezone / `e-improved`) → `wait_auth` ticket → `GET`+`POST /v1/user-service/my/ticket/<T>` `source:device`; stages via `OnUpdateStatusFn`. |
+| `bambu_network_unbind` | ✅ | Wire-aligned: `DELETE /v1/iot-service/api/user/bind` with JSON body `{"dev_id","force":false}`. |
 | `bambu_network_request_bind_ticket` | ✅ | WebView SSO ticket: `GET /user-service/user/ticket` then **`POST /user-service/my/ticket/<T>`** to bind the code to the session (required — mint alone leaves MakerWorld with an empty `token` cookie / sign-in page). Used for Print History detail, MakerWorld, bind WebViews. |
-| `bambu_network_query_bind_status` | ✅ | Cloud bind-status query. |
+| `bambu_network_query_bind_status` | ✅ | Wire-aligned: `GET /v1/iot-service/api/user/bind_list?dev_ids=…`; forwards raw `http_code`/`http_body` (incl. non-2xx via `on_http_error`). |
 | `bambu_network_report_consent` | ❌ | Intentional no-op (`SUCCESS`). Studio **does** call this when logged in ([`ba049f6a2`](https://github.com/bambulab/BambuStudio/commit/ba049f6a2e08c3b6033660bb84da80c08722974b): privacy / improvement policy / Helio TOU) with body for `POST /v1/user-service/user/consent`; return value ignored; local dialogs still persist via `app_config`. Not implemented: privacy-preserving (no consent telemetry to Bambu); logged-out Studio already POSTs itself. See `research/08.10-http.md`. |
 
 ### 8.7. Printer selection and metadata
@@ -216,7 +216,7 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 | `bambu_network_disconnect_printer` | ✅ | Tears the LAN MQTT session down. |
 | `bambu_network_send_message_to_printer` | ✅ | Publishes on the active LAN MQTT session; payload is log-redacted. |
 | `bambu_network_update_cert` | ⚠️ | Stock: `GET …/user/applications/{enc_secret}/cert?aes256=…&ver=1` (shared app cert; [§10.2](research/10.02-secrets.md), [§8.4.6](research/08.04-lan.md)). OBN still no-ops — app key is supplied out-of-band until response `key` unwrap is reversed. |
-| `bambu_network_install_device_cert` | ✅ | Snapshots the device leaf to `<config_dir>/certs/<serial>.pem` (bootstrap connect uses verify-off once); subsequent LAN TLS loads that leaf with `X509_V_FLAG_PARTIAL_CHAIN`. Deduped per device. |
+| `bambu_network_install_device_cert` | ✅ | Primary: MQTT `security.app_cert_install` → harvest `printer_cert` → cache `certs/<dev_id>.pem` + `on_message(…, "device_cert_installed")`. TOFU leaf snapshot on `:8883` only as fallback when app cert is unavailable and LAN MQTT is not already up. Deduped (~1 Hz Studio refresh). |
 | `bambu_network_start_discovery` | ✅ | Starts the SSDP UDP listener on `:2021` (printer NOTIFY; see research §6.1). SSDP updates populate the LAN TLS registry (IP → serial) when values change. |
 
 #### Always-on LAN for the selected printer

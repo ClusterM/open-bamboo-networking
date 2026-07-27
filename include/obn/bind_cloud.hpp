@@ -12,9 +12,8 @@ class Agent;
 
 namespace cloud_bind {
 
-// Cloud-side helpers for abi_bind.cpp (HTTP to api.bambulab.com / .cn).
-// LAN printer steps (MQTT ticket exchange) are not replicated yet — bind()
-// posts the same bind_code the user already uses for LAN (access code).
+// Bind helpers for abi_bind.cpp. Account bind uses LAN TCP :3000 ticket mint
+// plus cloud GET/POST /v1/user-service/my/ticket/<T> (research/08.06-bind.md).
 
 int ping_bind(Agent* agent, const std::string& ping_code);
 

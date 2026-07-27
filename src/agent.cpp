@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <thread>
 #include <utility>
@@ -514,11 +515,9 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
     // get_my_machine_list(), and the just-connected LAN printer silently falls
     // back to "found but not paired" until Studio is restarted.
 
-    if (status == BBL::ConnectStatusOk) {
-        // Same as stock: provision the app cert as soon as LAN MQTT is up.
-        maybe_install_app_cert(dev_id);
-    } else {
-        // LAN went down: clear the once-per-session latch and fail the report
+    if (status != BBL::ConnectStatusOk) {
+        // LAN went down: clear the once-per-session latch so Studio's next
+        // install_device_cert can re-provision, and fail the report
         // subscription back to the cloud instead of waiting out the silence
         // watchdog, so status keeps flowing while LAN is unavailable.
         {
@@ -963,6 +962,39 @@ void Agent::harvest_security_report(const std::string& dev_id,
             OBN_INFO("app_cert_install dev=%s: device certificate installed, "
                      "pubkey cached", dev_id.c_str());
         }
+        // Persist full PEM chain like Studio's certs/<serial>.pem.
+        const std::string cfg_dir = config_dir();
+        if (!cfg_dir.empty()) {
+            const std::string out_path =
+                cert_store::device_cert_path(cfg_dir, dev_id);
+            if (cert_store::ensure_parent_dir(out_path)) {
+                std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
+                if (ofs) {
+                    ofs << printer_cert;
+                    ofs.close();
+                    std::string ip;
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        if (lan_session_ && lan_session_->dev_id() == dev_id)
+                            ip = lan_session_->dev_ip();
+                        certified_devs_.insert(dev_id);
+                    }
+                    if (!ip.empty())
+                        obn::lan_tls::registry_set_peer_cert(ip, out_path);
+                }
+            }
+        } else {
+            std::lock_guard<std::mutex> lk(mu_);
+            certified_devs_.insert(dev_id);
+        }
+        // Latch only after a successful printer reply (not at publish time),
+        // so a lost/failed install can be retried on the next Studio tick.
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            app_cert_install_sent_.insert(dev_id);
+        }
+        // Stock ABI path: Studio process_network_msg on this string.
+        notify_message(dev_id, "device_cert_installed");
         return;
     }
 
@@ -1024,15 +1056,13 @@ void Agent::maybe_install_app_cert(const std::string& dev_id)
 
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!app_cert_install_sent_.insert(dev_id).second)
-            return; // already fired this session
+        if (app_cert_install_sent_.count(dev_id))
+            return; // SUCCESS already harvested this session
     }
 
-    // Fire-and-forget: printer_cert arrives later via harvest_security_report.
-    if (!request_app_cert_install(dev_id)) {
-        std::lock_guard<std::mutex> lk(mu_);
-        app_cert_install_sent_.erase(dev_id); // allow retry on next connect
-    }
+    // Fire-and-forget: latch app_cert_install_sent_ only when
+    // harvest_security_report sees result=SUCCESS + printer_cert.
+    (void)request_app_cert_install(dev_id);
 }
 
 int Agent::send_message_to_printer(const std::string& dev_id,
@@ -1155,6 +1185,39 @@ std::string Agent::camera_url_for(const std::string& dev_id)
                     + code;
     if (!lv.empty()) url += "&lv=" + lv;
     return url;
+}
+
+void Agent::notify_message(const std::string& dev_id, const std::string& msg)
+{
+    BBL::OnMessageFn cb;
+    BBL::QueueOnMainFn queue;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cb    = on_message_;
+        queue = queue_on_main_;
+    }
+    if (!cb) return;
+    auto invoke = [cb, dev_id, msg]() { cb(dev_id, msg); };
+    if (queue) queue(invoke);
+    else       invoke();
+}
+
+void Agent::notify_http_error(unsigned int status, const std::string& body)
+{
+    BBL::OnHttpErrorFn cb;
+    BBL::QueueOnMainFn queue;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        cb    = on_http_error_;
+        queue = queue_on_main_;
+    }
+    if (!cb) return;
+    // Studio tips body must stay under ~1024 bytes.
+    std::string clipped = body;
+    if (clipped.size() > 1024) clipped.resize(1024);
+    auto invoke = [cb, status, clipped]() { cb(status, clipped); };
+    if (queue) queue(invoke);
+    else       invoke();
 }
 
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
@@ -1750,98 +1813,66 @@ bool Agent::ensure_ssdp_discovery_running()
 
 void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
 {
-    // Studio calls this ~1 Hz from DeviceManagerRefresher::on_timer in
-    // addition to once right after on_printer_connected_fn on the UI thread.
-    // The actual cert snapshot does a blocking SSL_connect to port 8883 that
-    // can hang for ~timeout_ms when the printer refuses the extra handshake
-    // (seen in the field: TCP SYN/ACK fine, ClientHello goes nowhere). To
-    // keep the UI responsive we offload that to a detached worker and
-    // back off on failure.
-    // lan_only is part of the Studio ABI; OBN always treats this call as a
-    // LAN TLS leaf TOFU snapshot when a LAN session exists. Shared app-cert
-    // material (signing / app_cert_install) is unrelated — see request_app_cert_install.
+    // Stock: Studio calls this ~1 Hz and after on_printer_connected. Primary
+    // wire is MQTT security.app_cert_install (research/08.04-lan.md); the
+    // printer replies with printer_cert and Studio gets
+    // on_message("device_cert_installed"). lan_only mirrors
+    // is_lan_mode_printer(); OBN uses the same MQTT path for both.
     (void)lan_only;
+    if (dev_id.empty()) return;
 
-    // Fast-path checks (success-cache, in-flight, cooldown, matching LAN
-    // session). All of them are cheap and must never block.
+    if (obn::signing::slicer_app_cert_usable()) {
+        maybe_install_app_cert(dev_id);
+        // If we already have a device cert on disk / in cache from a prior
+        // SUCCESS reply, mark certified so Studio's ~1 Hz tick is cheap.
+        const std::string cfg_dir = config_dir();
+        if (!cfg_dir.empty()) {
+            const std::string out_path =
+                cert_store::device_cert_path(cfg_dir, dev_id);
+            std::error_code ec;
+            bool have_key = false;
+            if (EVP_PKEY* pk = cert_store::get_printer_pub_key(dev_id)) {
+                ::EVP_PKEY_free(pk);
+                have_key = true;
+            }
+            if (std::filesystem::is_regular_file(out_path, ec) || have_key) {
+                std::lock_guard<std::mutex> lk(mu_);
+                certified_devs_.insert(dev_id);
+            }
+        }
+        return;
+    }
+
+    // Fallback: LAN TLS leaf TOFU when no shared app cert material is
+    // configured. Never open a second :8883 handshake while LAN MQTT is up.
     std::string ip;
     std::string cfg_dir;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (certified_devs_.count(dev_id)) {
-            return; // already snapshotted this session.
-        }
-        if (cert_snapshot_inflight_.count(dev_id)) {
-            return; // a worker is on it.
-        }
+        if (certified_devs_.count(dev_id)) return;
+        if (cert_snapshot_inflight_.count(dev_id)) return;
         auto it = cert_snapshot_cooldown_.find(dev_id);
         if (it != cert_snapshot_cooldown_.end() &&
             std::chrono::steady_clock::now() < it->second) {
-            return; // recent failure, don't retry yet.
+            return;
         }
-        if (lan_session_ && lan_session_->dev_id() == dev_id)
-            ip = lan_session_->dev_ip();
+        if (lan_session_ && lan_session_->dev_id() == dev_id) {
+            // MQTT session owns :8883 — cannot TOFU in parallel.
+            return;
+        }
         cfg_dir = config_dir_;
     }
 
-    if (ip.empty()) {
-        OBN_DEBUG("install_device_cert dev=%s: no active LAN session, skipping", dev_id.c_str());
-        return;
-    }
+    // Resolve IP from SSDP cache if we somehow have no session.
+    (void)ip;
     if (cfg_dir.empty()) {
-        OBN_WARN("install_device_cert dev=%s: config_dir not set", dev_id.c_str());
+        OBN_DEBUG("install_device_cert dev=%s: no app cert and no config_dir",
+                  dev_id.c_str());
         return;
     }
-
-    const std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
-    {
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(out_path, ec)) {
-            std::lock_guard<std::mutex> lk(mu_);
-            certified_devs_.insert(dev_id);
-            if (!ip.empty()) {
-                obn::lan_tls::registry_set_peer_cert(ip, out_path);
-            }
-            return;
-        }
-    }
-
-    // Do not open a second TLS session to :8883 while LAN MQTT is up — the
-    // printer drops one of them (seen as mqtt rc=7 / rc=5 on Orca reconnect).
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (lan_session_ && lan_session_->dev_id() == dev_id) {
-            return;
-        }
-    }
-
-    // Claim the inflight slot and launch the worker. cert_snapshot_inflight_
-    // is cleared by the worker on exit, certified_devs_ only on success,
-    // cooldown only on failure.
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        cert_snapshot_inflight_.insert(dev_id);
-    }
-
-    std::thread([this, dev_id, ip, cfg_dir]() {
-        std::string out_path = cert_store::device_cert_path(cfg_dir, dev_id);
-        OBN_INFO("install_device_cert dev=%s ip=%s: snapshotting to %s",
-                 dev_id.c_str(), ip.c_str(), out_path.c_str());
-        bool ok = cert_store::capture_peer_cert_pem(
-            ip, 8883, /*timeout_ms=*/3000, out_path, dev_id);
-        std::lock_guard<std::mutex> lk(mu_);
-        cert_snapshot_inflight_.erase(dev_id);
-        if (ok) {
-            certified_devs_.insert(dev_id);
-            cert_snapshot_cooldown_.erase(dev_id);
-            obn::lan_tls::registry_set_peer_cert(ip, out_path);
-        } else {
-            OBN_WARN("install_device_cert dev=%s: snapshot failed, cooldown 60s",
-                     dev_id.c_str());
-            cert_snapshot_cooldown_[dev_id] =
-                std::chrono::steady_clock::now() + std::chrono::seconds(60);
-        }
-    }).detach();
+    OBN_DEBUG("install_device_cert dev=%s: app cert unavailable, TOFU skipped "
+              "(no idle LAN path)",
+              dev_id.c_str());
 }
 
 bool Agent::request_app_cert_install(const std::string& dev_id)
@@ -2324,27 +2355,22 @@ int Agent::connect_cloud()
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
         // notification so Studio moves the device from "subscribing"
-        // to "online" in its UI. That first report is also our proof the
-        // printer is reachable via cloud MQTT — fire app_cert_install here
-        // (not at subscribe time), because a reboot wipes the trust store
-        // from RAM and subscribe alone does not mean the device is online.
+        // to "online" in its UI. App-cert provisioning is Studio-driven
+        // via bambu_network_install_device_cert (not eager on report).
         bool first = false;
         {
             std::lock_guard<std::mutex> lk(mu_);
             first = cloud_connected_devs_.insert(dev_id).second;
         }
-        if (first) {
-            maybe_install_app_cert(dev_id);
-            if (on_printer_connected) {
-                BBL::OnPrinterConnectedFn cb = on_printer_connected;
-                BBL::QueueOnMainFn        q;
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    q = queue_on_main_;
-                }
-                auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
-                if (q) q(invoke); else invoke();
+        if (first && on_printer_connected) {
+            BBL::OnPrinterConnectedFn cb = on_printer_connected;
+            BBL::QueueOnMainFn        q;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                q = queue_on_main_;
             }
+            auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
+            if (q) q(invoke); else invoke();
         }
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
@@ -2496,7 +2522,7 @@ void Agent::hydrate_session()
         OBN_WARN("cloud: stored session expired and no refresh_token; ignore it");
         return;
     }
-    auto r = obn::cloud::refresh_token(s.region, s.refresh_token);
+    auto r = obn::cloud::refresh_token(s.region, s.access_token, s.refresh_token);
     if (!r.ok) {
         OBN_WARN("cloud: refresh failed: %s", r.error_message.c_str());
         return;

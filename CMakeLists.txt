@@ -279,6 +279,7 @@ add_library(bambu_networking SHARED
     src/config.cpp
     src/cloud_auth.cpp
     src/bind_cloud.cpp
+    src/lan_bind_tcp.cpp
     src/cloud_filament.cpp
     src/cloud_presets.cpp
     src/cloud_print.cpp
@@ -811,5 +812,19 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(oss_sign_test PRIVATE include)
     target_link_libraries(oss_sign_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME oss_sign COMMAND oss_sign_test)
+
+    # Hermetic round-trip for TCP :3000 bind framing (A5 A5|u16le|JSON|A7 A7).
+    add_executable(lan_bind_tcp_test tests/lan_bind_tcp_test.cpp
+        src/lan_bind_tcp.cpp
+        src/config.cpp
+        src/json_lite.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(lan_bind_tcp_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(lan_bind_tcp_test PRIVATE
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(lan_bind_tcp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME lan_bind_tcp COMMAND lan_bind_tcp_test)
 
 endif()

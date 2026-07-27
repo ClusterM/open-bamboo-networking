@@ -39,7 +39,7 @@ struct Request {
     Method                                method = Method::GET;
     std::string                           url;
     std::map<std::string, std::string>    headers;
-    std::string                           body;   // for POST/PUT; ignored for GET/DEL
+    std::string                           body;   // for POST/PUT/PATCH; also DELETE when set
     std::string                           ca_file;
     bool                                  insecure = false;
     int                                   connect_timeout_s = 10;

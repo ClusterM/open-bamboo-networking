@@ -18,8 +18,8 @@ OBN_ABI int bambu_network_change_user(void* agent, std::string user_info)
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     OBN_INFO("change_user info_len=%zu", user_info.size());
     if (user_info.empty() || user_info == "{}") {
-        // Studio calls change_user("") on startup / logout.
-        a->clear_session();
+        // Stock: empty / {} do not clear the session (research/08.05-auth.md).
+        // Logout is bambu_network_user_logout only.
         return BAMBU_NETWORK_SUCCESS;
     }
     return a->apply_login_info(user_info);

@@ -182,13 +182,10 @@ public:
     // harvest_security_flags().
     bool printer_supports_new_auth(const std::string& dev_id) const;
 
-    // Fire-and-forget app_cert_install once per printer MQTT session when
-    // slicer_app_cert_usable(). Triggers: LAN CONNACK Ok, or the first cloud
-    // report for a device (proof the printer is online). Not on cloud
-    // subscribe alone — the trust store lives in printer RAM and is wiped
-    // on reboot, so we only publish when delivery is likely. Does not wait
-    // for the printer_cert reply; harvest_security_report installs the key
-    // asynchronously.
+    // Fire-and-forget app_cert_install when slicer_app_cert_usable().
+    // Called from install_device_cert (Studio ABI ~1 Hz / after connect).
+    // Skips if app_cert_install_sent_ already has a SUCCESS for this
+    // session; does not wait for the reply.
     void maybe_install_app_cert(const std::string& dev_id);
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
@@ -259,6 +256,13 @@ public:
     // reach the Studio UI thread safely.
     void notify_local_connected(int status, const std::string& dev_id, const std::string& msg);
     void notify_local_message(const std::string& dev_id, const std::string& json);
+
+    // Studio process_network_msg string events (e.g. "device_cert_installed")
+    // go through on_message_, not on_local_message_.
+    void notify_message(const std::string& dev_id, const std::string& msg);
+
+    // Cloud REST non-2xx → on_http_error_fn (research/08.02-callbacks.md).
+    void notify_http_error(unsigned int status, const std::string& body);
 
     // Lookup: given a synthetic subtask id we minted in notify_local_message,
     // returns the (subtask_name, plate_idx) combo and a ready-to-fetch
@@ -520,9 +524,9 @@ private:
     // install_device_cert() ~1 Hz, and we don't want to pound the printer
     // with a fresh TLS handshake every tick.
     std::set<std::string> certified_devs_;
-    // Devices for which we already fired fire-and-forget app_cert_install
-    // in the current MQTT session (LAN or cloud). Cleared on disconnect so
-    // a reconnect re-provisions. Guarded by mu_.
+    // Devices whose app_cert_install got result=SUCCESS (+ printer_cert)
+    // this MQTT session. Set in harvest_security_report, not at publish.
+    // Cleared on LAN disconnect so Studio can re-provision. Guarded by mu_.
     std::set<std::string> app_cert_install_sent_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that

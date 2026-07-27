@@ -144,9 +144,11 @@ Response perform(const Request& req)
     if (!have_accept && !req.no_default_accept) {
         hdrs = curl_slist_append(hdrs, "Accept: application/json");
     }
-    if ((req.method == Method::POST || req.method == Method::PUT ||
-         req.method == Method::PATCH) && !have_ct &&
-        !req.no_default_content_type) {
+    const bool method_has_body =
+        req.method == Method::POST || req.method == Method::PUT ||
+        req.method == Method::PATCH ||
+        (req.method == Method::DEL && !req.body.empty());
+    if (method_has_body && !have_ct && !req.no_default_content_type) {
         hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     }
 
@@ -163,8 +165,7 @@ Response perform(const Request& req)
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,   on_header);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA,       &resp);
 
-    if (req.method == Method::POST || req.method == Method::PUT ||
-        req.method == Method::PATCH) {
+    if (method_has_body) {
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(req.body.size()));
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    req.body.data());
     }
