@@ -123,7 +123,7 @@ Source: [src/abi_user.cpp](src/abi_user.cpp).
 | --- | :--: | --- |
 | `bambu_network_change_user` | ✅ | Empty / `{}` user_info clears the session (Studio's logout path); otherwise parses the envelope and applies it. |
 | `bambu_network_is_user_login` | ✅ | Polled on every sidebar repaint; returns the current session state. |
-| `bambu_network_user_logout` | ✅ | Clears the agent session. |
+| `bambu_network_user_logout` | ✅ | Clears the agent session. When `request=true`, also `POST /v1/user-service/my/logout` (Bearer + `{"refreshtoken":…}`) before the local clear. |
 | `bambu_network_get_user_id` | ✅ | Returned from the agent's session snapshot. |
 | `bambu_network_get_user_name` | ✅ | Returned from the agent's session snapshot. |
 | `bambu_network_get_user_avatar` | ✅ | Returned from the agent's session snapshot. |
@@ -215,7 +215,7 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 | `bambu_network_connect_printer` | ✅ | Opens a LAN MQTT session (TLS to `mqtts://<ip>:8883`, user `bblp`, password = access code). With verify enabled (default): `printer.cer` + optional snapshotted device leaf, SNI/CN = serial (`dev_id`). |
 | `bambu_network_disconnect_printer` | ✅ | Tears the LAN MQTT session down. |
 | `bambu_network_send_message_to_printer` | ✅ | Publishes on the active LAN MQTT session; payload is log-redacted. |
-| `bambu_network_update_cert` | ✅ | No-op: the CA bundle is loaded once in `set_cert_file` and re-used for the lifetime of the agent. |
+| `bambu_network_update_cert` | ⚠️ | Stock: `GET …/user/applications/{enc_secret}/cert?aes256=…&ver=1` (shared app cert; [§10.2](research/10.02-secrets.md), [§8.4.6](research/08.04-lan.md)). OBN still no-ops — app key is supplied out-of-band until response `key` unwrap is reversed. |
 | `bambu_network_install_device_cert` | ✅ | Snapshots the device leaf to `<config_dir>/certs/<serial>.pem` (bootstrap connect uses verify-off once); subsequent LAN TLS loads that leaf with `X509_V_FLAG_PARTIAL_CHAIN`. Deduped per device. |
 | `bambu_network_start_discovery` | ✅ | Starts the SSDP UDP listener on `:2021` (printer NOTIFY; see research §6.1). SSDP updates populate the LAN TLS registry (IP → serial) when values change. |
 

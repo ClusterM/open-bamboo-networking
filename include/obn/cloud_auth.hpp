@@ -5,10 +5,11 @@
 // Studio drives the interactive sign-in through its own wxWebView /
 // system-browser flow and hands the resulting tokens back via
 // `bambu_network_change_user` (see Agent::apply_login_info). On our
-// side we only need:
+// side we need:
 //   * a ticket->token exchange (for the "system browser" callback),
-//   * a refresh_token rotation (to keep the session alive), and
-//   * a profile fetch (uid / nickname / avatar).
+//   * a refresh_token rotation (to keep the session alive),
+//   * a profile fetch (uid / nickname / avatar), and
+//   * a cloud logout revoke when Studio passes request=true.
 // The global host is `api.bambulab.com`, with a CN mirror at
 // `api.bambulab.cn`.
 
@@ -72,5 +73,13 @@ AuthResult refresh_token(const std::string& region,
 
 ProfileResult get_profile(const std::string& region,
                           const std::string& access_token);
+
+// Cloud session revoke for `bambu_network_user_logout(..., request=true)`.
+// Stock: POST /v1/user-service/my/logout with Bearer + body
+// `{"refreshtoken":"<optional>"}` (lowercase key). Returns true on
+// HTTP 2xx or when there is nothing to revoke (empty access_token).
+bool logout(const std::string& region,
+            const std::string& access_token,
+            const std::string& refresh_token);
 
 } // namespace obn::cloud

@@ -96,6 +96,8 @@ PluginExports load(const std::string& so_path)
 
     out.start_subscribe = resolve_required<func_start_subscribe>(
         out.dl_handle, "bambu_network_start_subscribe", so_path);
+    out.stop_subscribe = resolve<func_stop_subscribe>(
+        out.dl_handle, "bambu_network_stop_subscribe");
     out.send_message_to_printer = resolve_required<func_send_message_to_printer>(
         out.dl_handle, "bambu_network_send_message_to_printer", so_path);
     out.set_on_ssdp_msg_fn = resolve_required<func_set_on_ssdp_msg_fn>(
@@ -113,8 +115,30 @@ PluginExports load(const std::string& so_path)
                                       "bambu_network_change_user", so_path);
     out.is_user_login           = resolve_required<func_is_user_login>(out.dl_handle,
                                       "bambu_network_is_user_login", so_path);
+    out.user_logout             = resolve<func_user_logout>(out.dl_handle,
+                                      "bambu_network_user_logout");
+    out.build_login_cmd         = resolve<func_build_login_cmd>(out.dl_handle,
+                                      "bambu_network_build_login_cmd");
+    out.build_logout_cmd        = resolve<func_build_logout_cmd>(out.dl_handle,
+                                      "bambu_network_build_logout_cmd");
+    out.build_login_info        = resolve<func_build_login_info>(out.dl_handle,
+                                      "bambu_network_build_login_info");
+    out.get_user_id             = resolve<func_get_user_id>(out.dl_handle,
+                                      "bambu_network_get_user_id");
+    out.connect_server          = resolve<func_connect_server>(out.dl_handle,
+                                      "bambu_network_connect_server");
+    out.is_server_connected     = resolve<func_is_server_connected>(out.dl_handle,
+                                      "bambu_network_is_server_connected");
+    out.refresh_connection      = resolve<func_refresh_connection>(out.dl_handle,
+                                      "bambu_network_refresh_connection");
     out.bind_detect             = resolve_required<func_bind_detect>(out.dl_handle,
                                       "bambu_network_bind_detect", so_path);
+    out.query_bind_status       = resolve<func_query_bind_status>(out.dl_handle,
+                                      "bambu_network_query_bind_status");
+    out.request_bind_ticket     = resolve<func_request_bind_ticket>(out.dl_handle,
+                                      "bambu_network_request_bind_ticket");
+    out.bind                    = resolve<func_bind>(out.dl_handle,
+                                      "bambu_network_bind");
     // Optional in older builds.
     out.check_debug_consistent  = resolve<func_check_debug_consistent>(out.dl_handle,
                                       "bambu_network_check_debug_consistent");
@@ -123,6 +147,8 @@ PluginExports load(const std::string& so_path)
     // privileged MQTT publish on it having run at least once.
     out.install_device_cert     = resolve<func_install_device_cert>(out.dl_handle,
                                       "bambu_network_install_device_cert");
+    out.update_cert             = resolve<func_update_cert>(out.dl_handle,
+                                      "bambu_network_update_cert");
 
     // Print-action entry points are all optional at load time; per-action
     // dispatch in main.cpp re-validates that the user-requested one was

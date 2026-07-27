@@ -3,7 +3,9 @@
 #include "obn/config.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/log.hpp"
 
+#include <map>
 #include <sstream>
 
 namespace obn::cloud {
@@ -15,6 +17,18 @@ std::string refresh_body(const std::string& refresh)
     std::ostringstream os;
     os << '{'
        << "\"refreshToken\":" << obn::json::escape(refresh)
+       << '}';
+    return os.str();
+}
+
+// Stock logout body uses the all-lowercase key `refreshtoken` (not
+// camelCase). Observed MITM had an empty value with a valid Bearer;
+// we still forward a non-empty refresh token when we have one.
+std::string logout_body(const std::string& refresh)
+{
+    std::ostringstream os;
+    os << '{'
+       << "\"refreshtoken\":" << obn::json::escape(refresh)
        << '}';
     return os.str();
 }
@@ -118,6 +132,31 @@ AuthResult refresh_token(const std::string& region,
     r.ok = !r.access_token.empty();
     if (!r.ok) r.error_message = api_error(*root, resp.status_code);
     return r;
+}
+
+bool logout(const std::string& region,
+            const std::string& access_token,
+            const std::string& refresh)
+{
+    if (access_token.empty()) return true;
+    std::map<std::string, std::string> hdrs{
+        {"Authorization", "Bearer " + access_token},
+    };
+    // Evidence: MITM stock agent 02.08.01.53 — POST …/my/logout → 200
+    // empty body. Failure must not block local session clear.
+    auto resp = obn::http::post_json(
+        api_host(region) + "/v1/user-service/my/logout",
+        logout_body(refresh),
+        hdrs);
+    if (!resp.error.empty()) {
+        OBN_WARN("cloud logout: transport %s", resp.error.c_str());
+        return false;
+    }
+    if (resp.status_code < 200 || resp.status_code >= 300) {
+        OBN_WARN("cloud logout: http %ld", resp.status_code);
+        return false;
+    }
+    return true;
 }
 
 ProfileResult get_profile(const std::string& region,

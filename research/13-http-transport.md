@@ -76,8 +76,11 @@ For endpoints that return a plain-text error (notably `POST /slicer/setting` wit
 
 | Concern | Endpoint(s) | Section | Evidence |
 |---------|-------------|---------|----------|
-| Bearer-token login / refresh / profile | `POST /v1/user-service/user/ticket/<T>`, `POST /v1/user-service/user/refreshtoken`, `GET /v1/user-service/my/profile` | [§8.5](08.05-auth.md) | MITM + probe |
-| Device bind / unbind / rename | `POST /v1/iot-service/api/user/bind`, `GET /v1/iot-service/api/user/bind`, `PATCH /v1/iot-service/api/user/device/info`, `DELETE /v1/iot-service/api/user/bind?dev_id=<id>` | [§8.6](08.06-bind.md) | MITM + probe |
+| Bearer-token login / refresh / profile / logout | `POST /v1/user-service/user/ticket/<T>`, `POST /v1/user-service/user/refreshtoken` (body `{"refreshToken":…}`), `GET /v1/user-service/my/profile`, `POST /v1/user-service/my/logout` (body `{"refreshtoken":…}`, on `user_logout(true)`) | [§8.5](08.05-auth.md) ([§8.5.1](08.05-auth.md), [§8.5.14](08.05-auth.md)) | MITM + probe |
+| Device account bind / pin bind / unbind | Account bind cloud: `GET`+`POST /v1/user-service/my/ticket/<T>` (device ticket; LAN mint is TCP `:3000` login, [§8.6.3](08.06-bind.md)); pin: `POST /v1/user-service/my/pincode/<PIN>` body `{"pincode":…}`; unbind: `DELETE /v1/iot-service/api/user/bind` body `{"dev_id","force"}` | [§8.6](08.06-bind.md) ([§8.6.3](08.06-bind.md)–[§8.6.5](08.06-bind.md)) | MITM + LAN pcap (stock 2026-07) |
+| Bind ownership query (`query_bind_status`) | `GET /v1/iot-service/api/user/bind_list?dev_ids=<id>[,…]` (not `/user/bind`) | [§8.6.7](08.06-bind.md) | MITM probe (`stock_query_bind.mitm`) |
+| WebView SSO ticket | `GET /v1/user-service/user/ticket` then `POST /v1/user-service/my/ticket/<T>` | [§8.6.6](08.06-bind.md) | MITM |
+| Device list / rename (not bind ABI) | `GET /v1/iot-service/api/user/bind`, `PATCH /v1/iot-service/api/user/device/info` (also `GET …/user/print`) | [§8.10](08.10-http.md) | MITM + probe |
 | Printer firmware catalogue | stock: `GET /v1/iot-service/api/user/device/version?dev_id=<serial>` (add `X-BBL-Client-ID: slicer:<uid>:<4-char-suffix>`) | [§8.7](08.07-printer-selection.md) | SSLKEYLOGFILE (stock) |
 | Cloud print-job pipeline | `POST /v1/iot-service/api/user/project`, `PUT <presigned>`, …, `POST /v1/user-service/my/task` | [§11.2](11.02-cloud-upload.md) | MITM |
 | Generic HTTP ABI (`get_user_tasks`, …) | see per-symbol list | [§8.10](08.10-http.md) | MITM + probe |

@@ -148,6 +148,15 @@ struct CliArgs {
     int         rating_id     = 0;
     int         rating_score  = 5;
 
+    // --action account_bind extras (Studio BindJob defaults).
+    std::string dev_model = "N7";
+    std::string timezone  = "UTC+02:00";
+    bool        improved  = true;
+
+    // gap_probe: call user_logout(true) at the end under MITM to capture
+    // the logout body when refresh_token is present (revokes the session).
+    bool        do_logout = false;
+
     // For wire-format reverse-engineering: after a print action
     // finishes (Finished or ERROR latched), publish
     //   {"print":{"command":"stop","param":"","sequence_id":"…"}}
@@ -217,9 +226,37 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--mw-seed N] [--mw-limit N] [--mw-put-rating]
                      [--rating-id N] [--rating-score N] [--country US]
 
+       plugin_runner --action update_cert --plugin-path PATH
+                     [--user-info @session.json] [--data-dir DIR]
+                     [--country US]
+
+       plugin_runner --action query_bind --plugin-path PATH
+                     --user-info @session.json --dev-id ID
+                     [--data-dir DIR] [--country US]
+
+       plugin_runner --action bind_detect --plugin-path PATH
+                     --dev-ip IP [--dev-id ID] [--data-dir DIR]
+                     [--country US] [--timeout SECONDS]
+
+       plugin_runner --action account_bind --plugin-path PATH
+                     --user-info @session.json
+                     --dev-id ID --dev-ip IP --access-code CODE
+                     [--dev-model MODEL] [--timezone TZ] [--improved 0|1]
+                     [--data-dir DIR] [--country US]
+
+       plugin_runner --action gap_probe --plugin-path PATH
+                     --user-info @session.json [--dev-id ID]
+                     [--do-logout] [--data-dir DIR] [--country US]
+
+       plugin_runner --action cert_probe --plugin-path PATH
+                     --dev-id ID --dev-ip IP --access-code CODE
+                     [--user-info @session.json] [--data-dir DIR]
+                     [--country US] [--timeout SECONDS]
+
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
                 | local_print_with_record | send_raw | none | http_probe
-                | mw_probe
+                | mw_probe | update_cert | query_bind | bind_detect
+                | account_bind | gap_probe | cert_probe
 
   none: skip the print dispatch entirely. Useful for diagnostics: just
   init + connect_printer, then sit for --timeout seconds dumping every
@@ -241,6 +278,36 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   get_model_mall_detail_url / get_model_mall_rating /
   get_mw_user_preference / get_mw_user_4ulist (put_model_mall_rating
   only with --mw-put-rating). Use under MITM to capture MakerWorld URLs.
+
+  update_cert: no printer. Mirrors Studio GUI_App::check_cert →
+  bambu_network_update_cert. Under MITM this should be the shared app
+  cert fetch (GET …/user/applications/{enc_secret}/cert?aes256=…&ver=1).
+  --user-info optional (stock still attaches Bearer when logged in).
+
+  query_bind: no printer. change_user then bambu_network_query_bind_status
+  ([--dev-id]) and request_bind_ticket. Use under MITM for orphan
+  query_bind_status URL capture. Do NOT attach strace/gdb — stock
+  anti-debug aborts with a zenity dialog.
+
+  bind_detect: LAN only. start_discovery + bambu_network_bind_detect,
+  then exit (no MQTT connect). Pair with tcpdump on udp/2021 and host
+  <printer> to see SSDP vs any TCP /info.
+
+  account_bind: change_user + bind_detect + bambu_network_bind with
+  OnUpdateStatusFn progress events. Captures device-ticket cloud steps
+  under MITM; pair with an MQTT logger on device/<id>/request|report.
+
+  gap_probe: no printer. change_user then probe build_login_* /
+  build_login_info, change_user JSON shapes, query_bind_status,
+  connect_server + start/stop_subscribe("app") + refresh_connection +
+  enable_multi_machine. Optional --do-logout calls user_logout(true)
+  (revokes tokens — re-login after). Use under HTTPS_PROXY + mitmproxy;
+  pair with SSLKEYLOGFILE + tcpdump on *.mqtt.bambulab.com for MQTT wire.
+
+  cert_probe: LAN MQTT without the automatic install_device_cert, then
+  call install_device_cert(lan_only=true) and (lan_only=false). Watch
+  local_message for security.* / app_cert_install. Pair with tcpdump on
+  host <printer> port 8883 and optional SSLKEYLOGFILE.
 
 Driven from tools/plugin_runner.sh; see tools/plugin_runner/README.md.
 )", stderr);
@@ -299,6 +366,10 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--rating-id")         c.rating_id = std::stoi(require(a, ++i, f));
         else if (f == "--rating-score")      c.rating_score = std::stoi(require(a, ++i, f));
         else if (f == "--auto-stop")         c.auto_stop = true;
+        else if (f == "--dev-model")         c.dev_model = require(a, ++i, f);
+        else if (f == "--timezone")          c.timezone  = require(a, ++i, f);
+        else if (f == "--improved")          c.improved  = (require(a, ++i, f) != "0");
+        else if (f == "--do-logout")         c.do_logout = true;
         else if (f == "--fast-exit")         c.fast_exit = true;
         else if (f == "--no-fast-exit")      c.fast_exit = false;
         else if (f == "--download-only")     c.download_only = true;
@@ -319,18 +390,43 @@ CliArgs parse_cli(int argc, char** argv)
         return c;
     }
     // params_json is only mandatory for actions that consume PrintParams.
-    // send_raw / none / http_probe / mw_probe can run without it.
-    const bool cloud_probe = (c.action == "http_probe" || c.action == "mw_probe");
-    bool needs_params = (c.action != "send_raw" && c.action != "none" && !cloud_probe);
+    const bool cloud_probe =
+        (c.action == "http_probe" || c.action == "mw_probe" ||
+         c.action == "update_cert" || c.action == "query_bind" ||
+         c.action == "gap_probe");
+    const bool bind_detect_only = (c.action == "bind_detect");
+    const bool account_bind     = (c.action == "account_bind");
+    const bool cert_probe       = (c.action == "cert_probe");
+    bool needs_params = (c.action != "send_raw" && c.action != "none" &&
+                         !cloud_probe && !bind_detect_only && !account_bind &&
+                         !cert_probe);
     if (c.plugin_path.empty()) {
         std::fprintf(stderr, "plugin_runner: --plugin-path is required\n");
         usage(64);
     }
-    if (!cloud_probe) {
+    if (bind_detect_only) {
+        if (c.dev_ip.empty()) {
+            std::fprintf(stderr, "plugin_runner: --action bind_detect requires --dev-ip\n");
+            usage(64);
+        }
+    } else if (account_bind) {
+        if (c.dev_id.empty() || c.dev_ip.empty() || c.access_code.empty() ||
+            c.user_info.empty()) {
+            std::fprintf(stderr, "plugin_runner: --action account_bind requires "
+                                 "--dev-id --dev-ip --access-code --user-info\n");
+            usage(64);
+        }
+    } else if (cert_probe) {
+        if (c.dev_id.empty() || c.dev_ip.empty() || c.access_code.empty()) {
+            std::fprintf(stderr, "plugin_runner: --action cert_probe requires "
+                                 "--dev-id --dev-ip --access-code\n");
+            usage(64);
+        }
+    } else if (!cloud_probe) {
         if (c.dev_id.empty() || c.dev_ip.empty() || c.access_code.empty()) {
             std::fprintf(stderr, "plugin_runner: --dev-id, --dev-ip and "
                                  "--access-code are all required (except "
-                                 "for --action http_probe|mw_probe)\n");
+                                 "for cloud/bind_detect probes)\n");
             usage(64);
         }
     }
@@ -343,9 +439,15 @@ CliArgs parse_cli(int argc, char** argv)
         std::fprintf(stderr, "plugin_runner: --action send_raw requires --raw-json PATH\n");
         usage(64);
     }
-    if (cloud_probe && c.user_info.empty()) {
+    if ((c.action == "http_probe" || c.action == "mw_probe" ||
+         c.action == "query_bind" || c.action == "gap_probe") &&
+        c.user_info.empty()) {
         std::fprintf(stderr, "plugin_runner: --action %s requires "
                              "--user-info JSON|@path\n", c.action.c_str());
+        usage(64);
+    }
+    if (c.action == "query_bind" && c.dev_id.empty()) {
+        std::fprintf(stderr, "plugin_runner: --action query_bind requires --dev-id\n");
         usage(64);
     }
     return c;
@@ -508,6 +610,10 @@ struct ReadyLatch {
     std::condition_variable cv;
     bool                    ready = false;
 
+    void reset() {
+        std::lock_guard<std::mutex> lk(m);
+        ready = false;
+    }
     void signal() {
         { std::lock_guard<std::mutex> lk(m); ready = true; }
         cv.notify_all();
@@ -682,9 +788,13 @@ try {
             printer_connected.store(true);
             session_ready.signal();
         });
+    ReadyLatch server_ready;
     exports.set_on_server_connected_fn(agent,
-        [](int rc, int reason) {
+        [&server_ready](int rc, int reason) {
             emit_event("server_connected", { {"rc", rc}, {"reason", reason} });
+            // Stock fires this on both success and auth failure; treat any
+            // callback as "connect attempt resolved" for gap_probe waits.
+            server_ready.signal();
         });
     exports.set_on_http_error_fn(agent,
         [](unsigned int status, std::string body) {
@@ -813,15 +923,27 @@ try {
 
     const bool http_probe  = (args.action == "http_probe");
     const bool mw_probe    = (args.action == "mw_probe");
-    const bool cloud_probe = http_probe || mw_probe;
+    const bool update_cert_probe = (args.action == "update_cert");
+    const bool query_bind_probe  = (args.action == "query_bind");
+    const bool gap_probe_action  = (args.action == "gap_probe");
+    const bool cert_probe_action = (args.action == "cert_probe");
+    const bool bind_detect_only  = (args.action == "bind_detect");
+    const bool account_bind_probe = (args.action == "account_bind");
+    const bool cloud_probe =
+        http_probe || mw_probe || update_cert_probe || query_bind_probe ||
+        gap_probe_action;
+    // account_bind / bind_detect call bind_detect themselves then exit
+    // (or call bind()); they must not open a competing LAN MQTT session.
+    const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
 
-    // Step 6.5–7.5: LAN bring-up. Skipped for cloud probes (HTTP only —
-    // no printer required).
-    if (!cloud_probe) {
-    // bind_detect — the LAN HTTP /info ping Studio runs before
-    // connect_printer (sLocalBindFunc in GUI_App.cpp:8242). The stock
-    // plugin needs detectResult cached so its MQTT layer knows whether
-    // it's talking to a LAN/cloud/farm device. Skipping it makes the
+    // Step 6.5–7.5: LAN bring-up. Skipped for cloud probes and for the
+    // dedicated bind probes (those own their own detect/bind calls).
+    if (!skip_lan_mqtt) {
+    // bind_detect — stock probes TCP dev_ip:3000 with framed
+    // {"login":{"command":"detect",…}} (not HTTP /info). Studio also
+    // runs this before connect_printer (sLocalBindFunc). The plugin
+    // needs detectResult cached so its MQTT layer knows whether it's
+    // talking to a LAN/cloud/farm device. Skipping it makes the
     // subsequent local_connect callback fire with status=1, msg="-1"
     // even though connect_printer itself returns 0.
     {
@@ -928,16 +1050,24 @@ try {
         // because there's no cert available to sign it with. lan_only=1
         // matches what Studio passes when is_lan_mode_printer() is true
         // (no cloud lookup).
-        if (exports.install_device_cert) {
-            exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
-            emit_event("install_device_cert", {
-                {"dev_id", args.dev_id}, {"lan_only", true},
-            });
+        // cert_probe owns install_device_cert itself so the LAN bring-up
+        // path must not auto-provision (would muddy lan_only true/false).
+        if (!cert_probe_action) {
+            if (exports.install_device_cert) {
+                exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
+                emit_event("install_device_cert", {
+                    {"dev_id", args.dev_id}, {"lan_only", true},
+                });
+            } else {
+                emit_text("warning",
+                    "plugin does not export bambu_network_install_device_cert; "
+                    "privileged MQTT publishes (start_local_print, etc.) will "
+                    "likely fail with -4030.");
+            }
         } else {
-            emit_text("warning",
-                "plugin does not export bambu_network_install_device_cert; "
-                "privileged MQTT publishes (start_local_print, etc.) will "
-                "likely fail with -4030.");
+            emit_event("install_device_cert_skipped", {
+                {"reason", "cert_probe owns explicit lan_only true/false calls"},
+            });
         }
 
         // Settle so:
@@ -946,9 +1076,10 @@ try {
         //      from cloud, on-disk cert import, etc.) before we publish
         //      a privileged command. Empirically the cert provisioning
         //      path inside stock plugins can take ~3-5s on first call.
-        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            cert_probe_action ? 1500 : 3500));
     }
-    } // !cloud_probe
+    } // !skip_lan_mqtt
 
     // Step 8: load PrintParams from JSON, then back-fill the LAN-required
     // fields from the CLI so the user doesn't have to encode the printer
@@ -993,7 +1124,361 @@ try {
 
     // Step 9: dispatch the requested action.
     int rc_action = -1;
-    if (args.action == "http_probe") {
+    if (args.action == "query_bind") {
+        auto trunc = [](const std::string& s, size_t n = 600) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n) + "...";
+        };
+        emit_event("query_bind_begin", {
+            {"dev_id", args.dev_id},
+            {"have_query_bind_status", exports.query_bind_status != nullptr},
+            {"have_request_bind_ticket", exports.request_bind_ticket != nullptr},
+        });
+        if (!exports.query_bind_status) {
+            emit_event("query_bind_status", { {"missing", true} });
+            return 70;
+        }
+        std::vector<std::string> qlist{args.dev_id};
+        unsigned http_code = 0;
+        std::string http_body;
+        int rc = exports.query_bind_status(agent, qlist, &http_code, &http_body);
+        emit_event("query_bind_status", {
+            {"rc", rc},
+            {"http_code", http_code},
+            {"body_bytes", http_body.size()},
+            {"body", trunc(http_body)},
+        });
+        // Brief settle so async HTTPS (if any) lands under MITM.
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        emit_event("query_bind_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(rc == 0 ? 0 : 1);
+        }
+        rc_action = rc;
+    } else if (args.action == "bind_detect") {
+        // Give SSDP a moment after start_discovery before the detect wait.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto t0 = std::chrono::steady_clock::now();
+        BBL::detectResult detect{};
+        int rc = exports.bind_detect(agent, args.dev_ip, "secure", detect);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        emit_event("bind_detect", {
+            {"rc",           rc},
+            {"elapsed_ms",   ms},
+            {"dev_id",       detect.dev_id},
+            {"dev_name",     detect.dev_name},
+            {"model_id",     detect.model_id},
+            {"version",      detect.version},
+            {"bind_state",   detect.bind_state},
+            {"connect_type", detect.connect_type},
+            {"command",      detect.command},
+            {"result_msg",   detect.result_msg},
+        });
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(rc == 0 ? 0 : 1);
+        }
+        rc_action = rc;
+    } else if (args.action == "account_bind") {
+        if (!exports.bind) {
+            emit_event("account_bind", { {"missing", true} });
+            emit_text("fatal", "plugin missing bambu_network_bind");
+            return 70;
+        }
+        // Warm detect so stock has MachineObject-like identity cached.
+        {
+            BBL::detectResult detect{};
+            int rc_detect =
+                exports.bind_detect(agent, args.dev_ip, "secure", detect);
+            emit_event("bind_detect", {
+                {"rc",           rc_detect},
+                {"dev_id",       detect.dev_id},
+                {"dev_name",     detect.dev_name},
+                {"model_id",     detect.model_id},
+                {"version",      detect.version},
+                {"bind_state",   detect.bind_state},
+                {"connect_type", detect.connect_type},
+            });
+        }
+        emit_event("account_bind_begin", {
+            {"dev_id", args.dev_id},
+            {"dev_ip", args.dev_ip},
+            {"dev_model", args.dev_model},
+            {"timezone", args.timezone},
+            {"improved", args.improved},
+        });
+        auto on_bind_status = [](int stage, int code, std::string info) {
+            emit_event("bind_status", {
+                {"stage", stage}, {"code", code}, {"info", info},
+            });
+        };
+        int rc = exports.bind(agent,
+                              args.dev_ip,
+                              args.dev_id,
+                              args.dev_model,
+                              /*sec_link=*/"secure",
+                              args.timezone,
+                              args.improved,
+                              on_bind_status);
+        emit_event("account_bind", { {"rc", rc} });
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(rc == 0 ? 0 : 1);
+        }
+        rc_action = rc;
+    } else if (args.action == "gap_probe") {
+        auto trunc = [](const std::string& s, size_t n = 800) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n) + "...";
+        };
+        auto emit_login_strings = [&](const char* phase) {
+            json o{{"phase", phase}};
+            if (exports.build_login_cmd) {
+                auto s = exports.build_login_cmd(agent);
+                o["build_login_cmd"] = trunc(s);
+                o["build_login_cmd_bytes"] = s.size();
+            } else {
+                o["build_login_cmd_missing"] = true;
+            }
+            if (exports.build_logout_cmd) {
+                auto s = exports.build_logout_cmd(agent);
+                o["build_logout_cmd"] = trunc(s);
+                o["build_logout_cmd_bytes"] = s.size();
+            } else {
+                o["build_logout_cmd_missing"] = true;
+            }
+            if (exports.build_login_info) {
+                auto s = exports.build_login_info(agent);
+                o["build_login_info"] = trunc(s);
+                o["build_login_info_bytes"] = s.size();
+            } else {
+                o["build_login_info_missing"] = true;
+            }
+            if (exports.get_user_id) {
+                o["get_user_id"] = exports.get_user_id(agent);
+            }
+            if (exports.is_user_login) {
+                o["is_user_login"] = exports.is_user_login(agent);
+            }
+            emit_event("login_strings", o);
+        };
+
+        emit_event("gap_probe_begin", {
+            {"dev_id", args.dev_id},
+            {"do_logout", args.do_logout},
+            {"have_connect_server", exports.connect_server != nullptr},
+            {"have_refresh", exports.refresh_connection != nullptr},
+            {"have_stop_subscribe", exports.stop_subscribe != nullptr},
+            {"have_user_logout", exports.user_logout != nullptr},
+        });
+        emit_login_strings("after_change_user");
+
+        // Catalogue of change_user JSON shapes stock accepts. Restore
+        // the Studio login_info envelope at the end of this block.
+        {
+            json studio_env = json::parse(user_blob);
+            json data = studio_env.value("data", json::object());
+            struct Shape {
+                const char* name;
+                std::string blob;
+            };
+            std::vector<Shape> shapes;
+            shapes.push_back({"empty_object", "{}"});
+            shapes.push_back({"empty_string", ""});
+            shapes.push_back({"token_only",
+                json{{"data", {{"token", data.value("token", "")}}}}.dump()});
+            shapes.push_back({"studio_login_info", user_blob});
+            // WebView path: change_user(j.dump()) where j has command.
+            json wv = studio_env;
+            wv["command"] = "user_login";
+            shapes.push_back({"webview_user_login_wrapper", wv.dump()});
+            // Flat token at top level (OBN-ish / mistaken).
+            shapes.push_back({"flat_access_token",
+                json{{"access_token", data.value("token", "")},
+                     {"refresh_token", data.value("refresh_token", "")},
+                     {"user_id", data.value("user", json::object()).value("uid", "")}}
+                    .dump()});
+
+            for (const auto& sh : shapes) {
+                // Clear first so a no-op / parse-reject cannot leave the
+                // previous session looking like "accepted".
+                if (exports.user_logout) {
+                    exports.user_logout(agent, /*request=*/false);
+                }
+                bool before =
+                    exports.is_user_login ? exports.is_user_login(agent) : false;
+                int rc = exports.change_user(agent, sh.blob);
+                bool logged =
+                    exports.is_user_login ? exports.is_user_login(agent) : false;
+                emit_event("change_user_shape", {
+                    {"name", sh.name},
+                    {"rc", rc},
+                    {"cleared_before", !before},
+                    {"is_logged_in", logged},
+                    {"bytes", sh.blob.size()},
+                });
+            }
+            // Restore canonical Studio envelope for cloud MQTT / logout.
+            int rc_restore = exports.change_user(agent, user_blob);
+            emit_event("change_user_restore", {
+                {"rc", rc_restore},
+                {"is_logged_in",
+                 exports.is_user_login ? exports.is_user_login(agent) : false},
+            });
+            emit_login_strings("after_restore");
+        }
+
+        if (!args.dev_id.empty() && exports.query_bind_status) {
+            std::vector<std::string> qlist{args.dev_id};
+            unsigned http_code = 0;
+            std::string http_body;
+            int rc = exports.query_bind_status(agent, qlist, &http_code, &http_body);
+            emit_event("query_bind_status", {
+                {"rc", rc},
+                {"http_code", http_code},
+                {"body_bytes", http_body.size()},
+                {"body", trunc(http_body)},
+            });
+        }
+
+        // Cloud MQTT lifecycle: connect → refresh → subscribe toggles.
+        if (exports.enable_multi_machine) {
+            exports.enable_multi_machine(agent, true);
+            emit_event("enable_multi_machine", {{"enable", true}});
+        }
+        if (exports.connect_server) {
+            server_ready.reset();
+            int rc = exports.connect_server(agent);
+            emit_event("connect_server", {{"rc", rc}});
+            bool got = server_ready.wait_for(std::chrono::seconds(15));
+            emit_event("server_ready", {
+                {"got", got},
+                {"is_server_connected",
+                 exports.is_server_connected
+                     ? exports.is_server_connected(agent)
+                     : false},
+            });
+        }
+        if (exports.refresh_connection) {
+            for (int i = 0; i < 3; ++i) {
+                int rc = exports.refresh_connection(agent);
+                emit_event("refresh_connection", {{"iter", i}, {"rc", rc}});
+                std::this_thread::sleep_for(std::chrono::milliseconds(400));
+            }
+        }
+        if (exports.start_subscribe) {
+            int rc = exports.start_subscribe(agent, "app");
+            emit_event("start_subscribe", {{"module", "app"}, {"rc", rc}});
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        if (exports.stop_subscribe) {
+            int rc = exports.stop_subscribe(agent, "app");
+            emit_event("stop_subscribe", {{"module", "app"}, {"rc", rc}});
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        if (exports.start_subscribe) {
+            int rc = exports.start_subscribe(agent, "app");
+            emit_event("start_subscribe", {
+                {"module", "app"}, {"rc", rc}, {"phase", "reenable"},
+            });
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        if (exports.enable_multi_machine) {
+            exports.enable_multi_machine(agent, false);
+            emit_event("enable_multi_machine", {{"enable", false}});
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        // Extra settle so MITM / SSLKEYLOG see late HTTPS or MQTT.
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+
+        if (args.do_logout && exports.user_logout) {
+            // Non-empty refresh_token is already in the session from
+            // change_user — this is the capture that closes §8.5.14 TODO.
+            int rc = exports.user_logout(agent, /*request=*/true);
+            emit_event("user_logout", {
+                {"rc", rc},
+                {"request", true},
+                {"is_logged_in",
+                 exports.is_user_login ? exports.is_user_login(agent) : false},
+            });
+            emit_login_strings("after_logout_request_true");
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+
+        emit_event("gap_probe_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        rc_action = 0;
+    } else if (args.action == "cert_probe") {
+        if (!exports.install_device_cert) {
+            emit_event("cert_probe", { {"missing", true} });
+            emit_text("fatal", "plugin missing bambu_network_install_device_cert");
+            return 70;
+        }
+        emit_event("cert_probe_begin", {
+            {"dev_id", args.dev_id},
+            {"logged_in",
+             exports.is_user_login ? exports.is_user_login(agent) : false},
+        });
+        // lan_only=true first (Studio LAN-mode path).
+        exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
+        emit_event("install_device_cert", {
+            {"dev_id", args.dev_id}, {"lan_only", true}, {"phase", "1"},
+        });
+        std::this_thread::sleep_for(std::chrono::seconds(6));
+        // lan_only=false — cloud-paired path (may HTTP + MQTT publish).
+        exports.install_device_cert(agent, args.dev_id, /*lan_only=*/false);
+        emit_event("install_device_cert", {
+            {"dev_id", args.dev_id}, {"lan_only", false}, {"phase", "2"},
+        });
+        std::this_thread::sleep_for(std::chrono::seconds(8));
+        emit_event("cert_probe_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        rc_action = 0;
+    } else if (args.action == "update_cert") {
+        if (!exports.update_cert) {
+            emit_event("update_cert", { {"missing", true} });
+            emit_text("fatal", "plugin missing bambu_network_update_cert");
+            return 70;
+        }
+        emit_event("update_cert_begin", json::object());
+        int rc = exports.update_cert(agent);
+        // Stock performs the HTTPS cert fetch asynchronously; settle so
+        // mitmproxy sees the GET …/applications/…/cert before exit.
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        emit_event("update_cert", { {"rc", rc} });
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::_Exit(rc == 0 ? 0 : 1);
+        }
+        rc_action = rc;
+    } else if (args.action == "http_probe") {
         auto trunc = [](const std::string& s, size_t n = 400) {
             if (s.size() <= n) return s;
             return s.substr(0, n) + "...";

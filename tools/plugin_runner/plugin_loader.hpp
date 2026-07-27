@@ -34,6 +34,7 @@ using func_set_on_local_connect_fn     = int (*)(void* agent, BBL::OnLocalConnec
 using func_set_on_local_message_fn     = int (*)(void* agent, BBL::OnMessageFn          fn);
 using func_set_queue_on_main_fn        = int (*)(void* agent, BBL::QueueOnMainFn        fn);
 using func_start_subscribe             = int (*)(void* agent, std::string module);
+using func_stop_subscribe              = int (*)(void* agent, std::string module);
 using func_send_message_to_printer     = int (*)(void* agent, std::string dev_id, std::string json_str, int qos, int flag);
 using func_set_on_ssdp_msg_fn          = int (*)(void* agent, BBL::OnMsgArrivedFn       fn);
 using func_set_server_callback         = int (*)(void* agent, BBL::OnServerErrFn        fn);
@@ -45,7 +46,21 @@ using func_connect_printer    = int (*)(void* agent, std::string dev_id, std::st
 using func_disconnect_printer = int (*)(void* agent);
 using func_change_user        = int (*)(void* agent, std::string user_info);
 using func_is_user_login      = bool (*)(void* agent);
-using func_bind_detect        = int (*)(void* agent, std::string dev_ip, std::string sec_link, BBL::detectResult& detect);
+using func_user_logout        = int (*)(void* agent, bool request);
+using func_build_login_cmd    = std::string (*)(void* agent);
+using func_build_logout_cmd   = std::string (*)(void* agent);
+using func_build_login_info   = std::string (*)(void* agent);
+using func_get_user_id        = std::string (*)(void* agent);
+using func_connect_server      = int (*)(void* agent);
+using func_is_server_connected = bool (*)(void* agent);
+using func_refresh_connection  = int (*)(void* agent);
+using func_bind_detect         = int (*)(void* agent, std::string dev_ip, std::string sec_link, BBL::detectResult& detect);
+using func_query_bind_status  = int (*)(void* agent, std::vector<std::string> query_list,
+                                        unsigned int* http_code, std::string* http_body);
+using func_request_bind_ticket = int (*)(void* agent, std::string* ticket);
+using func_bind = int (*)(void* agent, std::string dev_ip, std::string dev_id, std::string dev_model,
+                          std::string sec_link, std::string timezone, bool improved,
+                          BBL::OnUpdateStatusFn update_fn);
 // Provisions the per-printer device certificate the plugin uses to RSA-sign
 // privileged MQTT commands (project_file, etc.). Studio calls this from
 // set_on_printer_connected_fn right after command_request_push_all; without
@@ -54,6 +69,10 @@ using func_bind_detect        = int (*)(void* agent, std::string dev_ip, std::st
 // error start_local_print surfaces as -4030 ("send msg failed") on the
 // Sending stage.
 using func_install_device_cert = void (*)(void* agent, std::string dev_id, bool lan_only);
+// Studio name: check_cert(); export symbol is bambu_network_update_cert.
+// Fetches shared app cert / CRL / encrypted key from
+// GET /v1/iot-service/api/user/applications/{enc_secret}/cert?...
+using func_update_cert = int (*)(void* agent);
 
 using func_start_send_gcode_to_sdcard    = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn, BBL::OnWaitFn wait_fn);
 using func_start_local_print             = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn);
@@ -135,6 +154,7 @@ struct PluginExports {
     func_set_on_local_message_fn     set_on_local_message_fn     = nullptr;
     func_set_queue_on_main_fn        set_queue_on_main_fn        = nullptr;
     func_start_subscribe             start_subscribe             = nullptr;
+    func_stop_subscribe              stop_subscribe              = nullptr;
 
     // Direct MQTT publish onto device/<dev_id>/request. The killer
     // primitive for reverse-engineering the print command JSON shape:
@@ -165,15 +185,27 @@ struct PluginExports {
     // has been called once (even with an empty payload to mark "logged out"):
     func_change_user                 change_user                 = nullptr;
     func_is_user_login               is_user_login               = nullptr;
+    func_user_logout                 user_logout                 = nullptr;
+    func_build_login_cmd             build_login_cmd             = nullptr;
+    func_build_logout_cmd            build_logout_cmd            = nullptr;
+    func_build_login_info            build_login_info            = nullptr;
+    func_get_user_id                 get_user_id                 = nullptr;
+    func_connect_server              connect_server              = nullptr;
+    func_is_server_connected         is_server_connected         = nullptr;
+    func_refresh_connection          refresh_connection          = nullptr;
     func_check_debug_consistent      check_debug_consistent      = nullptr;
     func_install_device_cert         install_device_cert         = nullptr;
-    // bind_detect is the LAN /info ping Studio runs before connect_printer.
-    // The stock plugin uses its result (connect_type, bind_state) to decide
-    // whether to attempt MQTT and which credentials path to wire up. Skip
-    // it and connect_printer can return success but the actual MQTT
-    // connect ends up status=ConnectStatusFailed without a clear error
-    // (msg="-1"). Required for any LAN flow.
+    func_update_cert                 update_cert                 = nullptr;
+    // bind_detect: stock TCP :3000 login/detect (framed JSON), not HTTP
+    // /info. Studio runs it before connect_printer. The plugin uses
+    // connect_type / bind_state to choose the MQTT path. Skip it and
+    // connect_printer can return success but local_connect ends up
+    // ConnectStatusFailed (msg="-1"). Required for any LAN flow.
     func_bind_detect                 bind_detect                 = nullptr;
+    // Optional bind/cloud helpers (--action query_bind / account_bind).
+    func_query_bind_status           query_bind_status           = nullptr;
+    func_request_bind_ticket         request_bind_ticket         = nullptr;
+    func_bind                        bind                        = nullptr;
 
     // Print actions. At least one of the four must be present for the
     // wanted --action; main.cpp validates per-action.

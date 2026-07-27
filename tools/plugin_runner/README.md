@@ -126,6 +126,11 @@ per ABI). Plugin downloads are cached in
 `mw_probe` calls `get_subtask`, `get_model_mall_detail_url`, `get_model_mall_rating`,
 `get_mw_user_preference`, `get_mw_user_4ulist` (and optionally `put_model_mall_rating`).
 
+`update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
+`--user-info` optional. Under MITM this is the shared app-cert fetch
+`GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256=…&ver=1`
+([research §10.2](../../research/10.02-secrets.md)).
+
 Capture stock HTTPS under mitmproxy:
 
 ```bash

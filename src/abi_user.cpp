@@ -44,7 +44,18 @@ OBN_ABI int bambu_network_user_logout(void* agent, bool request)
     // Polled by Studio every ~2 s as a safety-net even when the user
     // isn't logged in. Keep this off the default log to avoid noise.
     OBN_TRACE("user_logout request=%d", request);
-    if (auto* a = as_agent(agent)) a->clear_session();
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (request) {
+        auto s = a->user_session_snapshot();
+        if (!s.access_token.empty()) {
+            // Stock: POST /v1/user-service/my/logout (Bearer). Local
+            // clear always proceeds even if the revoke fails.
+            (void)obn::cloud::logout(a->cloud_region(), s.access_token,
+                                     s.refresh_token);
+        }
+    }
+    a->clear_session();
     return BAMBU_NETWORK_SUCCESS;
 }
 
