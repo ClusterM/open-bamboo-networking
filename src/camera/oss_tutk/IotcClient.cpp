@@ -2207,6 +2207,10 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
 
     set_recv_timeout(sock, 3000);
     bool got_assignment = false;
+    // The rendezvous (02 06 12) is sent by the printer from its own P2P media
+    // address, not by the master server. That source address is the peer we must
+    // punch and run DTLS/media against; the master only brokers the rendezvous.
+    struct sockaddr_in peer_addr{};
     for (int attempt = 0; attempt < 3; ++attempt) {
         uint8_t resp[256];
         struct sockaddr_in src{};
@@ -2250,8 +2254,14 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
             }
         }
 
+        peer_addr = src;
         got_assignment = true;
-        OBN_DEBUG("[relay] relay assignment received");
+        {
+            char pip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &peer_addr.sin_addr, pip, sizeof(pip));
+            OBN_DEBUG("[relay] rendezvous received; peer = %s:%u",
+                      pip, ntohs(peer_addr.sin_port));
+        }
         break;
     }
 
@@ -2261,15 +2271,17 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
         return -1;
     }
 
-    if (send_relay_knock(sock, &relay_addr, uid_upper, session_token, true) != 0) {
+    // Punch and run the session against the peer's own address (from the
+    // rendezvous), not the master server.
+    if (send_relay_knock(sock, &peer_addr, uid_upper, session_token, true) != 0) {
         OBN_ERROR("[relay] post-assignment KNOCK failed: %s", strerror(errno));
         obn::net::close_socket(sock);
         return -1;
     }
-    OBN_DEBUG("[relay] post-assignment KNOCK sent");
+    OBN_DEBUG("[relay] post-assignment KNOCK sent to peer");
 
     out->sock = sock;
-    out->relay_addr = relay_addr;
+    out->relay_addr = peer_addr;
     memcpy(out->session_token, session_token, 8);
     memset(&out->dtls, 0, sizeof(out->dtls));
 
