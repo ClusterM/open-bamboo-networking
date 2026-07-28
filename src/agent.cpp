@@ -1052,13 +1052,14 @@ bool Agent::printer_supports_new_auth(const std::string& dev_id) const
 void Agent::maybe_install_app_cert(const std::string& dev_id)
 {
     if (dev_id.empty()) return;
-    if (!obn::signing::slicer_app_cert_usable()) return;
 
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id))
             return; // SUCCESS already harvested this session
     }
+
+    if (!obn::signing::slicer_app_cert_usable()) return;
 
     // Fire-and-forget: latch app_cert_install_sent_ only when
     // harvest_security_report sees result=SUCCESS + printer_cert.
@@ -1820,6 +1821,16 @@ void Agent::install_device_cert(const std::string& dev_id, bool lan_only)
     // is_lan_mode_printer(); OBN uses the same MQTT path for both.
     (void)lan_only;
     if (dev_id.empty()) return;
+
+    // Studio's ~1 Hz refresh: once this session already got SUCCESS +
+    // printer_cert, skip PEM/CRL re-parse (and its WARN spam) entirely.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (app_cert_install_sent_.count(dev_id)) {
+            certified_devs_.insert(dev_id);
+            return;
+        }
+    }
 
     if (obn::signing::slicer_app_cert_usable()) {
         maybe_install_app_cert(dev_id);
