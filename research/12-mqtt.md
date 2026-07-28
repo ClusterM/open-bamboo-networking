@@ -40,6 +40,6 @@ Each outbound command below follows the envelope from [§6.2](06.02-mqtt.md):
 { "<section>": { "command": "<name>", "sequence_id": "<decimal-string>", "...": "..." } }
 ```
 
-Studio assigns `sequence_id` in **20000–29999**. Replies arrive on `device/<dev_id>/report` under the same top-level section; Studio usually dispatches by `command` name (exact seq matching is sparse). See [§6.2 Request → response](06.02-mqtt.md#request--response-acks-and-errors).
+Studio assigns `sequence_id` in **20000–29999**. Replies arrive on `device/<dev_id>/report` under the same top-level section; Studio usually dispatches by `command` name (exact seq matching is sparse). See [§6.2 Request → response](06.02-mqtt.md#request-response-acks-and-errors).
 
 **Out of scope:** `print.project_file` (plugin), TCP `:3000` `login.*`, cloud HTTPS ([§6.6](06.06-cloud-rest.md)).
