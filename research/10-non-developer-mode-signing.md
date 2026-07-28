@@ -13,4 +13,4 @@ When **Developer Mode** is off, the printer and (for cloud-dispatched prints) Ba
 - [10.5. HTTP proof-of-possession](10.05-http-pop.md) — which REST calls need the app key; PoP headers
 - [10.6. LAN TLS and Studio certificate files](10.06-lan-tls-and-access-codes.md) — Studio PEMs; leaf shape → [§6](06-channels.md) for access code / CN-pin
 
-Cross-references from the ABI chapters (§8) and the Print / MQTT wire chapters (§11 / §12) point here for detail.
+Cross-references from the ABI chapters (§8, including print [§8.8](08.08-print-abi.md)) and Studio-forwarded MQTT ([§12](12-mqtt.md)) point here for detail.

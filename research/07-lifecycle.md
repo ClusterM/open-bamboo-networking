@@ -2,7 +2,7 @@
 
 Idle behaviour of the stock networking plugin **outside print** — what has to be running so Studio can show printers, telemetry, and be ready for a later job. This is not a single linear pipeline: after `start()`, discovery, cloud REST, cloud MQTT, LAN MQTT, and cert provisioning overlap in time and keep running for the whole session. Channel map: [§6](06-channels.md). Algorithms live in the linked chapters; here is only the operating picture.
 
-Print / upload / `POST /my/task` are **out of scope** — see [§11 Print](11-print.md).
+Print / upload / `POST /my/task` are **out of scope** — see [§8.8](08.08-print-abi.md).
 
 ### Agent bring-up
 
@@ -14,7 +14,7 @@ Independently of whether anyone is logged in, the stock client needs the **share
 
 ### User authentication
 
-When the user signs in, Studio drives ticket / OAuth exchange through the auth ABI and ends up with an access token (and refresh path) for `api.bambulab.*`. That token is what authorizes printer-list and bind REST; it is **not** the same credential as the shared app cert above. Login can complete while SSDP is already listening and while the cert endpoint is still in flight. Token login, refresh, and profile shapes: [§8.5](08.05-auth.md) ([§8.5.1](08.05-auth.md)–[§8.5.3](08.05-auth.md)). Shared HTTPS hosts / headers: [§13 Cloud HTTP transport](13-http-transport.md). Overview: [§6.6](06.06-cloud-rest.md).
+When the user signs in, Studio drives ticket / OAuth exchange through the auth ABI and ends up with an access token (and refresh path) for `api.bambulab.*`. That token is what authorizes printer-list and bind REST; it is **not** the same credential as the shared app cert above. Login can complete while SSDP is already listening and while the cert endpoint is still in flight. Token login, refresh, and profile shapes: [§8.5](08.05-auth.md) ([§8.5.1](08.05-auth.md)–[§8.5.3](08.05-auth.md)). Cloud REST hosts / headers / envelope: [§6.6](06.06-cloud-rest.md).
 
 ### Printer inventory and bind metadata
 

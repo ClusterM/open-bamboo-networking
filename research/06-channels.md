@@ -12,7 +12,7 @@ How a client talks to a Bambu printer (and when it talks to Bambu’s cloud inst
 | **TCP :3000** | client → printer | Plaintext framed JSON **login/detect** channel used by `bind_detect` / account `bind` (device ticket mint) — not HTTP | [§8.6.2](08.06-bind.md)–[§8.6.3](08.06-bind.md) |
 | **TCP :6000** | bidirectional | CTRL file browser, `ft_*` model cache, MJPEG on some models; TUTK relay off-LAN | [§6.4](06.04-port-6000.md) |
 | **RTSP(S)** | printer → client | H.264 live view on RTSP-capable models | [§6.5](06.05-rtsp.md) |
-| **Cloud REST** | client ↔ Bambu API | Account, device list, access codes, cloud print, certs — **not** TCP to the printer IP | [§6.6](06.06-cloud-rest.md) → transport [§13](13-http-transport.md) |
+| **Cloud REST** | client ↔ Bambu API | Account, device list, access codes, cloud print, certs — **not** TCP to the printer IP | [§6.6](06.06-cloud-rest.md) |
 
 Also noted under MQTT / :6000: plaintext MQTT **:1883** on some firmware; **MJPEG** live view on `:6000` for A1/P1-class (different handshake from CTRL). Printer HTTP `/info` is **not** used by stock `bind_detect` (that path is TCP `:3000` `login/detect`).
 
