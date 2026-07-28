@@ -228,7 +228,8 @@ bool is_print_payload(const std::string& payload) noexcept
 
 // Applies device-cert field encryption to the parsed `print` object in place.
 // For each cleartext field in kEncryptFields, adds `<field>_enc` (RSA) and
-// drops the cleartext. Idempotent when `*_enc` already exists. If a field
+// keeps the cleartext (Developer Mode needs it; secured callers must strip
+// cleartext themselves). Idempotent when `*_enc` already exists. If a field
 // needs encryption but there is no device key (or RSA fails), logs ERROR and
 // leaves the cleartext — the printer will reject and surface the error.
 void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
@@ -270,8 +271,9 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
         }
         obj[enc_key] = obn::json::Value(std::move(enc));
         // Keep cleartext: Developer Mode firmware ignores *_enc and only
-        // reads url/param. Secured firmware wants *_enc only for gcode_line
-        // (both fields rejected) — see research/10.03-mqtt-field-encryption.md.
+        // reads url/param. Secured gcode_line rejects both together — callers
+        // that target secured mode must omit cleartext before maybe_sign
+        // (or gate on fun bit 29). See research/10.03-mqtt-field-encryption.md.
         // obj.erase(field);
     }
 }

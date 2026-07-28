@@ -326,30 +326,27 @@ static int test_device_security_sign_is_raw_timestamp()
 
 static int test_gcode_line_param_encrypted()
 {
-    // With a device key, gcode_line's cleartext `param` must become `param_enc`
-    // (device-encrypted) and the cleartext `param` must be dropped. The
-    // signature must cover the transformed (encrypted) print block.
+    // With a device key, gcode_line gains `param_enc` but cleartext `param`
+    // is kept (Developer Mode reads only cleartext). Signature covers the
+    // print block that includes both fields.
     const std::string gcode   = "M104 S220\n"; // real newline after JSON decode
     const std::string payload =
         R"({"print":{"command":"gcode_line","param":"M104 S220\n","sequence_id":"7"}})";
     const std::string env = obn::signing::maybe_sign(payload, g_test_key);
     auto val = obn::json::parse(env);
     CHECK(val);
-    // param dropped, param_enc present.
-    CHECK(val->find("print.param").kind()     == obn::json::Value::Kind::Null);
-    CHECK(val->find("print.param_enc").kind()  == obn::json::Value::Kind::String);
-    // param_enc decrypts back to the original gcode.
+    CHECK(val->find("print.param").as_string()     == gcode);
+    CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::String);
     CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == gcode);
-    // Signature covers the transformed block.
     std::string to_sign = "{\"print\":" + val->find("print").dump() + "}";
     CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
     return 0;
 }
 
-static int test_project_file_url_encrypted_drops_url()
+static int test_project_file_url_encrypted_keeps_url()
 {
-    // With a device key, project_file's `url` and `param` both become *_enc
-    // (encrypt_print_fields walks a fixed field list).
+    // With a device key, project_file gains url_enc/param_enc and keeps
+    // cleartext url/param (encrypt_print_fields does not erase).
     const std::string url   = "https://example.com/model.3mf?sig=abc";
     const std::string param = "Metadata/plate_1.gcode";
     const std::string payload =
@@ -358,10 +355,10 @@ static int test_project_file_url_encrypted_drops_url()
     const std::string env = obn::signing::maybe_sign(payload, g_test_key);
     auto val = obn::json::parse(env);
     CHECK(val);
-    CHECK(val->find("print.url").kind()            == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.url").as_string()       == url);
     CHECK(val->find("print.url_enc").kind()        == obn::json::Value::Kind::String);
     CHECK(rsa_decrypt_blocks_b64(val->find("print.url_enc").as_string()) == url);
-    CHECK(val->find("print.param").kind()          == obn::json::Value::Kind::Null);
+    CHECK(val->find("print.param").as_string()     == param);
     CHECK(val->find("print.param_enc").kind()      == obn::json::Value::Kind::String);
     CHECK(rsa_decrypt_blocks_b64(val->find("print.param_enc").as_string()) == param);
     return 0;
@@ -465,7 +462,7 @@ int main()
     if (test_sign_bytes_verifies()         != 0) rc = 1;
     if (test_device_security_sign_is_raw_timestamp() != 0) rc = 1;
     if (test_gcode_line_param_encrypted()  != 0) rc = 1;
-    if (test_project_file_url_encrypted_drops_url() != 0) rc = 1;
+    if (test_project_file_url_encrypted_keeps_url() != 0) rc = 1;
     if (test_project_file_no_key_keeps_url() != 0) rc = 1;
     if (test_no_device_key_leaves_cleartext() != 0) rc = 1;
     if (test_param_enc_idempotent()        != 0) rc = 1;
