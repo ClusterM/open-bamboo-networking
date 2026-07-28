@@ -269,7 +269,10 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
             continue;
         }
         obj[enc_key] = obn::json::Value(std::move(enc));
-        obj.erase(field);
+        // Keep cleartext: Developer Mode firmware ignores *_enc and only
+        // reads url/param. Secured firmware wants *_enc only for gcode_line
+        // (both fields rejected) — see research/10.03-mqtt-field-encryption.md.
+        // obj.erase(field);
     }
 }
 
