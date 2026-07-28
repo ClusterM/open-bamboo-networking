@@ -6,6 +6,7 @@ Reverse-engineered from the upstream BambuStudio tree (see **Source citations** 
 
 Neighbors: TLS `:6000` wire ([§6.4](06.04-port-6000.md)); RTSP(S) ([§6.5](06.05-rtsp.md)); FTPS dialect ([§6.3](06.03-ftps.md)); cloud camera URL mint ([§8.11](08.11-camera.md)); Send-to-Printer `ft_*` ([§8.14](08.14-file-transfer.md)).
 
+### Contents
 
 | Section | File |
 | --- | --- |

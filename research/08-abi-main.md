@@ -1,6 +1,29 @@
 ## 8. The main module ABI contract
 
-All symbols are resolved through `GetProcAddress` (Windows) / `dlsym` (Linux, macOS) in `NetworkAgent::get_network_function`:
+All symbols are resolved through `GetProcAddress` (Windows) / `dlsym` (Linux, macOS) in `NetworkAgent::get_network_function`. Symbol names are not mangled — every function must be declared `extern "C"`.
+
+### Contents
+
+| Section | File |
+| --- | --- |
+| 8.1 Initialization | [08.01-initialization.md](08.01-initialization.md) |
+| 8.2 Callbacks (registration) | [08.02-callbacks.md](08.02-callbacks.md) |
+| 8.3 Cloud — connection and subscriptions | [08.03-cloud-mqtt.md](08.03-cloud-mqtt.md) |
+| 8.4 Local printer connection (LAN) | [08.04-lan.md](08.04-lan.md) |
+| 8.5 Authentication and user | [08.05-auth.md](08.05-auth.md) |
+| 8.6 Binding / bind | [08.06-bind.md](08.06-bind.md) |
+| 8.7 Printer selection and metadata | [08.07-printer-selection.md](08.07-printer-selection.md) |
+| 8.8 Submitting a print job | [08.08-print-abi.md](08.08-print-abi.md) |
+| 8.9 User presets | [08.09-presets.md](08.09-presets.md) |
+| 8.10 HTTP / cloud service | [08.10-http.md](08.10-http.md) |
+| 8.11 Camera | [08.11-camera.md](08.11-camera.md) |
+| 8.12 MakerWorld / Mall | [08.12-makerworld.md](08.12-makerworld.md) |
+| 8.13 Tracking / telemetry | [08.13-tracking.md](08.13-tracking.md) |
+| 8.14 File Transfer ABI (`ft_*`) | [08.14-file-transfer.md](08.14-file-transfer.md) |
+| 8.15 Filament Manager | [08.15-filament.md](08.15-filament.md) |
+| 8.16 Error codes | [08.16-errors.md](08.16-errors.md) |
+
+### Symbol resolution
 
 Source: [NetworkAgent.cpp:529-580](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/src/slic3r/Utils/NetworkAgent.cpp#L529-L580)
 
@@ -15,8 +38,6 @@ void* NetworkAgent::get_network_function(const char* name)
 #endif
 }
 ```
-
-Symbol names are not mangled — every function must be declared `extern "C"`.
 
 > ABI note: even though this is a C-style interface, the signatures use C++ types (`std::string`, `std::vector`, `std::map`, `std::function`, and custom structs `PrintParams`/`BBLModelTask`/…). The plugin must therefore be built with the same compiler and libstdc++/libc++ standard-library ABI as Bambu Studio itself. It is **not** a pure C ABI — mixing compilers/linkers (e.g. GCC vs. MSVC) is not safe.
 

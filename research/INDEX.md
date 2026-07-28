@@ -6,7 +6,7 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
 
 ## Contents
 
-- [Introduction](00-intro.md) (includes [Summary](00-intro.md#summary))
+- [Introduction](00-intro.md)
 - [1. Architecture overview](01-architecture.md)
 - [2. Where the plugin is downloaded from](02-download.md)
 - [3. Where it is stored and how it is installed](03-install.md)
@@ -28,7 +28,7 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [8.5. Authentication and user](08.05-auth.md)
   - [8.6. Binding / bind](08.06-bind.md)
   - [8.7. Printer selection and metadata](08.07-printer-selection.md)
-  - [8.8. Submitting a print job](08.08-print-abi.md) — five `start_*` ABIs (plugin steps, shared `project_file` payload, Studio call-selection bonus)
+  - [8.8. Submitting a print job](08.08-print-abi.md)
   - [8.9. User presets](08.09-presets.md)
   - [8.10. HTTP / cloud service](08.10-http.md)
   - [8.11. Camera](08.11-camera.md)
@@ -53,6 +53,12 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [10.6. LAN TLS and Studio certificate files](10.06-lan-tls-and-access-codes.md)
 - [12. MQTT wire format (Studio-forwarded)](12-mqtt.md)
   - [12.1. Status / `push_status`](12.01-status.md)
+    - [12.1.1. Fields — job / progress](12.01.01-fields-job.md)
+    - [12.1.2. Fields — thermal / fans / lights](12.01.02-fields-thermal-fans.md)
+    - [12.1.3. Fields — AMS / filament](12.01.03-fields-ams.md)
+    - [12.1.4. Fields — `device.*`](12.01.04-fields-device.md)
+    - [12.1.5. Fields — camera / AI](12.01.05-fields-camera-ai.md)
+    - [12.1.6. Fields — net / upgrade / errors](12.01.06-fields-net-upgrade-errors.md)
   - [12.2. System](12.02-system.md)
   - [12.3. Print job & HMS](12.03-print-job.md)
   - [12.4. Temperatures / extruder](12.04-temps-extruder.md)

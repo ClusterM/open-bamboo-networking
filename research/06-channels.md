@@ -2,6 +2,17 @@
 
 How a client talks to a Bambu printer (and when it talks to Bambu’s cloud instead). This chapter is the map of transports; ABI call tables, print orchestration, and on-wire MQTT command catalogues live elsewhere.
 
+### Contents
+
+| Section | File |
+| --- | --- |
+| 6.1 SSDP discovery | [06.01-ssdp.md](06.01-ssdp.md) |
+| 6.2 MQTT (LAN and cloud) | [06.02-mqtt.md](06.02-mqtt.md) |
+| 6.3 FTPS | [06.03-ftps.md](06.03-ftps.md) |
+| 6.4 Port 6000 | [06.04-port-6000.md](06.04-port-6000.md) |
+| 6.5 RTSP / RTSPS | [06.05-rtsp.md](06.05-rtsp.md) |
+| 6.6 Cloud REST API | [06.06-cloud-rest.md](06.06-cloud-rest.md) |
+
 ### Channel list
 
 | Channel | Direction | Role | Detail |

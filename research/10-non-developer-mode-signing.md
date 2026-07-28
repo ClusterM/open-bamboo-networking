@@ -6,11 +6,13 @@ When **Developer Mode** is off, the printer and (for cloud-dispatched prints) Ba
 
 ### Contents
 
-- [10.1. What changes when Developer Mode is off](10.01-overview.md) — checklist of extra requirements by surface; who verifies
-- [10.2. Where Bambu secrets live](10.02-secrets.md) — embedded secrets; cert endpoint; provisioning (`app_cert_install`); printer device cert
-- [10.3. MQTT field encryption](10.03-mqtt-field-encryption.md) — `url_enc` / `param_enc`; device-cert key
-- [10.4. MQTT message signing](10.04-mqtt-signing.md) — which commands; `SignMessage`; app private key
-- [10.5. HTTP proof-of-possession](10.05-http-pop.md) — which REST calls need the app key; PoP headers
-- [10.6. LAN TLS and Studio certificate files](10.06-lan-tls-and-access-codes.md) — Studio PEMs; leaf shape → [§6](06-channels.md) for access code / CN-pin
+| Section | File |
+| --- | --- |
+| 10.1 What changes when Developer Mode is off | [10.01-overview.md](10.01-overview.md) |
+| 10.2 Where Bambu secrets live | [10.02-secrets.md](10.02-secrets.md) |
+| 10.3 MQTT field encryption | [10.03-mqtt-field-encryption.md](10.03-mqtt-field-encryption.md) |
+| 10.4 MQTT message signing | [10.04-mqtt-signing.md](10.04-mqtt-signing.md) |
+| 10.5 HTTP proof-of-possession | [10.05-http-pop.md](10.05-http-pop.md) |
+| 10.6 LAN TLS and Studio certificate files | [10.06-lan-tls-and-access-codes.md](10.06-lan-tls-and-access-codes.md) |
 
 Cross-references from the ABI chapters (§8, including print [§8.8](08.08-print-abi.md)) and Studio-forwarded MQTT ([§12](12-mqtt.md)) point here for detail.
