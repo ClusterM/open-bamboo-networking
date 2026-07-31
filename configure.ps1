@@ -11,6 +11,7 @@
 #   .\configure.ps1 -ClientType orca_slicer
 #   .\configure.ps1 -BuildType Debug -EnableTests:$false
 #   .\configure.ps1 -VcpkgRoot C:\vcpkg -VcpkgTriplet x64-windows
+#   .\configure.ps1 -Architecture ARM64 -VcpkgTriplet arm64-windows-static-md
 #   .\configure.ps1 -Generator "Visual Studio 17 2022"   # pin a VS version
 #
 # If -Generator is omitted, it is not passed to CMake and CMake picks its
@@ -21,7 +22,8 @@
 # Requirements:
 #   - Visual Studio 2019 (toolset v142) -- matches the MSVC ABI Bambu Studio
 #     itself ships with. Newer toolsets *may* work but the std::string layout
-#     across the DLL boundary is not guaranteed.
+#     across the DLL boundary is not guaranteed. For Windows ARM64 use a VS
+#     install that includes the ARM64 C++ toolset (CI uses windows-11-arm).
 #   - vcpkg (manifest mode picks up vcpkg.json automatically).
 #   - cmake on PATH (3.16+).
 
@@ -47,12 +49,15 @@ param(
     # LIBCMT-vs-MSVCRT mismatch warning (LNK4098) and -- worse -- run two
     # copies of the C runtime side by side with diverging stdio and heap
     # state. -static (without -md) is left as an option for users who want
-    # the older default.
-    [ValidateSet("x64-windows","x64-windows-static","x64-windows-static-md","x86-windows","x86-windows-static")]
+    # the older default. Use arm64-windows-static-md for native Windows ARM64.
+    [ValidateSet("x64-windows","x64-windows-static","x64-windows-static-md","x86-windows","x86-windows-static","arm64-windows","arm64-windows-static-md")]
     [string]   $VcpkgTriplet = "x64-windows-static-md",
     # Empty = let CMake choose (-G omitted). Pass an explicit name to pin
     # a Visual Studio version (e.g. "Visual Studio 16 2019").
     [string]   $Generator    = "",
+    # CMake -A platform: "x64", "Win32", or "ARM64". When an arm64-* / x86-*
+    # triplet is selected and this is still the default "x64", configure.ps1
+    # rewrites it automatically below.
     [string]   $Architecture = "x64",
     [string[]] $CMakeArg     = @()
 )
@@ -264,12 +269,18 @@ if ([string]::IsNullOrEmpty($WithVersion)) {
 
 # ----- assemble cmake command line --------------------------------------
 
-# x86 builds usually want "Win32" as the architecture, x64 builds use "x64".
-# If the user picked an x86 triplet without flipping -Architecture, normalize
-# automatically so the generator string lines up with the deps vcpkg builds.
+# Keep -A in sync with the vcpkg triplet when the user only flipped the
+# triplet (or left -Architecture at its default "x64"):
+#   x86-*   → Win32
+#   arm64-* → ARM64
+#   x64-*   → x64 (default)
 if ($VcpkgTriplet -like "x86-*" -and $Architecture -eq "x64") {
     Write-Note "x86 triplet selected; switching architecture to Win32"
     $Architecture = "Win32"
+}
+if ($VcpkgTriplet -like "arm64-*" -and $Architecture -eq "x64") {
+    Write-Note "arm64 triplet selected; switching architecture to ARM64"
+    $Architecture = "ARM64"
 }
 
 # Convert booleans to ON/OFF first; if we inline the ternary into the

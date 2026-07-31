@@ -124,13 +124,16 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: v${{ matrix.abi }}.xx-windows-x64
+    name: v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
     needs: [preflight]
-    runs-on: windows-2022
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
     strategy:
       fail-fast: false
       matrix:
         abi: ${{ fromJSON(needs.preflight.outputs.abi-matrix) }}
+        arch:
+          - x64
+          - arm64
 
     steps:
       - name: Checkout
@@ -142,10 +145,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:GITHUB_WORKSPACE "install"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          $arch = '${{ matrix.arch }}'
+          $cmakeArch = if ($arch -eq 'arm64') { 'ARM64' } else { 'x64' }
+          $triplet = if ($arch -eq 'arm64') { 'arm64-windows-static-md' } else { 'x64-windows-static-md' }
           .\configure.ps1 `
             -ClientType bambu_studio `
             -WithVersion '${{ matrix.abi }}.99' `
             -Prefix $staging `
+            -Architecture $cmakeArch `
+            -VcpkgTriplet $triplet `
             -PatchConf:$false `
             -RegisterDShowFilter:$false `
             -EnableTests:$true
@@ -189,7 +197,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: obn-v${{ matrix.abi }}.xx-windows-x64
+          name: obn-v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
 

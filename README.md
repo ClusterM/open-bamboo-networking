@@ -106,6 +106,7 @@ Please note:
 - Linux x86_64 (primary target).
 - Linux aarch64 (primary target).
 - Windows x64 (experimental).
+- Windows ARM64 (experimental).
 - macOS (very experimental, works partially, not documented yet).
 
 ## Supported Bambu Studio versions (ABI versions)

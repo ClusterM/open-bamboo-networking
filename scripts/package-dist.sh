@@ -12,6 +12,7 @@
 # Output: dist-out/obn-linux-x64.tar.gz
 #         dist-out/obn-linux-aarch64.tar.gz
 #         dist-out/obn-windows-x64.zip
+#         dist-out/obn-windows-arm64.zip
 #         dist-out/obn-macos-arm64.tar.gz
 #         dist-out/obn-macos-x64.tar.gz
 set -eu
@@ -129,6 +130,21 @@ generate_readme "Windows x64" "install.bat" \
     "Double-click install.bat, or run in PowerShell:  .\\\\install.ps1" "$STAGE/README.txt"
 (cd "$OUTDIR" && zip -qr obn-windows-x64.zip obn-windows-x64/)
 echo "  -> obn-windows-x64.zip"
+
+# ── Windows ARM64 ────────────────────────────────────────────────────────
+
+echo "Assembling obn-windows-arm64..."
+STAGE="$OUTDIR/obn-windows-arm64"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+collect_abi_dirs "obn-v*-windows-arm64" "$STAGE"
+cp "$REPO_ROOT/packaging/install.ps1" "$STAGE/"
+cp "$REPO_ROOT/packaging/install.bat" "$STAGE/"
+write_version_file "$STAGE"
+generate_readme "Windows ARM64" "install.bat" \
+    "Double-click install.bat, or run in PowerShell:  .\\\\install.ps1" "$STAGE/README.txt"
+(cd "$OUTDIR" && zip -qr obn-windows-arm64.zip obn-windows-arm64/)
+echo "  -> obn-windows-arm64.zip"
 
 # ── macOS arm64 ───────────────────────────────────────────────────────────
 

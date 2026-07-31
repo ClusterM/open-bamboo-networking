@@ -1,5 +1,5 @@
 # Build and test open-bamboo-networking on Linux x64 / aarch64,
-# Windows x64 (MSVC + vcpkg manifest), and macOS arm64.
+# Windows x64 + ARM64 (MSVC + vcpkg manifest), and macOS arm64.
 # release.yml always builds both macOS architectures.
 #
 # Version strategy: the plugin must report a string whose first 8 characters
@@ -15,7 +15,7 @@
 #   * liblive555.so
 #   * network_plugins.json
 #
-# Windows artifacts (one set per ABI version):
+# Windows artifacts (one set per ABI version / architecture — x64 and ARM64):
 #   * bambu_networking.dll
 #   * BambuSource.dll
 #   * live555.dll (stub)
@@ -128,13 +128,16 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: v${{ matrix.abi }}.xx-windows-x64
+    name: v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
     needs: [discover-abi]
-    runs-on: windows-2022
+    runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
     strategy:
       fail-fast: false
       matrix:
         abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
+        arch:
+          - x64
+          - arm64
 
     steps:
       - name: Checkout
@@ -146,10 +149,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:GITHUB_WORKSPACE "install"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          $arch = '${{ matrix.arch }}'
+          $cmakeArch = if ($arch -eq 'arm64') { 'ARM64' } else { 'x64' }
+          $triplet = if ($arch -eq 'arm64') { 'arm64-windows-static-md' } else { 'x64-windows-static-md' }
           .\configure.ps1 `
             -ClientType bambu_studio `
             -WithVersion '${{ matrix.abi }}.99' `
             -Prefix $staging `
+            -Architecture $cmakeArch `
+            -VcpkgTriplet $triplet `
             -PatchConf:$false `
             -RegisterDShowFilter:$false `
             -EnableTests:$true
@@ -191,7 +199,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: obn-v${{ matrix.abi }}.xx-windows-x64
+          name: obn-v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
 
@@ -395,6 +403,7 @@ jobs:
             case "$name" in
               *linux-x64*)       platform="Linux x64" ;;
               *linux-aarch64*)   platform="Linux aarch64" ;;
+              *windows-arm64*)   platform="Windows ARM64" ;;
               *windows-x64*)     platform="Windows x64" ;;
               *macos-arm64*)     platform="macOS (Apple Silicon)" ;;
               *macos-x64*|*macos-intel*) platform="macOS (Intel)" ;;
