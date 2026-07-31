@@ -69,14 +69,13 @@ struct Settings {
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
 
-    // Slicer signing key, certificate id, and app-cert provisioning files.
+    // Slicer signing key and app-cert provisioning files.
     // Empty = look for the corresponding file in config_dir:
     //   slicer_key_pem  -> slicer_key.pem
-    //   slicer_cert_id  -> slicer_cert_id.txt
-    //   slicer_cert_pem -> slicer_cert.pem   (app cert chain for app_cert_install)
+    //   slicer_cert_pem -> slicer_cert.pem   (app cert chain; MQTT/HTTP cert_id
+    //                                         is derived from the leaf)
     //   slicer_crl_pem  -> slicer_crl.pem    (app CRL for app_cert_install)
     std::string slicer_key_pem;
-    std::string slicer_cert_id;
     std::string slicer_cert_pem;
     std::string slicer_crl_pem;
 
@@ -114,7 +113,7 @@ Settings load_if_exists(const std::string& config_dir);
 const Settings& current();
 
 // The config_dir passed to the most recent load_or_create() call.
-// All default file paths (key, cert_id, …) are relative to this.
+// All default file paths (key, cert, CRL, …) are relative to this.
 const std::string& dir();
 
 // Join `basename` onto the active config_dir() using the platform's native

@@ -9,6 +9,7 @@
 #include "obn/log.hpp"
 
 #include <openssl/bio.h>
+#include <openssl/bn.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -31,6 +32,8 @@ namespace {
 struct PkeyDel { void operator()(EVP_PKEY*     p) const { EVP_PKEY_free(p); } };
 struct MdDel   { void operator()(EVP_MD_CTX*   p) const { EVP_MD_CTX_free(p); } };
 struct CtxDel  { void operator()(EVP_PKEY_CTX* p) const { EVP_PKEY_CTX_free(p); } };
+struct X509Del { void operator()(X509*         p) const { X509_free(p); } };
+struct BnDel   { void operator()(BIGNUM*       p) const { BN_free(p); } };
 
 static constexpr const char kSignAlg[] = "RSA_SHA256";
 static constexpr const char kSignVer[] = "v1.0";
@@ -42,22 +45,6 @@ static std::string resolve_key_path()
     const auto& cfg = obn::config::current().slicer_key_pem;
     if (!cfg.empty()) return cfg;
     return obn::config::path_in_dir("slicer_key.pem");
-}
-
-// Read cert_id from slicer_cert_id.txt in config_dir.
-static std::string load_cert_id_from_file()
-{
-    std::string path = obn::config::path_in_dir("slicer_cert_id.txt");
-    if (path.empty()) return {};
-    std::FILE* f = std::fopen(path.c_str(), "r");
-    if (!f) return {};
-    char buf[256] = {};
-    if (!std::fgets(buf, sizeof(buf), f)) buf[0] = '\0';
-    std::fclose(f);
-    std::string s(buf);
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
-        s.pop_back();
-    return s;
 }
 
 // Reads a whole file into a string. "" on any failure. `path` is an absolute
@@ -78,58 +65,6 @@ static std::string read_pem_file(const std::string& path)
 
 } // namespace
 
-// cert_id identifies the slicer's registered signing certificate on Bambu's
-// backend. It is fixed for the life of a given RSA key pair and is not secret.
-// Priority: obn.conf slicer_cert_id > config_dir/slicer_cert_id.txt
-const std::string& slicer_cert_id()
-{
-    static const std::string id = []() -> std::string {
-        const auto& cfg = obn::config::current().slicer_cert_id;
-        if (!cfg.empty()) return cfg;
-        std::string from_file = load_cert_id_from_file();
-        if (!from_file.empty()) return from_file;
-        return "";
-    }();
-    return id;
-}
-
-// Convert the stored cert_id (`<serial_hex><issuer_dn>`, e.g.
-// `a4e8faaa…192383fCN=GLOF3813734089.bambulab.com`) into the HTTP-header form
-// `<issuer_dn>:<serial_lower>`. The split point is the start of the issuer
-// DN: we find the first '=' (a DN always has one, a hex serial never does)
-// and walk back over the RDN attribute-type letters (e.g. "CN").
-//
-// The tricky part is the serial/issuer boundary. The serial is a LOWERCASE
-// hex string that can END in a hex letter (…192383f), and the issuer's
-// leading RDN attribute type is UPPERCASE (CN, O, OU, C, L, ST, DC, …). A
-// naive "walk back over all letters" (std::isalpha) wrongly swallows the
-// serial's trailing 'f' into the issuer, yielding `fCN=…` and a serial short
-// by one nibble — which the cloud rejects with HTTP 403. Conversely a naive
-// "longest hex prefix" split wrongly swallows the 'C' of "CN" (C is a hex
-// digit). We therefore walk back over UPPERCASE letters only: that keeps the
-// uppercase RDN type ("CN") in the issuer and leaves the lowercase serial
-// (including a trailing a–f) intact.
-const std::string& app_certification_id()
-{
-    static const std::string id = []() -> std::string {
-        const std::string& raw = slicer_cert_id();
-        if (raw.empty()) return "";
-        const auto eq = raw.find('=');
-        if (eq == std::string::npos) return "";
-        std::size_t issuer_start = eq;
-        while (issuer_start > 0 &&
-               std::isupper(static_cast<unsigned char>(raw[issuer_start - 1])))
-            --issuer_start;
-        if (issuer_start == 0) return ""; // no serial prefix -> can't build
-        std::string serial = raw.substr(0, issuer_start);
-        std::string issuer = raw.substr(issuer_start);
-        for (char& c : serial)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return issuer + ":" + serial;
-    }();
-    return id;
-}
-
 std::string slicer_cert_pem()
 {
     const auto& cfg = obn::config::current().slicer_cert_pem;
@@ -142,6 +77,96 @@ std::string slicer_crl_pem()
     const auto& cfg = obn::config::current().slicer_crl_pem;
     return read_pem_file(cfg.empty() ? obn::config::path_in_dir("slicer_crl.pem")
                                      : cfg);
+}
+
+namespace {
+
+// Leaf of slicer_cert.pem (first PEM block). nullptr when absent/unparseable.
+static std::unique_ptr<X509, X509Del> load_slicer_leaf_cert()
+{
+    const std::string pem = slicer_cert_pem();
+    if (pem.empty()) return nullptr;
+    BIO* bio = ::BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return nullptr;
+    X509* cert = ::PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    ::BIO_free(bio);
+    return std::unique_ptr<X509, X509Del>(cert);
+}
+
+static std::string leaf_serial_hex_lower(X509* cert)
+{
+    const ASN1_INTEGER* sn = ::X509_get_serialNumber(cert);
+    if (!sn) return {};
+    std::unique_ptr<BIGNUM, BnDel> bn(::ASN1_INTEGER_to_BN(sn, nullptr));
+    if (!bn) return {};
+    char* hex = ::BN_bn2hex(bn.get());
+    if (!hex) return {};
+    std::string serial(hex);
+    ::OPENSSL_free(hex);
+    for (char& c : serial)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Wire form uses an even number of hex digits (byte-aligned).
+    if (serial.size() % 2)
+        serial.insert(serial.begin(), '0');
+    return serial;
+}
+
+static std::string leaf_issuer_rfc2253(X509* cert)
+{
+    X509_NAME* name = ::X509_get_issuer_name(cert);
+    if (!name) return {};
+    BIO* bio = ::BIO_new(::BIO_s_mem());
+    if (!bio) return {};
+    if (::X509_NAME_print_ex(bio, name, 0, XN_FLAG_RFC2253) < 0) {
+        ::BIO_free(bio);
+        return {};
+    }
+    char* data = nullptr;
+    const long len = ::BIO_get_mem_data(bio, &data);
+    std::string issuer;
+    if (data && len > 0)
+        issuer.assign(data, static_cast<std::size_t>(len));
+    ::BIO_free(bio);
+    return issuer;
+}
+
+// Parsed once: MQTT cert_id = serial+issuer; HTTP = issuer:serial.
+struct AppCertIds {
+    std::string mqtt;
+    std::string http;
+};
+
+static const AppCertIds& app_cert_ids()
+{
+    static const AppCertIds ids = []() -> AppCertIds {
+        auto cert = load_slicer_leaf_cert();
+        if (!cert) return {};
+        const std::string serial = leaf_serial_hex_lower(cert.get());
+        const std::string issuer = leaf_issuer_rfc2253(cert.get());
+        if (serial.empty() || issuer.empty()) return {};
+        AppCertIds out;
+        out.mqtt = serial + issuer;
+        out.http = issuer + ":" + serial;
+        return out;
+    }();
+    return ids;
+}
+
+} // namespace
+
+// cert_id identifies the slicer's registered signing certificate on Bambu's
+// backend. Derived from the leaf of slicer_cert.pem:
+//   lowercase_hex(serial) + issuer_RFC2253  (no separator).
+const std::string& slicer_cert_id()
+{
+    return app_cert_ids().mqtt;
+}
+
+// HTTP x-bbl-app-certification-id: issuer_RFC2253 + ":" + serial.lower(),
+// from the same leaf parse as slicer_cert_id().
+const std::string& app_certification_id()
+{
+    return app_cert_ids().http;
 }
 
 namespace {

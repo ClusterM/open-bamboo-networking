@@ -5,9 +5,12 @@
 #include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 
+#include <openssl/asn1.h>
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
+#include <openssl/x509.h>
 
 #include <cassert>
 #include <cstdio>
@@ -168,7 +171,7 @@ static int test_cert_id_constant()
 {
     const std::string payload = R"({"print":{"command":"pause","sequence_id":"2"}})";
     const std::string env     = obn::signing::maybe_sign(payload);
-    // MQTT envelope carries the stored cert_id verbatim (serial + issuer).
+    // MQTT envelope: serial.lower() + issuer_RFC2253 (no separator), from leaf.
     CHECK(envelope_field(env, "cert_id")
           == "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com");
     return 0;
@@ -177,15 +180,67 @@ static int test_cert_id_constant()
 static int test_app_certification_id_http_format()
 {
     // HTTP x-bbl-app-certification-id is issuer + ":" + serial.lower(),
-    // derived from the stored MQTT-form cert_id (serial + issuer).
-    // Stored: "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com"
-    //   serial = "a4e8faaa1a38e3650a0ea590d192383f" (note: ends in hex 'f'!)
-    //   issuer = "CN=GLOF3813734089.bambulab.com"
-    // Regression: walking back over ALL letters wrongly moved the serial's
-    // trailing 'f' into the issuer ("fCN=...:...192383"), which the cloud 403s.
+    // from the same leaf (serial ends in hex 'f' — must not be swallowed).
     CHECK(obn::signing::app_certification_id()
           == "CN=GLOF3813734089.bambulab.com:a4e8faaa1a38e3650a0ea590d192383f");
     return 0;
+}
+
+// Write a self-signed leaf with the production-shaped serial/issuer used by
+// cert_id assertions. Returns false on any OpenSSL failure.
+static bool write_test_slicer_cert(const char* path, EVP_PKEY* key)
+{
+    X509* cert = X509_new();
+    if (!cert) return false;
+    if (X509_set_version(cert, 2) != 1) { X509_free(cert); return false; }
+
+    // serial = 0xa4e8faaa1a38e3650a0ea590d192383f (ends in hex 'f')
+    BIGNUM* bn = nullptr;
+    if (BN_hex2bn(&bn, "a4e8faaa1a38e3650a0ea590d192383f") == 0 || !bn) {
+        X509_free(cert);
+        return false;
+    }
+    ASN1_INTEGER* ai = BN_to_ASN1_INTEGER(bn, nullptr);
+    BN_free(bn);
+    if (!ai || X509_set_serialNumber(cert, ai) != 1) {
+        ASN1_INTEGER_free(ai);
+        X509_free(cert);
+        return false;
+    }
+    ASN1_INTEGER_free(ai);
+
+    X509_NAME* name = X509_NAME_new();
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("GLOF3813734089.bambulab.com"),
+            -1, -1, 0) != 1) {
+        X509_NAME_free(name);
+        X509_free(cert);
+        return false;
+    }
+    // Self-signed: subject == issuer (RFC2253 prints CN=…).
+    if (X509_set_subject_name(cert, name) != 1 ||
+        X509_set_issuer_name(cert, name) != 1) {
+        X509_NAME_free(name);
+        X509_free(cert);
+        return false;
+    }
+    X509_NAME_free(name);
+
+    if (!X509_gmtime_adj(X509_getm_notBefore(cert), 0) ||
+        !X509_gmtime_adj(X509_getm_notAfter(cert), 60 * 60 * 24 * 365) ||
+        X509_set_pubkey(cert, key) != 1 ||
+        X509_sign(cert, key, EVP_sha256()) == 0) {
+        X509_free(cert);
+        return false;
+    }
+
+    FILE* f = std::fopen(path, "w");
+    if (!f) { X509_free(cert); return false; }
+    const int ok = PEM_write_X509(f, cert);
+    std::fclose(f);
+    X509_free(cert);
+    return ok == 1;
 }
 
 static int test_sign_alg_and_ver()
@@ -444,9 +499,16 @@ int main()
     fclose(f);
     unlink(tmp_path);
 
-    obn::config::test_settings().slicer_key_pem = pem_path;
-    obn::config::test_settings().slicer_cert_id =
-        "a4e8faaa1a38e3650a0ea590d192383fCN=GLOF3813734089.bambulab.com";
+    const std::string cert_path = pem_path + ".cert.pem";
+    if (!write_test_slicer_cert(cert_path.c_str(), g_test_key)) {
+        std::cerr << "write_test_slicer_cert failed\n";
+        unlink(pem_path.c_str());
+        EVP_PKEY_free(g_test_key);
+        return 1;
+    }
+
+    obn::config::test_settings().slicer_key_pem  = pem_path;
+    obn::config::test_settings().slicer_cert_pem = cert_path;
 
     int rc = 0;
     if (test_non_print_passthrough()       != 0) rc = 1;
@@ -472,6 +534,7 @@ int main()
 
     // Cleanup.
     unlink(pem_path.c_str());
+    unlink(cert_path.c_str());
     EVP_PKEY_free(g_test_key);
     return rc;
 }

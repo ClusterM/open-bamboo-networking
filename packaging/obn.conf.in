@@ -126,11 +126,12 @@ patch_mqtt_internal_storage = 0
 # !!! WARNING !!!
 #
 # Full cloud operation with a secured printer also REQUIRES you to
-# supply your own slicer_cert_id, slicer_key_pem, slicer_cert_pem, and
-# slicer_crl_pem (see below). These are private credentials; this
-# project does not distribute them. You must obtain them yourself, and
-# you alone are responsible for ensuring that your use of them complies
-# with applicable terms and law.
+# supply your own slicer_cert_pem, slicer_key_pem, and slicer_crl_pem
+# (see below). The MQTT/HTTP cert_id is derived from the leaf of
+# slicer_cert.pem. These are private credentials; this project does not
+# distribute them. You must obtain them yourself, and you alone are
+# responsible for ensuring that your use of them complies with
+# applicable terms and law.
 
 # Fully blocks talking to Bambu's cloud (live status, subscriptions,
 # cloud printing / uploading print files), except login, syncing
@@ -140,22 +141,19 @@ patch_mqtt_internal_storage = 0
 
 block_cloud = 1
 
-# Slicer certificate ID registered on the Bambu backend.
-# If empty, reads slicer_cert_id.txt from this config directory.
+# Path to the app certificate chain (PEM) sent to the printer via the
+# security.app_cert_install MQTT command (new authorization-control system).
+# MQTT header.cert_id and HTTP x-bbl-app-certification-id are derived from
+# the leaf of this chain. If empty, looks for slicer_cert.pem in this
+# config directory.
 
-slicer_cert_id =
-
+slicer_cert_pem =
 # Path to the slicer RSA private key (PEM) used for MQTT payload signing
 # and cloud REST request authentication.
 # If empty, looks for slicer_key.pem in this config directory.
 
 slicer_key_pem =
 
-# Path to the app certificate chain (PEM) sent to the printer via the
-# security.app_cert_install MQTT command (new authorization-control system).
-# If empty, looks for slicer_cert.pem in this config directory.
-
-slicer_cert_pem =
 
 # Path to the app certificate revocation list (PEM CRL) sent alongside the
 # app certificate in security.app_cert_install.

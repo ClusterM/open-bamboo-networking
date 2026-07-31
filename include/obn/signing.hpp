@@ -48,22 +48,20 @@ std::string device_security_sign();
 std::string base64_encode(const unsigned char* data, std::size_t len);
 
 // Returns the cert_id string used in the MQTT envelope header.
-// Priority: obn.conf slicer_cert_id > config_dir/slicer_cert_id.txt.
-// Serialization is `serial + issuer` (no separator), matching the wire
-// `header.cert_id`. Returns empty string if neither is configured.
+// Derived from the leaf of slicer_cert.pem:
+//   lowercase_hex(serial) + issuer_RFC2253  (no separator).
+// Returns empty string when the cert is absent or unparseable.
 const std::string& slicer_cert_id();
 
 // Returns the value for the HTTP `x-bbl-app-certification-id` header used on
-// secured-printer REST writes (e.g. POST /my/task). This is a DIFFERENT
-// serialization from slicer_cert_id(): `issuer + ":" + serial.lower()`
-// (per reverse-networking `6. HTTP.md`). Derived from the same stored
-// cert_id by splitting the leading serial from the trailing issuer DN.
-// Returns "" when the cert_id is unset or cannot be parsed.
+// secured-printer REST writes (e.g. POST /my/task). DIFFERENT serialization
+// from slicer_cert_id(): `issuer_RFC2253 + ":" + serial.lower()`, from the
+// same leaf. Returns "" when the cert is absent or unparseable.
 const std::string& app_certification_id();
 
 // PEM chain of the slicer (app) certificate matching slicer_key.pem, read
-// from config_dir/slicer_cert.pem. Sent to the printer in the
-// security.app_cert_install MQTT command. "" when the file is absent.
+// from config_dir/slicer_cert.pem (or obn.conf slicer_cert_pem). Source of
+// MQTT/HTTP cert_id and of security.app_cert_install. "" when absent.
 std::string slicer_cert_pem();
 
 // PEM CRL entry accompanying the app certificate, read from
