@@ -250,6 +250,11 @@ jobs:
       - name: Verify built plugin exports every ABI symbol
         run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
 
+      - name: Verify BambuPlayer ObjC class is exported
+        run: |
+          set -eu
+          nm -gU build/libBambuSource.dylib | grep '_OBJC_CLASS_\$_BambuPlayer'
+
       - name: Stage artifacts
         run: |
           set -eu
