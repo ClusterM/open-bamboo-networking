@@ -159,6 +159,25 @@ EOF
     exit 1
 fi
 
+# macOS static OpenSSL/curl embed (OBN_MACOS_STATIC_DEPS, default ON) needs
+# OPENSSL_ROOT_DIR pointing at brew openssl@3 so FindOpenSSL resolves the
+# static .a archives. CI already exports this; for local ./configure we
+# auto-detect when unset.
+if [ "$(uname -s)" = "Darwin" ] \
+   && [ -z "${OPENSSL_ROOT_DIR:-}" ] \
+   && command -v brew >/dev/null 2>&1
+then
+    _obn_brew_openssl="$(brew --prefix openssl@3 2>/dev/null || true)"
+    if [ -n "$_obn_brew_openssl" ] && [ -d "$_obn_brew_openssl" ]; then
+        EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DOPENSSL_ROOT_DIR=${_obn_brew_openssl}"
+        echo "configure: macOS OPENSSL_ROOT_DIR=${_obn_brew_openssl} (brew openssl@3)"
+    else
+        echo "configure: warning: brew openssl@3 not found; macOS static OpenSSL link may fail." >&2
+        echo "configure:          install with: brew install openssl@3" >&2
+    fi
+    unset _obn_brew_openssl
+fi
+
 # On Linux and macOS, default the install prefix to the per-client config
 # directory when PREFIX is unset. Linux also prefers native ~/.config over
 # Flatpak under ~/.var/app when only one exists.
