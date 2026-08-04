@@ -24,6 +24,7 @@ plugin.
     - [Prerequisites](#prerequisites-linux)
     - [Linux: configure, build and install](#linux-configure-build-and-install)
     - [`./configure` options](#configure-options)
+  - [macOS](#macos)
   - [Windows](#windows)
     - [Prerequisites](#prerequisites-windows)
     - [Windows: configure, build and install](#windows-configure-build-and-install)
@@ -107,7 +108,7 @@ Please note:
 - Linux aarch64 (primary target).
 - Windows x64 (experimental).
 - Windows ARM64 (experimental).
-- macOS (very experimental, works partially, not documented yet).
+- macOS (experimental; curl and OpenSSL are statically embedded — no Homebrew runtime dependency).
 
 ## Supported Bambu Studio versions (ABI versions)
 
@@ -397,6 +398,38 @@ The detected `W.X.Y.Z` or `W.X.Y` is turned into a **four-component** `OBN_VERSI
 `./configure --help` also lists less common flags (including Mosquitto linking
 options). Driving **CMake** directly works the same way; see `OBN_`* and
 other cache variables in `CMakeLists.txt`.
+
+### macOS
+
+macOS builds **statically embed** OpenSSL and libcurl into the plugin dylibs
+(`OBN_MACOS_STATIC_DEPS=ON` by default). Homebrew is needed only at **build**
+time for `openssl@3` (static `.a` archives); the installed plugin does **not**
+require `brew install curl` / a Homebrew OpenSSL at runtime
+([issue #60](https://github.com/ClusterM/open-bamboo-networking/issues/60)).
+libcurl itself is vendored from source via FetchContent (minimal OpenSSL +
+system zlib build).
+
+#### Prerequisites (macOS)
+
+```sh
+brew install cmake pkg-config openssl@3 uthash
+```
+
+`./configure` auto-detects `OPENSSL_ROOT_DIR` from `brew --prefix openssl@3`
+when unset. Opt out of the static embed with
+`--cmake-arg=-DOBN_MACOS_STATIC_DEPS=OFF` (then you need a pkg-config
+`libcurl` as on Linux).
+
+#### macOS: configure, build and install
+
+```sh
+./configure
+make
+make install
+```
+
+Default `--prefix` is `~/Library/Application Support/BambuStudio` (or
+`…/OrcaSlicer` with `--client-type=orca_slicer`).
 
 ### Windows
 

@@ -36,28 +36,6 @@ case "$OS" in
     *)      die "Unsupported OS: $OS (this installer supports Linux and macOS)" ;;
 esac
 
-# ── macOS: check for Homebrew and curl ───────────────────────────────────
-
-if [ "$OS" = "Darwin" ]; then
-    if ! command -v brew >/dev/null 2>&1; then
-        die "Homebrew is not installed.
-  The plugin requires libcurl from Homebrew. Install Homebrew first:
-    /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"
-  Then install curl:
-    brew install curl
-  and re-run this installer."
-    fi
-
-    if ! brew list curl >/dev/null 2>&1; then
-        die "curl is not installed via Homebrew.
-  The plugin requires libcurl from Homebrew (the system curl may lack OpenSSL support).
-  Install it with:
-    brew install curl
-  and re-run this installer."
-    fi
-    info "Homebrew curl found: $(brew --prefix curl)/lib"
-fi
-
 # ── Client selection ─────────────────────────────────────────────────────
 
 printf "\n${BOLD}Open Bamboo Networking — Installer${RESET}\n"

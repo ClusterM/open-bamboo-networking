@@ -173,6 +173,21 @@ set(OBN_MOSQUITTO_GIT_TAG "v2.1.2"
     CACHE STRING "Git tag for eclipse/mosquitto (FetchContent)")
 set(OBN_CJSON_GIT_TAG "v1.7.18"
     CACHE STRING "Git tag for DaveGamble/cJSON (FetchContent)")
+# Vendored libcurl (static) used on macOS so the plugin dylib has no
+# runtime NEEDED on Homebrew's libcurl.4.dylib (issue #60).
+set(OBN_CURL_GIT_TAG "curl-8_11_1"
+    CACHE STRING "Git tag for curl/curl (FetchContent, macOS static embed)")
+
+# On macOS, statically embed Homebrew's OpenSSL .a archives and a
+# minimal vendored libcurl.a. Opt out with -DOBN_MACOS_STATIC_DEPS=OFF
+# (then pkg-config libcurl + shared OpenSSL are used, as on Linux).
+if(APPLE)
+    option(OBN_MACOS_STATIC_DEPS
+        "Statically embed OpenSSL + libcurl on macOS (no Homebrew runtime deps)"
+        ON)
+else()
+    set(OBN_MACOS_STATIC_DEPS OFF)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -233,7 +248,9 @@ endif()
 # --------------------------------------------------------------------------
 
 # Dependency resolution:
-#   - Linux/macOS: pkg-config for libcurl; OpenSSL/zlib via CMake.
+#   - Linux: pkg-config for libcurl; OpenSSL/zlib via CMake.
+#   - macOS (OBN_MACOS_STATIC_DEPS ON, default): Homebrew OpenSSL static
+#     archives + vendored static libcurl (no Homebrew runtime NEEDED).
 #   - Windows: vcpkg manifest for curl/openssl/zlib; mosquitto is always
 #     vendored via FetchContent (same as Linux).
 if(WIN32)
@@ -242,19 +259,41 @@ if(WIN32)
     find_package(CURL CONFIG REQUIRED)
 else()
     find_package(PkgConfig REQUIRED)
+    # Must be set before find_package(OpenSSL) AND before the vendored
+    # curl subdirectory's own find_package(OpenSSL), so both resolve
+    # libssl.a / libcrypto.a from OPENSSL_ROOT_DIR (brew openssl@3).
+    if(APPLE AND OBN_MACOS_STATIC_DEPS)
+        set(OPENSSL_USE_STATIC_LIBS TRUE)
+    endif()
     find_package(OpenSSL COMPONENTS SSL REQUIRED)
     find_package(ZLIB REQUIRED)
+    # Homebrew's static libcrypto.a needs Security.framework at final link.
+    # Attach it to the imported OpenSSL targets so every consumer
+    # (plugin, BambuSource, vendored mosquitto/curl, tests) picks it up.
+    if(APPLE AND OBN_MACOS_STATIC_DEPS)
+        foreach(_obn_ssl_tgt IN ITEMS OpenSSL::SSL OpenSSL::Crypto)
+            if(TARGET ${_obn_ssl_tgt})
+                set_property(TARGET ${_obn_ssl_tgt} APPEND PROPERTY
+                    INTERFACE_LINK_LIBRARIES "-framework Security")
+            endif()
+        endforeach()
+    endif()
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
 obn_vendor_mosquitto_setup()
 
-# CURL imported target: PkgConfig::CURL on POSIX, CURL::libcurl on Windows
-# (vcpkg's CURLConfig.cmake exports that name). We expose a unified alias
-# so the per-target target_link_libraries calls below stay platform-free.
+# CURL imported target: PkgConfig::CURL on Linux, vendored static on
+# macOS (OBN_MACOS_STATIC_DEPS), CURL::libcurl on Windows (vcpkg). We
+# expose a unified alias so the per-target target_link_libraries calls
+# below stay platform-free.
 add_library(obn_curl_iface INTERFACE)
 if(WIN32)
     target_link_libraries(obn_curl_iface INTERFACE CURL::libcurl)
+elseif(APPLE AND OBN_MACOS_STATIC_DEPS)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorCurl.cmake")
+    obn_vendor_curl_setup()
+    target_link_libraries(obn_curl_iface INTERFACE obn_vendor_curl_iface)
 else()
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)

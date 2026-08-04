@@ -220,16 +220,15 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eu
-          for pkg in pkg-config cmake openssl@3 curl cjson zlib uthash; do
+          # curl/cjson/zlib are NOT brew runtime deps: libcurl is vendored
+          # static, cJSON is vendored with mosquitto, zlib is system.
+          # openssl@3 is build-time only (static .a archives embedded).
+          for pkg in pkg-config cmake openssl@3 uthash; do
             brew list "$pkg" &>/dev/null || brew install "$pkg"
           done
           {
             echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
-            PC="$(brew --prefix openssl@3)/lib/pkgconfig"
-            PC="${PC}:$(brew --prefix curl)/lib/pkgconfig"
-            PC="${PC}:$(brew --prefix zlib)/lib/pkgconfig"
-            PC="${PC}:$(brew --prefix cjson)/lib/pkgconfig"
-            echo "PKG_CONFIG_PATH=${PC}"
+            echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig"
           } >> "$GITHUB_ENV"
 
       - name: Configure
@@ -249,6 +248,22 @@ jobs:
 
       - name: Verify built plugin exports every ABI symbol
         run: tools/check_abi_compat.sh --abi='${{ matrix.abi }}' --so=build/libbambu_networking.dylib
+
+      - name: Assert no Homebrew runtime dylib deps
+        run: |
+          set -eu
+          # Static OpenSSL + vendored curl must leave no /opt/homebrew or
+          # /usr/local/opt NEEDED entries (issue #60).
+          bad=0
+          for dylib in build/libbambu_networking.dylib build/libBambuSource.dylib; do
+            echo "== otool -L $dylib =="
+            otool -L "$dylib"
+            if otool -L "$dylib" | grep -E '/opt/homebrew/|/usr/local/opt/'; then
+              echo "error: $dylib still links Homebrew paths" >&2
+              bad=1
+            fi
+          done
+          exit "$bad"
 
       - name: Verify BambuPlayer ObjC class is exported
         run: |
