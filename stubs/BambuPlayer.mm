@@ -469,6 +469,26 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
 
 - (int)play
 {
+    // Reap a previous reader that exited on its own (EOF/error) without
+    // close. Joining must happen *outside* the mutex — readerLoop may
+    // still be taking _impl->mu on its way out. Deleting a joinable
+    // std::thread is UB (std::terminate).
+    std::thread* stale = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(_impl->mu);
+        if (!_impl->tunnel) {
+            [self logAt:1 message:"play: no open tunnel [-1]"];
+            return -1;
+        }
+        if (_impl->running.load()) return 0;
+        stale = _impl->reader;
+        _impl->reader = nullptr;
+    }
+    if (stale) {
+        if (stale->joinable()) stale->join();
+        delete stale;
+    }
+
     {
         std::lock_guard<std::recursive_mutex> lk(_impl->mu);
         if (!_impl->tunnel) {
@@ -479,10 +499,6 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         _impl->running.store(true);
         _impl->sessionStart  = std::chrono::steady_clock::now();
         _impl->lastFrameTime = _impl->sessionStart;
-        if (_impl->reader) {
-            delete _impl->reader;
-            _impl->reader = nullptr;
-        }
         _impl->reader = new std::thread([self] { [self readerLoop]; });
     }
     [self emitTrack:"liveview_play" phase:"play" result:"ok" error:nullptr];
@@ -740,11 +756,12 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
             obn::h264::contains_idr(sample.buffer,
                                     static_cast<size_t>(sample.size));
 
-        std::vector<uint8_t> copy(sample.buffer, sample.buffer + sample.size);
-
+        // sample.buffer is borrowed until the next Bambu_ReadSample; we
+        // consume it synchronously here (and enqueueAnnexB copies into a
+        // CMBlockBuffer), so no intermediate std::vector is needed.
         auto decode_start = std::chrono::steady_clock::now();
-        BOOL ok = [self enqueueAnnexB:copy.data()
-                                 size:copy.size()
+        BOOL ok = [self enqueueAnnexB:sample.buffer
+                                 size:static_cast<size_t>(sample.size)
                                  sync:isSync ? YES : NO];
         auto decode_end = std::chrono::steady_clock::now();
         if (!ok) continue;

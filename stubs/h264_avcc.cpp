@@ -1,5 +1,8 @@
 #include "h264_avcc.hpp"
 
+#include <cstdint>
+#include <limits>
+
 namespace obn {
 namespace h264 {
 namespace {
@@ -43,10 +46,13 @@ void for_each_nal(const uint8_t* data, size_t size, Fn fn)
         if (nal_start < next && nal_start < size) {
             NalView v;
             v.data = data + nal_start;
+            // Bytes between this start code and the next. The scanner
+            // consumes the next start-code prefix (00 00 01 / 00 00 00 01),
+            // so those zeros are not part of this NAL. Any
+            // trailing_zero_8bits that sit *before* that prefix remain in
+            // v.size. Do not strip trailing 0x00 — that would corrupt
+            // slice payloads that legitimately end in zero.
             v.size = next - nal_start;
-            // Keep the NAL bytes verbatim (including any trailing_zero_8bits
-            // the encoder left before the next start code). Stripping 0x00
-            // would corrupt slice payloads that legitimately end in zero.
             v.type = (v.size > 0) ? static_cast<uint8_t>(v.data[0] & 0x1f) : 0;
             if (v.size > 0) fn(v);
         }
@@ -56,14 +62,19 @@ void for_each_nal(const uint8_t* data, size_t size, Fn fn)
     }
 }
 
-void append_avcc_nal(std::vector<uint8_t>& out, const uint8_t* nal, size_t nal_size)
+// Append one length-prefixed NAL. AVCC lengths are 32-bit; reject anything
+// that would truncate. Returns false on overflow.
+bool append_avcc_nal(std::vector<uint8_t>& out, const uint8_t* nal, size_t nal_size)
 {
+    if (nal_size > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+        return false;
     const uint32_t n = static_cast<uint32_t>(nal_size);
     out.push_back(static_cast<uint8_t>((n >> 24) & 0xff));
     out.push_back(static_cast<uint8_t>((n >> 16) & 0xff));
     out.push_back(static_cast<uint8_t>((n >>  8) & 0xff));
     out.push_back(static_cast<uint8_t>( n        & 0xff));
     out.insert(out.end(), nal, nal + nal_size);
+    return true;
 }
 
 } // namespace
@@ -85,13 +96,20 @@ bool annexb_to_avcc(const uint8_t* data, size_t size, AvccFrame* out)
     if (!data || !out) return false;
     out->data.clear();
     out->contains_idr = false;
+    bool ok = true;
     for_each_nal(data, size, [&](const NalView& v) {
+        if (!ok) return;
         // Parameter sets and AUDs belong in the format description / are
         // not sample payload for AVSampleBufferDisplayLayer.
         if (v.type == 7 || v.type == 8 || v.type == 9) return;
         if (v.type == 5) out->contains_idr = true;
-        append_avcc_nal(out->data, v.data, v.size);
+        if (!append_avcc_nal(out->data, v.data, v.size)) ok = false;
     });
+    if (!ok) {
+        out->data.clear();
+        out->contains_idr = false;
+        return false;
+    }
     return !out->data.empty();
 }
 
