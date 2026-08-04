@@ -163,8 +163,13 @@ fi
 # OPENSSL_ROOT_DIR pointing at brew openssl@3 so FindOpenSSL resolves the
 # static .a archives. CI already exports this; for local ./configure we
 # auto-detect when unset.
+case "$EXTRA_CMAKE_ARGS" in
+    *-DOPENSSL_ROOT_DIR=*|*-DOPENSSL_ROOT_DIR:*) _obn_openssl_root_in_args=1 ;;
+    *) _obn_openssl_root_in_args=0 ;;
+esac
 if [ "$(uname -s)" = "Darwin" ] \
    && [ -z "${OPENSSL_ROOT_DIR:-}" ] \
+   && [ "$_obn_openssl_root_in_args" -eq 0 ] \
    && command -v brew >/dev/null 2>&1
 then
     _obn_brew_openssl="$(brew --prefix openssl@3 2>/dev/null || true)"
@@ -177,6 +182,7 @@ then
     fi
     unset _obn_brew_openssl
 fi
+unset _obn_openssl_root_in_args
 
 # On Linux and macOS, default the install prefix to the per-client config
 # directory when PREFIX is unset. Linux also prefers native ~/.config over
