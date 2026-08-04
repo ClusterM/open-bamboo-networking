@@ -279,28 +279,43 @@ bool parse_url(const std::string& url, TunnelUrl* out)
 {
     // Recognise the three URL shapes Studio hands us. Whichever it is,
     // strip the prefix and leave `rest` = "<...>[?query]".
-    static const std::string p_local  = "bambu:///local/";
-    static const std::string p_rtsps  = "bambu:///rtsps___";
-    static const std::string p_rtsp   = "bambu:///rtsp___";
+    //
+    // wxURI (macOS wxMediaCtrl2 / Windows DShow path) may collapse
+    // authority-less `bambu:///rtsps___…` into `bambu://rtsps___…`
+    // before Load/open. Accept any run of `/` after `bambu:` — same
+    // normaliser as stubs/dshow_filter.cpp.
+    static const char kBambu[] = "bambu:";
+    std::string body;
+    if (url.compare(0, sizeof(kBambu) - 1, kBambu) == 0) {
+        size_t p = sizeof(kBambu) - 1;
+        while (p < url.size() && url[p] == '/') ++p;
+        body = url.substr(p);
+    } else {
+        body = url;
+    }
+
+    static const std::string p_local = "local/";
+    static const std::string p_rtsps = "rtsps___";
+    static const std::string p_rtsp  = "rtsp___";
 
     std::string rest;
-    if (url.compare(0, p_local.size(), p_local) == 0) {
+    if (body.compare(0, p_local.size(), p_local) == 0) {
         out->scheme = Scheme::Local;
         out->port   = 6000;
-        rest = url.substr(p_local.size());
-    } else if (url.compare(0, p_rtsps.size(), p_rtsps) == 0) {
+        rest = body.substr(p_local.size());
+    } else if (body.compare(0, p_rtsps.size(), p_rtsps) == 0) {
         out->scheme = Scheme::Rtsps;
         out->port   = 322;
-        rest = url.substr(p_rtsps.size());
-    } else if (url.compare(0, p_rtsp.size(), p_rtsp) == 0) {
+        rest = body.substr(p_rtsps.size());
+    } else if (body.compare(0, p_rtsp.size(), p_rtsp) == 0) {
         out->scheme = Scheme::Rtsp;
         out->port   = 554;
-        rest = url.substr(p_rtsp.size());
+        rest = body.substr(p_rtsp.size());
     } else {
         // Bare "<ip>:<port>/..." fallback.
         out->scheme = Scheme::Local;
         out->port   = 6000;
-        rest = url;
+        rest = body;
     }
 
     // Split host.part vs ?query.

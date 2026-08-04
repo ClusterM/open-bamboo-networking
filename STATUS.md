@@ -465,14 +465,14 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 | `Bambu_SendMessage` | ✅ | Used by the file-browser path to enqueue CTRL JSON requests. |
 | `Bambu_SetLogger` | ✅ | Stored on the tunnel; routed through the same level-aware sink the rest of the library uses (see [README — `libBambuSource.so` logging](README.md#libbambusourceso-logging)). |
 | `Bambu_GetLastErrorMsg` | ✅ | Thread-local last-error string, populated by every TLS / RTSP / FTPS error site. |
-| `OBJC_CLASS_$_BambuPlayer` (macOS) | ❌ | Not exported. macOS Studio's camera tab will sit at `MEDIASTATE_LOADING` because the dlsym fails (Studio explicitly handles a missing symbol — no crash). The CTRL/file-browser path through `Bambu_*` keeps working on macOS. |
+| `OBJC_CLASS_$_BambuPlayer` (macOS) | ✅ | Clean-room Objective-C++ adapter in [`stubs/BambuPlayer.mm`](stubs/BambuPlayer.mm) (MRC, `-fno-objc-arc`; `@interface` marked `visibility("default")` so `dlsym` finds it under global `-fvisibility=hidden`). Reuses the existing `Bambu_*` C ABI for RTSPS/H.264 Annex-B; converts to AVCC and renders via `AVSampleBufferDisplayLayer`. Optional Studio callbacks (`setTrackReporter` / `setFirstFrameCallback` / `setSessionEndCallback`) implemented. MJPEG `:6000` is rejected (`-3`) — X1/P1S/P2S use RTSPS. End-to-end hardware validation pending (issue [#68](https://github.com/ClusterM/open-bamboo-networking/issues/68) tester). |
 
 ### Camera live view (per camera protocol)
 
 | Camera transport | Applies to | Status | Notes |
 | --- | --- | :--: | --- |
 | MJPEG over TLS, port 6000 | A1 / A1 mini / P1 / P1P | ✅ (not tested) | TLS + 80-byte auth + 16-byte framed JPEG samples. Linux: passes JPEG bytes through to `gstbambusrc`'s `jpegdec`. Windows: same JPEG payload pushed through our DShow source filter as `MEDIASUBTYPE_MJPG`. No A-series hardware available for on-device verification. |
-| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested P2S/N7: Linux Orca, Windows Bambu Studio `wxMediaCtrl3`, Windows Orca DShow) | Custom in-process RTSP/RTSPS client with LAN TLS verify (see §8.4.1); raw H.264 Annex-B byte stream out. Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec`. Windows Studio: FFmpeg `AVVideoDecoder`. Windows Orca: DShow `MEDIASUBTYPE_H264`. |
+| RTSPS → H.264 byte-stream, port 322 | X1 / X1C / X1E / P1S / P2S / H-series / X2D | ✅ (tested P2S/N7: Linux Orca, Windows Bambu Studio `wxMediaCtrl3`, Windows Orca DShow; macOS BambuPlayer built — hardware validation pending) | Custom in-process RTSP/RTSPS client with LAN TLS verify (see §8.4.1); raw H.264 Annex-B byte stream out. Linux: `gstbambusrc` → `h264parse + avdec_h264 / openh264dec`. Windows Studio: FFmpeg `AVVideoDecoder`. Windows Orca: DShow `MEDIASUBTYPE_H264`. macOS: `BambuPlayer` → AVCC → `AVSampleBufferDisplayLayer`. |
 | Cloud camera (TUTK / Agora p2p) | any printer over WAN | 🔒 | Proprietary SDK; out of scope. Stays on the LAN/Developer-Mode path. |
 
 ### PrinterFileSystem (MediaFilePanel)
@@ -544,7 +544,7 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 
 | Feature | Status | Notes |
 | --- | :--: | --- |
-| Objective-C `BambuPlayer` class | ❌ | Required for camera live view on macOS; not shipped. The `Bambu_*` C ABI for the file browser still works on macOS once the dylib is built. |
+| Objective-C `BambuPlayer` class | ✅ | Required for camera live view on macOS (`wxMediaCtrl2.mm` → `dlsym(…, "OBJC_CLASS_$_BambuPlayer")`). Shipped in `libBambuSource.dylib` ([`stubs/BambuPlayer.mm`](stubs/BambuPlayer.mm)): MRC (`-fno-objc-arc`, Studio calls `[player dealloc]` directly), `visibility("default")` on the `@interface`, Annex-B→AVCC helper in [`stubs/h264_avcc.cpp`](stubs/h264_avcc.cpp). Shared `parse_url` accepts wxURI slash-collapse (`bambu://rtsps___…`). CI asserts the class symbol with `nm`. Hardware LiveView validation tracked in issue [#68](https://github.com/ClusterM/open-bamboo-networking/issues/68). |
 
 ---
 
