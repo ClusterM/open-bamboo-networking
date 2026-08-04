@@ -5,6 +5,11 @@ project(open-bamboo-networking
     LANGUAGES C CXX
 )
 
+# macOS BambuPlayer adapter (stubs/BambuPlayer.mm) is Objective-C++.
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 # Vendored mosquitto pulls cJSON via FetchContent; released cJSON tags still
 # declare cmake_minimum_required(VERSION 3.0) or older. CMake 3.31+ rejects
 # that unless we raise the policy floor (same effect as -DCMAKE_POLICY_VERSION_MINIMUM=3.5).
@@ -440,6 +445,7 @@ set(_obn_bambusource_sources
     stubs/tls_socket.cpp
     stubs/rtsp_client.cpp
     stubs/rtsp_passthrough.cpp
+    stubs/h264_avcc.cpp
     src/config.cpp
     src/ftps.cpp
     src/json_lite.cpp
@@ -459,6 +465,14 @@ if(WIN32)
         stubs/BambuSource.def
     )
 endif()
+if(APPLE)
+    # MRC required: wxMediaCtrl2::~wxMediaCtrl2 calls [player dealloc]
+    # directly. Keep -fno-objc-arc on this translation unit only.
+    list(APPEND _obn_bambusource_sources stubs/BambuPlayer.mm)
+    set_source_files_properties(stubs/BambuPlayer.mm PROPERTIES
+        COMPILE_OPTIONS "-fno-objc-arc"
+    )
+endif()
 
 add_library(BambuSource SHARED ${_obn_bambusource_sources})
 # `src` is on the include path for src/ftps.cpp's private ftps_parse.hpp.
@@ -470,6 +484,17 @@ if(WIN32)
         ws2_32 crypt32 secur32 bcrypt iphlpapi
         strmiids ole32 oleaut32 uuid
         advapi32 shell32 user32
+    )
+elseif(APPLE)
+    set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
+    target_link_libraries(BambuSource PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto
+        "-framework Foundation"
+        "-framework Cocoa"
+        "-framework QuartzCore"
+        "-framework AVFoundation"
+        "-framework CoreMedia"
+        "-framework CoreVideo"
     )
 else()
     set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
@@ -731,6 +756,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(tunnel_local_test PRIVATE include stubs ${OBN_GENERATED_DIR})
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME tunnel_local COMMAND tunnel_local_test)
+
+    # Portable Annex-B → AVCC helper used by the macOS BambuPlayer adapter.
+    add_executable(h264_avcc_test tests/h264_avcc_test.cpp
+        stubs/h264_avcc.cpp)
+    target_include_directories(h264_avcc_test PRIVATE stubs)
+    add_test(NAME h264_avcc COMMAND h264_avcc_test)
 
     # Hermetic unit test for obn::auth::Store persistence, specifically
     # the firmware_beta_open field (profile setting.isFirmwareBetaOpen)
