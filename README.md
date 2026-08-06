@@ -6,29 +6,23 @@ plugin.
 ## Table of contents
 
 - [Downloads](#downloads)
+- [Installation](#installation)
 - [Why this project exists](#why-this-project-exists)
 - [Supported platforms](#supported-platforms)
-- [Supported Bambu Studio versions (ABI versions)](#supported-bambu-studio-versions-abi-versions)
-- [Developer Mode requirement](#developer-mode-requirement)
+- [Supported slicers](#supported-slicers)
+- [Two ways to run](#two-ways-to-run)
+  - [Option A: Developer Mode](#option-a-developer-mode)
+  - [Option B: cloud mode without Developer Mode](#option-b-cloud-mode-without-developer-mode)
 - [What works and what's not](#what-works-and-whats-not)
   - [TL;DR: what is **not** implemented](#tldr-what-is-not-implemented)
   - [More details](#more-details)
     - [Basics (model-independent)](#basics-model-independent)
     - [Printing](#printing)
     - [Camera liveview](#camera-liveview)
-    - [File browser (Device → Files)](#file-browser-device-files)
     - [Status / Device tab](#status-device-tab)
-  - [Cloud sign-in](#cloud-sign-in)
-- [How to build](#how-to-build)
-  - [Linux](#linux)
-    - [Prerequisites](#prerequisites-linux)
-    - [Linux: configure, build and install](#linux-configure-build-and-install)
-    - [`./configure` options](#configure-options)
-  - [macOS](#macos)
-  - [Windows](#windows)
-    - [Prerequisites](#prerequisites-windows)
-    - [Windows: configure, build and install](#windows-configure-build-and-install)
-- [Manual installation](#manual-installation)
+  - [Cloud sign-in in Developer or LAN-only mode](#cloud-sign-in-in-developer-or-lan-only-mode)
+- [Building from source](#building-from-source)
+- [Configuration file](#configuration-file)
 - [Logging](#logging)
   - [`libBambuSource.so` logging](#libbambusourceso-logging)
 - [Known issues](#known-issues)
@@ -49,6 +43,21 @@ they can also be unstable, contain incomplete functionality, or introduce
 breaking changes that will be revised before the next stable release. Use them
 if you want the cutting edge and are comfortable reporting issues.
 
+## Installation
+
+Every release / interim archive ships with an interactive installer, so you do
+**not** need to build anything. Download the archive for your platform, unpack
+it, and run the bundled installer:
+
+| Platform | Archive | Installer |
+| --- | --- | --- |
+| Linux (x86_64 / aarch64) | `obn-linux-*.tar.gz` | `chmod +x install.sh && ./install.sh` |
+| Windows (x64 / ARM64) | `obn-windows-*.zip` | double-click `install.bat`, or `.\install.ps1` in PowerShell |
+| macOS (Apple Silicon / Intel) | `obn-macos-*.tar.gz` | double-click `install.command` in Finder, or `./install.sh` |
+
+Close the slicer before running the installer. After installing, launch it
+again and (optionally) tune the plugin via [`obn.conf`](#configuration-file).
+
 ## Why this project exists
 
 [Bambu Studio](https://github.com/bambulab/BambuStudio) is an excellent
@@ -67,11 +76,12 @@ Device-tab click hits it again. The workaround
 performance and still misbehaves in LAN-only mode. Reported to Bambu
 over a year ago and still open:
 [bambulab/BambuStudio#8605](https://github.com/bambulab/BambuStudio/issues/8605).
-- **No ARM or non-x86_64 build.** The plugin is only published as
-Linux x86_64 (plus Windows and macOS). You can't use Studio or any
-third-party tool that reuses the plugin on a Raspberry Pi, an
-Ampere workstation, or any other aarch64 / riscv host, even though
-the rest of Studio builds cleanly.
+- **No ARM or non-x86_64 build.** The stock plugin is published for
+x86_64 only. You can't use Studio or any third-party tool that reuses
+the plugin on a Raspberry Pi, an Ampere workstation, or any other
+aarch64 host, even though the rest of Studio builds cleanly. (This
+project additionally builds for Linux aarch64 and Windows ARM64 — see
+[Supported platforms](#supported-platforms).)
 - **Cloud chatter on every action, even in LAN-only mode.** Even when
 the printer is sitting on the same subnet as Studio in Developer
 Mode, the stock plugin keeps reaching out to
@@ -82,9 +92,11 @@ surveillance footprint a lot of users didn't opt in to.
 
 This project is a drop-in replacement for that library: same `dlsym`
 ABI, same file name, same install location, but open source,
-aligned-atomic-clean, cross-architecture-buildable, and strictly
-LAN-first (the cloud is only ever contacted for sign-in, so that
-Studio's preset sync works — the rest is straight to the printer).
+aligned-atomic-clean, cross-architecture-buildable, and LAN-first **by
+default** (`block_cloud = 1`: the cloud is only contacted for sign-in
+and preset sync, the rest goes straight to the printer). The cloud path
+is there when you deliberately opt in — see
+[Option B](#option-b-cloud-mode-without-developer-mode).
 
 Protocol knowledge comes from
 [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI) and the
@@ -106,11 +118,21 @@ Please note:
 
 - Linux x86_64 (primary target).
 - Linux aarch64 (primary target).
-- Windows x64 (experimental).
-- Windows ARM64 (experimental).
-- macOS (experimental; curl and OpenSSL are statically embedded — no Homebrew runtime dependency).
+- Windows x64 (primary target).
+- Windows ARM64 (experimental, no video).
+- macOS ARM64 (experimental).
+- macOS x64 (experimental).
 
-## Supported Bambu Studio versions (ABI versions)
+All of these are built and smoke-tested in CI for every supported ABI.
+
+## Supported slicers
+
+The same plugin binary drives both **Bambu Studio** and **Orca Slicer** — they
+consume the same C ABI — and the installer handles the per-client conventions
+for you. But they are not equal targets.
+
+**Bambu Studio — primary target.** Development and testing happen here first;
+every feature is verified against Studio. Supported ABI series:
 
 - Bambu Studio **02.03.00**._xx_
 - Bambu Studio **02.03.01**._xx_
@@ -124,26 +146,44 @@ Please note:
 - Bambu Studio **02.07.00**._xx_
 - Bambu Studio **02.07.01**._xx_
 - Bambu Studio **02.08.00**._xx_
+- Bambu Studio **02.08.01**._xx_
 
 Compatibility with plugin ABI depends on the first three numbers in the version number, e.g.
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
 
-Orca Slicer lets you select plugin versions directly.
+**Orca Slicer — supported, with caveats.** Orca tracks the plugin ABI
+separately from its own app version, so the installer always installs the
+**`02.03.00`** series and patches `network_plugin_version` in `OrcaSlicer.conf`
+to match — you do not have to pick a version in Preferences. That is the series
+Orca has shipped since **Orca Slicer v2.3.2**; earlier releases ask for
+`02.01.01`, which this project does not build, so v2.3.2 is the minimum. The
+library file name must carry the version (`libbambu_networking_<ver>.so`), which
+the installer also handles. Expect these differences from Studio:
 
-## Developer Mode requirement
+- **No current-print thumbnail.** Orca routes `get_subtask_info` through its
+  own `OrcaCloudServiceAgent` stub instead of the plugin, so the Device panel
+  shows a placeholder cover. This needs a patch to Orca itself and cannot be
+  fixed plugin-side (see [Known issues](#known-issues)).
+- **MQTT reconnect churn.** Orca tears down and re-establishes the MQTT
+  session after every print, causing a 5-30 s delay on printers with few MQTT
+  slots — which is why `mqtt_keep_connection` defaults to `1`.
+- **Camera on Windows needs the DirectShow filter.** Orca plays video through
+  `wxMediaCtrl2` / DirectShow, so `BambuSource.dll` must be registered with
+  `regsvr32` (the installer offers to do this). Bambu Studio does not need it.
+
+## Two ways to run
 
 Recent (2024+) printer firmware cryptographically verifies every MQTT command
-it receives when the printer is paired with the Bambu cloud. The verification
-uses a per-installation RSA key that the stock plugin ships as obfuscated data
-and which we do not reproduce. Symptom on the printer screen when an unsigned
-command arrives:
+it receives while the printer is paired with the Bambu cloud. The verification
+uses a per-installation RSA key that the stock plugin ships as obfuscated data.
+There are two ways to work with that, and they trade convenience against how
+much of the cloud you keep.
 
-```
-MQTT Command verification failed
-err_code: 84033543
-```
+### Option A: Developer Mode
 
-To use this plugin, put the printer in **Developer Mode**:
+This is the **simple path, and it is enough for most people.** The printer is
+switched into Developer Mode, which turns MQTT command verification off, so the
+plugin can drive it over the LAN with no signing keys at all.
 
 1. On the printer screen, enable LAN-only mode and Developer mode. Bambu places these toggles in different submenus depending on the model and firmware — look for options named along the lines of "LAN Only", "LAN Only liveview", and "Developer mode". Examples:
    - **P2S**: Nut icon -> Settings -> **LAN Only Mode**
@@ -152,25 +192,90 @@ To use this plugin, put the printer in **Developer Mode**:
 
 In this mode the printer skips MQTT verification and accepts plain LAN
 commands. All LAN features of the plugin (discovery, telemetry, printing,
-filename browsing, file transfer, camera) work normally.
+file browsing, file transfer, camera) work normally.
 
-Non-developer / hybrid / cloud-only modes are **only partially
-implemented** and remain **severely limited**: the plugin can still
-sign you into the cloud, fetch presets, and show telemetry, but **you
-cannot reliably start a print** — the printer expects MQTT commands to
-carry the stock plugin's RSA signature, which we do not ship. Without
-Developer Mode every `print` / `project_file` / similar command is
-rejected (`err_code: 84033543`). Fully replicating that signing chain
-is out of scope for an open-source project. MakerWorld task history is
-likewise out of scope.
+**What Developer Mode costs you:**
+
+- **No cloud print dispatch — you can only start prints while on the same
+  network as the printer.** This is solvable but more work to set up: run a VPN
+  (e.g. WireGuard / Tailscale) back into your home network, or port-forward
+  `8883` / `990` / `6000` / `322` to the printer and set `override_lan_ip = 1`
+  so the camera and file browser also use the reachable address.
+- **No cloud print records:** MakerWorld print history and model ratings are
+  not written for LAN prints.
+- Cloud camera and cloud file browsing are unavailable — but those are not
+  implemented in either mode (LAN only, see below).
+
+### Option B: cloud mode without Developer Mode
+
+Starting with v2.0.0 the plugin can also drive a **cloud-paired printer with
+verification left ON** — no Developer Mode. This keeps the cloud features
+(cloud print dispatch, print history, MakerWorld) but is meant for advanced
+users, because it requires private slicer credentials that this project does
+**not** distribute.
+
+Two things are needed:
+
+**1. Bambu's slicer credentials, which you provide yourself.** Put
+`slicer_cert.pem`, `slicer_key.pem` and `slicer_crl.pem` in the plugin's config
+directory (or point at them with `slicer_cert_pem` / `slicer_key_pem` /
+`slicer_crl_pem` in [`obn.conf`](#configuration-file)). The plugin uses the key
+to sign MQTT `print` commands and to install its app certificate on the printer.
+**These are private credentials. This project does not ship them and gives no
+instructions on obtaining them** — you have to find or extract them yourself,
+and you alone are responsible for ensuring your use complies with the
+applicable terms and law.
+
+**2. Two settings in [`obn.conf`](#configuration-file).** Set `block_cloud = 0`
+(the default `1` blocks cloud printing outright) and
+`client_name = BambuStudio` (the honest default client name is rejected by the
+cloud print API with HTTP 403).
+
+With that in place you get signed MQTT commands, on-printer app-certificate
+install, cloud print dispatch, print history and MakerWorld — without touching
+Developer Mode.
+
+**What the default `cloud_print = cloud_only` actually uploads.** Even in this
+mode the model itself normally stays on your network: for a print with a cloud
+record the plugin sends the `.3mf` straight to the printer over LAN FTPS, and
+only the *record* goes to Bambu — a project entry, a task entry
+(`mode=lan_file`) and a small config `.3mf` that print history uses for its
+thumbnails. That record is exactly what buys you the cloud extras: print
+history in Studio and Handy, and the ability to rate models on MakerWorld. The
+full model is uploaded to Bambu's servers only when Studio dispatches a pure
+cloud print (`start_print`), e.g. for a printer that is not reachable on your
+LAN.
+
+**You can limit even that:** set `cloud_print = try_lan_first` or `lan_only` to
+print over the LAN without writing a cloud record at all, and
+`cloud_hide_history = 1` to hide the cloud print history in Studio.
+
+If you run **neither** Developer Mode **nor** valid credentials, the printer
+rejects every `print` / `project_file` command and shows on its screen:
+
+```
+MQTT Command verification failed
+err_code: 84033543
+```
 
 ## What works and what's not
 
 ### TL;DR: what is **not** implemented
 
-- Printing in non-developer mode
-- MakerWorld integration
-- Internal storage file browser/operations
+- **Camera live view over the cloud** (TUTK / Agora p2p) — video works on the
+  LAN only.
+- **File operations over the cloud** — browsing / download / delete work over
+  the LAN only (`:6000` / FTPS).
+- **Go Live** and **HMS photo snapshot** — both are cloud-only and need the
+  proprietary SDK.
+
+Two things that used to be listed here now work with caveats:
+
+- **Printing without Developer Mode** works if you supply your own slicer
+  credentials — see [Option B](#option-b-cloud-mode-without-developer-mode).
+- **MakerWorld** (print history, model ratings, task list) works in cloud mode;
+  see the [Printing](#printing) table and
+  [Option B](#option-b-cloud-mode-without-developer-mode).
 
 ### More details
 
@@ -195,6 +300,7 @@ Legend:
 | ---- | ------------------------------------------------------------------------------------------------------------ |
 | ✅   | Implemented and working on the listed models. "Tested" column says where the author has physically verified. |
 | ⚠️   | Partial / soft-fails / needs a prerequisite (see Notes).                                                     |
+| 🔒   | Implemented, but only works with proprietary Bambu secrets you supply yourself (see [Option B](#option-b-cloud-mode-without-developer-mode)). |
 | ❌   | Not implemented (see [TL;DR: what is **not** implemented](#tldr-what-is-not-implemented) for scope rationale). |
 
 The **Impl** column distinguishes:
@@ -215,7 +321,8 @@ Studio does the work.
 | Cloud MQTT telemetry                 | ✅     | Native              | TLS to `us.mqtt.bambulab.com:8883`. Runs in parallel with LAN when signed in; not exercised during LAN-focused testing.                                              |
 | Cloud login / ticket flow            | ✅     | Native              | Browser → `localhost` callback → `POST /user-service/user/ticket/<T>`. Session persisted to `obn.auth.json`.                                                         |
 | User presets sync / profile / avatar | ✅     | Native              | List / create / update / delete works                                                                                                                                |
-| MQTT command signing                 | ❌     | —                   | Stock plugin carries per-install RSA keys we don't reproduce. Workaround for the user: enable Developer Mode on the printer (all LAN commands bypass signing there). |
+| Filament Manager (cloud spool catalogue) | ✅ | Native              | Studio's spool tab (Studio 02.06.01+). All CRUD endpoints plus the bulk AMS sync added in ABI 02.08.01 (new in v2.0.0). Needs cloud sign-in; works under the default `block_cloud = 1`. |
+| MQTT command signing                 | 🔒     | Native              | (new in v2.0.0) Signs `print` commands (RSA-PKCS#1 v1.5 + SHA-256) and installs the app cert on the printer **when you supply your own `slicer_key.pem` / `slicer_cert.pem`** — see [Option B](#option-b-cloud-mode-without-developer-mode). Without those keys nothing is signed; use Developer Mode instead. |
 
 #### Printing
 
@@ -224,7 +331,8 @@ Studio does the work.
 | LAN print (FTPS + MQTT, Dev Mode)          | ✅ (tested on P2S) | Native      | FTPS upload and `{"print":{"command":"project_file",...}}` command on LAN MQTT.                                                                                                                                             |
 | "Send to Printer" dialog (`ft_*`)          | ✅ (tested on P2S) | Native    | `ft_*` over TLS :6000 — upload `cmd_type=5`, ability `7`, Printer Preview `cmd_type=4` (`mem:/26`). See [STATUS.md §8.14](STATUS.md#814-file-transfer-abi-ft_). |
 | Cloud 3MF upload to S3                     | ✅                 | Native      | 6-step upload sequence reversed from MITM of the stock plugin.                                                                                                                                                              |
-| `create_task` (MakerWorld entry)           | ⚠️                 | ❌          | Soft-fails — logs 4xx, keeps going with `task_id="0"`. Printing works; MakerWorld history and timelapse-on-printer cloud flags don't. See [TL;DR: what is **not** implemented](#tldr-what-is-not-implemented) (MakerWorld). |
+| Cloud print dispatch (`start_print`)       | ⚠️                 | Native      | (new in v2.0.0) Full cloud pipeline: `POST /user/project` → presigned S3 upload → `POST /my/task`. Requires `block_cloud = 0`, `client_name = BambuStudio`, cloud login, and (on a verified printer) your own `slicer_key.pem`. Governed by `cloud_print` (see [Configuration file](#configuration-file)). |
+| `create_task` (MakerWorld entry)           | ⚠️                 | Native      | (new in v2.0.0) Writes the MakerWorld task/print-history record as part of the cloud print flow. Needs `client_name = BambuStudio` (otherwise `POST /my/task` → HTTP 403). Not written for pure LAN prints (`try_lan_first` / `lan_only`). |
 | "Print from Device" (`start_sdcard_print`) | ✅ (tested on P2S) | Alternative | Stock plugin: cloud REST endpoint we can't sign. Ours: publish `project_file` on LAN MQTT for a file already on the printer.                                                                                                |
 | AMS telemetry / mapping                    | ✅                 | Passthrough | Studio consumes `push_status` directly.                                                                                                                                                                                     |
 | Nozzle mapping / multi-extruder            | ✅ (not tested)    | Passthrough | Plugin puts nozzle mapping data into JSON but the author has no such printer to test.                                                                                                                                       |
@@ -241,22 +349,6 @@ difference is what happens inside.
 | RTSPS → H.264 byte-stream, port 322     | P1S, X1 (all), P2S, H-series, X2D | ✅ (tested on P2S) | Native | Same wire format the stock plugin uses: raw H.264 Annex-B byte-stream out via `Bambu_ReadSample`; the slicer's vendored `gstbambusrc` decodes it. |
 | Cloud camera (TUTK / Agora p2p)         | any printer out of LAN            | ❌                 | ❌     | Proprietary libraries.                                                                                                                            |
 
-#### File browser (Device → Files)
-
-**Default (stock parity):** `libBambuSource.so` opens TLS **:6000**, runs the BambuTunnelLocal handshake (`StartStreamEx` / `mtype` 12291), then **forwards** Studio's CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) to printer firmware — same wire as stock. See [research/09.05-ctrl.md §9.5.1](research/09.05-ctrl.md#951-where-the-printer-side-bytes-actually-come-from).
-
-**3MF model thumbnails in the browser:** Studio sends **`SUB_FILE`** (`cmdtype=2`). Typical shapes:
-- `req.paths`: `["/path/model.gcode.3mf#thumbnail"]` — firmware returns `Metadata/plate_N.png` bytes (or sidecar `.jpg` for timelapses).
-- `req.zip=true` — whole `.3mf` archive in chunks for FetchModel.
-
-Our plugin forwards `SUB_FILE` to firmware over native `:6000` passthrough; no client-side ZIP parse.
-
-| Feature | Status | Notes |
-| --- | :--: | --- |
-| Browse / download / delete | ✅ (P2S) | Native `:6000` passthrough |
-| `SUB_FILE` / `.3mf` plate thumbnails | ✅ | Stock wire; `#thumbnail` in path |
-| Internal eMMC tab (`storage=internal`) | ⚠️ | Depends on firmware + native :6000 (same as stock) |
-
 #### Status / Device tab
 
 | Feature                                     | Applies to | Status             | Impl        | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -265,33 +357,17 @@ Our plugin forwards `SUB_FILE` to firmware over native `:6000` passthrough; no c
 | Firmware version panel (Device → Update)    | All models | ✅ (tested on P2S) | Mixed       | `bambu_network_get_printer_firmware` re-synthesises the "firmware list" Studio expects from the MQTT frames the printer already sends (`info.module[]` replies + `push_status.upgrade_state.new_ver_list`). That populates the Update tab with current per-module versions (OTA, AMS, AHB, …), stock-style. When the printer advertises a newer version the "current → new" arrow and the green "update available" badge appear.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Firmware Release Notes dialog               | All models | ✅ (tested on P2S) | Alternative | Shown when a new version is advertised. Description text is synthesised locally with a link to the model-specific page on [bambulab.com/support/firmware-download](https://bambulab.com/en/support/firmware-download/all); we can't reach Bambu's cloud changelog API without login. If no new version is advertised the dialog is empty — which matches stock behaviour in the same situation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Start firmware update (Update button)       | All models | ✅ (tested on P2S) | Passthrough | Button publishes `{"upgrade":{"command":"upgrade_confirm"}}` on LAN MQTT. The printer already knows which OTA package it advertised and downloads it from Bambu's CDN itself — the plugin doesn't need to supply a URL.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| Flash an arbitrary version (version picker) | —          | ❌                 | —           | Stock plugin lets you pick any older/newer OTA from Bambu's cloud catalogue; that catalogue is auth-gated and we don't have cloud signing. Only the printer-advertised version is flashable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
-### Alternative implementation reference
+### Cloud sign-in in Developer or LAN-only mode
 
-Features marked **Alternative** in the tables above use a different
-transport from the stock plugin to achieve the same user-visible result
-on Developer-Mode printers without proprietary cloud signing.
-
-| Feature                                                        | What the stock plugin does                                                                                                                                                                                                                                                                                                                                                                                                                           | What we do                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Why this is acceptable                                                                                                                                                                                                                                                                                                                                                                                            | Trade-offs                                                                                                                                                                                                                                                                                                                               |
-| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Device → Files (`libBambuSource`)                              | Stock keeps TLS :6000 open and forwards CTRL JSON to firmware.                                                                                                                                                                                                                                                                                                                                                                                          | Same — native BambuTunnelLocal passthrough (`start_native_ctrl_handshake`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Matches stock wire.                                                                                                                                                                                                                                                                                                                                                                           | —                                                                                                                                                                                                                      |
-| 3MF thumbnails in file browser                                 | Firmware handles `SUB_FILE` (`path#thumbnail` or zip mode) over :6000.                                                                                                                                                                                                                                                                                                                                                                                | Passthrough — firmware returns PNG/JPEG bytes; no local ZIP parse.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Same as stock.                                                                                                                                                                                                                                                                                                                                                                         | —                                                                                                                                                                                                                                   |
-| Camera liveview (RTSPS)                                        | Stock `libBambuSource.so` does the RTSP/RTSPS handshake on port 322 (live555-based) and hands raw H.264 byte-stream back through `Bambu_ReadSample`; the slicer's `gstbambusrc` then decodes it.                                                                                                                                                                                                                                                     | Same thing with our own RTSP client (`stubs/rtsp_client.cpp` — TLS + Basic/Digest auth + RTP/TCP-interleaved depacketisation, FU-A / STAP-A reassembly, GET_PARAMETER keepalive) and an Annex-B passthrough worker (`stubs/rtsp_passthrough.cpp`) that re-prefixes SPS/PPS in front of every IDR. The byte stream is the same one stock returns.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Owning the RTSP layer ourselves drops the live555 dependency and keeps the plugin self-contained.                                                                                                                                                                                                                                                                                                                 | Single H.264 video track, baseline/main profile, no audio. Reconnect on stream drop is "tear down + re-`Bambu_Open`", same as stock.                                                                                                                                                                                                     |
-| `start_sdcard_print` over LAN MQTT                             | Stock plugin hits a cloud REST endpoint (`start_sdcard_print`) that signs and relays the command via the cloud tunnel.                                                                                                                                                                                                                                                                                                                               | We publish `{"print":{"command":"project_file", "url":"file:///<path>", …}}` directly on the active LAN MQTT session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | The cloud endpoint requires MakerWorld signing we don't reproduce, and Developer Mode printers have no cloud route to receive it on anyway. LAN MQTT is what the firmware actually consumes.                                                                                                                                                                                                                      | No cloud task record. `task_id` / `subtask_id` / `project_id` are all `0`, which a very old firmware could refuse if it ever validates them (none observed).                                                                                                                                                                             |
-| Cross-device user preset sync                                  | Stock plugin's `get_setting_list2` only fetches metadata (`setting_id`, `name`, `update_time`, …) from `GET /v1/iot-service/api/slicer/setting`, assuming the matching preset body is already present on disk under `<config_dir>/user/<uid>/`. On a fresh machine the list walk produces a `setting_id` with no `setting` map to merge in, so `PresetCollection::load_user_preset()` silently skips every cloud preset and your profiles disappear. | For each preset the Studio-provided `CheckFn` flags as needed, we additionally issue `GET /v1/iot-service/api/slicer/setting/<setting_id>` to pull the full `setting` payload, then inject `user_id` (not returned by the server) and convert `update_time` from `"YYYY-MM-DD HH:MM:SS"` into the unix-seconds string `load_user_preset()` expects. The resulting flat `values_map` is handed to Studio exactly where it would expect one from a local file.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Studio's loader path and the cloud endpoint both exist; the stock plugin simply never connects the two. The extra `GET /setting/<id>` per preset is the minimum RTT needed to survive a wiped local cache (on which the author got burnt while reverse-engineering this section).                                                                                                                                 | One HTTPS round-trip per synced preset on the first sync after a wipe (~100 KB response each). On a machine that already has the local files, Studio's `need_sync()` check short-circuits the download — same bandwidth as stock.                                                                                                        |
-| Firmware info synthesis (`get_printer_firmware`)               | Stock plugin serves `GET /v1/iot-service/api/slicer/resource/printer/firmware?dev_id=…` against the Bambu cloud, returning a JSON envelope (current/new version per module + release notes + binary URL) that Studio's `UpgradePanel` and `ReleaseNoteDialog` render.                                                                                                                                                                                | The plugin doesn't call the cloud at all. Instead the agent maintains a `DeviceFw` cache keyed by `dev_id` that harvests versions from every MQTT frame the printer already sends: `info.command=get_version` replies (module array with `name`/`sw_ver`/`sn`/`loader_ver`) and `push_status.upgrade_state.new_ver_list`. `render_firmware_json(dev_id)` then emits the same envelope Studio expects — current versions populate the Update panel, advertised newer versions light up the "update available" banner, the description links to `bambulab.com/en/support/firmware-download/all`. The actual flash is a passthrough: Studio's "Update" button publishes `{"upgrade":{"command":"upgrade_confirm"}}` on LAN MQTT, and the printer fetches the binary from Bambu's CDN itself.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | The cloud firmware catalogue requires a signed request with an `accessToken` for a linked account and answers with HTML behind Cloudflare from an untrusted client (no stable public JSON). What we need (current version, advertised new version, a way to flash the advertised one) is already on the wire in plaintext via MQTT, so we re-synthesise the envelope locally.                                     | No cross-version history — you can only flash what the printer is currently advertising, not an older or a beta OTA from the cloud catalogue. Release Notes text is a short auto-generated stub with an external link, not the full changelog. No effect when no new version is advertised (Release Notes dialog empty — same as stock). |
-| `ft_*` over TLS :6000 | Port-6000 BambuTunnelLocal for Send-to-Printer, eMMC preflight, LAN print upload, and **Printer Preview** (`cmd_type=4` / `mem:/26`). | Native `:6000` wire (`tunnel_upload.cpp` + `abi_ft.cpp`): chunked upload / mem download — [§6.4](research/06.04-port-6000.md); ABI [§8.14](research/08.14-file-transfer.md). | Same BambuTunnelLocal framing as stock `ft_*`. | Shared with `start_local_print` when `try_emmc_print`. Legacy printers without `:6000` use Studio `SendJob` → FTPS. [STATUS.md §8.14](STATUS.md#814-file-transfer-abi-ft_). |
-| Current-print thumbnail cover                                  | Stock plugin gets `project_id`/`profile_id`/`subtask_id` from cloud tasks; `get_subtask_info` returns CDN `thumbnail.url`.                                                                                                                                                                                                                                                                            | **(a)** LAN prints with zero ids → rewrite to synthetic `lan-<fnv>` on `push_status`. **(b)** Real cloud subtask ids after unbind → same `get_subtask_info` hook. Backend: loopback HTTP + **`SUB_FILE` on :6000** (`/cache/*.gcode.3mf#thumbnail`). Linux needs [`patches/bambustudio-statuspanel-thumbnail.patch`](patches/bambustudio-statuspanel-thumbnail.patch). | wxWebRequest rejects `file://`; loopback HTTP mirrors cloud path. Cache under `obn-covers/`. | One SUB_FILE per print; 503 if `/cache/` file gone.              |
-
-
-### Cloud sign-in
-
-Even though every print path is local, the plugin still implements
-Bambu's cloud account login. The reason is that Studio's UI and preset
-machinery are heavily wired to a logged-in `user_id`: without a session
-a number of features quietly degrade. With a session they behave as
-they did under the stock plugin.
+Signing in to your Bambu account is worth doing even when every print goes over
+the LAN. Studio's UI and preset machinery are heavily wired to a logged-in
+`user_id`, so without a session several features quietly degrade; with one they
+behave as they did under the stock plugin. Signing in does **not** move your
+printing to the cloud: in the default configuration (`block_cloud = 1`) the
+session is used for account-level REST only — background cloud connections and
+cloud printing stay blocked. Enabling those is
+[Option B](#option-b-cloud-mode-without-developer-mode).
 
 **What login gives you:**
 
@@ -304,6 +380,16 @@ around:
 2. **Filament presets**
 3. **Printer presets** (machine profiles)
 
+It also unlocks the **Filament Manager** tab (Bambu Studio 02.06.01 and newer),
+the cloud spool catalogue where Studio tracks every spool you own — RFID,
+vendor, type, remaining weight, AMS slot binding. The plugin implements all of
+its endpoints, including the bulk AMS sync added in ABI 02.08.01, so the tab
+works as it does with the stock plugin.
+
+Bind/unbind and cloud print history remain available too; history and MakerWorld
+records are only written for cloud prints, so a Developer-Mode LAN print leaves
+no trace there.
+
 > **Note:** To sync custom filaments to the printer so they show up in its filament menu, temporarily
 > disable LAN-only mode and bind the printer to Bambu Cloud. Afterward, you can turn LAN-only mode and
 > Developer Mode back on.
@@ -311,238 +397,19 @@ around:
 **Running without sign-in** is fully supported: go straight to 
 "Device → Connect via LAN with access code",
 and LAN printing / camera / discovery / FTPS all work. You'll just
-lose the Studio features in the second list above.
+lose the Studio features in the list above (and, obviously, anything
+cloud-side such as print history / MakerWorld).
 
-## How to build
+## Building from source
 
-### Linux
+Most users should install a pre-built archive (see [Installation](#installation))
+instead of building. If you are developing, packaging for a distribution, or
+targeting a platform / ABI we do not ship binaries for, the full build and
+manual-installation guide lives in **[BUILDING.md](BUILDING.md)**.
 
-#### Prerequisites (Linux)
-
-You need **CMake ≥ 3.20**, a **C++17** compiler, **pkg-config**, and development
-headers for everything the project links against:
-
-| Component                           | Debian / Ubuntu packages                                                                             | Fedora-style packages                                                             |
-| ----------------------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Toolchain                           | `build-essential`, `cmake`, `pkg-config`                                                             | `gcc-c++`, `cmake`, `pkgconf-pkg-config`                                          |
-| MQTT / HTTP / TLS / zlib              | `git`, `uthash-dev`, `libcurl4-openssl-dev`, `libssl-dev`, `zlib1g-dev` | `git`, `uthash-devel`, `libcurl-devel`, `openssl-devel`, `zlib-devel` |
-
-> Note  
-> libmosquitto is **always vendored** via FetchContent at configure time (needs `git` + network). `uthash-dev` supplies `utlist.h`; cJSON is bundled automatically.
-
-One-shot install examples:
-
-```sh
-# Debian / Ubuntu
-sudo apt install build-essential cmake pkg-config git \
-  uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
-```
-
-```sh
-# Fedora
-sudo dnf install gcc-c++ cmake pkgconf-pkg-config git \
-  uthash-devel libcurl-devel openssl-devel zlib-devel
-```
-
-#### Linux: configure, build and install
-
-From the repository root, the usual three commands:
-
-```sh
-./configure
-make
-make install
-```
-
-For Orca Slicer (it uses the same binaries; only the installation process is different):
-```
-./configure --client-type=orca_slicer
-make
-make install
-```
-
-No `sudo` needed — the default install prefix is inside your home directory.
-
-That's it. `./configure` is a thin wrapper around CMake that writes the build
-tree into `build/` and by default this script autodetects the Bambu Studio version
-and the config location, then picks sensible defaults for a typical user.
-
-`make install` runs the automated install. For the manual steps (copy paths, conf keys), see [Manual installation](#manual-installation) below.
-
-`make uninstall` walks the install manifest and removes whatever was put
-down; `make clean` / `make distclean` drop build artefacts; `make test`
-runs the smoke tests via `ctest`.
-
-#### `./configure` options
-
-`./configure --help` prints the full list; the most useful ones:
-
-| Flag                      | Default                                                        | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--client-type=TYPE`      | `bambu_studio`                                                 | Which slicer the plugin is being installed for: `bambu_studio` or `orca_slicer`. Drives the default `--prefix`, the auto-detected version source and the installation procedure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `--prefix=DIR`            | per-client native config dir on Linux, with a Flatpak fallback | Where `make install` copies the shared objects and the OTA manifest. For both clients, `./configure` prefers the native config dir and only falls back to the Flatpak config dir when the native one is missing AND the Flatpak one exists: Studio: `~/.config/BambuStudio` → `~/.var/app/com.bambulab.BambuStudio/config/BambuStudio/`. Orca: `~/.config/OrcaSlicer` → `~/.var/app/com.orcaslicer.OrcaSlicer/config/OrcaSlicer/`. When this does not point at one of the two known dirs for the selected `--client-type`, the conf-file patch is skipped automatically — you are clearly building into a staging tree.                                                                                     |
-| `--build-type=TYPE`       | `Release`                                                      | `Release`, `Debug`, `RelWithDebInfo`, `MinSizeRel`. Maps to `-DCMAKE_BUILD_TYPE=…`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `--with-version=VER`      | auto (see **Version auto-detection** below)                    | Overrides automatic `OBN_VERSION`. The slicer compares only the **first 8 characters** (`MAJOR.MINOR.PATCH`), so e.g. AppImage `v02.05.02.51` wants `02.05.02.*`. Maps to `-DOBN_VERSION=…`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `--enable-tests`          | disabled                                                       | Build `probe_plugin`, `ftps_parse_test`, and `*_live_test` smoke tests. Default is off for regular user builds; CI enables it explicitly. Maps to `-DOBN_BUILD_TESTS=ON`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `--no-conf-patch`         | patch enabled                                                  | Do not edit the slicer's conf file (`BambuStudio.conf` / `OrcaSlicer.conf`) during `make install`. Handy when you want to inspect it yourself first or if you manage it through some other means. Maps to `-DOBN_PATCH_CLIENT_CONF=OFF`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `--build-dir=DIR`         | `build`                                                        | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `--cmake-arg=ARG`         | none                                                           | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-
-**Version auto-detection** (omit `--with-version`):
-
-- **Bambu Studio** — baseline comes from the slicer’s own build id: the `"version"` field inside the `"app"` object of `<prefix>/BambuStudio.conf` (written after you launch Studio at least once). That is the tag Studio and its bundled agent advertise; the plugin must match the **first eight characters** (`MAJOR.MINOR.PATCH`).
-- **Orca Slicer** — baseline comes from `"network_plugin_version"` in the `"app"` object of `<prefix>/OrcaSlicer.conf`, because Orca tracks plugin ABI separately from the Orca app version. If that key is still missing (fresh Orca install, no plugin installed yet), both scripts fall back to **`02.03.00`**.
-
-The detected `W.X.Y.Z` or `W.X.Y` is turned into a **four-component** `OBN_VERSION` with the **last component set to `99`** (e.g. `02.06.01.55` → `02.06.01.99`, `02.03.00` → `02.03.00.99`) so the replacement plugin always wins the “newer than the bundled agent” check.
-
-`./configure --help` also lists less common flags (including Mosquitto linking
-options). Driving **CMake** directly works the same way; see `OBN_`* and
-other cache variables in `CMakeLists.txt`.
-
-### macOS
-
-macOS builds **statically embed** OpenSSL and libcurl into the plugin dylibs
-(`OBN_MACOS_STATIC_DEPS=ON` by default). Homebrew is needed only at **build**
-time for `openssl@3` (static `.a` archives); the installed plugin does **not**
-require `brew install curl` / a Homebrew OpenSSL at runtime
-([issue #60](https://github.com/ClusterM/open-bamboo-networking/issues/60)).
-libcurl itself is vendored from source via FetchContent (minimal OpenSSL +
-system zlib build).
-
-#### Prerequisites (macOS)
-
-```sh
-brew install cmake pkg-config openssl@3 uthash
-```
-
-`./configure` auto-detects `OPENSSL_ROOT_DIR` from `brew --prefix openssl@3`
-when unset. Opt out of the static embed with
-`--cmake-arg=-DOBN_MACOS_STATIC_DEPS=OFF` (then you need a pkg-config
-`libcurl` as on Linux).
-
-#### macOS: configure, build and install
-
-```sh
-./configure
-make
-make install
-```
-
-Default `--prefix` is `~/Library/Application Support/BambuStudio` (or
-`…/OrcaSlicer` with `--client-type=orca_slicer`).
-
-### Windows
-
-Bambu Studio for Windows is a 64-bit MSVC build (Visual Studio 2019, see
-`3rd_party/BambuStudio/build_win.bat`). The plugin ABI passes
-`std::string`, `std::map` and `std::function` across the DLL boundary, so
-**the plugin must be built with the same compiler and STL Studio uses** —
-i.e. MSVC from Visual Studio 2019 (toolset v142). MinGW or any libstdc++
-flavour will silently mangle types and crash on the first `bambu_network_*`
-call. C++ libraries (OpenSSL, libcurl, zlib) come from
-[vcpkg](https://github.com/microsoft/vcpkg) in manifest mode (`vcpkg.json`).
-libmosquitto is always vendored via FetchContent (same as Linux).
-
-#### Prerequisites (Windows)
-
-- Visual Studio 2019 with the *Desktop development with C++* workload
-  (toolset v142). Newer toolsets *may* work but the std::string layout
-  across the DLL boundary is not guaranteed.
-- CMake ≥ 3.20 (the one bundled with VS 2019 works).
-- vcpkg checked out somewhere on disk; export `VCPKG_ROOT` so PowerShell
-  can find it. The vcpkg shipped with Visual Studio 2022 (under
-  `…\VC\vcpkg\`) works as well — `vcpkg.json` pins a `builtin-baseline`
-  SHA so modern, strict-manifest vcpkg installations are happy out of
-  the box.
-
-#### Windows: configure, build and install
-
-Recommended path through the supplied PowerShell wrapper (mirrors the POSIX
-`./configure`):
-
-For Bambu Studio:
-```powershell
-$env:VCPKG_ROOT = "C:\path\to\vcpkg"
-.\configure.ps1
-cmake --build   build --config Release
-cmake --install build --config Release
-```
-
-For Orca Slicer:
-```powershell
-$env:VCPKG_ROOT = "C:\path\to\vcpkg"
-.\configure.ps1 -ClientType orca_slicer
-cmake --build   build --config Release
-cmake --install build --config Release
-```
-
-The wrapper's full option list is `Get-Help .\configure.ps1 -Detailed`; the
-useful ones:
-
-| Flag                                  | Default                                    | Equivalent `./configure` flag                           |
-| ------------------------------------- | ------------------------------------------ | ------------------------------------------------------- |
-| `-ClientType bambu_studio`            | `bambu_studio`                             | `--client-type=bambu_studio` (or `orca_slicer`)         |
-| `-Prefix C:\Foo\BambuStudio`          | `%APPDATA%\<client>`                       | `--prefix=DIR`                                          |
-| `-WithVersion 02.06.01.99`            | auto-detected (see below)                  | `--with-version=VER`                                    |
-| `-EnableTests:$true`                  | `$false`                                   | `--enable-tests` (builds `probe_plugin.exe` on Windows) |
-| `-PatchConf:$false`                   | `$true`                                    | `--no-conf-patch`                                       |
-
-Windows-only options (no POSIX `./configure` equivalent — MSVC + vcpkg path only):
-
-| Flag                                  | Default                                    | What it does                                                                                                                                                                                                                                                                                                                                                                                 |
-| ------------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-VcpkgTriplet x64-windows-static-md` | static deps + dynamic CRT (matches Studio) | Selects the **vcpkg triplet** CMake uses (`VCPKG_TARGET_TRIPLET`): which variants of OpenSSL, zlib, curl, mosquitto, etc. get linked. The default **static libs + `/MD` runtime** matches typical Bambu Studio builds so you do not mix CRT modes across the DLL boundary. Use **`x64-windows`** if you want **shared** vcpkg DLLs (often quicker rebuilds, different deployment trade-off). |
-| `-VcpkgRoot C:\vcpkg`                 | `$env:VCPKG_ROOT`                          | **Path to your vcpkg checkout.** The script feeds CMake `…/scripts/buildsystems/vcpkg.cmake` from here so manifest mode can resolve `vcpkg.json`. Set the env var globally or pass this when vcpkg lives outside `%VCPKG_ROOT%` / you use several trees.                                                                                                                                     |
-| `-RegisterDShowFilter:$false`         | `$true`                                    | When **on** (default), `cmake --install` runs **`regsvr32`** on `BambuSource.dll` so the **DirectShow** source filter is **COM-registered** — needed for **Orca / `wxMediaCtrl2` / Windows Media Player** camera playback. Turn **off** for portable or staged installs, CI, or if you register the DLL yourself (`regsvr32 /s` / `/u`) after copying plugins by hand.                       |
-
-**Version auto-detection** (omit `-WithVersion`; same intent as Linux, different primary source):
-
-- **Bambu Studio** — `configure.ps1` first tries the **installed application binary**, not the conf file alone. It scans the **Add/Remove Programs** uninstall registry (`HKLM\…\Uninstall`, `HKLM\…\Wow6432Node\…\Uninstall`, `HKCU\…\Uninstall`) for an entry whose **DisplayName** is **`Bambu Studio`**, resolves the real **`bambu-studio.exe`** from **`DisplayIcon`** (or **`InstallLocation`** + `bambu-studio.exe`), and reads the PE **`FileVersion`** string. That matches what Studio uses internally as **`SLIC3R_VERSION`** and what the About box shows. Only if that path fails does it fall back to the **`"version"`** field under **`"app"`** in **`<Prefix>\BambuStudio.conf`** (default prefix is **`%APPDATA%\BambuStudio`**). The binary wins when both exist because the conf can **lag the `.exe`** after a patch, and Studio’s plugin gate compares against the **running build**, not the stale JSON line — picking only the conf can make Studio reject the DLL every launch. If **neither** `FileVersion` nor conf **`version`** is available, the script **errors** and asks for **`-WithVersion`** (same “no silent guess” idea as Linux).
-- **Orca Slicer** — the same registry walk for **DisplayName `OrcaSlicer`**, then **`FileVersion`** of the Orca executable; if that fails, **`"network_plugin_version"`** under **`"app"`** in **`<Prefix>\OrcaSlicer.conf`**. If that key is still absent (never installed a plugin), fall back to **`02.03.00`** — the newest network version Orca advertises upstream (see **`AVAILABLE_NETWORK_VERSIONS`** in Orca’s `bambu_networking.hpp`), so a pristine Orca profile still configures. When **FileVersion** and the conf disagree, the script prints a note and keeps the **binary** value.
-
-Identical to Linux: the chosen `W.X.Y.Z` or `W.X.Y` is normalized to **four** dotted components with the **last set to `99`** so the plugin passes the “newer than bundled agent” check.
-
-Driving CMake directly is also fine:
-
-```powershell
-cmake -S . -B build -G "Visual Studio 16 2019" -A x64 `
-    -DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake `
-    -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
-    -DOBN_VERSION=02.06.01.99 -DOBN_CLIENT_TYPE=bambu_studio
-cmake --build   build --config Release
-cmake --install build --config Release
-```
-
-`cmake --install` runs the automated install. For the manual steps (copy paths, conf keys), see [Manual installation](#manual-installation) below.
-
-## Manual installation
-
-First, copy the plugin binaries themselves: `*.so` on Linux and `*.dll` on Windows.
-For both Bambu Studio and Orca Slicer, put them in the `plugins` directory under the application’s data / config directory:
-
-  - `~/.config/<client_name>/plugins` — Linux
-  - `~/.var/app/<namespace>/config/<client_name>/plugins` — Linux (Flatpak install)
-  - `%APPDATA%\<client_name>\plugins` — Windows
-
-Here `client_name` is `BambuStudio` or `OrcaSlicer`, and `namespace` is `com.bambulab.BambuStudio` or `com.orcaslicer.OrcaSlicer` respectively.
-
-- **Bambu Studio:** also place `network_plugins.json` in `ota/plugins` (alongside the `plugins` directory).
-- **Orca Slicer:** rename `libbambu_networking.so` (or `bambu_networking.dll` on Windows) so the filename includes the plugin version, e.g. `libbambu_networking_02.03.00.99.so`.
-
-Then edit the configuration file.
-
-**Bambu Studio** — `BambuStudio.conf` (under the `app` object):
-
-  - set `"installed_networking"` to `"1"` (mark the plugin as installed)
-  - set `"update_network_plugin"` to `"false"` (avoid auto-update replacing it with the stock plugin)
-  - on **Windows** and **macOS**, set `ignore_module_cert` to `"1"` to skip publisher / certificate validation for the plugin
-
-**Orca Slicer** — `OrcaSlicer.conf` (under the `app` object):
-
-  - set `"installed_networking"` to `"true"`
-  - set `"network_plugin_version"` to your built plugin version, e.g. `02.03.00.99`
-  - set `"network_plugin_remind_later"` to `"true"` to suppress “newer plugin available” prompts
-  - remove your plugin version from `"network_plugin_skipped_versions"` if it appears there
+It covers prerequisites, all `./configure` / `configure.ps1` options, version
+auto-detection, and the [manual installation](BUILDING.md#manual-installation)
+steps.
 
 ## Configuration file
 
@@ -568,6 +435,8 @@ with every key and its default value.
 `##` section headers are comments too.
 Spaces around `=` are optional.
 
+**Logging** (see also [Logging](#logging); env vars override these):
+
 | Key | Default | Effect |
 | --- | --- | --- |
 | `log_level` | `info` | Log threshold: `trace`, `debug`, `info`, `warn`, `error`, `off`. Overridden by `OBN_LOG_LEVEL`. |
@@ -578,6 +447,35 @@ Spaces around `=` are optional.
 | `bambusource_log_stderr` | `1` | Copy BambuSource log lines to stderr with `[obn-bs]` prefix. Overridden by `OBN_BAMBUSOURCE_LOG_STDERR`. |
 | `bambusource_log_to_file` | `0` | When `1`, append to `<data_dir>/obn-bambusource.log`. Overridden by `OBN_BAMBUSOURCE_LOG_TO_FILE`. |
 | `bambusource_log_file` | *(empty)* | Explicit log file path for BambuSource. Overridden by `OBN_BAMBUSOURCE_LOG_FILE`. |
+
+**LAN networking:**
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
+| `override_lan_ip` | `0` | Replace the printer's self-reported LAN IP in push_status with the IP used in connect_printer. Enable for NAT / port-forwarding setups where the printer advertises its internal address. |
+| `mqtt_keep_connection` | `1` | Keep the MQTT connection alive across the slicer's internal disconnect/reconnect cycles (e.g. after sending a print job). Avoids 5-30s reconnection delays on printers with limited MQTT session slots. Useful for Orca Slicer. |
+
+**Print behaviour & file transfer:**
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
+| `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot (mem:/N over TLS :6000) shown in the device panel when live view is off. |
+| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
+
+**MQTT push_status patches** (all off by default; enable only if your model needs it):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `patch_mqtt_home_flag` | `0` | Rewrite home_flag SD-card bits from NO_SDCARD to HAS_SDCARD. Useful on some A-series where Studio greys out storage UI even though USB storage works. |
+| `patch_mqtt_ipcam_file` | `0` | Inject `ipcam.file` block into push_status when firmware omits it. Without this, Studio may refuse to open the file browser on some models. |
+| `patch_mqtt_internal_storage` | `0` | Set the internal storage capability bit so Studio shows the eMMC tab in the file browser. Firmware often omits this bit even when :6000/FTPS lists eMMC, and browsing internal memory may still be slow or unreliable (e.g. on P2S). |
+
+**Cloud endpoints** (change only for CN accounts or a dev host):
+
+| Key | Default | Effect |
+| --- | --- | --- |
 | `cloud_global_api_host` | `https://api.bambulab.com` | REST API base for non-CN accounts. |
 | `cloud_global_web_host` | `https://bambulab.com` | Web portal base for sign-in / bind UI (non-CN). |
 | `cloud_global_mqtt_host` | `us.mqtt.bambulab.com` | Cloud MQTT broker hostname (non-CN). |
@@ -585,32 +483,27 @@ Spaces around `=` are optional.
 | `cloud_cn_web_host` | `https://bambulab.cn` | Web portal base for sign-in / bind UI (CN). |
 | `cloud_cn_mqtt_host` | `cn.mqtt.bambulab.com` | Cloud MQTT broker hostname (CN). |
 | `cloud_mqtt_port` | `8883` | Cloud MQTT broker port (both regions). |
-| `block_cloud` | `1` | Block background cloud MQTT/REST connections. Auth, preset sync, and bind/unbind are still allowed. |
-| `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
-| `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
-| `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot (mem:/N over TLS :6000) shown in the device panel when live view is off. |
-| `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
-| `mqtt_keep_connection` | `1` | Keep the MQTT connection alive across the slicer's internal disconnect/reconnect cycles (e.g. after sending a print job). Avoids 5-30s reconnection delays on printers with limited MQTT session slots. Useful for Orca Slicer. |
-| `override_lan_ip` | `0` | Replace the printer's self-reported LAN IP in push_status with the IP used in connect_printer. Enable for NAT / port-forwarding setups where the printer advertises its internal address. |
-| `patch_mqtt_home_flag` | `0` | Rewrite home_flag SD-card bits from NO_SDCARD to HAS_SDCARD. Useful on some A-series where Studio greys out storage UI even though USB storage works. |
-| `patch_mqtt_ipcam_file` | `0` | Inject `ipcam.file` block into push_status when firmware omits it. Without this, Studio may refuse to open the file browser on some models. |
-| `patch_mqtt_internal_storage` | `0` | Set the internal storage capability bit so Studio shows the eMMC tab in the file browser. |
 
-Example — enable a persistent log file without env vars:
+**Cloud mode**, privacy and slicer credentials (see [Option B](#option-b-cloud-mode-without-developer-mode); the `slicer_*` keys matter only for cloud mode on a verified printer):
 
-```ini
-log_to_file = 1
-log_level = debug
-```
+| Key | Default | Effect |
+| --- | --- | --- |
+| `block_cloud` | `1` | Block background cloud MQTT/REST connections **and cloud printing**. Login, preset sync, Filament Manager and bind/unbind are still allowed. Set to `0` to enable the cloud MQTT session and any `cloud_print` mode. |
+| `cloud_print` | `cloud_only` | (new in v2.0.0) How a print is sent when cloud mode is on. `cloud_only`: write a cloud print record (history / MakerWorld); the model itself still goes to the printer over your LAN when possible, and is uploaded to Bambu only if the printer is not reachable locally. `try_lan_first`: print entirely over the LAN with no cloud record, falling back to a cloud print only if that fails. `lan_only`: always local, never upload. |
+| `cloud_hide_history` | `0` | (new in v2.0.0) Return an empty task list so the Bambu Studio home page shows no cloud print history. Handy with the true-LAN `cloud_print` modes. |
+| `slicer_cert_pem` | *(empty)* | (new in v2.0.0) Path to the slicer certificate (PEM). Empty = look for `slicer_cert.pem` in the config directory. |
+| `slicer_key_pem` | *(empty)* | (new in v2.0.0) Path to the slicer private key (PEM) used to sign print commands. Empty = look for `slicer_key.pem` in the config directory. |
+| `slicer_crl_pem` | *(empty)* | (new in v2.0.0) Path to the certificate revocation list (PEM). Empty = look for `slicer_crl.pem` in the config directory. |
+| `client_name` | `OpenBambooNetworking` | (new in v2.0.0) Name the plugin presents to Bambu's cloud. Cloud printing only accepts the stock name `BambuStudio`; leave the default and it is refused. Set to `BambuStudio` for cloud mode. |
 
-Example — point Global cloud REST at a dev host:
-
-```ini
-cloud_global_api_host = https://api-dev.bambulab.net
-```
+**These credential files are private and are not shipped with this project;
+you must obtain them yourself and are responsible for complying with the
+applicable terms and law.**
 
 Typical paths: `~/.config/BambuStudio/obn.conf`, `~/.config/OrcaSlicer/obn.conf`,
-`%APPDATA%\BambuStudio\obn.conf`, `%APPDATA%\OrcaSlicer\obn.conf`.
+`%APPDATA%\BambuStudio\obn.conf`, `%APPDATA%\OrcaSlicer\obn.conf`. You do not
+have to guess — the installer prints the exact path for your slicer when it
+finishes.
 
 ## Logging
 
@@ -732,6 +625,7 @@ Pack on N/KN editions).
   delegates to the plugin. The thumbnail URL never reaches the UI, so the
   Device panel shows a placeholder. This cannot be fixed on the plugin
   side; a patch to Orca Slicer is needed. Works correctly in Bambu Studio.
+  (Also listed under [Supported slicers](#supported-slicers).)
 
 ## License
 

@@ -32,7 +32,7 @@ The same plugin binary works under both **Bambu Studio** and **Orca Slicer** —
 | Conf-file patch (`make install`) | `BambuStudio.conf`: `installed_networking="1"`, `update_network_plugin="false"` | `OrcaSlicer.conf`: `installed_networking="true"`, `network_plugin_version="<OBN_VERSION>"`, `network_plugin_remind_later="true"`, `<OBN_VERSION>` stripped from `network_plugin_skipped_versions` |
 | Windows camera back-end | Direct C ABI (`Bambu_*`) consumed by the new `wxMediaCtrl3` (FFmpeg in-tree). No DirectShow filter required. | Legacy `wxMediaCtrl2` over the Windows Media Player / DirectShow path. Camera live view goes through our **`BambuSource.dll`** registered as a DirectShow Source Filter (CLSID `{233E64FB-2041-4A6C-AFAB-FF9BCF83E7AA}`). |
 
-See [README — Manual installation](README.md#manual-installation) for the full setup story.
+See [BUILDING — Manual installation](BUILDING.md#manual-installation) for the full setup story.
 
 ---
 
@@ -564,4 +564,3 @@ If you touch the DirectShow source filter or the `Bambu_*` path on Windows, thre
 | LAN TLS verification & IPC | [STATUS.md § 8.4.1](STATUS.md#841-lan-tls-verification-mqtt-ftps-rtsps-mjpeg) |
 | Windows: MSVC `setvbuf`, wxURI `bambu://` slashes, DirectShow `Paused` vs `Running`, Win32 env IPC | [STATUS.md — Windows-specific footguns](STATUS.md#windows-specific-footguns) |
 | Feature-level status tables (per-model) | [README.md](README.md) |
-| Alternative impl reference | [README.md § Alternative implementation reference](README.md#alternative-implementation-reference) |
