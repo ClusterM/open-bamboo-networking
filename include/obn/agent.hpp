@@ -471,6 +471,10 @@ private:
     bool                    deferred_dc_active_ = false;
     void schedule_deferred_disconnect();
     void cancel_deferred_disconnect();
+    // Teardown path: cancels any pending deferred disconnect and closes the LAN
+    // session right away, so the printer gets a clean MQTT DISCONNECT while we
+    // are still alive to send it.
+    void shutdown_lan_session();
     std::unique_ptr<ssdp::Discovery> discovery_;
     std::unique_ptr<CloudSession>   cloud_session_;
     // Lazy localhost HTTP server that hands cover PNGs to Studio's

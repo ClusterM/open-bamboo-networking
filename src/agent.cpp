@@ -69,7 +69,7 @@ std::string now_seq_id()
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
 Agent::~Agent()
 {
-    cancel_deferred_disconnect();
+    shutdown_lan_session();
     {
         std::lock_guard<std::mutex> lk(lan_watchdog_mu_);
         lan_watchdog_active_ = false;
@@ -137,6 +137,29 @@ void Agent::cancel_deferred_disconnect()
     }
     if (deferred_dc_thread_.joinable())
         deferred_dc_thread_.join();
+}
+
+void Agent::shutdown_lan_session()
+{
+    // cancel_deferred_disconnect() means "Studio came back in time, keep the
+    // session"; the deferred thread returns without touching the printer. That
+    // is wrong on teardown, where Studio is going away for good: Orca calls
+    // disconnect_printer() and destroy_agent() ~100ms apart, so with
+    // mqtt_keep_connection the grace timer never fires and the DISCONNECT used
+    // to depend on member-destruction order running after this body. Do it
+    // explicitly instead, and before discovery/cloud teardown, so the printer
+    // frees the session slot while we can still write to the socket (#38).
+    cancel_deferred_disconnect();
+
+    std::unique_ptr<LanSession> session;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        session = std::move(lan_session_);
+    }
+    if (!session) return;
+    OBN_INFO("shutdown: closing LAN session to %s", session->dev_id().c_str());
+    session->disconnect();
+    cert_store::forget_printer(session->dev_id());
 }
 
 int Agent::connect_printer(std::string dev_id,

@@ -1,6 +1,7 @@
 #include "obn/mqtt_client.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -143,6 +144,8 @@ void remove_trust_bundle_file(const std::string& path)
 
 Client::~Client()
 {
+    // Before mosquitto_destroy: the watch thread dereferences mosq_.
+    stop_reconnect_watch_();
     remove_trust_bundle_file(merged_trust_path_);
     merged_trust_path_.clear();
     if (mosq_) {
@@ -150,8 +153,10 @@ Client::~Client()
         // is a plain destroy. If not, shut down gracefully too so we don't
         // leave a ghost session on the printer (see disconnect()).
         if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
-            ::mosquitto_disconnect(mosq_);
-            ::mosquitto_loop_stop(mosq_, /*force=*/false);
+            const int rc      = ::mosquitto_disconnect(mosq_);
+            const int stop_rc = ::mosquitto_loop_stop(mosq_, /*force=*/false);
+            OBN_INFO("mqtt destroy: sending DISCONNECT from destructor "
+                     "(disconnect_rc=%d loop_stop_rc=%d)", rc, stop_rc);
         }
         ::mosquitto_destroy(mosq_);
         mosq_ = nullptr;
@@ -176,6 +181,37 @@ void Client::set_on_message(OnMessageCb cb)
     std::lock_guard<std::mutex> lk(mu_);
     on_message_ = std::move(cb);
 }
+
+namespace {
+
+// Reconnect cadence, applied by the supervisor thread as an outage grows.
+// `delay` is handed to mosquitto_reconnect_delay_set (flat, no backoff);
+// `log_every` throttles the "still not connected" progress line so a printer
+// that is simply powered off does not flood the log.
+constexpr unsigned kFlatRetryDelay = 1;   // seconds
+
+struct RetryTier {
+    unsigned delay_s;
+    unsigned log_every_s;
+};
+
+RetryTier retry_tier_for(long long down_for_s)
+{
+    // Fresh outage: probe every second. This is the window that matters for
+    // "printer refuses :8883 while reaping a stale session" (#34, #38) and for
+    // Orca's disconnect+reconnect on print start (#50).
+    if (down_for_s < 20)  return {kFlatRetryDelay, 1};
+    // Longer than a reap window: the printer is busy, rebooting or gone.
+    if (down_for_s < 120) return {5, 10};
+    // Most likely powered off or off-network. Keep probing, quietly.
+    return {10, 30};
+}
+
+// How often the supervisor re-evaluates state. Cheap enough to keep at 1s so
+// the tier table above is expressed purely in wall-clock terms.
+constexpr auto kRetryWatchTick = std::chrono::seconds(1);
+
+} // namespace
 
 int Client::connect(const ConnectConfig& cfg)
 {
@@ -289,20 +325,26 @@ int Client::connect(const ConnectConfig& cfg)
         }
     }
 
-    // Let the loop thread (started below) keep retrying with exponential
-    // backoff instead of making a single attempt. A transient TCP timeout —
-    // e.g. a P1-series printer that briefly refuses :8883 while it reaps a
-    // stale MQTT session — then self-heals without Studio having to drive a
-    // manual reconnect (GitHub issues #34, #38).
+    // Let the loop thread (started below) keep retrying instead of making a
+    // single attempt. A transient TCP failure — e.g. a P1-series printer that
+    // briefly refuses :8883 while it reaps a stale MQTT session — then
+    // self-heals without Studio having to drive a manual reconnect (GitHub
+    // issues #34, #38).
     //
-    // Start at 1s (not 2s): Orca's DeviceManager does disconnect+reconnect
-    // on every print-job completion (set_selected_machine with same dev_id),
-    // and the printer typically frees its TCP listen backlog within ~1s of
-    // receiving DISCONNECT.  A 2s initial delay doubled to ~30s total via
-    // backoff, making the reconnect feel broken (#50).
-    ::mosquitto_reconnect_delay_set(mosq_, /*reconnect_delay=*/1,
-                                    /*reconnect_delay_max=*/10,
-                                    /*reconnect_exponential_backoff=*/true);
+    // Retry FLAT at kFlatRetryDelay rather than with exponential backoff.
+    // Backoff is the wrong trade for a LAN connect: one attempt costs a single
+    // RTT, but every doubling adds dead time *after* the printer is ready
+    // again. With mosquitto's exponential schedule (delay*(n+1)^2, capped at
+    // reconnect_delay_max) a P1S that refuses for ~15s was only probed at
+    // t=1,5,14,24s, so connecting took ~27s — up to 10s of it pure sleep
+    // (#38). Flat 1s bounds that overshoot to one second.
+    //
+    // The supervisor started after loop_start escalates the delay if the
+    // outage turns out to be long, so an unreachable printer is not probed
+    // once a second forever.
+    ::mosquitto_reconnect_delay_set(mosq_, /*reconnect_delay=*/kFlatRetryDelay,
+                                    /*reconnect_delay_max=*/kFlatRetryDelay,
+                                    /*reconnect_exponential_backoff=*/false);
 
     // mosquitto_connect_async only kicks off a non-blocking TCP/TLS
     // connect; the handshake + CONNECT/CONNACK run on the loop thread.
@@ -322,22 +364,32 @@ int Client::connect(const ConnectConfig& cfg)
                                        cfg.host.c_str(),
                                        cfg.port,
                                        cfg.keepalive_s);
+    // Snapshot the Winsock error before anything else can clobber it. rc alone
+    // is useless for the interesting case: mosquitto reports a failed socket
+    // connect as MOSQ_ERR_ERRNO, whose strerror() text is read from CRT errno
+    // and therefore prints "No error" on Windows, where the real code lives in
+    // WSAGetLastError(). Without this we cannot tell WSAECONNREFUSED (broker
+    // not listening / backlog full — the stale-session case) from
+    // WSAEHOSTUNREACH (no route / ARP failure), which are different bugs (#38).
+#if defined(_WIN32)
+    const int wsa_err = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
+#else
+    const int wsa_err = 0;
+#endif
     if (rc != MOSQ_ERR_SUCCESS) {
         // INVAL/NOMEM are our own programming/allocation errors and won't fix
         // themselves, so don't spin up a loop thread for them. Anything else
         // (notably MOSQ_ERR_ERRNO from a transient TCP failure) is handed to
         // the loop thread's reconnect logic.
         if (rc == MOSQ_ERR_INVAL || rc == MOSQ_ERR_NOMEM) {
-#if defined(_WIN32)
-            int wsa = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
-            OBN_ERROR("mqtt connect_async rc=%d (%s)", rc, detailed_err(rc, wsa).c_str());
-#else
-            OBN_ERROR("mqtt connect_async rc=%d (%s)", rc, err_str(rc));
-#endif
+            OBN_ERROR("mqtt connect_async rc=%d (%s)",
+                      rc, detailed_err(rc, wsa_err).c_str());
             return rc;
         }
-        OBN_INFO("mqtt connect_async rc=%d (%s); loop will reconnect in background",
-                 rc, err_str(rc));
+        OBN_INFO("mqtt connect_async to %s:%d rc=%d (%s); loop will reconnect "
+                 "in background",
+                 cfg.host.c_str(), cfg.port, rc,
+                 detailed_err(rc, wsa_err).c_str());
     }
 
     rc = ::mosquitto_loop_start(mosq_);
@@ -351,7 +403,109 @@ int Client::connect(const ConnectConfig& cfg)
         return rc;
     }
     loop_started_.store(true, std::memory_order_release);
+    start_reconnect_watch_(cfg.host + ":" + std::to_string(cfg.port));
     return MOSQ_ERR_SUCCESS;
+}
+
+void Client::start_reconnect_watch_(std::string endpoint)
+{
+    stop_reconnect_watch_();
+    {
+        std::lock_guard<std::mutex> lk(retry_mu_);
+        retry_stop_ = false;
+    }
+    try {
+        retry_watch_thread_ = std::thread(
+            [this, endpoint = std::move(endpoint)]() {
+                using clock = std::chrono::steady_clock;
+                // applied_delay_s mirrors what connect() already handed to
+                // mosquitto, so we only call the setter on a tier change.
+                unsigned          applied_delay_s = kFlatRetryDelay;
+                bool              down            = true;
+                clock::time_point down_since      = clock::now();
+                clock::time_point last_log        = down_since;
+
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(retry_mu_);
+                        if (retry_cv_.wait_for(lk, kRetryWatchTick,
+                                               [this] { return retry_stop_; }))
+                            return;
+                    }
+
+                    if (connected_.load(std::memory_order_acquire)) {
+                        if (down) {
+                            // Reset the escalation: if the link drops later we
+                            // want the fast flat window again, not whatever
+                            // tier the previous outage ended on.
+                            down = false;
+                            if (applied_delay_s != kFlatRetryDelay) {
+                                applied_delay_s = kFlatRetryDelay;
+                                ::mosquitto_reconnect_delay_set(
+                                    mosq_, kFlatRetryDelay, kFlatRetryDelay,
+                                    false);
+                            }
+                        }
+                        continue;
+                    }
+
+                    const auto now = clock::now();
+                    if (!down) {
+                        down       = true;
+                        down_since = now;
+                        last_log   = now;
+                    }
+                    const auto down_for = std::chrono::duration_cast<
+                        std::chrono::seconds>(now - down_since).count();
+                    const RetryTier tier = retry_tier_for(down_for);
+
+                    // Always log the tier change itself, so the log shows when
+                    // we backed off rather than leaving a gap that looks like
+                    // the supervisor died.
+                    bool tier_changed = false;
+                    if (tier.delay_s != applied_delay_s) {
+                        applied_delay_s = tier.delay_s;
+                        tier_changed    = true;
+                        // libmosquitto offers no loop-safe setter; this writes
+                        // two unsigned fields and a bool that the loop thread
+                        // only reads when computing its next sleep, so a torn
+                        // read would at worst pick the previous cadence.
+                        ::mosquitto_reconnect_delay_set(mosq_, tier.delay_s,
+                                                        tier.delay_s, false);
+                    }
+
+                    if (tier_changed
+                        || std::chrono::duration_cast<std::chrono::seconds>(
+                               now - last_log).count()
+                               >= static_cast<long long>(tier.log_every_s)) {
+                        last_log = now;
+                        // libmosquitto's internal reconnect gives us no
+                        // per-attempt callback, so this progress line is what
+                        // turns an unexplained gap in the log into a measured
+                        // outage.
+                        OBN_INFO("mqtt %s: not connected for %llds; retrying "
+                                 "every %us",
+                                 endpoint.c_str(),
+                                 static_cast<long long>(down_for),
+                                 applied_delay_s);
+                    }
+                }
+            });
+    } catch (const std::system_error& e) {
+        OBN_WARN("mqtt reconnect watch: thread creation failed (%s); "
+                 "reconnects stay at %us and will not be logged",
+                 e.what(), kFlatRetryDelay);
+    }
+}
+
+void Client::stop_reconnect_watch_()
+{
+    {
+        std::lock_guard<std::mutex> lk(retry_mu_);
+        retry_stop_ = true;
+        retry_cv_.notify_all();
+    }
+    if (retry_watch_thread_.joinable()) retry_watch_thread_.join();
 }
 
 int Client::subscribe(const std::string& topic, int qos)
@@ -390,19 +544,30 @@ int Client::publish(const std::string& topic, const std::string& payload, int qo
 void Client::disconnect()
 {
     if (!mosq_) return;
+    stop_reconnect_watch_();
     // Request a clean MQTT DISCONNECT so the broker frees the session right
     // away. This matters on P1-series printers, which accept only a very small
     // number of concurrent LAN MQTT sessions: a half-open ghost session (left
     // behind when a forced thread cancel drops the DISCONNECT packet) blocks
     // the next connect until the firmware reaps it ~1 keepalive later, which
     // surfaces as "connection failed, works on the second try" (issues #34, #38).
-    ::mosquitto_disconnect(mosq_);
+    const bool was_connected = connected_.load(std::memory_order_acquire);
+    const int  rc            = ::mosquitto_disconnect(mosq_);
     if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
         // force=false: mosquitto_disconnect() set the request-disconnect flag,
         // so the loop thread flushes the DISCONNECT, closes the socket and
         // exits on its own; loop_stop then joins it. (force=true would
         // pthread_cancel the thread mid-write and drop the DISCONNECT.)
-        ::mosquitto_loop_stop(mosq_, /*force=*/false);
+        const int stop_rc = ::mosquitto_loop_stop(mosq_, /*force=*/false);
+        // Log the outcome: "was the DISCONNECT actually flushed before we went
+        // away?" is the first question when the next connect gets refused, and
+        // it used to be unanswerable from the log.
+        OBN_INFO("mqtt disconnect: was_connected=%d disconnect_rc=%d (%s) "
+                 "loop_stop_rc=%d (%s)",
+                 was_connected ? 1 : 0, rc, err_str(rc), stop_rc,
+                 err_str(stop_rc));
+    } else {
+        OBN_DEBUG("mqtt disconnect: no loop thread running (rc=%d)", rc);
     }
     remove_trust_bundle_file(merged_trust_path_);
     merged_trust_path_.clear();

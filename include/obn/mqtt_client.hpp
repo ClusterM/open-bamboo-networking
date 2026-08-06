@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 
 struct mosquitto;
 struct mosquitto_message;
@@ -97,6 +99,14 @@ private:
     static void s_on_disconnect(::mosquitto* m, void* obj, int rc);
     static void s_on_message(::mosquitto* m, void* obj, const ::mosquitto_message* msg);
 
+    // libmosquitto's loop thread retries a failed connect on its own but
+    // reports nothing while it does, so a printer that refuses :8883 for half
+    // a minute leaves an unexplained silent gap in the log. This supervisor
+    // makes the wait visible and re-tunes the retry cadence as the outage
+    // grows (see connect() for the tier table).
+    void start_reconnect_watch_(std::string endpoint);
+    void stop_reconnect_watch_();
+
     ::mosquitto*      mosq_{};
     std::string       client_id_;
     std::atomic<bool> connected_{false};
@@ -107,6 +117,11 @@ private:
     OnDisconnectCb     on_disconnect_;
     OnMessageCb        on_message_;
     std::string        merged_trust_path_;
+
+    std::thread             retry_watch_thread_;
+    std::mutex              retry_mu_;
+    std::condition_variable retry_cv_;
+    bool                    retry_stop_ = false;
 };
 
 // One-time mosquitto_lib_init for the lifetime of the loaded plugin. global_init
