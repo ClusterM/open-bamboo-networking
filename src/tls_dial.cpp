@@ -67,7 +67,9 @@ void ignore_sigpipe_if_default()
     if (old.sa_handler != SIG_DFL) return;
     struct sigaction act{};
     act.sa_handler = SIG_IGN;
-    ::sigemptyset(&act.sa_mask);
+    // Unqualified on purpose: Apple's SDK defines sigemptyset as a macro,
+    // which a ::-qualified call cannot name.
+    sigemptyset(&act.sa_mask);
     ::sigaction(SIGPIPE, &act, nullptr);
 #endif
 }
