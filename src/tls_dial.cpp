@@ -396,13 +396,14 @@ namespace {
 
 using SteadyPoint = std::chrono::steady_clock::time_point;
 
-// Block until the peer has bytes for us or `deadline` passes.
-// Returns 1 when a read can make progress, 0 on timeout, -1 on a dead
-// socket. SSL_pending() short-circuits the poll: bytes already sitting
-// in the record buffer are readable even when the socket is not.
-int wait_ssl_readable(SSL* ssl, SteadyPoint deadline)
+// Block until the socket can move data in the direction OpenSSL asked for
+// (`want` is poll_event::in or ::out) or `deadline` passes. Returns 1 when
+// the next SSL call can make progress, 0 on timeout, -1 on a dead socket.
+// SSL_pending() short-circuits the poll: bytes already sitting in the
+// record buffer are readable even when the socket is not.
+int wait_ssl_io(SSL* ssl, short want, SteadyPoint deadline)
 {
-    if (SSL_pending(ssl) > 0) return 1;
+    if (want == obn::net::poll_event::in && SSL_pending(ssl) > 0) return 1;
     const obn::os::socket_t fd =
         static_cast<obn::os::socket_t>(SSL_get_fd(ssl));
     if (!obn::os::socket_valid(fd)) return -1;
@@ -415,17 +416,19 @@ int wait_ssl_readable(SSL* ssl, SteadyPoint deadline)
         // another thread is noticed promptly even on a long deadline.
         if (left_ms > 1000) left_ms = 1000;
         short revents = 0;
-        const int rc = obn::os::poll_one(fd, obn::net::poll_event::in,
+        const int rc = obn::os::poll_one(fd, want,
                                          static_cast<int>(left_ms), &revents);
         if (rc < 0) return -1;
-        if (rc > 0) return (revents & obn::net::poll_event::in) ? 1 : -1;
+        if (rc > 0) return (revents & want) ? 1 : -1;
     }
 }
 
-void set_timeout_error(int timeout_ms)
+void set_timeout_error(int timeout_ms, short want)
 {
     char msg[96];
-    std::snprintf(msg, sizeof(msg), "read timed out after %d ms", timeout_ms);
+    std::snprintf(msg, sizeof(msg), "%s timed out after %d ms",
+                  (want == obn::net::poll_event::out) ? "TLS write" : "read",
+                  timeout_ms);
     set_error(msg);
 }
 
@@ -436,10 +439,11 @@ int read_some_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
 {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
+    short want = obn::net::poll_event::in;
     for (;;) {
-        const int ready = wait_ssl_readable(ssl, deadline);
+        const int ready = wait_ssl_io(ssl, want, deadline);
         if (ready == 0) {
-            set_timeout_error(timeout_ms);
+            set_timeout_error(timeout_ms, want);
             return -1;
         }
         if (ready < 0) return -1;
@@ -447,8 +451,19 @@ int read_some_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
         if (n > 0) return n;
         const int err = SSL_get_error(ssl, n);
         if (err == SSL_ERROR_ZERO_RETURN) return 0;
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-            continue;  // renegotiation or a short record: wait again
+        // A read that has to send first (renegotiation, TLS 1.3 KeyUpdate)
+        // needs the socket writable, not readable -- polling the wrong
+        // direction would burn the whole budget and report a phantom read
+        // timeout. Blocking BIOs rarely surface this, but SO_SNDTIMEO
+        // expiring mid-flight does.
+        if (err == SSL_ERROR_WANT_WRITE) {
+            want = obn::net::poll_event::out;
+            continue;
+        }
+        if (err == SSL_ERROR_WANT_READ) {
+            want = obn::net::poll_event::in;
+            continue;  // short record: wait for the rest
+        }
         if (err == SSL_ERROR_SYSCALL &&
             (obn::os::socket_in_progress(obn::os::last_socket_error()) ||
              obn::os::last_socket_error() == EINTR))
@@ -494,7 +509,7 @@ int ssl_read_line_timeout(SSL* ssl, std::string* out, int timeout_ms,
         out->push_back(c);
         prev = c;
     }
-    set_error("ssl_read_line: line exceeded max_len");
+    set_error("ssl_read_line_timeout: line exceeded max_len");
     return -1;
 }
 

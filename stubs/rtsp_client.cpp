@@ -1462,8 +1462,13 @@ int Client::start(const Url& url, int connect_timeout_ms)
                 SSL_get_cipher(I.ssl));
         // dial_tls leaves the socket fully blocking. Give it a receive
         // timeout so a read that starts mid-TLS-record cannot park the
-        // thread past the deadline our read helpers enforce.
-        obn::tls::set_socket_io_timeout(I.fd, I.data_timeout_ms);
+        // thread past the deadline our read helpers enforce. The tighter of
+        // the two budgets wins: a socket timeout longer than the control
+        // deadline would let one SSL_read overshoot it, while one shorter
+        // than a caller's budget only costs an extra poll round, since
+        // read_some_timeout treats the EAGAIN as "not ready yet".
+        obn::tls::set_socket_io_timeout(
+            I.fd, std::min(I.ctrl_timeout_ms, I.data_timeout_ms));
     } else {
         I.fd = obn::tls::dial(url.host, url.port, connect_timeout_ms);
         if (!obn::os::socket_valid(I.fd)) {
