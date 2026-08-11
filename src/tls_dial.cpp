@@ -21,6 +21,7 @@
 #  include <ws2tcpip.h>
 #  include <windows.h>
 #else
+#  include <csignal>
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
@@ -29,7 +30,9 @@
 #  include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -51,10 +54,31 @@ void set_error(const char* msg)
     }
 }
 
+// A write to a socket whose peer is gone raises SIGPIPE, and the default
+// disposition kills the whole process -- here, the slicer that loaded us.
+// OpenSSL has no per-write MSG_NOSIGNAL equivalent, so neutralise the
+// signal instead, and only when the host has not installed a handler of
+// its own (never override the application's choice).
+void ignore_sigpipe_if_default()
+{
+#if !defined(_WIN32)
+    struct sigaction old{};
+    if (::sigaction(SIGPIPE, nullptr, &old) != 0) return;
+    if (old.sa_handler != SIG_DFL) return;
+    struct sigaction act{};
+    act.sa_handler = SIG_IGN;
+    // Unqualified on purpose: Apple's SDK defines sigemptyset as a macro,
+    // which a ::-qualified call cannot name.
+    sigemptyset(&act.sa_mask);
+    ::sigaction(SIGPIPE, &act, nullptr);
+#endif
+}
+
 void init_once()
 {
     std::call_once(g_init_flag, []() {
         obn::os::winsock_init_once();
+        ignore_sigpipe_if_default();
 
         SSL_library_init();
         OpenSSL_add_all_algorithms();
@@ -366,6 +390,198 @@ int ssl_read_full(SSL* ssl, void* buf, std::size_t len)
         got += static_cast<std::size_t>(n);
     }
     return 0;
+}
+
+namespace {
+
+using SteadyPoint = std::chrono::steady_clock::time_point;
+
+// Block until the socket can move data in the direction OpenSSL asked for
+// (`want` is poll_event::in or ::out) or `deadline` passes. Returns 1 when
+// the next SSL call can make progress, 0 on timeout, -1 on a dead socket.
+// SSL_pending() short-circuits the poll: bytes already sitting in the
+// record buffer are readable even when the socket is not.
+int wait_ssl_io(SSL* ssl, short want, SteadyPoint deadline)
+{
+    if (want == obn::net::poll_event::in && SSL_pending(ssl) > 0) return 1;
+    const obn::os::socket_t fd =
+        static_cast<obn::os::socket_t>(SSL_get_fd(ssl));
+    if (!obn::os::socket_valid(fd)) return -1;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - now).count();
+        // Cap a single poll so a caller that shuts the socket down from
+        // another thread is noticed promptly even on a long deadline.
+        if (left_ms > 1000) left_ms = 1000;
+        short revents = 0;
+        const int rc = obn::os::poll_one(fd, want,
+                                         static_cast<int>(left_ms), &revents);
+        if (rc < 0) return -1;
+        if (rc > 0) return (revents & want) ? 1 : -1;
+    }
+}
+
+void set_timeout_error(int timeout_ms, short want)
+{
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "%s timed out after %d ms",
+                  (want == obn::net::poll_event::out) ? "TLS write" : "read",
+                  timeout_ms);
+    set_error(msg);
+}
+
+// SSL_read on a blocking BIO parks inside recv() until the peer delivers
+// the rest of a TLS record it started -- polling for readability first
+// cannot prevent that, it only proves the record's opening bytes arrived.
+// Bound the syscall itself for the duration of a timed read so the
+// deadline holds however the caller left the descriptor; dial_tls clears
+// its handshake timeout, so relying on the caller would make the timeout
+// helpers silently unbounded. read_some_timeout reads the resulting EAGAIN
+// as "not ready yet" and goes back to its own deadline check.
+//
+// A receive timeout already at least as tight as our budget is left alone,
+// which keeps the common path (the RTSP client sets one) syscall-free.
+class ScopedRecvTimeout {
+public:
+    ScopedRecvTimeout(obn::os::socket_t fd, int timeout_ms) : fd_(fd)
+    {
+        if (!obn::os::socket_valid(fd_) || timeout_ms <= 0) return;
+#if defined(_WIN32)
+        int len = static_cast<int>(sizeof(prev_));
+        if (::getsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<char*>(&prev_), &len) != 0)
+            return;
+        const DWORD want = static_cast<DWORD>(timeout_ms);
+        if (prev_ != 0 && prev_ <= want) return;
+        if (::setsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<const char*>(&want),
+                         sizeof(want)) == 0)
+            restore_ = true;
+#else
+        socklen_t len = static_cast<socklen_t>(sizeof(prev_));
+        if (::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &prev_, &len) != 0)
+            return;
+        const long prev_ms = static_cast<long>(prev_.tv_sec) * 1000 +
+                             prev_.tv_usec / 1000;
+        if (prev_ms > 0 && prev_ms <= timeout_ms) return;
+        timeval want{};
+        want.tv_sec  = timeout_ms / 1000;
+        want.tv_usec = (timeout_ms % 1000) * 1000;
+        if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &want,
+                         sizeof(want)) == 0)
+            restore_ = true;
+#endif
+    }
+
+    ~ScopedRecvTimeout()
+    {
+        if (!restore_) return;
+#if defined(_WIN32)
+        ::setsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&prev_), sizeof(prev_));
+#else
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &prev_, sizeof(prev_));
+#endif
+    }
+
+    ScopedRecvTimeout(const ScopedRecvTimeout&)            = delete;
+    ScopedRecvTimeout& operator=(const ScopedRecvTimeout&) = delete;
+
+private:
+    obn::os::socket_t fd_;
+    bool              restore_ = false;
+#if defined(_WIN32)
+    DWORD             prev_    = 0;
+#else
+    timeval           prev_{};
+#endif
+};
+
+// Read exactly one chunk into `buf`, waiting no longer than `timeout_ms`
+// for it to start arriving. Returns the byte count (>0), 0 for a clean
+// EOS, or -1 on error / timeout.
+int read_some_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    short want = obn::net::poll_event::in;
+    for (;;) {
+        const int ready = wait_ssl_io(ssl, want, deadline);
+        if (ready == 0) {
+            set_timeout_error(timeout_ms, want);
+            return -1;
+        }
+        if (ready < 0) return -1;
+        const int n = SSL_read(ssl, buf, static_cast<int>(len));
+        if (n > 0) return n;
+        const int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        // A read that has to send first (renegotiation, TLS 1.3 KeyUpdate)
+        // needs the socket writable, not readable -- polling the wrong
+        // direction would burn the whole budget and report a phantom read
+        // timeout. Blocking BIOs rarely surface this, but SO_SNDTIMEO
+        // expiring mid-flight does.
+        if (err == SSL_ERROR_WANT_WRITE) {
+            want = obn::net::poll_event::out;
+            continue;
+        }
+        if (err == SSL_ERROR_WANT_READ) {
+            want = obn::net::poll_event::in;
+            continue;  // short record: wait for the rest
+        }
+        if (err == SSL_ERROR_SYSCALL &&
+            (obn::os::socket_in_progress(obn::os::last_socket_error()) ||
+             obn::os::last_socket_error() == EINTR))
+            continue;  // SO_RCVTIMEO / signal, not a real failure
+        return -1;
+    }
+}
+
+} // namespace
+
+int ssl_read_full_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
+{
+    if (!ssl) return -1;
+    if (timeout_ms <= 0) return ssl_read_full(ssl, buf, len);
+    ScopedRecvTimeout guard(static_cast<obn::os::socket_t>(SSL_get_fd(ssl)),
+                            timeout_ms);
+    auto*       p   = static_cast<std::uint8_t*>(buf);
+    std::size_t got = 0;
+    while (got < len) {
+        const int n = read_some_timeout(ssl, p + got, len - got, timeout_ms);
+        if (n == 0) return 1;
+        if (n < 0) return -1;
+        got += static_cast<std::size_t>(n);
+    }
+    return 0;
+}
+
+int ssl_read_line_timeout(SSL* ssl, std::string* out, int timeout_ms,
+                          std::size_t max_len)
+{
+    if (!ssl) return -1;
+    if (timeout_ms <= 0) return ssl_read_line(ssl, out, max_len);
+    ScopedRecvTimeout guard(static_cast<obn::os::socket_t>(SSL_get_fd(ssl)),
+                            timeout_ms);
+    out->clear();
+    out->reserve(128);
+    char prev = '\0';
+    while (out->size() < max_len) {
+        char      c = '\0';
+        const int n = read_some_timeout(ssl, &c, 1, timeout_ms);
+        if (n == 0) return 1;
+        if (n < 0) return -1;
+        if (prev == '\r' && c == '\n') {
+            if (!out->empty()) out->pop_back();
+            return 0;
+        }
+        out->push_back(c);
+        prev = c;
+    }
+    set_error("ssl_read_line_timeout: line exceeded max_len");
+    return -1;
 }
 
 int ssl_read_line(SSL* ssl, std::string* out, std::size_t max_len)

@@ -30,8 +30,8 @@
 // read_nalu() in a loop and another thread calling stop() exactly
 // once. cancel() is the only call that may be made from any thread:
 // it shuts the socket down to break the producer out of an in-flight
-// SSL_read. The 15-second GET_PARAMETER keepalive runs on its own
-// internal thread that the client owns.
+// SSL_read. The RTSP keepalive and the RTCP receiver reports run on
+// one internal thread that the client owns.
 #pragma once
 
 #include <cstdint>
@@ -76,6 +76,15 @@ struct H264Track {
     // emit NAL units originating from this PT; others (RTCP, audio)
     // are dropped before reaching read_nalu().
     int           rtp_pt     = 96;
+
+    // Geometry and frame rate decoded from the SDP's SPS, cropping
+    // applied. Zero when the SDP carried no SPS or it did not parse,
+    // in which case the caller keeps its own default.
+    int           width      = 0;
+    int           height     = 0;
+    // Rounded frames per second from the SPS VUI timing info; 0 when
+    // the SPS omits it (VUI timing is optional).
+    int           fps        = 0;
 };
 
 // One NAL unit handed back to the caller. `data` is *raw NAL bytes*:

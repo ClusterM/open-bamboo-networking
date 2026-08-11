@@ -666,17 +666,22 @@ int ssl_read_all(Tunnel* t, void* buf, size_t len)
     // pipeline already speaks (h264parse copes with any framing
     // h264parse can detect, and Annex-B is the simplest one).
     t->sub_type   = AVC1;
-    // Width/height/frame_rate are advisory until h264parse pulls them
-    // out of SPS; surface the firmware's well-known 1280x720@30 default
-    // so Studio's UI shows reasonable numbers from the start.
-    t->width      = 1280;
-    t->height     = 720;
-    t->frame_rate = 30;
+    // Prefer what the SDP's SPS actually says: the coded size and frame
+    // rate differ per model (a P2S serves 1168x720 @ ~24.7 fps), and a
+    // wrong frame rate makes the slicer's sink judge live frames late.
+    // The 1280x720@30 fallback only applies when the SPS did not parse.
+    {
+        const auto p  = t->rtsp_pass->params();
+        t->width      = (p.width  > 0) ? p.width  : 1280;
+        t->height     = (p.height > 0) ? p.height : 720;
+        t->frame_rate = (p.fps    > 0) ? p.fps    : 30;
+    }
     t->t0         = std::chrono::steady_clock::now();
     t->started    = true;
     log_fmt(t->logger, t->log_ctx,
-            "open_rtsp: passthrough ready (avc1 %dx%d, gstbambusrc decodes)",
-            t->width, t->height);
+            "open_rtsp: passthrough ready (avc1 %dx%d @ %d fps, "
+            "gstbambusrc decodes)",
+            t->width, t->height, t->frame_rate);
     return Bambu_success;
 }
 

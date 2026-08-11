@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -27,6 +28,21 @@ constexpr int kFlagSync = 1;
 // bound. gstbambusrc polls every 33 ms (30 Hz); a queue of 8 access
 // units gives ~250 ms of headroom which is plenty.
 constexpr std::size_t kMaxReadyQueue = 8;
+
+// How long try_pull() keeps answering "would block" before declaring
+// the stream dead. Deliberately longer than the RTSP client's own read
+// deadline so the more precise error from the reader thread wins when
+// both would fire. OBN_RTSP_STALL_TIMEOUT_MS overrides it.
+constexpr int kStallTimeoutMs = 8000;
+
+int stall_timeout_ms()
+{
+    if (const char* e = std::getenv("OBN_RTSP_STALL_TIMEOUT_MS")) {
+        const int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return kStallTimeoutMs;
+}
 
 // One Annex-B encoded access unit ready to be handed to the caller.
 struct Sample {
@@ -60,6 +76,13 @@ struct Passthrough::Impl {
     std::mutex              q_mu;
     std::condition_variable q_cv;
     std::deque<Sample>      ready;
+
+    // Watchdog state, guarded by q_mu. `last_progress` moves forward on
+    // every produced access unit; `stalled` latches once try_pull has
+    // reported the stall so the error is stable across calls.
+    std::chrono::steady_clock::time_point last_progress;
+    bool                                  stalled = false;
+    int                                   stall_ms = kStallTimeoutMs;
 
     Sample                  current;            // borrowed by last try_pull
     std::chrono::steady_clock::time_point t0;
@@ -109,6 +132,12 @@ int Passthrough::start(const std::string& host,
             tr.sps.size(), tr.pps.size(), tr.rtp_pt);
 
     I.t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(I.q_mu);
+        I.last_progress = I.t0;
+        I.stalled       = false;
+        I.stall_ms      = stall_timeout_ms();
+    }
     I.stop_flag.store(false, std::memory_order_release);
     I.worker = std::thread([this] {
         auto& I = *impl_;
@@ -155,6 +184,7 @@ int Passthrough::start(const std::string& host,
                 I.ready.pop_front();
             }
             I.ready.emplace_back(std::move(s));
+            I.last_progress = now;
             lk.unlock();
             I.q_cv.notify_all();
         };
@@ -190,6 +220,7 @@ int Passthrough::start(const std::string& host,
                 marker.flags    = (rc == 1 || stopping)
                                     ? 0x100 /*EOS*/ : 0x200 /*ERR*/;
                 I.ready.emplace_back(std::move(marker));
+                I.last_progress = std::chrono::steady_clock::now();
                 lk.unlock();
                 I.q_cv.notify_all();
                 break;
@@ -235,6 +266,16 @@ int Passthrough::start(const std::string& host,
     return 0;
 }
 
+Passthrough::StreamParams Passthrough::params() const
+{
+    const auto& tr = impl_->client.track();
+    StreamParams p;
+    p.width  = tr.width;
+    p.height = tr.height;
+    p.fps    = tr.fps;
+    return p;
+}
+
 Passthrough::PullResult Passthrough::try_pull(const std::uint8_t** out_buf,
                                               std::size_t*         out_size,
                                               std::uint64_t*       out_dt_100ns,
@@ -242,7 +283,21 @@ Passthrough::PullResult Passthrough::try_pull(const std::uint8_t** out_buf,
 {
     auto& I = *impl_;
     std::unique_lock<std::mutex> lk(I.q_mu);
-    if (I.ready.empty()) return Pull_WouldBlock;
+    if (I.ready.empty()) {
+        if (I.stalled) return Pull_Error;
+        const auto idle = std::chrono::steady_clock::now() - I.last_progress;
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(idle).count() >=
+            I.stall_ms) {
+            I.stalled = true;
+            lk.unlock();
+            log_fmt(I.logger, I.log_ctx,
+                    "rtsp_passthrough: no video for %d ms -- reporting the "
+                    "stream as dead so the pipeline can be torn down",
+                    I.stall_ms);
+            return Pull_Error;
+        }
+        return Pull_WouldBlock;
+    }
 
     I.current = std::move(I.ready.front());
     I.ready.pop_front();

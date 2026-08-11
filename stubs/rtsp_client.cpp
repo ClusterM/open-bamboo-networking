@@ -9,15 +9,27 @@
 // from RFC 2326 section 10.12. The interleaved channels are picked at
 // SETUP time -- we always ask for 0 = RTP, 1 = RTCP.
 //
-// The control plane keeps running after PLAY: GET_PARAMETER keepalive
-// requests fire every 15 seconds on a worker thread to avoid Bambu's
-// 30 s idle teardown. Their responses come back through the same TCP
-// connection; we let them flow into the demux loop, which recognises
-// them by the leading "RTSP/" string instead of the '$' interleave
-// marker, drains the response, and continues.
+// The control plane keeps running after PLAY, with two keepalives:
+//
+//   * RTCP receiver reports on interleaved channel 1 every 2 s, emitted
+//     by the reader thread between messages. The printer's live555 RTP
+//     sink treats a receiver that never reports as gone and stops
+//     sending; the session then simply goes quiet with no RTSP error
+//     anywhere (issue #54).
+//   * RTSP GET_PARAMETER every 5 s from a dedicated thread, which
+//     refreshes the session timeout on the server. Its response comes
+//     back through the same TCP connection; the demux loop recognises
+//     it by the leading "RTSP/" string instead of the '$' interleave
+//     marker, drains it, and continues.
+//
+// Every read on this connection carries a deadline
+// (ssl_read_full_timeout). A stream that dies mid-session therefore
+// surfaces as a logged error instead of parking the reader thread in
+// SSL_read forever.
 
 #include "rtsp_client.hpp"
 
+#include "h264_avcc.hpp"
 #include "source_log.hpp"
 #include "tls_socket.hpp"
 
@@ -49,6 +61,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -75,6 +88,33 @@ using obn::source::set_last_error;
 // (the interleave length field is 16 bits).
 constexpr std::size_t kMaxResponseBody = 64u << 10;
 constexpr std::size_t kMaxRtpPacket    = 64u << 10;
+
+// Keepalive cadence. The RTCP interval is what keeps the server's RTP
+// sink convinced someone is listening; the RTSP ping only refreshes the
+// session timeout, so it can be much lazier.
+constexpr int kRtcpIntervalMs = 2000;
+constexpr int kRtspPingMs     = 5000;
+
+// How long the data plane tolerates silence before declaring the
+// session dead. Generous enough to ride out a stalled GOP, short enough
+// that the UI does not sit on a frozen frame. OBN_RTSP_READ_TIMEOUT_MS
+// overrides it for field diagnosis.
+constexpr int kDataReadTimeoutMs = 5000;
+
+int data_read_timeout_ms()
+{
+    if (const char* e = std::getenv("OBN_RTSP_READ_TIMEOUT_MS")) {
+        const int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    return kDataReadTimeoutMs;
+}
+
+// RTCP payload types we care about (RFC 3550 section 12.1).
+constexpr int kRtcpSr   = 200;
+constexpr int kRtcpSdes = 202;
+constexpr int kRtcpBye  = 203;
+constexpr int kRtcpRr   = 201;
 
 // ---------- base64 (small, inline) ----------
 
@@ -308,8 +348,9 @@ struct Response {
 // `$` frames apart from `R` (RTSP/1.0 ...) responses, then hands the
 // `R` here to be re-stitched into the status line.
 //
-// Returns 0 / 1 / -1 like ssl_read_full.
-int read_response(SSL* ssl, Response* out, int prefetch_byte = -1)
+// Returns 0 / 1 / -1 like ssl_read_full. `timeout_ms` bounds every read
+// the response needs, so a half-sent reply cannot wedge the caller.
+int read_response(SSL* ssl, Response* out, int timeout_ms, int prefetch_byte = -1)
 {
     out->headers.clear();
     out->body.clear();
@@ -321,26 +362,12 @@ int read_response(SSL* ssl, Response* out, int prefetch_byte = -1)
         // Read the rest of the status line, byte by byte, with the
         // supplied byte as the seed. Mirrors ssl_read_line semantics.
         line.push_back(static_cast<char>(prefetch_byte));
-        char prev = static_cast<char>(prefetch_byte);
-        while (line.size() < 8192) {
-            char c = '\0';
-            int  n = SSL_read(ssl, &c, 1);
-            if (n <= 0) {
-                int err = SSL_get_error(ssl, n);
-                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-                    continue;
-                if (err == SSL_ERROR_ZERO_RETURN) return 1;
-                return -1;
-            }
-            if (prev == '\r' && c == '\n') {
-                line.pop_back(); // strip the CR we just pushed
-                break;
-            }
-            line.push_back(c);
-            prev = c;
-        }
+        std::string rest;
+        int rc = obn::tls::ssl_read_line_timeout(ssl, &rest, timeout_ms);
+        if (rc != 0) return rc;
+        line += rest;
     } else {
-        int rc = obn::tls::ssl_read_line(ssl, &line);
+        int rc = obn::tls::ssl_read_line_timeout(ssl, &line, timeout_ms);
         if (rc != 0) return rc;
     }
     // "RTSP/1.0 200 OK"
@@ -359,7 +386,7 @@ int read_response(SSL* ssl, Response* out, int prefetch_byte = -1)
     // Headers.
     std::size_t content_length = 0;
     for (;;) {
-        int hrc = obn::tls::ssl_read_line(ssl, &line);
+        int hrc = obn::tls::ssl_read_line_timeout(ssl, &line, timeout_ms);
         if (hrc != 0) return hrc;
         if (line.empty()) break;
         auto colon = line.find(':');
@@ -376,7 +403,8 @@ int read_response(SSL* ssl, Response* out, int prefetch_byte = -1)
     }
     if (content_length > 0) {
         out->body.resize(content_length);
-        int brc = obn::tls::ssl_read_full(ssl, out->body.data(), content_length);
+        int brc = obn::tls::ssl_read_full_timeout(ssl, out->body.data(),
+                                                  content_length, timeout_ms);
         if (brc != 0) return brc;
     }
     return 0;
@@ -393,6 +421,9 @@ bool parse_sdp(const std::string& sdp, H264Track* track, std::string* control)
     track->pps.clear();
     track->clock_rate = 90000;
     track->rtp_pt     = -1;
+    track->width      = 0;
+    track->height     = 0;
+    track->fps        = 0;
     control->clear();
 
     int  current_pt   = -1;
@@ -489,6 +520,15 @@ bool parse_sdp(const std::string& sdp, H264Track* track, std::string* control)
         set_last_error("rtsp: SDP had no usable H.264 video track");
         return false;
     }
+    if (!track->sps.empty()) {
+        obn::h264::SpsGeometry geom;
+        if (obn::h264::parse_sps_geometry(track->sps.data(), track->sps.size(),
+                                          &geom)) {
+            track->width  = geom.width;
+            track->height = geom.height;
+            track->fps    = geom.fps;
+        }
+    }
     return true;
 }
 
@@ -553,12 +593,55 @@ struct Client::Impl {
     // Keepalive.
     std::thread             keepalive;
     std::atomic<bool>       stop_flag{false};
+    // Set once the socket has been shut down. Any write after that point
+    // can only draw an EPIPE, so the senders below bail out instead.
+    std::atomic<bool>       socket_down{false};
     std::condition_variable keepalive_cv;
     std::mutex              keepalive_mu;
 
+    // Read deadlines. The control plane inherits the connect timeout
+    // (a printer that accepts TCP but never answers DESCRIBE must not
+    // wedge start()); the data plane gets its own, longer budget.
+    int ctrl_timeout_ms = 5000;
+    int data_timeout_ms = kDataReadTimeoutMs;
+
+    // True once the server sent an RTCP BYE: the session ended by
+    // agreement, so the reader reports a clean EOS rather than an error.
+    bool peer_bye = false;
+
+    // Receiver-side RTP bookkeeping for the RTCP reports. Written by
+    // the data thread, read by the keepalive thread, hence the mutex.
+    // The counters follow RFC 3550 appendix A.3.
+    std::mutex    stats_mu;
+    std::uint32_t our_ssrc         = 0;
+    bool          have_peer_ssrc   = false;
+    std::uint32_t peer_ssrc        = 0;
+    bool          seq_initialised  = false;
+    std::uint16_t max_seq          = 0;
+    std::uint32_t seq_cycles       = 0;
+    std::uint32_t base_seq         = 0;
+    std::uint32_t packets_received = 0;
+    std::uint32_t expected_prior   = 0;
+    std::uint32_t received_prior   = 0;
+    double        jitter           = 0.0;
+    bool          have_transit     = false;
+    std::int64_t  last_transit     = 0;
+    bool          have_sr          = false;
+    std::uint32_t last_sr_middle32 = 0;
+    std::chrono::steady_clock::time_point last_sr_at{};
+    std::chrono::steady_clock::time_point stream_t0{};
+
+    // When the next receiver report is due. Reader thread only.
+    std::chrono::steady_clock::time_point next_rtcp_due{};
+
     H264Track track;
 
-    Impl(Logger l, void* c) : logger(l ? l : obn::source::noop_logger), log_ctx(c) {}
+    Impl(Logger l, void* c) : logger(l ? l : obn::source::noop_logger), log_ctx(c)
+    {
+        std::random_device rd;
+        our_ssrc  = (static_cast<std::uint32_t>(rd()) << 16) ^ rd();
+        stream_t0 = std::chrono::steady_clock::now();
+    }
 
     ~Impl() = default;
 
@@ -747,11 +830,12 @@ struct Client::Impl {
         // frames into nalu_queue for the data path to drain later.
         for (;;) {
             std::uint8_t prefix;
-            int rc = obn::tls::ssl_read_full(ssl, &prefix, 1);
+            int rc = obn::tls::ssl_read_full_timeout(ssl, &prefix, 1,
+                                                     ctrl_timeout_ms);
             if (rc != 0) return rc;
             if (prefix == '$') {
                 std::uint8_t hdr[3];
-                rc = obn::tls::ssl_read_full(ssl, hdr, 3);
+                rc = obn::tls::ssl_read_full_timeout(ssl, hdr, 3, ctrl_timeout_ms);
                 if (rc != 0) return rc;
                 int channel = hdr[0];
                 std::uint16_t plen = static_cast<std::uint16_t>(
@@ -762,20 +846,22 @@ struct Client::Impl {
                 }
                 std::vector<std::uint8_t> rtp(plen);
                 if (plen > 0) {
-                    rc = obn::tls::ssl_read_full(ssl, rtp.data(), plen);
+                    rc = obn::tls::ssl_read_full_timeout(ssl, rtp.data(), plen,
+                                                         ctrl_timeout_ms);
                     if (rc != 0) return rc;
                 }
-                // Channel 0 = RTP, anything else (RTCP, etc.) we drop.
                 // The early frames are real video; keeping them avoids
                 // a brief blank at PLAY time once the data path picks
                 // up read_nalu().
-                if (channel == 0) decode_rtp_h264(rtp);
+                if (channel == 0)      handle_rtp(rtp);
+                else if (channel == 1) handle_rtcp(rtp);
                 log_at(LL_TRACE, logger, log_ctx,
                        "rtsp: buffered $-frame ahead of response "
                        "(ch=%d len=%u)", channel, static_cast<unsigned>(plen));
                 continue;
             }
-            int read_rc = read_response(ssl, out, static_cast<int>(prefix));
+            int read_rc = read_response(ssl, out, ctrl_timeout_ms,
+                                        static_cast<int>(prefix));
             if (read_rc != 0) return read_rc;
             log_at(LL_TRACE, logger, log_ctx,
                    "rtsp <- %d %s (body=%zu)",
@@ -867,6 +953,7 @@ struct Client::Impl {
     void do_teardown_best_effort()
     {
         if (session_id.empty() || !ssl) return;
+        if (socket_down.load(std::memory_order_acquire)) return;
         // Best-effort fire-and-forget; the response (if any) is
         // discarded. We ignore errors here because by the time we
         // call this the user is already exiting.
@@ -886,31 +973,171 @@ struct Client::Impl {
     void keepalive_main()
     {
         while (!stop_flag.load(std::memory_order_acquire)) {
-            std::unique_lock<std::mutex> lk(keepalive_mu);
-            keepalive_cv.wait_for(lk, std::chrono::seconds(15), [&] {
-                return stop_flag.load(std::memory_order_acquire);
-            });
-            if (stop_flag.load(std::memory_order_acquire)) break;
-            // GET_PARAMETER with no body is the standard idle ping
-            // live555 accepts. Build the request inline (instead of
-            // through send_request) so we keep the Session: header
-            // even if the data path also wants the io_mu mutex.
-            std::string auth = compute_authorization("GET_PARAMETER", url_full);
-            std::string req  = std::string("GET_PARAMETER ") + url_full +
-                               " RTSP/1.0\r\n" +
-                               "CSeq: " + std::to_string(cseq++) + "\r\n" +
-                               "Session: " + session_id + "\r\n" +
-                               auth +
-                               "\r\n";
-
-            std::lock_guard<std::mutex> io_lk(io_mu);
-            if (!ssl) break;
-            if (obn::tls::ssl_write_all(ssl, req.data(), req.size()) != 0) {
-                log_at(LL_DEBUG, logger, log_ctx, "rtsp: keepalive write failed");
-                break;
+            {
+                std::unique_lock<std::mutex> lk(keepalive_mu);
+                keepalive_cv.wait_for(lk, std::chrono::milliseconds(kRtspPingMs),
+                                      [&] {
+                    return stop_flag.load(std::memory_order_acquire);
+                });
             }
-            log_at(LL_TRACE, logger, log_ctx, "rtsp: keepalive sent");
+            if (stop_flag.load(std::memory_order_acquire)) break;
+            if (!send_rtsp_ping()) break;
         }
+    }
+
+    // Called by the reader thread between messages. RTCP lives here
+    // rather than on the keepalive thread on purpose: the reader wakes
+    // on every RTP packet, so the cadence stays accurate without a
+    // second thread writing into the same SSL object.
+    void maybe_send_rtcp()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_rtcp_due) return;
+        next_rtcp_due = now + std::chrono::milliseconds(kRtcpIntervalMs);
+        send_rtcp_receiver_report();
+    }
+
+    // GET_PARAMETER with no body is the standard idle ping live555
+    // accepts. Built inline (instead of through send_request) so we keep
+    // the Session: header even while the data path holds io_mu.
+    bool send_rtsp_ping()
+    {
+        if (socket_down.load(std::memory_order_acquire)) return false;
+        std::string auth = compute_authorization("GET_PARAMETER", url_full);
+        std::string req  = std::string("GET_PARAMETER ") + url_full +
+                           " RTSP/1.0\r\n" +
+                           "CSeq: " + std::to_string(cseq++) + "\r\n" +
+                           "Session: " + session_id + "\r\n" +
+                           auth +
+                           "\r\n";
+
+        std::lock_guard<std::mutex> io_lk(io_mu);
+        if (!ssl) return false;
+        if (obn::tls::ssl_write_all(ssl, req.data(), req.size()) != 0) {
+            log_at(LL_DEBUG, logger, log_ctx, "rtsp: keepalive write failed");
+            return false;
+        }
+        log_at(LL_TRACE, logger, log_ctx, "rtsp: keepalive sent");
+        return true;
+    }
+
+    // Emit a compound RTCP packet (receiver report + SDES/CNAME) on
+    // interleaved channel 1. This is what tells the printer's RTP sink
+    // that we are still here; without it the sink eventually stops
+    // sending and the session dies silently.
+    bool send_rtcp_receiver_report()
+    {
+        if (socket_down.load(std::memory_order_acquire)) return false;
+        std::vector<std::uint8_t> pkt;
+        {
+            std::lock_guard<std::mutex> lk(stats_mu);
+            // Nothing to report on before the first RTP packet arrives.
+            if (!seq_initialised || !have_peer_ssrc) return true;
+            build_receiver_report(&pkt);
+        }
+        append_sdes_cname(&pkt);
+
+        std::uint8_t frame[4] = {
+            '$', 1,
+            static_cast<std::uint8_t>((pkt.size() >> 8) & 0xff),
+            static_cast<std::uint8_t>(pkt.size() & 0xff),
+        };
+
+        std::lock_guard<std::mutex> io_lk(io_mu);
+        if (!ssl) return false;
+        if (obn::tls::ssl_write_all(ssl, frame, sizeof(frame)) != 0 ||
+            obn::tls::ssl_write_all(ssl, pkt.data(), pkt.size()) != 0) {
+            log_at(LL_DEBUG, logger, log_ctx, "rtsp: RTCP RR write failed");
+            return false;
+        }
+        log_at(LL_TRACE, logger, log_ctx, "rtsp: RTCP RR sent (%zu bytes)",
+               pkt.size());
+        return true;
+    }
+
+    // RFC 3550 section 6.4.2 receiver report with a single report block.
+    // Caller holds stats_mu.
+    void build_receiver_report(std::vector<std::uint8_t>* out)
+    {
+        const std::uint32_t extended_max = seq_cycles + max_seq;
+        const std::uint32_t expected     = extended_max - base_seq + 1;
+        std::int64_t        lost = static_cast<std::int64_t>(expected) -
+                                   static_cast<std::int64_t>(packets_received);
+        if (lost < 0)         lost = 0;
+        if (lost > 0x7fffff)  lost = 0x7fffff;
+
+        const std::uint32_t expected_interval = expected - expected_prior;
+        const std::uint32_t received_interval = packets_received - received_prior;
+        expected_prior = expected;
+        received_prior = packets_received;
+        const std::int64_t lost_interval =
+            static_cast<std::int64_t>(expected_interval) -
+            static_cast<std::int64_t>(received_interval);
+        std::uint8_t fraction = 0;
+        if (expected_interval > 0 && lost_interval > 0) {
+            fraction = static_cast<std::uint8_t>(
+                (lost_interval << 8) / expected_interval);
+        }
+
+        // Delay since the last sender report, in 1/65536 s.
+        std::uint32_t dlsr = 0;
+        if (have_sr) {
+            const auto d = std::chrono::steady_clock::now() - last_sr_at;
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(d)
+                                .count();
+            dlsr = static_cast<std::uint32_t>((us * 65536) / 1000000);
+        }
+
+        auto push32 = [out](std::uint32_t v) {
+            out->push_back(static_cast<std::uint8_t>((v >> 24) & 0xff));
+            out->push_back(static_cast<std::uint8_t>((v >> 16) & 0xff));
+            out->push_back(static_cast<std::uint8_t>((v >>  8) & 0xff));
+            out->push_back(static_cast<std::uint8_t>( v        & 0xff));
+        };
+
+        out->push_back(0x80 | 1);                       // V=2, P=0, RC=1
+        out->push_back(static_cast<std::uint8_t>(kRtcpRr));
+        out->push_back(0);                              // length, patched below
+        out->push_back(7);                              // 32 bytes = 8 words - 1
+        push32(our_ssrc);
+        push32(peer_ssrc);
+        out->push_back(fraction);
+        out->push_back(static_cast<std::uint8_t>((lost >> 16) & 0xff));
+        out->push_back(static_cast<std::uint8_t>((lost >>  8) & 0xff));
+        out->push_back(static_cast<std::uint8_t>( lost        & 0xff));
+        push32(extended_max);
+        push32(static_cast<std::uint32_t>(jitter));
+        push32(have_sr ? last_sr_middle32 : 0);
+        push32(dlsr);
+    }
+
+    // Minimal SDES chunk carrying just a CNAME, which report receivers
+    // use to correlate our RR with our RTP source.
+    void append_sdes_cname(std::vector<std::uint8_t>* out)
+    {
+        char cname[32];
+        const int cn = std::snprintf(cname, sizeof(cname), "obn-%08x",
+                                     static_cast<unsigned>(our_ssrc));
+        const std::size_t cname_len = (cn > 0) ? static_cast<std::size_t>(cn) : 0;
+
+        const std::size_t start = out->size();
+        out->push_back(0x80 | 1);                       // V=2, P=0, SC=1
+        out->push_back(static_cast<std::uint8_t>(kRtcpSdes));
+        out->push_back(0);                              // length, patched below
+        out->push_back(0);
+        out->push_back(static_cast<std::uint8_t>((our_ssrc >> 24) & 0xff));
+        out->push_back(static_cast<std::uint8_t>((our_ssrc >> 16) & 0xff));
+        out->push_back(static_cast<std::uint8_t>((our_ssrc >>  8) & 0xff));
+        out->push_back(static_cast<std::uint8_t>( our_ssrc        & 0xff));
+        out->push_back(1);                              // CNAME
+        out->push_back(static_cast<std::uint8_t>(cname_len));
+        out->insert(out->end(), cname, cname + cname_len);
+        out->push_back(0);                              // end of item list
+        while ((out->size() - start) % 4 != 0) out->push_back(0);
+
+        const std::size_t words = (out->size() - start) / 4 - 1;
+        (*out)[start + 2] = static_cast<std::uint8_t>((words >> 8) & 0xff);
+        (*out)[start + 3] = static_cast<std::uint8_t>(words & 0xff);
     }
 
     // ----- demux -----
@@ -923,12 +1150,12 @@ struct Client::Impl {
     int pull_one_message()
     {
         std::uint8_t prefix;
-        int rc = obn::tls::ssl_read_full(ssl, &prefix, 1);
+        int rc = obn::tls::ssl_read_full_timeout(ssl, &prefix, 1, data_timeout_ms);
         if (rc != 0) return rc;
         if (prefix == '$') {
             // Interleaved RTP/RTCP frame.
             std::uint8_t hdr[3];
-            rc = obn::tls::ssl_read_full(ssl, hdr, 3);
+            rc = obn::tls::ssl_read_full_timeout(ssl, hdr, 3, data_timeout_ms);
             if (rc != 0) return rc;
             int channel = hdr[0];
             std::uint16_t plen = static_cast<std::uint16_t>(
@@ -938,12 +1165,17 @@ struct Client::Impl {
                 return -1;
             }
             std::vector<std::uint8_t> rtp(plen);
-            rc = obn::tls::ssl_read_full(ssl, rtp.data(), plen);
+            rc = obn::tls::ssl_read_full_timeout(ssl, rtp.data(), plen,
+                                                 data_timeout_ms);
             if (rc != 0) return rc;
-            // Channel 0 = RTP, channel 1 = RTCP. Bambu only sends 0
-            // for video, but we filter defensively.
-            if (channel != 0) return 0;
-            decode_rtp_h264(rtp);
+            // Channel 0 = RTP, channel 1 = RTCP (sender reports we
+            // answer, plus BYE when the server closes the session).
+            if (channel == 0) {
+                handle_rtp(rtp);
+            } else if (channel == 1) {
+                handle_rtcp(rtp);
+                if (peer_bye) return 1;
+            }
             return 0;
         }
         if (prefix == 'R') {
@@ -951,7 +1183,7 @@ struct Client::Impl {
             // Re-prepend the 'R' we already consumed and parse normally.
             std::string status = "R";
             std::string rest;
-            rc = obn::tls::ssl_read_line(ssl, &rest);
+            rc = obn::tls::ssl_read_line_timeout(ssl, &rest, data_timeout_ms);
             if (rc != 0) return rc;
             status += rest;
             (void)status;
@@ -959,7 +1191,7 @@ struct Client::Impl {
             std::size_t content_length = 0;
             for (;;) {
                 std::string line;
-                rc = obn::tls::ssl_read_line(ssl, &line);
+                rc = obn::tls::ssl_read_line_timeout(ssl, &line, data_timeout_ms);
                 if (rc != 0) return rc;
                 if (line.empty()) break;
                 auto colon = line.find(':');
@@ -976,7 +1208,9 @@ struct Client::Impl {
             }
             if (content_length > 0) {
                 std::vector<std::uint8_t> body(content_length);
-                rc = obn::tls::ssl_read_full(ssl, body.data(), content_length);
+                rc = obn::tls::ssl_read_full_timeout(ssl, body.data(),
+                                                     content_length,
+                                                     data_timeout_ms);
                 if (rc != 0) return rc;
             }
             log_at(LL_TRACE, logger, log_ctx, "rtsp: drained stray response");
@@ -991,6 +1225,104 @@ struct Client::Impl {
                       prefix);
         set_last_error(e);
         return -1;
+    }
+
+    // Account one received RTP packet, then depacketise it. The stats
+    // feed the RTCP receiver reports the keepalive thread sends.
+    void handle_rtp(const std::vector<std::uint8_t>& rtp)
+    {
+        if (rtp.size() >= 12) {
+            const std::uint16_t seq = static_cast<std::uint16_t>(
+                (std::uint16_t(rtp[2]) << 8) | rtp[3]);
+            const std::uint32_t ts = (std::uint32_t(rtp[4]) << 24)
+                                   | (std::uint32_t(rtp[5]) << 16)
+                                   | (std::uint32_t(rtp[6]) <<  8)
+                                   |  std::uint32_t(rtp[7]);
+            const std::uint32_t ssrc = (std::uint32_t(rtp[8]) << 24)
+                                     | (std::uint32_t(rtp[9]) << 16)
+                                     | (std::uint32_t(rtp[10]) <<  8)
+                                     |  std::uint32_t(rtp[11]);
+            update_rtp_stats(seq, ts, ssrc);
+        }
+        decode_rtp_h264(rtp);
+    }
+
+    void update_rtp_stats(std::uint16_t seq, std::uint32_t rtp_ts,
+                          std::uint32_t ssrc)
+    {
+        std::lock_guard<std::mutex> lk(stats_mu);
+        peer_ssrc      = ssrc;
+        have_peer_ssrc = true;
+        if (!seq_initialised) {
+            seq_initialised  = true;
+            base_seq         = seq;
+            max_seq          = seq;
+            seq_cycles       = 0;
+            packets_received = 0;
+            expected_prior   = 0;
+            received_prior   = 0;
+        } else {
+            // RFC 3550 A.1: a small forward delta advances the highest
+            // sequence number and wraps the cycle counter; anything else
+            // is a duplicate or a reorder and only counts as received.
+            const std::uint16_t delta = static_cast<std::uint16_t>(seq - max_seq);
+            if (delta < 0x8000) {
+                if (seq < max_seq) seq_cycles += 0x10000;
+                max_seq = seq;
+            }
+        }
+        ++packets_received;
+
+        // Interarrival jitter (RFC 3550 A.8) in RTP timestamp units.
+        const auto now = std::chrono::steady_clock::now();
+        const auto us  = std::chrono::duration_cast<std::chrono::microseconds>(
+                             now - stream_t0).count();
+        const std::int64_t arrival =
+            (us * static_cast<std::int64_t>(track.clock_rate)) / 1000000;
+        const std::int64_t transit = arrival - static_cast<std::int64_t>(rtp_ts);
+        if (have_transit) {
+            std::int64_t d = transit - last_transit;
+            if (d < 0) d = -d;
+            jitter += (static_cast<double>(d) - jitter) / 16.0;
+        }
+        last_transit = transit;
+        have_transit = true;
+    }
+
+    // Walk a compound RTCP packet: remember the newest sender report so
+    // the next receiver report can echo it, and notice a BYE.
+    void handle_rtcp(const std::vector<std::uint8_t>& pkt)
+    {
+        std::size_t off = 0;
+        while (off + 4 <= pkt.size()) {
+            if ((pkt[off] >> 6) != 2) return;             // not RTCP v2
+            const int pt = pkt[off + 1];
+            const std::size_t words = (std::size_t(pkt[off + 2]) << 8) | pkt[off + 3];
+            const std::size_t len   = (words + 1) * 4;
+            if (off + len > pkt.size()) return;
+
+            if (pt == kRtcpSr && len >= 20) {
+                // NTP timestamp lives at +8; the report echoes its
+                // middle 32 bits (low 16 of seconds, high 16 of fraction).
+                const std::uint32_t msw = (std::uint32_t(pkt[off +  8]) << 24)
+                                        | (std::uint32_t(pkt[off +  9]) << 16)
+                                        | (std::uint32_t(pkt[off + 10]) <<  8)
+                                        |  std::uint32_t(pkt[off + 11]);
+                const std::uint32_t lsw = (std::uint32_t(pkt[off + 12]) << 24)
+                                        | (std::uint32_t(pkt[off + 13]) << 16)
+                                        | (std::uint32_t(pkt[off + 14]) <<  8)
+                                        |  std::uint32_t(pkt[off + 15]);
+                std::lock_guard<std::mutex> lk(stats_mu);
+                last_sr_middle32 = (msw << 16) | (lsw >> 16);
+                last_sr_at       = std::chrono::steady_clock::now();
+                have_sr          = true;
+            } else if (pt == kRtcpBye) {
+                log_fmt(logger, log_ctx, "rtsp: server sent RTCP BYE");
+                peer_bye = true;
+                return;
+            }
+            off += len;
+        }
     }
 
     void decode_rtp_h264(const std::vector<std::uint8_t>& rtp)
@@ -1115,6 +1447,9 @@ int Client::start(const Url& url, int connect_timeout_ms)
             "rtsp: dialing %s://%s:%d",
             url.tls ? "rtsps" : "rtsp", url.host.c_str(), url.port);
 
+    I.ctrl_timeout_ms = (connect_timeout_ms > 0) ? connect_timeout_ms : 5000;
+    I.data_timeout_ms = data_read_timeout_ms();
+
     if (url.tls) {
         if (obn::tls::dial_tls(url.host, url.port, connect_timeout_ms,
                                &I.fd, &I.ssl,
@@ -1125,6 +1460,14 @@ int Client::start(const Url& url, int connect_timeout_ms)
         }
         log_fmt(I.logger, I.log_ctx, "rtsp: TLS established (cipher=%s)",
                 SSL_get_cipher(I.ssl));
+        // dial_tls leaves the socket fully blocking. The read helpers bound
+        // their own receives, but nothing bounds a *write*: the keepalive
+        // and RTCP senders would wedge on a printer that stopped draining
+        // its receive window. Give both directions the tighter of the two
+        // budgets, which also spares the read path a pair of setsockopt
+        // calls per read since it then finds a timeout it can live with.
+        obn::tls::set_socket_io_timeout(
+            I.fd, std::min(I.ctrl_timeout_ms, I.data_timeout_ms));
     } else {
         I.fd = obn::tls::dial(url.host, url.port, connect_timeout_ms);
         if (!obn::os::socket_valid(I.fd)) {
@@ -1162,12 +1505,18 @@ int Client::start(const Url& url, int connect_timeout_ms)
                 impl_->track.rtp_pt, impl_->track.clock_rate,
                 impl_->track.sps.size(), impl_->track.pps.size(),
                 I.url_setup.c_str());
+        if (impl_->track.width > 0) {
+            log_fmt(I.logger, I.log_ctx, "rtsp: SPS geometry %dx%d @ %d fps",
+                    impl_->track.width, impl_->track.height, impl_->track.fps);
+        }
     }
     if (I.do_setup(url) != 0)               goto fail;
     if (I.do_play(url) != 0)                goto fail;
 
     log_fmt(I.logger, I.log_ctx, "rtsp: PLAY ok, session=%s", I.session_id.c_str());
-    I.keepalive = std::thread(&Impl::keepalive_main, impl_.get());
+    I.stream_t0     = std::chrono::steady_clock::now();
+    I.next_rtcp_due = I.stream_t0 + std::chrono::milliseconds(kRtcpIntervalMs);
+    I.keepalive     = std::thread(&Impl::keepalive_main, impl_.get());
     return 0;
 
 fail:
@@ -1184,6 +1533,7 @@ int Client::read_nalu(Nalu* out)
     auto& I = *impl_;
     while (I.nalu_queue.empty()) {
         if (I.stop_flag.load(std::memory_order_acquire) || !I.ssl) return -1;
+        I.maybe_send_rtcp();
         int rc = I.pull_one_message();
         if (rc != 0) return rc;
     }
@@ -1198,9 +1548,13 @@ void Client::stop()
     auto& I = *impl_;
     if (I.stop_flag.exchange(true)) return;
     I.keepalive_cv.notify_all();
-    if (obn::os::socket_valid(I.fd)) obn::os::shutdown_both(I.fd);
     if (I.keepalive.joinable()) I.keepalive.join();
+    // TEARDOWN is worth sending only while the connection is still up;
+    // after a cancel() it is a write to a shut-down socket. Closing the
+    // TCP connection ends the session on the server either way.
     I.do_teardown_best_effort();
+    I.socket_down.store(true, std::memory_order_release);
+    if (obn::os::socket_valid(I.fd)) obn::os::shutdown_both(I.fd);
     std::lock_guard<std::mutex> lk(I.io_mu);
     obn::tls::close_tls(&I.fd, &I.ssl);
 }
@@ -1209,6 +1563,7 @@ void Client::cancel()
 {
     if (!impl_) return;
     auto& I = *impl_;
+    I.socket_down.store(true, std::memory_order_release);
     if (obn::os::socket_valid(I.fd)) obn::os::shutdown_both(I.fd);
     I.keepalive_cv.notify_all();
 }
