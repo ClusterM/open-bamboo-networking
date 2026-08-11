@@ -147,6 +147,49 @@ int main()
         CHECK(f.contains_idr);
     }
 
+    // 7. parse_sps_geometry against real x264 output. Both fixtures are
+    //    the SPS NAL as it appears on the wire; ffmpeg reports 1168x720
+    //    @ 24.67 fps and 1280x720 @ 30 fps for them respectively, and
+    //    the first one exercises the crop path (80 macroblocks = 1280
+    //    coded pixels cropped down to 1168) plus the High-profile
+    //    chroma_format_idc block.
+    {
+        const uint8_t sps_high_1168x720[] = {
+            0x67, 0x64, 0x00, 0x1f, 0xac, 0xd9, 0x40, 0x49, 0x05, 0xbb,
+            0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x30, 0x00, 0x00, 0x09,
+            0x40, 0xf1, 0x83, 0x19, 0x60,
+        };
+        obn::h264::SpsGeometry g;
+        CHECK(obn::h264::parse_sps_geometry(sps_high_1168x720,
+                                            sizeof(sps_high_1168x720), &g));
+        CHECK(g.width  == 1168);
+        CHECK(g.height == 720);
+        CHECK(g.fps    == 25);   // 24.67 fps, rounded
+    }
+    {
+        const uint8_t sps_baseline_1280x720[] = {
+            0x67, 0x42, 0xc0, 0x1f, 0xd9, 0x00, 0x50, 0x05, 0xbb, 0x01,
+            0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03,
+            0xc0, 0xf1, 0x83, 0x24, 0x80,
+        };
+        obn::h264::SpsGeometry g;
+        CHECK(obn::h264::parse_sps_geometry(sps_baseline_1280x720,
+                                            sizeof(sps_baseline_1280x720), &g));
+        CHECK(g.width  == 1280);
+        CHECK(g.height == 720);
+        CHECK(g.fps    == 30);
+    }
+
+    // 8. Truncated and empty SPS inputs must fail rather than read past
+    //    the buffer or invent a geometry.
+    {
+        const uint8_t truncated[] = { 0x67, 0x64, 0x00 };
+        obn::h264::SpsGeometry g;
+        CHECK(!obn::h264::parse_sps_geometry(truncated, sizeof(truncated), &g));
+        CHECK(!obn::h264::parse_sps_geometry(nullptr, 0, &g));
+        CHECK(g.width == 0 && g.height == 0 && g.fps == 0);
+    }
+
     if (g_fail) {
         std::printf("h264_avcc_test FAILED (%d)\n", g_fail);
         return 1;

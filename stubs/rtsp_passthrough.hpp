@@ -49,6 +49,13 @@ public:
         Pull_Error      = -1,
     };
 
+    // Geometry the SDP's SPS advertised, zeroed when it did not parse.
+    struct StreamParams {
+        int width  = 0;
+        int height = 0;
+        int fps    = 0;
+    };
+
     Passthrough(obn::source::Logger logger, void* log_ctx);
     ~Passthrough();
 
@@ -64,6 +71,9 @@ public:
               const std::string& device = {},
               int                connect_timeout_ms = 5000);
 
+    // Valid after a successful start().
+    StreamParams params() const;
+
     // Non-blocking pop of the next ready Annex-B sample. The caller
     // gets a borrowed pointer; it remains valid until the next
     // try_pull() call (or stop()). dt_100ns is wall-clock since
@@ -71,6 +81,13 @@ public:
     // gstbambusrc's `decode_time * 100ULL` does the right thing).
     // flags carries Bambu_SampleFlag::f_sync (1) on access units
     // containing an IDR slice.
+    //
+    // Never answers Pull_WouldBlock forever: once no access unit has
+    // been produced for the stall timeout, every call returns
+    // Pull_Error. gstbambusrc polls "would block" in a usleep loop
+    // while holding the pad's stream lock and has no unlock() handler,
+    // so an endlessly blocked source deadlocks the slicer's teardown
+    // (issue #54) -- reporting the dead stream is what breaks the loop.
     PullResult try_pull(const std::uint8_t** out_buf,
                         std::size_t*         out_size,
                         std::uint64_t*       out_dt_100ns,

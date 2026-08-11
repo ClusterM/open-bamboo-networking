@@ -21,6 +21,7 @@
 #  include <ws2tcpip.h>
 #  include <windows.h>
 #else
+#  include <csignal>
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
@@ -29,7 +30,9 @@
 #  include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -51,10 +54,29 @@ void set_error(const char* msg)
     }
 }
 
+// A write to a socket whose peer is gone raises SIGPIPE, and the default
+// disposition kills the whole process -- here, the slicer that loaded us.
+// OpenSSL has no per-write MSG_NOSIGNAL equivalent, so neutralise the
+// signal instead, and only when the host has not installed a handler of
+// its own (never override the application's choice).
+void ignore_sigpipe_if_default()
+{
+#if !defined(_WIN32)
+    struct sigaction old{};
+    if (::sigaction(SIGPIPE, nullptr, &old) != 0) return;
+    if (old.sa_handler != SIG_DFL) return;
+    struct sigaction act{};
+    act.sa_handler = SIG_IGN;
+    ::sigemptyset(&act.sa_mask);
+    ::sigaction(SIGPIPE, &act, nullptr);
+#endif
+}
+
 void init_once()
 {
     std::call_once(g_init_flag, []() {
         obn::os::winsock_init_once();
+        ignore_sigpipe_if_default();
 
         SSL_library_init();
         OpenSSL_add_all_algorithms();
@@ -366,6 +388,112 @@ int ssl_read_full(SSL* ssl, void* buf, std::size_t len)
         got += static_cast<std::size_t>(n);
     }
     return 0;
+}
+
+namespace {
+
+using SteadyPoint = std::chrono::steady_clock::time_point;
+
+// Block until the peer has bytes for us or `deadline` passes.
+// Returns 1 when a read can make progress, 0 on timeout, -1 on a dead
+// socket. SSL_pending() short-circuits the poll: bytes already sitting
+// in the record buffer are readable even when the socket is not.
+int wait_ssl_readable(SSL* ssl, SteadyPoint deadline)
+{
+    if (SSL_pending(ssl) > 0) return 1;
+    const obn::os::socket_t fd =
+        static_cast<obn::os::socket_t>(SSL_get_fd(ssl));
+    if (!obn::os::socket_valid(fd)) return -1;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - now).count();
+        // Cap a single poll so a caller that shuts the socket down from
+        // another thread is noticed promptly even on a long deadline.
+        if (left_ms > 1000) left_ms = 1000;
+        short revents = 0;
+        const int rc = obn::os::poll_one(fd, obn::net::poll_event::in,
+                                         static_cast<int>(left_ms), &revents);
+        if (rc < 0) return -1;
+        if (rc > 0) return (revents & obn::net::poll_event::in) ? 1 : -1;
+    }
+}
+
+void set_timeout_error(int timeout_ms)
+{
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "read timed out after %d ms", timeout_ms);
+    set_error(msg);
+}
+
+// Read exactly one chunk into `buf`, waiting no longer than `timeout_ms`
+// for it to start arriving. Returns the byte count (>0), 0 for a clean
+// EOS, or -1 on error / timeout.
+int read_some_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const int ready = wait_ssl_readable(ssl, deadline);
+        if (ready == 0) {
+            set_timeout_error(timeout_ms);
+            return -1;
+        }
+        if (ready < 0) return -1;
+        const int n = SSL_read(ssl, buf, static_cast<int>(len));
+        if (n > 0) return n;
+        const int err = SSL_get_error(ssl, n);
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            continue;  // renegotiation or a short record: wait again
+        if (err == SSL_ERROR_SYSCALL &&
+            (obn::os::socket_in_progress(obn::os::last_socket_error()) ||
+             obn::os::last_socket_error() == EINTR))
+            continue;  // SO_RCVTIMEO / signal, not a real failure
+        return -1;
+    }
+}
+
+} // namespace
+
+int ssl_read_full_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
+{
+    if (!ssl) return -1;
+    if (timeout_ms <= 0) return ssl_read_full(ssl, buf, len);
+    auto*       p   = static_cast<std::uint8_t*>(buf);
+    std::size_t got = 0;
+    while (got < len) {
+        const int n = read_some_timeout(ssl, p + got, len - got, timeout_ms);
+        if (n == 0) return 1;
+        if (n < 0) return -1;
+        got += static_cast<std::size_t>(n);
+    }
+    return 0;
+}
+
+int ssl_read_line_timeout(SSL* ssl, std::string* out, int timeout_ms,
+                          std::size_t max_len)
+{
+    if (!ssl) return -1;
+    if (timeout_ms <= 0) return ssl_read_line(ssl, out, max_len);
+    out->clear();
+    out->reserve(128);
+    char prev = '\0';
+    while (out->size() < max_len) {
+        char      c = '\0';
+        const int n = read_some_timeout(ssl, &c, 1, timeout_ms);
+        if (n == 0) return 1;
+        if (n < 0) return -1;
+        if (prev == '\r' && c == '\n') {
+            if (!out->empty()) out->pop_back();
+            return 0;
+        }
+        out->push_back(c);
+        prev = c;
+    }
+    set_error("ssl_read_line: line exceeded max_len");
+    return -1;
 }
 
 int ssl_read_line(SSL* ssl, std::string* out, std::size_t max_len)

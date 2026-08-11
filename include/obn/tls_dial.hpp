@@ -39,4 +39,15 @@ int ssl_read_full(SSL* ssl, void* buf, std::size_t len);
 
 int ssl_read_line(SSL* ssl, std::string* out, std::size_t max_len = 8192);
 
+// Deadline-aware variants of the two readers above. `timeout_ms` bounds
+// the wait for *each* chunk of incoming data, so a peer that goes quiet
+// mid-message fails with -1 and a "read timed out" last_error instead of
+// parking the calling thread in SSL_read forever. A long-lived stream
+// reader (the RTSP data plane) needs this: without it a silently dropped
+// session is indistinguishable from an idle one.
+int ssl_read_full_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms);
+
+int ssl_read_line_timeout(SSL* ssl, std::string* out, int timeout_ms,
+                          std::size_t max_len = 8192);
+
 } // namespace obn::tls

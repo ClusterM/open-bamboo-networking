@@ -37,5 +37,19 @@ bool annexb_to_avcc(const uint8_t* data, size_t size, AvccFrame* out);
 // True if the Annex-B buffer contains an IDR slice (NAL type 5).
 bool contains_idr(const uint8_t* data, size_t size);
 
+// Display geometry carried by an SPS. `fps` is 0 when the SPS omits VUI
+// timing information, which is optional.
+struct SpsGeometry {
+    int width  = 0;
+    int height = 0;
+    int fps    = 0;
+};
+
+// Decode display geometry (cropping applied) and the frame rate from a
+// raw SPS NAL -- `sps` includes the 1-byte NAL header but no Annex-B
+// start code. Returns false when the SPS does not parse, leaving *out
+// untouched.
+bool parse_sps_geometry(const uint8_t* sps, size_t size, SpsGeometry* out);
+
 } // namespace h264
 } // namespace obn
