@@ -432,6 +432,73 @@ void set_timeout_error(int timeout_ms, short want)
     set_error(msg);
 }
 
+// SSL_read on a blocking BIO parks inside recv() until the peer delivers
+// the rest of a TLS record it started -- polling for readability first
+// cannot prevent that, it only proves the record's opening bytes arrived.
+// Bound the syscall itself for the duration of a timed read so the
+// deadline holds however the caller left the descriptor; dial_tls clears
+// its handshake timeout, so relying on the caller would make the timeout
+// helpers silently unbounded. read_some_timeout reads the resulting EAGAIN
+// as "not ready yet" and goes back to its own deadline check.
+//
+// A receive timeout already at least as tight as our budget is left alone,
+// which keeps the common path (the RTSP client sets one) syscall-free.
+class ScopedRecvTimeout {
+public:
+    ScopedRecvTimeout(obn::os::socket_t fd, int timeout_ms) : fd_(fd)
+    {
+        if (!obn::os::socket_valid(fd_) || timeout_ms <= 0) return;
+#if defined(_WIN32)
+        int len = static_cast<int>(sizeof(prev_));
+        if (::getsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<char*>(&prev_), &len) != 0)
+            return;
+        const DWORD want = static_cast<DWORD>(timeout_ms);
+        if (prev_ != 0 && prev_ <= want) return;
+        if (::setsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                         reinterpret_cast<const char*>(&want),
+                         sizeof(want)) == 0)
+            restore_ = true;
+#else
+        socklen_t len = static_cast<socklen_t>(sizeof(prev_));
+        if (::getsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &prev_, &len) != 0)
+            return;
+        const long prev_ms = static_cast<long>(prev_.tv_sec) * 1000 +
+                             prev_.tv_usec / 1000;
+        if (prev_ms > 0 && prev_ms <= timeout_ms) return;
+        timeval want{};
+        want.tv_sec  = timeout_ms / 1000;
+        want.tv_usec = (timeout_ms % 1000) * 1000;
+        if (::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &want,
+                         sizeof(want)) == 0)
+            restore_ = true;
+#endif
+    }
+
+    ~ScopedRecvTimeout()
+    {
+        if (!restore_) return;
+#if defined(_WIN32)
+        ::setsockopt(static_cast<SOCKET>(fd_), SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&prev_), sizeof(prev_));
+#else
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &prev_, sizeof(prev_));
+#endif
+    }
+
+    ScopedRecvTimeout(const ScopedRecvTimeout&)            = delete;
+    ScopedRecvTimeout& operator=(const ScopedRecvTimeout&) = delete;
+
+private:
+    obn::os::socket_t fd_;
+    bool              restore_ = false;
+#if defined(_WIN32)
+    DWORD             prev_    = 0;
+#else
+    timeval           prev_{};
+#endif
+};
+
 // Read exactly one chunk into `buf`, waiting no longer than `timeout_ms`
 // for it to start arriving. Returns the byte count (>0), 0 for a clean
 // EOS, or -1 on error / timeout.
@@ -478,6 +545,8 @@ int ssl_read_full_timeout(SSL* ssl, void* buf, std::size_t len, int timeout_ms)
 {
     if (!ssl) return -1;
     if (timeout_ms <= 0) return ssl_read_full(ssl, buf, len);
+    ScopedRecvTimeout guard(static_cast<obn::os::socket_t>(SSL_get_fd(ssl)),
+                            timeout_ms);
     auto*       p   = static_cast<std::uint8_t*>(buf);
     std::size_t got = 0;
     while (got < len) {
@@ -494,6 +563,8 @@ int ssl_read_line_timeout(SSL* ssl, std::string* out, int timeout_ms,
 {
     if (!ssl) return -1;
     if (timeout_ms <= 0) return ssl_read_line(ssl, out, max_len);
+    ScopedRecvTimeout guard(static_cast<obn::os::socket_t>(SSL_get_fd(ssl)),
+                            timeout_ms);
     out->clear();
     out->reserve(128);
     char prev = '\0';

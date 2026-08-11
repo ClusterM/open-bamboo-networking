@@ -1460,13 +1460,12 @@ int Client::start(const Url& url, int connect_timeout_ms)
         }
         log_fmt(I.logger, I.log_ctx, "rtsp: TLS established (cipher=%s)",
                 SSL_get_cipher(I.ssl));
-        // dial_tls leaves the socket fully blocking. Give it a receive
-        // timeout so a read that starts mid-TLS-record cannot park the
-        // thread past the deadline our read helpers enforce. The tighter of
-        // the two budgets wins: a socket timeout longer than the control
-        // deadline would let one SSL_read overshoot it, while one shorter
-        // than a caller's budget only costs an extra poll round, since
-        // read_some_timeout treats the EAGAIN as "not ready yet".
+        // dial_tls leaves the socket fully blocking. The read helpers bound
+        // their own receives, but nothing bounds a *write*: the keepalive
+        // and RTCP senders would wedge on a printer that stopped draining
+        // its receive window. Give both directions the tighter of the two
+        // budgets, which also spares the read path a pair of setsockopt
+        // calls per read since it then finds a timeout it can live with.
         obn::tls::set_socket_io_timeout(
             I.fd, std::min(I.ctrl_timeout_ms, I.data_timeout_ms));
     } else {
