@@ -267,17 +267,6 @@ else()
     endif()
     find_package(OpenSSL COMPONENTS SSL REQUIRED)
     find_package(ZLIB REQUIRED)
-    # Homebrew's static libcrypto.a needs Security.framework at final link.
-    # Attach it to the imported OpenSSL targets so every consumer
-    # (plugin, BambuSource, vendored mosquitto/curl, tests) picks it up.
-    if(APPLE AND OBN_MACOS_STATIC_DEPS)
-        foreach(_obn_ssl_tgt IN ITEMS OpenSSL::SSL OpenSSL::Crypto)
-            if(TARGET ${_obn_ssl_tgt})
-                set_property(TARGET ${_obn_ssl_tgt} APPEND PROPERTY
-                    INTERFACE_LINK_LIBRARIES "-framework Security")
-            endif()
-        endforeach()
-    endif()
 endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VendorMosquitto.cmake")
@@ -298,6 +287,18 @@ else()
     pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
     target_link_libraries(obn_curl_iface INTERFACE PkgConfig::CURL)
 endif()
+
+# Homebrew's static libcrypto.a pulls Security.framework symbols that
+# FindOpenSSL only records for the dylib variant.
+if(APPLE AND OBN_MACOS_STATIC_DEPS)
+    foreach(_obn_ssl_tgt IN ITEMS OpenSSL::SSL OpenSSL::Crypto)
+        if(TARGET ${_obn_ssl_tgt})
+            set_property(TARGET ${_obn_ssl_tgt} APPEND PROPERTY
+                INTERFACE_LINK_LIBRARIES "-framework Security")
+        endif()
+    endforeach()
+endif()
+
 # zlib is shared between BambuSource (FTPS fallback: client-side ZIP
 # extract for file-browser thumbnails) and other zlib users in the tree.
 

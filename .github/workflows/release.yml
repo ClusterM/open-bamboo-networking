@@ -222,7 +222,7 @@ jobs:
           set -eu
           # curl/cjson/zlib are NOT brew runtime deps: libcurl is vendored
           # static, cJSON is vendored with mosquitto, zlib is system.
-          # openssl@3 is build-time only (static .a archives embedded).
+          # openssl@3 is build-time only: we link its static .a archives.
           for pkg in pkg-config cmake openssl@3 uthash; do
             brew list "$pkg" &>/dev/null || brew install "$pkg"
           done

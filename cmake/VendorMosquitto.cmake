@@ -13,6 +13,20 @@ function(obn_vendor_mosquitto_setup)
     include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorCJSON.cmake")
     obn_vendor_cjson_setup()
 
+    # Upstream leaves WITH_ARGON2 undefined ("Disable until separate password
+    # handling thread is implemented") but still links libmosquitto_common
+    # against the SHARED IMPORTED target its own Findargon2.cmake creates, so
+    # the plugin gets an unused libargon2 in its NEEDED list (a Homebrew dylib
+    # on macOS). Shadow the module: no argon2 symbol is referenced either way.
+    set(_obn_mosq_override_dir "${CMAKE_CURRENT_BINARY_DIR}/_obn_cmake_overrides")
+    file(MAKE_DIRECTORY "${_obn_mosq_override_dir}")
+    list(PREPEND CMAKE_MODULE_PATH "${_obn_mosq_override_dir}")
+    file(WRITE "${_obn_mosq_override_dir}/Findargon2.cmake"
+        "include_guard(GLOBAL)\n"
+        "set(ARGON2_FOUND FALSE)\n"
+        "set(argon2_FOUND FALSE)\n"
+    )
+
     FetchContent_Declare(eclipse_mosquitto
         GIT_REPOSITORY https://github.com/eclipse/mosquitto.git
         GIT_TAG ${OBN_MOSQUITTO_GIT_TAG}
