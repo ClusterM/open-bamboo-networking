@@ -40,6 +40,9 @@ struct FilamentDeleteParams;
 #if ABI_VERSION >= 0x020801
 struct AmsSyncParams;
 #endif
+#if ABI_VERSION >= 0x020802
+struct SlotMappingsSyncParams;
+#endif
 }
 
 namespace obn {
@@ -88,6 +91,39 @@ int config(Agent* agent, std::string* out_body);
 int sync_ams(Agent* agent, const BBL::AmsSyncParams& params,
              std::string* out_body);
 #endif
+
+#if ABI_VERSION >= 0x020802
+// POST /my/filament/v2/slot-mappings/sync. Studio's Filament Manager calls
+// this to bind a manually-tracked spool to an AMS slot, or to unbind one
+// after the tray is emptied. MITM shape (stock 02.08.02.54):
+//   {"devId":"...","mappings":[{"amsId":0,"amsSn":"...","amsType":3,
+//                               "rfid":null,"slotId":"1","spoolId":null}]}
+// Studio does not parse the response; it only logs it.
+int sync_slot_mappings(Agent* agent, const BBL::SlotMappingsSyncParams& params,
+                       std::string* out_body);
+#endif
+
+// Request-body serializers, exposed for tests that pin the wire format
+// against MITM captures of the stock plugin.
+namespace detail {
+#if ABI_VERSION >= 0x020801
+std::string build_ams_sync_body(const BBL::AmsSyncParams& params);
+#endif
+#if ABI_VERSION >= 0x020802
+// Emits item keys in ASCII order (amsId, amsSn, amsType, rfid, slotId,
+// spoolId), matching stock. `rfid` and `spoolId` are the two nullable
+// fields: an empty rfid and a zero spoolId serialize as JSON null, which
+// is how an unbind is expressed. amsId / amsType keep a literal 0.
+std::string build_slot_mappings_body(const BBL::SlotMappingsSyncParams& params);
+
+// True when every mapping passes the checks stock applies before it will
+// touch the network: non-empty amsSn and slotId, and non-negative amsId,
+// amsType and spoolId. A failing item makes stock return
+// BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED without issuing a request.
+// An empty devId or an empty mappings array both pass — stock posts those.
+bool slot_mappings_valid(const BBL::SlotMappingsSyncParams& params);
+#endif
+} // namespace detail
 
 } // namespace cloud_filament
 } // namespace obn

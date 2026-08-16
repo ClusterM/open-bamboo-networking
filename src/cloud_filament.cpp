@@ -163,15 +163,27 @@ std::string build_ams_sync_item(const BBL::AmsSyncItem& item)
     return os.str();
 }
 
-std::string build_ams_sync_body(const BBL::AmsSyncParams& params)
+#endif
+
+#if ABI_VERSION >= 0x020802
+
+// Unlike the ams/sync serializer, which sends "" and 0 verbatim, the
+// stock slot-mapping serializer maps an empty rfid and a zero spoolId to
+// JSON null. The pair being null is exactly what tells the cloud "this
+// slot no longer holds a spool".
+std::string build_slot_mapping_item(const BBL::SlotMappingItem& item)
 {
     std::ostringstream os;
-    os << "{\"devId\":" << json_str(params.devId) << ",\"items\":[";
-    for (size_t i = 0; i < params.items.size(); ++i) {
-        if (i) os << ',';
-        os << build_ams_sync_item(params.items[i]);
-    }
-    os << "]}";
+    os << '{'
+       << "\"amsId\":"   << item.amsId
+       << ",\"amsSn\":"  << json_str(item.amsSn)
+       << ",\"amsType\":" << item.amsType
+       << ",\"rfid\":"   << (item.rfid.empty() ? "null" : json_str(item.rfid))
+       << ",\"slotId\":" << json_str(item.slotId)
+       << ",\"spoolId\":";
+    if (item.spoolId == 0) os << "null";
+    else                   os << item.spoolId;
+    os << '}';
     return os.str();
 }
 
@@ -191,6 +203,51 @@ bool prepare(Agent* a,
 }
 
 } // namespace
+
+namespace detail {
+
+#if ABI_VERSION >= 0x020801
+
+std::string build_ams_sync_body(const BBL::AmsSyncParams& params)
+{
+    std::ostringstream os;
+    os << "{\"devId\":" << json_str(params.devId) << ",\"items\":[";
+    for (size_t i = 0; i < params.items.size(); ++i) {
+        if (i) os << ',';
+        os << build_ams_sync_item(params.items[i]);
+    }
+    os << "]}";
+    return os.str();
+}
+
+#endif
+
+#if ABI_VERSION >= 0x020802
+
+std::string build_slot_mappings_body(const BBL::SlotMappingsSyncParams& params)
+{
+    std::ostringstream os;
+    os << "{\"devId\":" << json_str(params.devId) << ",\"mappings\":[";
+    for (size_t i = 0; i < params.mappings.size(); ++i) {
+        if (i) os << ',';
+        os << build_slot_mapping_item(params.mappings[i]);
+    }
+    os << "]}";
+    return os.str();
+}
+
+bool slot_mappings_valid(const BBL::SlotMappingsSyncParams& params)
+{
+    for (const auto& m : params.mappings) {
+        if (m.amsSn.empty() || m.slotId.empty()) return false;
+        if (m.amsId < 0 || m.amsType < 0 || m.spoolId < 0) return false;
+    }
+    return true;
+}
+
+#endif
+
+} // namespace detail
 
 int list(Agent* a, const BBL::FilamentQueryParams& params, std::string* out_body)
 {
@@ -329,14 +386,14 @@ int sync_ams(Agent* a, const BBL::AmsSyncParams& params, std::string* out_body)
     std::map<std::string, std::string> hdrs;
     if (!prepare(a, out_body, &hdrs)) {
         OBN_WARN("cloud_filament::sync_ams: not logged in");
-        return BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED;
+        return BAMBU_NETWORK_ERR_AMS_SYNC_FAILED;
     }
     if (params.devId.empty() || params.items.empty()) {
         OBN_WARN("cloud_filament::sync_ams: empty devId or items");
-        return BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED;
+        return BAMBU_NETWORK_ERR_AMS_SYNC_FAILED;
     }
 
-    const std::string body = build_ams_sync_body(params);
+    const std::string body = detail::build_ams_sync_body(params);
     auto resp = obn::http::post_json(base_v2(a) + "/ams/sync", body, hdrs);
     OBN_INFO("cloud_filament::sync_ams dev='%s' items=%zu http=%ld bytes=%zu",
              params.devId.c_str(), params.items.size(),
@@ -346,7 +403,44 @@ int sync_ams(Agent* a, const BBL::AmsSyncParams& params, std::string* out_body)
     if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
         OBN_WARN("cloud_filament::sync_ams failed: http=%ld err=%s body=%s",
                  resp.status_code, resp.error.c_str(), resp.body.c_str());
-        return BAMBU_NETWORK_ERR_UPDATE_FILAMENT_FAILED;
+        return BAMBU_NETWORK_ERR_AMS_SYNC_FAILED;
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+#endif
+
+#if ABI_VERSION >= 0x020802
+
+int sync_slot_mappings(Agent* a, const BBL::SlotMappingsSyncParams& params,
+                       std::string* out_body)
+{
+    std::map<std::string, std::string> hdrs;
+    if (!prepare(a, out_body, &hdrs)) {
+        OBN_WARN("cloud_filament::sync_slot_mappings: not logged in");
+        return BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED;
+    }
+    // Deliberately no guard on an empty devId or an empty mappings array:
+    // stock posts both (the server answers 400 and {"results":[]}
+    // respectively), and Studio relies on seeing that outcome.
+    if (!detail::slot_mappings_valid(params)) {
+        OBN_WARN("cloud_filament::sync_slot_mappings: rejecting malformed "
+                 "mapping (empty amsSn/slotId or negative amsId/amsType/spoolId)");
+        return BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED;
+    }
+
+    const std::string body = detail::build_slot_mappings_body(params);
+    auto resp = obn::http::post_json(base_v2(a) + "/slot-mappings/sync", body, hdrs);
+    OBN_INFO("cloud_filament::sync_slot_mappings dev='%s' mappings=%zu "
+             "http=%ld bytes=%zu",
+             params.devId.c_str(), params.mappings.size(),
+             resp.status_code, resp.body.size());
+
+    if (out_body) *out_body = resp.body;
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
+        OBN_WARN("cloud_filament::sync_slot_mappings failed: http=%ld err=%s body=%s",
+                 resp.status_code, resp.error.c_str(), resp.body.c_str());
+        return BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED;
     }
     return BAMBU_NETWORK_SUCCESS;
 }

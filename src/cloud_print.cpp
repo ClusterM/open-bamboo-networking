@@ -39,9 +39,11 @@
 #include "obn/print_params_ftp_prefs.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -216,6 +218,21 @@ std::string ams_mapping2_for_cloud(const BBL::PrintParams& p)
 }
 
 std::string to_bool(bool v) { return v ? "true" : "false"; }
+
+#if ABI_VERSION >= 0x020802
+// Whole-string int64 parse; anything that isn't one (empty, alphabetic,
+// trailing junk, out of range) collapses to 0 so the caller can drop the
+// field, which is how stock treats an unusable queue_plate_id.
+long long parse_int64_or_zero(const std::string& s)
+{
+    if (s.empty()) return 0;
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(s.c_str(), &end, 10);
+    if (errno == ERANGE || end != s.c_str() + s.size()) return 0;
+    return v;
+}
+#endif
 
 // ---------------------------------------------------------------
 // HTTP plumbing
@@ -574,10 +591,27 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << ",\"nozzleOffsetCali\":"    << p.auto_offset_cali;
     os << ",\"oriModelId\":"  << json_escape(p.origin_model_id);
     os << ",\"oriProfileId\":" << p.origin_profile_id;
+#if ABI_VERSION >= 0x020802
+    // queue_plate_id crosses the ABI as a string but goes on the wire as a
+    // JSON *number*, and the key is dropped when it doesn't parse or parses
+    // to zero — stock 02.08.02.54 emitted plateId=9988776655 for the numeric
+    // sentinel and no key at all for the alphabetic one. int64 because the
+    // service's plate ids exceed 32 bits. See
+    // ../research/08.08-print-abi.md §8.8.1.
+    if (const long long plate_id = parse_int64_or_zero(p.queue_plate_id))
+        os << ",\"plateId\":" << plate_id;
+#endif
     os << ",\"plateIndex\":"  << (p.plate_index <= 0 ? 1 : p.plate_index);
     // profileId must be a number in the MITM baseline.
     os << ",\"profileId\":"   << (profile_id.empty() ? std::string{"0"} : profile_id);
     os << ",\"sequence_id\":\"20000\""; // TODO: is it always 20000?
+#if ABI_VERSION >= 0x020701
+    // Opaque string forwarded verbatim, omitted when empty. Unlike
+    // slicer_uid this one is cloud-only — it never appears in the LAN
+    // project_file. See ../research/08.08-print-abi.md §8.8.1.
+    if (!p.svc_context.empty())
+        os << ",\"svcContext\":" << json_escape(p.svc_context);
+#endif
     os << ",\"timelapse\":"   << to_bool(p.task_record_timelapse);
     os << ",\"title\":"       << json_escape(p.project_name.empty()
                                              ? p.task_name : p.project_name);

@@ -829,10 +829,10 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME signing COMMAND signing_test)
 
-    # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
-    # build_task_body). OBN_TESTING promotes the anonymous-namespace
-    # helpers to obn::cloud_print::test_* wrappers.
-    add_executable(cloud_print_test tests/cloud_print_test.cpp
+    # Agent and its transitive deps: the tests below exercise pure helpers,
+    # but those live in translation units that reference the agent, so the
+    # whole core has to be linked in.
+    set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
         src/auth.cpp
         src/cert_store.cpp
@@ -859,6 +859,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/tls_dial.cpp
         src/tunnel_local.cpp
         src/tunnel_upload.cpp)
+
+    # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
+    # build_task_body). OBN_TESTING promotes the anonymous-namespace
+    # helpers to obn::cloud_print::test_* wrappers.
+    add_executable(cloud_print_test tests/cloud_print_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
     target_include_directories(cloud_print_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(cloud_print_test PRIVATE
         OBN_TESTING
@@ -873,6 +879,26 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME cloud_print COMMAND cloud_print_test)
+
+    # Pins the Filament Manager request bodies (ams/sync, slot-mappings/sync)
+    # byte-for-byte against MITM captures of the stock plugin.
+    add_executable(filament_body_test tests/filament_body_test.cpp
+        src/cloud_filament.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(filament_body_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(filament_body_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(filament_body_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME filament_body COMMAND filament_body_test)
 
     # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
     # the AWS SigV4 signing-key derivation against the vendors' published

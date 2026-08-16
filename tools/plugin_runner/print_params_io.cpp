@@ -82,6 +82,12 @@ const std::unordered_set<std::string> kKnownKeys = {
 #if ABI_VERSION >= 0x020701
     "svc_context",
 #endif
+#if ABI_VERSION >= 0x020801
+    "slicer_uid",
+#endif
+#if ABI_VERSION >= 0x020802
+    "queue_plate_id",
+#endif
 };
 
 void warn_unknown(const json& src, std::vector<std::string>& warnings)
@@ -161,6 +167,22 @@ void apply_overlay(const json& j, BBL::PrintParams& p,
 #else
     if (j.contains("svc_context")) {
         w.emplace_back("'svc_context' present but ABI < 0x020701; "
+                       "skipping (rebuild plugin_runner with newer --abi)");
+    }
+#endif
+#if ABI_VERSION >= 0x020801
+    set_string(j, "slicer_uid",                  p.slicer_uid,                  w);
+#else
+    if (j.contains("slicer_uid")) {
+        w.emplace_back("'slicer_uid' present but ABI < 0x020801; "
+                       "skipping (rebuild plugin_runner with newer --abi)");
+    }
+#endif
+#if ABI_VERSION >= 0x020802
+    set_string(j, "queue_plate_id",              p.queue_plate_id,              w);
+#else
+    if (j.contains("queue_plate_id")) {
+        w.emplace_back("'queue_plate_id' present but ABI < 0x020802; "
                        "skipping (rebuild plugin_runner with newer --abi)");
     }
 #endif

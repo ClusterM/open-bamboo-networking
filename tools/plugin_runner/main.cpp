@@ -148,6 +148,24 @@ struct CliArgs {
     int         rating_id     = 0;
     int         rating_score  = 5;
 
+    // --action filament_probe: Filament Manager cloud calls. The slot
+    // mapping defaults describe one AMS tray; --slot-mappings-json
+    // overrides the whole array for batch / multi-item captures.
+    std::string slot_dev_id;
+    std::string slot_ams_sn;
+    std::string slot_slot_id  = "0";
+    int         slot_spool_id = 0;
+    std::string slot_rfid;
+    int         slot_ams_id   = 0;
+    int         slot_ams_type = 0;
+    std::string slot_mappings_json;
+    // Skip the list/config reads and only exercise the sync calls.
+    bool        fil_sync_only = false;
+    // Also call sync_ams_filaments with the same tray identity, so the two
+    // serializers can be diffed on the wire. Off by default: it writes
+    // real mount state onto the cloud catalogue.
+    bool        probe_ams_sync = false;
+
     // --action account_bind extras (Studio BindJob defaults).
     std::string dev_model = "N7";
     std::string timezone  = "UTC+02:00";
@@ -167,6 +185,16 @@ struct CliArgs {
     // experiment leave physical heat-up running.
     bool        auto_stop = false;
     bool        use_ssl_mqtt = true;
+    // lan_only argument for install_device_cert during LAN bring-up.
+    // Studio passes is_lan_mode_printer(), so a cloud-paired printer needs
+    // false: only that branch publishes app_cert_install and gets the
+    // printer's public key back. With true on a cloud-paired printer the
+    // plugin has nothing to sign with and every print:* publish fails -4030.
+    bool        cert_lan_only = true;
+    // X-BBL-Client-Name. Honest by default, but the cloud gates some
+    // endpoints on the value: POST /my/task answers 403 for anything but
+    // "BambuStudio", so faithful stock captures need --client-name.
+    std::string client_name = "OpenBambooNetworking";
     int         timeout_s = 90;
     int         connect_settle_ms = 800;
     bool        keep_tmpdir = false;
@@ -205,8 +233,8 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--gcode-3mf PATH] --dev-id ID --dev-ip IP --access-code CODE
                      [--country US] [--use-ssl-mqtt 0|1]
                      [--cert-file PATH] [--timeout SECONDS]
-                     [--connect-settle-ms MS]
-                     [--log-out PATH] [--keep-tmpdir]
+                     [--connect-settle-ms MS] [--cert-lan-only 0|1]
+                     [--client-name NAME] [--log-out PATH] [--keep-tmpdir]
 
        plugin_runner --action send_raw --raw-json FILE
                      --plugin-path PATH --dev-id ID --dev-ip IP --access-code CODE
@@ -225,6 +253,14 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--task-id ID] [--instance-id N] [--design-id ID]
                      [--mw-seed N] [--mw-limit N] [--mw-put-rating]
                      [--rating-id N] [--rating-score N] [--country US]
+
+       plugin_runner --action filament_probe --plugin-path PATH
+                     --user-info @session.json [--data-dir DIR]
+                     [--slot-dev-id ID] [--slot-ams-sn SN] [--slot-id N]
+                     [--slot-spool-id N] [--slot-rfid HEX]
+                     [--slot-ams-id N] [--slot-ams-type N]
+                     [--slot-mappings-json JSON|@path] [--fil-sync-only]
+                     [--country US]
 
        plugin_runner --action update_cert --plugin-path PATH
                      [--user-info @session.json] [--data-dir DIR]
@@ -254,9 +290,18 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--country US] [--timeout SECONDS]
 
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
-                | local_print_with_record | send_raw | none | http_probe
-                | mw_probe | update_cert | query_bind | bind_detect
-                | account_bind | gap_probe | cert_probe
+                | local_print_with_record | cloud_print | send_raw | none
+                | http_probe | mw_probe | filament_probe | update_cert
+                | query_bind | bind_detect | account_bind | gap_probe
+                | cert_probe
+
+  cloud_print: bambu_network_start_print — the pure-cloud path. Uploads
+  the 3mf to S3 and dispatches through POST /my/task with
+  mode=cloud_file, so it needs --user-info; the printer then downloads
+  from S3 on its own. Still requires --dev-id/--dev-ip/--access-code and
+  --cert-file: the stock plugin gates the send stage on having the
+  device certificate and answers -3140 ENC_FLAG_NOT_READY without a live
+  LAN session. Honours --auto-stop.
 
   none: skip the print dispatch entirely. Useful for diagnostics: just
   init + connect_printer, then sit for --timeout seconds dumping every
@@ -278,6 +323,13 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   get_model_mall_detail_url / get_model_mall_rating /
   get_mw_user_preference / get_mw_user_4ulist (put_model_mall_rating
   only with --mw-put-rating). Use under MITM to capture MakerWorld URLs.
+
+  filament_probe: no printer. change_user then call get_filament_spools
+  and sync_slot_mappings (ABI >= 02.08.02). Studio drives the latter from
+  the Filament Manager AMS sync: a bind carries spoolId + rfid, an unbind
+  zeroes both and keeps the pre-eject amsSn/slotId/amsId/amsType. Use
+  --slot-mappings-json to send a batch or an empty array; --fil-sync-only
+  skips the catalogue read. Run under MITM to capture the request body.
 
   update_cert: no printer. Mirrors Studio GUI_App::check_cert →
   bambu_network_update_cert. Under MITM this should be the shared app
@@ -348,6 +400,8 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--use-ssl-mqtt")      c.use_ssl_mqtt = std::stoi(require(a, ++i, f)) != 0;
         else if (f == "--timeout")           c.timeout_s   = std::stoi(require(a, ++i, f));
         else if (f == "--connect-settle-ms") c.connect_settle_ms = std::stoi(require(a, ++i, f));
+        else if (f == "--cert-lan-only")     c.cert_lan_only = std::stoi(require(a, ++i, f)) != 0;
+        else if (f == "--client-name")       c.client_name = require(a, ++i, f);
         else if (f == "--keep-tmpdir")       c.keep_tmpdir = true;
         else if (f == "--data-dir")          c.data_dir = require(a, ++i, f);
         else if (f == "--user-info")         c.user_info = require(a, ++i, f);
@@ -365,6 +419,16 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--mw-put-rating")     c.mw_put_rating = true;
         else if (f == "--rating-id")         c.rating_id = std::stoi(require(a, ++i, f));
         else if (f == "--rating-score")      c.rating_score = std::stoi(require(a, ++i, f));
+        else if (f == "--slot-dev-id")       c.slot_dev_id = require(a, ++i, f);
+        else if (f == "--slot-ams-sn")       c.slot_ams_sn = require(a, ++i, f);
+        else if (f == "--slot-id")           c.slot_slot_id = require(a, ++i, f);
+        else if (f == "--slot-spool-id")     c.slot_spool_id = std::stoi(require(a, ++i, f));
+        else if (f == "--slot-rfid")         c.slot_rfid = require(a, ++i, f);
+        else if (f == "--slot-ams-id")       c.slot_ams_id = std::stoi(require(a, ++i, f));
+        else if (f == "--slot-ams-type")     c.slot_ams_type = std::stoi(require(a, ++i, f));
+        else if (f == "--slot-mappings-json") c.slot_mappings_json = require(a, ++i, f);
+        else if (f == "--fil-sync-only")     c.fil_sync_only = true;
+        else if (f == "--probe-ams-sync")    c.probe_ams_sync = true;
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--dev-model")         c.dev_model = require(a, ++i, f);
         else if (f == "--timezone")          c.timezone  = require(a, ++i, f);
@@ -393,7 +457,7 @@ CliArgs parse_cli(int argc, char** argv)
     const bool cloud_probe =
         (c.action == "http_probe" || c.action == "mw_probe" ||
          c.action == "update_cert" || c.action == "query_bind" ||
-         c.action == "gap_probe");
+         c.action == "gap_probe" || c.action == "filament_probe");
     const bool bind_detect_only = (c.action == "bind_detect");
     const bool account_bind     = (c.action == "account_bind");
     const bool cert_probe       = (c.action == "cert_probe");
@@ -440,7 +504,8 @@ CliArgs parse_cli(int argc, char** argv)
         usage(64);
     }
     if ((c.action == "http_probe" || c.action == "mw_probe" ||
-         c.action == "query_bind" || c.action == "gap_probe") &&
+         c.action == "query_bind" || c.action == "gap_probe" ||
+         c.action == "filament_probe") &&
         c.user_info.empty()) {
         std::fprintf(stderr, "plugin_runner: --action %s requires "
                              "--user-info JSON|@path\n", c.action.c_str());
@@ -842,7 +907,7 @@ try {
         // request as legacy.
         std::map<std::string, std::string> hdrs;
         hdrs["X-BBL-Client-Type"]    = "slicer";
-        hdrs["X-BBL-Client-Name"]    = "OpenBambooNetworking";
+        hdrs["X-BBL-Client-Name"]    = args.client_name;
         hdrs["X-BBL-Client-Version"] = "02.05.03.99";
         hdrs["X-BBL-OS-Type"]        = "linux";
         hdrs["X-BBL-OS-Version"]     = "1.0.0";
@@ -929,9 +994,10 @@ try {
     const bool cert_probe_action = (args.action == "cert_probe");
     const bool bind_detect_only  = (args.action == "bind_detect");
     const bool account_bind_probe = (args.action == "account_bind");
+    const bool filament_probe     = (args.action == "filament_probe");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
-        gap_probe_action;
+        gap_probe_action || filament_probe;
     // account_bind / bind_detect call bind_detect themselves then exit
     // (or call bind()); they must not open a competing LAN MQTT session.
     const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
@@ -1047,16 +1113,30 @@ try {
         // proximate cause of `start_local_print` returning -4030 ("send
         // msg failed") on the Sending stage — every `print:*` payload
         // the plugin tries to publish gets pre-flight-rejected with -4
-        // because there's no cert available to sign it with. lan_only=1
-        // matches what Studio passes when is_lan_mode_printer() is true
-        // (no cloud lookup).
+        // because there's no cert available to sign it with. Studio passes
+        // is_lan_mode_printer() here, mirrored by --cert-lan-only: only the
+        // lan_only=0 branch publishes app_cert_install and receives the
+        // printer_cert reply, so a cloud-paired printer needs 0.
         // cert_probe owns install_device_cert itself so the LAN bring-up
         // path must not auto-provision (would muddy lan_only true/false).
         if (!cert_probe_action) {
             if (exports.install_device_cert) {
-                exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
+                // Cloud-paired printers need both calls in this order:
+                // lan_only=1 alone never publishes app_cert_install, and
+                // lan_only=0 alone publishes nothing either. Only the pair
+                // (as cert_probe issues them) puts app_cert_install on the
+                // wire and brings printer_cert back, which is what the
+                // plugin signs privileged publishes with.
+                if (!args.cert_lan_only) {
+                    exports.install_device_cert(agent, args.dev_id, /*lan_only=*/true);
+                    emit_event("install_device_cert", {
+                        {"dev_id", args.dev_id}, {"lan_only", true}, {"phase", "1"},
+                    });
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                }
+                exports.install_device_cert(agent, args.dev_id, args.cert_lan_only);
                 emit_event("install_device_cert", {
-                    {"dev_id", args.dev_id}, {"lan_only", true},
+                    {"dev_id", args.dev_id}, {"lan_only", args.cert_lan_only},
                 });
             } else {
                 emit_text("warning",
@@ -1077,7 +1157,7 @@ try {
         //      a privileged command. Empirically the cert provisioning
         //      path inside stock plugins can take ~3-5s on first call.
         std::this_thread::sleep_for(std::chrono::milliseconds(
-            cert_probe_action ? 1500 : 3500));
+            cert_probe_action ? 1500 : (args.cert_lan_only ? 3500 : 8000)));
     }
     } // !skip_lan_mqtt
 
@@ -1724,6 +1804,155 @@ try {
         pr::unload(exports);
         emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
         return 0;
+    } else if (args.action == "filament_probe") {
+        auto trunc = [](const std::string& s, size_t n = 2000) {
+            if (s.size() <= n) return s;
+            return s.substr(0, n) + "...";
+        };
+        emit_event("filament_probe_begin", {
+            {"have_get_spools", exports.get_filament_spools != nullptr},
+            {"have_get_config", exports.get_filament_config != nullptr},
+#if ABI_VERSION >= 0x020801
+            {"have_sync_ams", exports.sync_ams_filaments != nullptr},
+#else
+            {"have_sync_ams", false},
+#endif
+#if ABI_VERSION >= 0x020802
+            {"have_sync_slot_mappings", exports.sync_slot_mappings != nullptr},
+#else
+            {"have_sync_slot_mappings", false},
+#endif
+        });
+
+        if (!args.fil_sync_only && exports.get_filament_spools) {
+            BBL::FilamentQueryParams q{};
+            q.offset = 0;
+            q.limit  = 20;
+            std::string body;
+            int rc = exports.get_filament_spools(agent, q, &body);
+            emit_event("get_filament_spools", {
+                {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        } else if (!args.fil_sync_only) {
+            emit_event("get_filament_spools", { {"missing", true} });
+        }
+
+#if ABI_VERSION >= 0x020801
+        // Path A/B counterpart: same devId, same tray identity, so the two
+        // serializers can be diffed on the wire (notably how each renders
+        // empty strings and zero ints).
+        if (args.probe_ams_sync && exports.sync_ams_filaments) {
+            BBL::AmsSyncParams p{};
+            p.devId = args.slot_dev_id.empty() ? args.dev_id : args.slot_dev_id;
+            BBL::AmsSyncItem it{};
+            it.RFID    = args.slot_rfid;
+            it.amsSn   = args.slot_ams_sn;
+            it.slotId  = args.slot_slot_id;
+            it.amsId   = args.slot_ams_id;
+            it.amsType = args.slot_ams_type;
+            p.items.push_back(std::move(it));
+
+            std::string body;
+            int rc = exports.sync_ams_filaments(agent, p, &body);
+            emit_event("sync_ams_filaments", {
+                {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        }
+#endif
+
+#if ABI_VERSION >= 0x020802
+        if (exports.sync_slot_mappings) {
+            BBL::SlotMappingsSyncParams p{};
+            p.devId = args.slot_dev_id.empty() ? args.dev_id : args.slot_dev_id;
+
+            // --slot-mappings-json wins; it is the only way to send a batch
+            // or an intentionally empty array (the negative capture).
+            bool parsed_json = false;
+            if (!args.slot_mappings_json.empty()) {
+                try {
+                    std::string raw = args.slot_mappings_json;
+                    if (!raw.empty() && raw.front() == '@') {
+                        std::ifstream mf(raw.substr(1));
+                        if (!mf) {
+                            throw std::runtime_error(
+                                "cannot open --slot-mappings-json file: " +
+                                raw.substr(1));
+                        }
+                        std::stringstream mss; mss << mf.rdbuf();
+                        raw = mss.str();
+                    }
+                    auto j = json::parse(raw);
+                    if (j.is_object() && j.contains("devId"))
+                        p.devId = j.value("devId", p.devId);
+                    const json& arr = j.is_array() ? j
+                                    : (j.contains("mappings") ? j["mappings"] : json::array());
+                    for (const auto& e : arr) {
+                        BBL::SlotMappingItem it{};
+                        it.amsSn   = e.value("amsSn", "");
+                        it.slotId  = e.value("slotId", "");
+                        it.spoolId = e.value("spoolId", 0);
+                        it.rfid    = e.value("rfid", "");
+                        it.amsId   = e.value("amsId", 0);
+                        it.amsType = e.value("amsType", 0);
+                        p.mappings.push_back(std::move(it));
+                    }
+                    parsed_json = true;
+                } catch (const std::exception& e) {
+                    emit_text("fatal", std::string("--slot-mappings-json parse failed: ")
+                                       + e.what());
+                    return 64;
+                }
+            }
+            if (!parsed_json) {
+                BBL::SlotMappingItem it{};
+                it.amsSn   = args.slot_ams_sn;
+                it.slotId  = args.slot_slot_id;
+                it.spoolId = args.slot_spool_id;
+                it.rfid    = args.slot_rfid;
+                it.amsId   = args.slot_ams_id;
+                it.amsType = args.slot_ams_type;
+                p.mappings.push_back(std::move(it));
+            }
+
+            json sent = json::array();
+            for (const auto& it : p.mappings) {
+                sent.push_back({
+                    {"amsSn", it.amsSn}, {"slotId", it.slotId},
+                    {"spoolId", it.spoolId}, {"rfid", it.rfid},
+                    {"amsId", it.amsId}, {"amsType", it.amsType},
+                });
+            }
+            emit_event("sync_slot_mappings_request", {
+                {"devId", p.devId}, {"mappings", sent},
+            });
+
+            std::string body;
+            int rc = exports.sync_slot_mappings(agent, p, &body);
+            emit_event("sync_slot_mappings", {
+                {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        } else {
+            emit_event("sync_slot_mappings", { {"missing", true} });
+        }
+#else
+        emit_event("sync_slot_mappings", { {"unsupported_abi", true} });
+#endif
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        emit_event("filament_probe_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            std::cout.flush();
+            if (g_log_file) g_log_file.flush();
+            std::_Exit(0);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return 0;
     } else if (args.action == "none") {
         emit_text("info", "action=none — sleeping for --timeout seconds and "
                           "logging callbacks; no print dispatch");
@@ -1805,6 +2034,12 @@ try {
             return 70;
         }
         rc_action = exports.start_local_print_with_record(agent, params, on_update, on_cancel, on_wait);
+    } else if (args.action == "cloud_print") {
+        if (!exports.start_print) {
+            emit_text("fatal", "plugin does not export bambu_network_start_print");
+            return 70;
+        }
+        rc_action = exports.start_print(agent, params, on_update, on_cancel, on_wait);
     } else {
         emit_text("fatal", "unknown --action '" + args.action + "'");
         return 64;
@@ -1833,7 +2068,8 @@ try {
     if (args.auto_stop &&
         (args.action == "local_print" ||
          args.action == "sdcard_print" ||
-         args.action == "local_print_with_record")) {
+         args.action == "local_print_with_record" ||
+         args.action == "cloud_print")) {
         const std::string stop_payload =
             "{\"print\":{\"command\":\"stop\",\"param\":\"\","
             "\"sequence_id\":\"99999\"}}";

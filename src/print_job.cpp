@@ -359,6 +359,15 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     os << ",\"task_id\":"    << json_escape(opts.task_id);
     os << ",\"subtask_id\":" << json_escape(opts.subtask_id);
     os << ",\"subtask_name\":" << json_escape(subtask);
+#if ABI_VERSION >= 0x020801
+    // Forwarded verbatim as a string — no parsing, no normalisation — and
+    // omitted entirely when the caller left it empty. Confirmed against
+    // stock 02.08.02.54 with sentinel values over both sdcard_print and
+    // local_print; the same field never reaches POST /my/task. See
+    // ../research/08.08-print-abi.md §8.8.1.
+    if (!p.slicer_uid.empty())
+        os << ",\"slicer_uid\":" << json_escape(p.slicer_uid);
+#endif
     os << ",\"file\":" << json_escape(strip_leading_slash(opts.file_path));
     os << url_field;
     os << ",\"md5\":"  << json_escape(opts.md5);

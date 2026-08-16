@@ -147,6 +147,7 @@ every feature is verified against Studio. Supported ABI series:
 - Bambu Studio **02.07.01**._xx_
 - Bambu Studio **02.08.00**._xx_
 - Bambu Studio **02.08.01**._xx_
+- Bambu Studio **02.08.02**._xx_
 
 Compatibility with plugin ABI depends on the first three numbers in the version number, e.g.
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
@@ -321,7 +322,7 @@ Studio does the work.
 | Cloud MQTT telemetry                 | ✅     | Native              | TLS to `us.mqtt.bambulab.com:8883`. Runs in parallel with LAN when signed in; not exercised during LAN-focused testing.                                              |
 | Cloud login / ticket flow            | ✅     | Native              | Browser → `localhost` callback → `POST /user-service/user/ticket/<T>`. Session persisted to `obn.auth.json`.                                                         |
 | User presets sync / profile / avatar | ✅     | Native              | List / create / update / delete works                                                                                                                                |
-| Filament Manager (cloud spool catalogue) | ✅ | Native              | Studio's spool tab (Studio 02.06.01+). All CRUD endpoints plus the bulk AMS sync added in ABI 02.08.01 (new in v2.0.0). Needs cloud sign-in; works under the default `block_cloud = 1`. |
+| Filament Manager (cloud spool catalogue) | ✅ | Native              | Studio's spool tab (Studio 02.06.01+). All CRUD endpoints plus the bulk AMS sync added in ABI 02.08.01 and the AMS slot bind/unbind added in ABI 02.08.02 (new in v2.0.0). Needs cloud sign-in; works under the default `block_cloud = 1`. |
 | MQTT command signing                 | 🔒     | Native              | (new in v2.0.0) Signs `print` commands (RSA-PKCS#1 v1.5 + SHA-256) and installs the app cert on the printer **when you supply your own `slicer_key.pem` / `slicer_cert.pem`** — see [Option B](#option-b-cloud-mode-without-developer-mode). Without those keys nothing is signed; use Developer Mode instead. |
 
 #### Printing
@@ -383,8 +384,9 @@ around:
 It also unlocks the **Filament Manager** tab (Bambu Studio 02.06.01 and newer),
 the cloud spool catalogue where Studio tracks every spool you own — RFID,
 vendor, type, remaining weight, AMS slot binding. The plugin implements all of
-its endpoints, including the bulk AMS sync added in ABI 02.08.01, so the tab
-works as it does with the stock plugin.
+its endpoints, including the bulk AMS sync added in ABI 02.08.01 and the AMS
+slot bind/unbind added in ABI 02.08.02, so the tab works as it does with the
+stock plugin.
 
 Bind/unbind and cloud print history remain available too; history and MakerWorld
 records are only written for cloud prints, so a Developer-Mode LAN print leaves

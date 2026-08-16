@@ -78,6 +78,9 @@ using func_start_send_gcode_to_sdcard    = int (*)(void* agent, BBL::PrintParams
 using func_start_local_print             = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn);
 using func_start_sdcard_print            = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn);
 using func_start_local_print_with_record = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn, BBL::OnWaitFn wait_fn);
+// Cloud print: uploads the 3mf to S3 and dispatches through POST /my/task
+// with mode=cloud_file, so unlike the LAN paths it needs a logged-in agent.
+using func_start_print                   = int (*)(void* agent, BBL::PrintParams params, BBL::OnUpdateStatusFn update_fn, BBL::WasCancelledFn cancel_fn, BBL::OnWaitFn wait_fn);
 
 // Cloud HTTP probes (optional — present on modern stock plugins; used by
 // --action http_probe). BambuStudio ba049f6a2 still dlsym's these even
@@ -119,6 +122,22 @@ using func_get_mw_user_preference = int (*)(void* agent,
                                             std::function<void(std::string)> cb);
 using func_get_mw_user_4ulist = int (*)(void* agent, int seed, int limit,
                                         std::function<void(std::string)> cb);
+
+// Filament Manager cloud probes (--action filament_probe). sync_ams_filaments
+// landed in ABI 02.08.01, sync_slot_mappings in 02.08.02; both take their
+// params by value, so BBL::AmsSyncParams / BBL::SlotMappingsSyncParams must
+// match the target plugin's layout (hence the per-ABI build dirs).
+using func_get_filament_spools = int (*)(void* agent, BBL::FilamentQueryParams params,
+                                         std::string* http_body);
+using func_get_filament_config = int (*)(void* agent, std::string* http_body);
+#if ABI_VERSION >= 0x020801
+using func_sync_ams_filaments = int (*)(void* agent, BBL::AmsSyncParams params,
+                                        std::string* http_body);
+#endif
+#if ABI_VERSION >= 0x020802
+using func_sync_slot_mappings = int (*)(void* agent, BBL::SlotMappingsSyncParams params,
+                                        std::string* http_body);
+#endif
 
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
@@ -207,12 +226,13 @@ struct PluginExports {
     func_request_bind_ticket         request_bind_ticket         = nullptr;
     func_bind                        bind                        = nullptr;
 
-    // Print actions. At least one of the four must be present for the
+    // Print actions. At least one of the five must be present for the
     // wanted --action; main.cpp validates per-action.
     func_start_send_gcode_to_sdcard    start_send_gcode_to_sdcard    = nullptr;
     func_start_local_print             start_local_print             = nullptr;
     func_start_sdcard_print            start_sdcard_print            = nullptr;
     func_start_local_print_with_record start_local_print_with_record = nullptr;
+    func_start_print                   start_print                   = nullptr;
 
     // Optional HTTP / task metadata probes (--action http_probe).
     func_get_studio_info_url     get_studio_info_url     = nullptr;
@@ -228,6 +248,16 @@ struct PluginExports {
     func_put_model_mall_rating       put_model_mall_rating       = nullptr;
     func_get_mw_user_preference      get_mw_user_preference      = nullptr;
     func_get_mw_user_4ulist          get_mw_user_4ulist          = nullptr;
+
+    // Optional Filament Manager probes (--action filament_probe).
+    func_get_filament_spools         get_filament_spools         = nullptr;
+    func_get_filament_config         get_filament_config         = nullptr;
+#if ABI_VERSION >= 0x020801
+    func_sync_ams_filaments          sync_ams_filaments          = nullptr;
+#endif
+#if ABI_VERSION >= 0x020802
+    func_sync_slot_mappings          sync_slot_mappings          = nullptr;
+#endif
 };
 
 // Loads `so_path`, resolves all entry points listed above. Throws

@@ -65,7 +65,8 @@ per ABI). Plugin downloads are cached in
                           send_raw / none / http_probe / mw_probe
 --action ACTION           send_gcode_to_sdcard | local_print
                           | sdcard_print | local_print_with_record
-                          | send_raw | none | http_probe | mw_probe
+                          | cloud_print | send_raw | none | http_probe
+                          | mw_probe | filament_probe
 --gcode-3mf PATH          path to the *.gcode.3mf file Studio would have
                           generated; used as `filename` and `ftp_file`
                           fallbacks if your params JSON omits them
@@ -80,6 +81,16 @@ per ABI). Plugin downloads are cached in
                           (status=ConnectStatusOk) before the publish
                           channel is considered ready. Default 800; bump
                           to 15000+ on slow handshakes (see §9).
+--client-name NAME        X-BBL-Client-Name. Default OpenBambooNetworking.
+                          POST /my/task answers 403 for anything other
+                          than `BambuStudio`, so pass that when you need a
+                          faithful stock cloud-print capture.
+--cert-lan-only 0|1       lan_only argument for install_device_cert during
+                          bring-up; Studio passes is_lan_mode_printer().
+                          Default 1. A cloud-paired printer needs 0: only
+                          that branch publishes app_cert_install and gets
+                          printer_cert back, and without it every print:*
+                          publish is rejected with -4030 (see §9).
 --log-out PATH            also mirror every JSON event line to this file
 --keep-tmpdir             leave the per-run /tmp/obn-plugin-runner-* alone
 --fast-exit               flush logs then `_Exit(0)` instead of letting
@@ -95,7 +106,7 @@ per ABI). Plugin downloads are cached in
 --user-info JSON|@FILE    change_user payload. Studio
                           `{"data":{"token":…,"user":{…}}}` envelope, or
                           OBN `obn.auth.json` (auto-converted). Required
-                          for `http_probe` / `mw_probe`.
+                          for `http_probe` / `mw_probe` / `filament_probe`.
 
 # --action send_raw flags
 --raw-json FILE                JSON payload to publish verbatim       (required)
@@ -118,6 +129,20 @@ per ABI). Plugin downloads are cached in
 --mw-seed / --mw-limit         get_mw_user_4ulist (defaults 0 / 10)
 --mw-put-rating                also call put_model_mall_rating (off by default)
 --rating-id / --rating-score   for optional put
+
+# --action filament_probe flags (no printer; cloud HTTP only)
+--slot-dev-id ID               devId for sync_slot_mappings (default --dev-id)
+--slot-ams-sn SN               amsSn of the tray
+--slot-id N                    slotId — a decimal string ("0".."3")
+--slot-spool-id N              spoolId — cloud spool id; 0 means unbind
+--slot-rfid HEX                rfid — empty on unbind
+--slot-ams-id N                amsId — AMS unit index
+--slot-ams-type N              amsType — DevAmsType (0 EXT, 1 AMS, 2 Lite,
+                               3 N3F, 4 N3S, 5 Lite-mixed)
+--slot-mappings-json JSON|@F   full mappings array (or {"devId":…,
+                               "mappings":[…]}), overrides the flags above;
+                               the only way to send a batch or an empty array
+--fil-sync-only                skip get_filament_spools, only run the syncs
 ```
 
 `http_probe` calls `get_studio_info_url`, `get_my_message`, `check_user_task_report`,
@@ -125,6 +150,12 @@ per ABI). Plugin downloads are cached in
 
 `mw_probe` calls `get_subtask`, `get_model_mall_detail_url`, `get_model_mall_rating`,
 `get_mw_user_preference`, `get_mw_user_4ulist` (and optionally `put_model_mall_rating`).
+
+`filament_probe` calls `get_filament_spools` and `sync_slot_mappings` (the latter
+needs `--abi 02.08.02` or newer). Studio drives `sync_slot_mappings` from the
+Filament Manager AMS sync in two flavours: a *bind* carries `spoolId` + `rfid`,
+an *unbind* zeroes both and keeps the pre-eject mount fields. Both hit
+`POST /my/filament/v2/slot-mappings/sync` ([research §8.15](../../research/08.15-filament.md)).
 
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch
@@ -183,6 +214,12 @@ Minimal experiment that toggles just `task_timelapse_use_internal`:
 `--access-code`) and `use_ssl_for_mqtt` only fall back to their CLI
 values when the JSON leaves them blank — encode them only if you want
 to override the wrapper.
+
+Version-gated keys are only accepted when the bridge is built for a new
+enough `--abi`; passing one to an older ABI logs a `params_warning` and
+skips it: `extruder_cali_manual_mode` (`02.04.00`),
+`task_timelapse_use_internal` (`02.05.03`), `svc_context` (`02.07.01`),
+`slicer_uid` (`02.08.01`), `queue_plate_id` (`02.08.02`).
 
 ## 5. Worked examples
 
@@ -281,9 +318,14 @@ changed; anything else is a wire bug in our plugin to investigate.
   happens on whichever worker thread the plugin called us back on.
   `set_queue_on_main_fn` is wired to inline-execute, which is fine for
   this LAN-only scope but would deadlock under a real UI loop.
-- Cloud printing (`bambu_network_start_print`) is deliberately
-  out-of-scope: it requires the bambu-cloud auth dance and OSS
-  upload, neither of which is needed for diffing the LAN command set.
+- Cloud printing (`bambu_network_start_print`) is `--action cloud_print`.
+  It needs `--user-info` for the bambu-cloud auth dance, and still needs
+  `--dev-id`/`--dev-ip`/`--access-code`/`--cert-file`: the stock plugin
+  gates its send stage on the device certificate and answers `-3140`
+  `ENC_FLAG_NOT_READY` without a live LAN session. Unlike the LAN
+  actions it uploads to S3 and dispatches via `POST /my/task` with
+  `mode=cloud_file`, so the printer starts downloading on its own —
+  pair it with `--auto-stop`.
 - A `--timeout` exceeded run returns exit code `75` (`EX_TEMPFAIL`); a
   finished-but-failed action returns `1`; a clean success returns `0`.
 

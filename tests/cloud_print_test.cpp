@@ -328,6 +328,105 @@ static void test_cloud_project_file_builder_also_plaintext()
 }
 
 // ---------------------------------------------------------------------------
+// slicer_uid / queue_plate_id / svc_context routing
+//
+// These three PrintParams fields each go to exactly one destination, pinned
+// here against a stock 02.08.02.54 sentinel capture (research/08.08-print-abi.md
+// §8.8.1): slicer_uid to the LAN project_file only, queue_plate_id and
+// svc_context to POST /my/task only.
+// ---------------------------------------------------------------------------
+
+#if ABI_VERSION >= 0x020801
+static void test_slicer_uid_in_project_file()
+{
+    BBL::PrintParams p = default_params();
+    p.slicer_uid = "OBNUIDAAAA1111";
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "slot.3mf";
+    opts.url       = "ftp:///slot.3mf";
+
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(field(json, "print.slicer_uid") == "OBNUIDAAAA1111");
+
+    // Empty drops the key entirely rather than sending "".
+    p.slicer_uid.clear();
+    const std::string bare = obn::print_job::build_project_file_json(p, opts);
+    CHECK(bare.find("\"slicer_uid\"") == std::string::npos);
+}
+
+static void test_slicer_uid_absent_from_task_body()
+{
+    BBL::PrintParams p = default_params();
+    p.slicer_uid = "OBNUIDAAAA1111";
+    const std::string body = obn::cloud_print::test_build_task_body(
+        p, "proj1", "model1", "42", false);
+    CHECK(body.find("OBNUIDAAAA1111") == std::string::npos);
+    CHECK(body.find("slicerUid") == std::string::npos);
+}
+#endif
+
+#if ABI_VERSION >= 0x020701
+static void test_svc_context_in_task_body()
+{
+    BBL::PrintParams p = default_params();
+    p.svc_context = "OBNSVCCCC3333";
+    const std::string body = obn::cloud_print::test_build_task_body(
+        p, "proj1", "model1", "42", false);
+    CHECK(field(body, "svcContext") == "OBNSVCCCC3333");
+
+    p.svc_context.clear();
+    const std::string bare = obn::cloud_print::test_build_task_body(
+        p, "proj1", "model1", "42", false);
+    CHECK(bare.find("\"svcContext\"") == std::string::npos);
+}
+
+static void test_svc_context_absent_from_project_file()
+{
+    BBL::PrintParams p = default_params();
+    p.svc_context = "OBNSVCCCC3333";
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "slot.3mf";
+    opts.url       = "ftp:///slot.3mf";
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(json.find("OBNSVCCCC3333") == std::string::npos);
+}
+#endif
+
+#if ABI_VERSION >= 0x020802
+static void test_queue_plate_id_is_numeric_in_task_body()
+{
+    BBL::PrintParams p = default_params();
+    // Exceeds 32 bits on purpose: stock emitted this verbatim as a number.
+    p.queue_plate_id = "9988776655";
+    const std::string body = obn::cloud_print::test_build_task_body(
+        p, "proj1", "model1", "42", false);
+    CHECK(body.find("\"plateId\":9988776655") != std::string::npos);
+}
+
+static void test_queue_plate_id_dropped_when_unusable()
+{
+    BBL::PrintParams p = default_params();
+    for (const char* bad : {"", "OBNQPIDBBBB2222", "0", "12abc"}) {
+        p.queue_plate_id = bad;
+        const std::string body = obn::cloud_print::test_build_task_body(
+            p, "proj1", "model1", "42", false);
+        CHECK(body.find("\"plateId\"") == std::string::npos);
+    }
+}
+
+static void test_queue_plate_id_absent_from_project_file()
+{
+    BBL::PrintParams p = default_params();
+    p.queue_plate_id = "9988776655";
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "slot.3mf";
+    opts.url       = "ftp:///slot.3mf";
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(json.find("9988776655") == std::string::npos);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -356,6 +455,20 @@ int main()
 
     test_lan_project_file_is_plaintext();
     test_cloud_project_file_builder_also_plaintext();
+
+#if ABI_VERSION >= 0x020801
+    test_slicer_uid_in_project_file();
+    test_slicer_uid_absent_from_task_body();
+#endif
+#if ABI_VERSION >= 0x020701
+    test_svc_context_in_task_body();
+    test_svc_context_absent_from_project_file();
+#endif
+#if ABI_VERSION >= 0x020802
+    test_queue_plate_id_is_numeric_in_task_body();
+    test_queue_plate_id_dropped_when_unusable();
+    test_queue_plate_id_absent_from_project_file();
+#endif
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

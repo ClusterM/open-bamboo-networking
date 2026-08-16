@@ -68,3 +68,16 @@ OBN_ABI int bambu_network_sync_ams_filaments(void* agent,
 }
 
 #endif
+
+#if ABI_VERSION >= 0x020802
+
+OBN_ABI int bambu_network_sync_slot_mappings(void* agent,
+                                             BBL::SlotMappingsSyncParams params,
+                                             std::string* http_body)
+{
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return obn::cloud_filament::sync_slot_mappings(a, params, http_body);
+}
+
+#endif

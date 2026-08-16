@@ -161,6 +161,8 @@ PluginExports load(const std::string& so_path)
         out.dl_handle, "bambu_network_start_sdcard_print");
     out.start_local_print_with_record = resolve<func_start_local_print_with_record>(
         out.dl_handle, "bambu_network_start_local_print_with_record");
+    out.start_print = resolve<func_start_print>(
+        out.dl_handle, "bambu_network_start_print");
 
     out.get_studio_info_url = resolve<func_get_studio_info_url>(
         out.dl_handle, "bambu_network_get_studio_info_url");
@@ -185,6 +187,19 @@ PluginExports load(const std::string& so_path)
         out.dl_handle, "bambu_network_get_mw_user_preference");
     out.get_mw_user_4ulist = resolve<func_get_mw_user_4ulist>(
         out.dl_handle, "bambu_network_get_mw_user_4ulist");
+
+    out.get_filament_spools = resolve<func_get_filament_spools>(
+        out.dl_handle, "bambu_network_get_filament_spools");
+    out.get_filament_config = resolve<func_get_filament_config>(
+        out.dl_handle, "bambu_network_get_filament_config");
+#if ABI_VERSION >= 0x020801
+    out.sync_ams_filaments = resolve<func_sync_ams_filaments>(
+        out.dl_handle, "bambu_network_sync_ams_filaments");
+#endif
+#if ABI_VERSION >= 0x020802
+    out.sync_slot_mappings = resolve<func_sync_slot_mappings>(
+        out.dl_handle, "bambu_network_sync_slot_mappings");
+#endif
 
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }
