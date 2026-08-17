@@ -416,13 +416,16 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     #endif
 
     // `cfg` is a string-encoded bitmask the stock plugin builds from
-    // PrintParams flags that don't have a dedicated MQTT field. So far
-    // only one bit is known:
-    //   bit 2 (value 4) = use internal storage for timelapse.
-    // Driven by `task_timelapse_use_internal` (added to PrintParams in
-    // ABI 02.05.03). All other bits stay 0 in every captured stock
-    // frame; if more flags surface later, OR them into `cfg_bits` here.
-    // See ../research/12.01-project-file.md §12.3.
+    // PrintParams flags that don't have a dedicated MQTT field. Two bits
+    // are known, and the same bitmask is reused verbatim in the cloud
+    // POST /my/task body (see cloud_print.cpp):
+    //   bit 0 (value 1) = task_ext_change_assist
+    //   bit 2 (value 4) = use internal storage for timelapse,
+    //                     i.e. task_timelapse_use_internal (ABI 02.05.03)
+    // Bit 1 (value 2) has never appeared: no PrintParams field this ABI
+    // exposes moves it, try_emmc_print included. `task_record_timelapse`
+    // is not part of cfg either — it rides in the `timelapse` boolean.
+    // See ../research/08.08-print-abi.md §8.8.8.
     //
     // Wire-level parity: the cross-ABI `tools/plugin_runner` matrix
     // (02.05.00 -> 02.06.01) showed the stock plugin emits `cfg` in
@@ -431,6 +434,7 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
     // So we emit unconditionally and gate only the *value* on the ABI
     // bound that introduced `task_timelapse_use_internal`.
     int cfg_bits = 0;
+    if (p.task_ext_change_assist) cfg_bits |= 1;
 #if ABI_VERSION >= 0x020503
     if (p.task_timelapse_use_internal &&
         !obn::config::current().force_timelapse_external)

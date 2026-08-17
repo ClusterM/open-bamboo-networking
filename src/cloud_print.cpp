@@ -143,14 +143,29 @@ std::string json_or_default(const std::string& raw, const char* fallback)
     return fallback;
 }
 
+// True when the caller actually handed us a mapping. Stock treats the
+// mapping keys as optional and omits them outright for an empty string
+// instead of substituting a default, so this gates them below. `[]` is
+// lumped in with "absent" since an empty array carries no mapping either
+// (this half is an inference — every stock body we captured without a
+// mapping had the field as an empty string).
+bool has_json_payload(const std::string& raw)
+{
+    const std::string s = trim(raw);
+    if (s.empty() || s == "[]") return false;
+    return s.front() == '[' || s.front() == '{';
+}
+
 // Build a single amsMapping2 element as the server expects it:
 // `{"amsId":N,"slotId":M}` (camelCase). The convention observed in
 // the MITM dump is:
 //   -1   -> amsId=255, slotId=0 (unset / "external spool" sentinel)
 //   >=0  -> amsId=i/4, slotId=i%4 (linear index over AMS slot 0..3)
 // The external-spool sentinel is `{amsId:255,slotId:0}`, NOT
-// `{...,slotId:255}`: a genuine no-AMS /my/task body carries slotId 0
-// and the endpoint 400s on the wrong shape (cross-validated in #48).
+// `{...,slotId:255}`: the endpoint 400s on the wrong shape
+// (cross-validated in #48), and stock emits exactly this pair for a -1
+// entry. A job with no AMS at all sends no amsMapping2 key whatsoever —
+// see the gate in build_task_body.
 std::string ams_slot_pair(int ams_id, int slot_id)
 {
     return "{\"amsId\":" + std::to_string(ams_id) +
@@ -557,30 +572,57 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << "{";
     os << "\"amsDetailMapping\":"
        << json_or_default(p.ams_mapping_info, "[]");
-    os << ",\"amsMapping\":"  << json_or_default(p.ams_mapping, "[-1]");
-    os << ",\"amsMapping2\":" << ams_mapping2_for_cloud(p);
-    if (!p.nozzle_mapping.empty()) {
-        os << ",\"nozzleMapping\":" << p.nozzle_mapping;
-    }
+    // Both mapping keys are optional. Stock 02.08.02.54 omits them for an
+    // empty string, and `task_use_ams` on its own does not bring them back
+    // (probed with useAms=true + empty mappings -> neither key), so keying
+    // them off useAms or defaulting amsMapping to [-1] over-reports on a
+    // no-AMS job. Conversely they *are* emitted with useAms=false when the
+    // strings are filled: each key is gated by its own field.
+    // amsMapping goes out verbatim; amsMapping2 is re-keyed to camelCase
+    // (see ams_mapping2_for_cloud) — stock does the same conversion, which
+    // is why Studio's snake_case input never reaches the wire.
+    if (has_json_payload(p.ams_mapping))
+        os << ",\"amsMapping\":" << trim(p.ams_mapping);
+    if (has_json_payload(p.ams_mapping2) || has_json_payload(p.ams_mapping))
+        os << ",\"amsMapping2\":" << ams_mapping2_for_cloud(p);
     os << ",\"autoBedLeveling\":"     << p.auto_bed_leveling;
     os << ",\"bedLeveling\":"         << to_bool(p.task_bed_leveling);
     os << ",\"bedType\":" << json_escape(p.task_bed_type.empty()
                                          ? std::string{"auto"} : p.task_bed_type);
 
+    // Decimal bitmask sent as a *string*, identical to the one the plugin
+    // puts in the LAN project_file (see print_job.cpp). Two bits are known,
+    // both probed one at a time against stock 02.08.02.54:
+    //   bit 0 (value 1) = task_ext_change_assist
+    //   bit 2 (value 4) = task_timelapse_use_internal
+    // Bit 1 (value 2) never appeared for any PrintParams field we can set
+    // (try_emmc_print included), so it is not reachable through this ABI.
+    // task_record_timelapse is deliberately absent here: it rides in the
+    // separate `timelapse` key and leaves cfg at 0.
     int cfg_bits = 0;
+    if (p.task_ext_change_assist) cfg_bits |= 1;
     #if ABI_VERSION >= 0x020503
         if (p.task_timelapse_use_internal &&
             !obn::config::current().force_timelapse_external)
             cfg_bits |= 4;
     #endif
     os << ",\"cfg\":\"" << cfg_bits << "\"";
-    os << ",\"cover\":\"\""; // TODO: investigate 
+    // cover and filamentSettingIds stay empty: stock still sent "" and []
+    // with every PrintParams string filled with sentinels, so neither is fed
+    // from this ABI — they come from Studio state the plugin reads elsewhere.
+    os << ",\"cover\":\"\"";
+    // Dropped when zero, matching Studio's default — it only fills
+    // stl_design_id for MakerWorld STL-sourced models.
+    if (p.stl_design_id != 0)
+        os << ",\"designId\":" << p.stl_design_id;
     os << ",\"deviceId\":"     << json_escape(p.dev_id);
     os << ",\"extrudeCaliFlag\":"         << p.auto_flow_cali;
     #if ABI_VERSION >= 0x020400
-        os << ",\"extrudeCaliManualMode\":"   << p.extruder_cali_manual_mode;
+        // -1 is Studio's "not set" default and stock drops the key for it.
+        if (p.extruder_cali_manual_mode != -1)
+            os << ",\"extrudeCaliManualMode\":" << p.extruder_cali_manual_mode;
     #endif
-    os << ",\"filamentSettingIds\":[]"; // TODO: investigate 
+    os << ",\"filamentSettingIds\":[]";
     os << ",\"flowCali\":"            << to_bool(p.task_flow_cali);
     os << ",\"layerInspect\":"        << to_bool(p.task_layer_inspect);
     os << ",\"mode\":"
@@ -588,6 +630,8 @@ std::string build_task_body(const BBL::PrintParams& p,
                            : std::string{"\"cloud_file\""});
     os << ",\"modelId\":"     << json_escape(model_id);
     os << ",\"nozzleInfos\":" << json_or_default(p.nozzles_info, "[]");
+    if (has_json_payload(p.nozzle_mapping))
+        os << ",\"nozzleMapping\":" << trim(p.nozzle_mapping);
     os << ",\"nozzleOffsetCali\":"    << p.auto_offset_cali;
     os << ",\"oriModelId\":"  << json_escape(p.origin_model_id);
     os << ",\"oriProfileId\":" << p.origin_profile_id;
@@ -604,7 +648,11 @@ std::string build_task_body(const BBL::PrintParams& p,
     os << ",\"plateIndex\":"  << (p.plate_index <= 0 ? 1 : p.plate_index);
     // profileId must be a number in the MITM baseline.
     os << ",\"profileId\":"   << (profile_id.empty() ? std::string{"0"} : profile_id);
-    os << ",\"sequence_id\":\"20000\""; // TODO: is it always 20000?
+    // Per-attempt counter in stock: the first POST of a create_task call is
+    // always 20001 and each retry bumps it (20002/20003 seen on 400 and 403
+    // responses), while a later, separate create_task starts over at 20001.
+    // We never retry, so the first value is all we ever emit.
+    os << ",\"sequence_id\":\"20001\"";
 #if ABI_VERSION >= 0x020701
     // Opaque string forwarded verbatim, omitted when empty. Unlike
     // slicer_uid this one is cloud-only — it never appears in the LAN
