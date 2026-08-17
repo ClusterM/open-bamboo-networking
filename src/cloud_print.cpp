@@ -48,11 +48,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
 #include <thread>
 #include <vector>
+
+#include <openssl/evp.h>
 
 namespace obn {
 
@@ -114,6 +117,46 @@ std::string slurp_file(const std::string& path, std::string* err)
         return {};
     }
     return oss.str();
+}
+
+// Stock plugin hashes the print-ready .3mf itself and puts the digest
+// in PATCH profile_print_3mf[].md5 (uppercase hex). Studio never fills
+// PrintParams.ftp_file_md5 — the field exists only on the ABI struct.
+// Cloud accepts an all-zero placeholder (OBN used to send one) but
+// stock never does; see stock_hybrid.mitm 2026-07-19.
+std::string md5_file_hex_upper(const std::string& path)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return {};
+
+    std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> ctx(
+        EVP_MD_CTX_new(),
+        [](EVP_MD_CTX* c) { if (c) EVP_MD_CTX_free(c); });
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1)
+        return {};
+
+    char buf[64 * 1024];
+    while (ifs) {
+        ifs.read(buf, sizeof(buf));
+        const auto n = ifs.gcount();
+        if (n > 0 &&
+            EVP_DigestUpdate(ctx.get(), buf, static_cast<std::size_t>(n)) != 1)
+            return {};
+    }
+    if (!ifs.eof()) return {};
+
+    unsigned char digest[EVP_MAX_MD_SIZE] = {};
+    unsigned len = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), digest, &len) != 1 || len == 0)
+        return {};
+
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string hex(len * 2, '\0');
+    for (unsigned i = 0; i < len; ++i) {
+        hex[2 * i    ] = kHex[(digest[i] >> 4) & 0xF];
+        hex[2 * i + 1] = kHex[ digest[i]       & 0xF];
+    }
+    return hex;
 }
 
 // AMS mapping helpers. Studio hands us the mapping as a JSON array
@@ -766,6 +809,8 @@ std::string test_build_task_body(const BBL::PrintParams& p,
                                  const std::string& profile_id,
                                  bool use_lan_channel)
     { return build_task_body(p, project_id, model_id, profile_id, use_lan_channel); }
+std::string test_md5_file_hex_upper(const std::string& path)
+    { return md5_file_hex_upper(path); }
 } // namespace cloud_print
 #endif
 
@@ -823,9 +868,17 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
     std::string remote_name = print_job::pick_remote_name(p);
-    std::string md5         = p.ftp_file_md5;
-    // Schema placeholder when Studio left ftp_file_md5 empty.
-    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: compute real md5
+    // Stock ignores ftp_file_md5 (Studio leaves it empty) and hashes
+    // the print-ready file. Uppercase hex, same as stock_hybrid.mitm.
+    std::string md5 = md5_file_hex_upper(p.filename);
+    if (md5.empty()) {
+        OBN_ERROR("cloud_print: md5 %s failed", p.filename.c_str());
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_WR_CHECK_MD5_FAILED,
+                                 "md5 failed");
+        return BAMBU_NETWORK_ERR_PRINT_WR_CHECK_MD5_FAILED;
+    }
+    OBN_INFO("cloud_print: file md5=%s", md5.c_str());
 
     std::string project_url; // ftp://… or S3 https — registered via PATCH
 

@@ -8,6 +8,8 @@
 #include "obn/print_job.hpp"
 
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace obn::cloud_print {
@@ -17,6 +19,7 @@ namespace obn::cloud_print {
                                      const std::string& model_id,
                                      const std::string& profile_id,
                                      bool use_lan_channel);
+    std::string test_md5_file_hex_upper(const std::string& path);
 }
 
 static int fail_count = 0;
@@ -791,6 +794,25 @@ static void test_format_upload_info_matches_stock()
     CHECK(obn::print_job::format_upload_info(104857, 1195684) == "0.1M/1.1M");
 }
 
+static void test_md5_file_hex_upper_matches_stock_style()
+{
+    // Stock PATCH md5 is uppercase hex of the print-ready file.
+    const auto path = std::filesystem::temp_directory_path() / "obn-md5-test.bin";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "hello";
+    }
+    CHECK(obn::cloud_print::test_md5_file_hex_upper(path.string())
+          == "5D41402ABC4B2A76B9719D911017C592");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    }
+    CHECK(obn::cloud_print::test_md5_file_hex_upper(path.string())
+          == "D41D8CD98F00B204E9800998ECF8427E");
+    std::filesystem::remove(path);
+    CHECK(obn::cloud_print::test_md5_file_hex_upper(path.string()).empty());
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -855,6 +877,7 @@ int main()
 #endif
 
     test_format_upload_info_matches_stock();
+    test_md5_file_hex_upper_matches_stock_style();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
