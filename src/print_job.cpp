@@ -28,6 +28,7 @@
 #include "obn/tunnel_upload.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
