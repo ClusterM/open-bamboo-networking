@@ -23,12 +23,11 @@
 #include "obn/config.hpp"
 #include "obn/ftps.hpp"
 #include "obn/log.hpp"
+#include "obn/mqtt_seq.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/tunnel_upload.hpp"
 
 #include <algorithm>
-#include <array>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -36,8 +35,6 @@
 #include <sstream>
 #include <string>
 #include <system_error>
-
-#include <openssl/evp.h>
 
 namespace obn::print_job {
 
@@ -111,57 +108,12 @@ std::string json_escape(const std::string& in)
 
 std::string to_bool(bool v) { return v ? "true" : "false"; }
 
-// Returns a millisecond-resolution epoch timestamp string suitable for
-// use as a sequence_id; matches the Bambu plugin's style.
-std::string now_seq_id()
-{
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::system_clock::now().time_since_epoch()).count();
-    return std::to_string(ms);
-}
-
 // Studio's SelectMachineDialog::get_ams_mapping_result serializes the
 // mapping into `params.ams_mapping` as a JSON array string, e.g.
 // "[0,-1,-1,-1]". We must not wrap it again - the firmware's parser
-// accepts the array as-is. When there's no AMS involved we leave the
-// field as an empty array; that matches what the original plugin does
-// and the firmware treats it the same as "not provided".
-// Compute the uppercase-hex MD5 of a local file. Stock plugin parity:
-// the Bambu firmware cross-checks the uploaded 3mf against `print.md5`,
-// and the stock libbambu_networking.so always populates that field
-// itself (Studio leaves `params.ftp_file_md5` empty). We mirror that
-// so callers don't have to pre-hash. Returns empty on I/O failure —
-// the firmware will then refuse the job rather than printing garbage.
-std::string md5_of_file(const std::string& path)
-{
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return {};
-
-    std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> ctx(
-        EVP_MD_CTX_new(),
-        [](EVP_MD_CTX* c){ if (c) EVP_MD_CTX_free(c); });
-    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_md5(), nullptr) != 1)
-        return {};
-
-    std::array<char, 64 * 1024> buf{};
-    while (f.read(buf.data(), buf.size()) || f.gcount() > 0) {
-        if (EVP_DigestUpdate(ctx.get(), buf.data(),
-                             static_cast<size_t>(f.gcount())) != 1)
-            return {};
-    }
-
-    unsigned char digest[EVP_MAX_MD_SIZE] = {0};
-    unsigned      len = 0;
-    if (EVP_DigestFinal_ex(ctx.get(), digest, &len) != 1) return {};
-
-    static const char kHex[] = "0123456789ABCDEF";
-    std::string hex(len * 2, '\0');
-    for (unsigned i = 0; i < len; ++i) {
-        hex[2 * i    ] = kHex[(digest[i] >> 4) & 0xF];
-        hex[2 * i + 1] = kHex[ digest[i]       & 0xF];
-    }
-    return hex;
-}
+// accepts the array as-is. When the caller left the string empty we
+// emit `[]` — stock 02.05.03 / 02.08.02 does that even with
+// `task_use_ams=true`, so the old `[0]` fallback was a guess.
 
 // Trim a single leading '/' from `s`. Stock plugin parity: when the
 // upload landed in the FTPS root the `print.file` and `print.url`
@@ -174,14 +126,14 @@ std::string strip_leading_slash(const std::string& s)
     return s;
 }
 
-std::string format_ams_mapping(const std::string& mapping, bool use_ams)
+std::string format_ams_mapping(const std::string& mapping)
 {
     std::string s = mapping;
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' ||
                           s.front() == '\r' || s.front() == '\n')) s.erase(s.begin());
     while (!s.empty() && (s.back() == ' ' || s.back() == '\t' ||
                           s.back() == '\r' || s.back() == '\n')) s.pop_back();
-    if (s.empty()) return use_ams ? "[0]" : "[]";
+    if (s.empty()) return "[]";
     if (s.front() == '[') return s; // already a JSON array
     std::string arr = "[";
     std::size_t start = 0;
@@ -347,11 +299,11 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
 {
     std::string subtask     = p.project_name.empty() ? p.task_name : p.project_name;
     std::string bed_type    = p.task_bed_type.empty() ? "auto" : p.task_bed_type;
-    std::string ams_mapping = format_ams_mapping(p.ams_mapping, p.task_use_ams);
+    std::string ams_mapping = format_ams_mapping(p.ams_mapping);
 
     std::ostringstream os;
     os << "{\"print\":{";
-    os << "\"sequence_id\":" << json_escape(now_seq_id());
+    os << "\"sequence_id\":" << json_escape(obn::next_mqtt_seq_id());
     os << ",\"command\":\"project_file\"";
     os << param_field;
     os << ",\"project_id\":" << json_escape(opts.project_id);
@@ -462,10 +414,16 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     std::string plate_param = "Metadata/plate_" +
                               std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
                               ".gcode";
+    // sdcard_print has no url/url_enc at all — stock 02.05.00–02.08.02
+    // omit the key and the firmware looks the file up by basename +
+    // md5="from_sd_card". An empty opts.url is how we signal that.
+    const std::string url_field = opts.url.empty()
+        ? std::string{}
+        : ",\"url\":" + json_escape(opts.url);
     return build_project_file_json_impl(
         p, opts,
         ",\"param\":" + json_escape(plate_param),
-        ",\"url\":"   + json_escape(opts.url));
+        url_field);
 }
 
 } // namespace obn::print_job
@@ -581,20 +539,10 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     } else {
         opts.url = print_job::build_ftp_url(stored_path);
     }
-    // Stock plugin parity: it always populates `print.md5` itself —
-    // Studio's PrintJob never sets `params.ftp_file_md5`. Hash the
-    // local 3mf if the caller didn't pre-compute one. Matters because
-    // the firmware refuses the job on MD5 mismatch (and an empty
-    // string trivially mismatches).
-    opts.md5 = params.ftp_file_md5;
-    if (opts.md5.empty()) {
-        opts.md5 = print_job::md5_of_file(params.filename);
-        if (opts.md5.empty()) {
-            OBN_WARN("local_print: failed to MD5 %s — sending empty md5; "
-                     "the printer will likely reject the job",
-                     params.filename.c_str());
-        }
-    }
+    // Stock 02.05.00–02.08.02 always emits the literal "from_sd_card",
+    // even on the FTPS local_print path and even when ftp_file_md5 is
+    // filled in. A real file hash never appeared in any captured frame.
+    opts.md5 = "from_sd_card";
     std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());
 
@@ -649,18 +597,15 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
 
     if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
 
-    // Studio's MediaFilePanel already stripped one leading slash when
-    // building dst_file; re-normalise so the printer sees an absolute
-    // path (it'll also accept a relative one, but this matches the
-    // format FILE_DOWNLOAD traffic uses).
-    std::string remote_path = params.dst_file;
-    if (remote_path.empty() || remote_path.front() != '/')
-        remote_path = "/" + remote_path;
-
+    // Stock ignores dst_file on the wire: `file` is the project_name
+    // basename (pick_remote_name), there is no url/url_enc key, and
+    // md5 is the literal "from_sd_card". dst_file is still required
+    // above because that's the ABI contract Studio fills for
+    // from_sdcard_view — we just don't forward it.
     print_job::ProjectFileOpts opts;
-    opts.file_path  = remote_path;
-    opts.url        = print_job::build_file_url(remote_path);
-    opts.md5        = "";  // not known for a pre-existing file on storage
+    opts.file_path  = print_job::pick_remote_name(params);
+    opts.url        = "";
+    opts.md5        = "from_sd_card";
     opts.project_id = "0";
     opts.profile_id = "0";
     opts.task_id    = "0";
@@ -682,7 +627,7 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
 
     if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
     OBN_INFO("sdcard_print dev=%s: queued for printing (file=%s, plate=%d)",
-             params.dev_id.c_str(), remote_path.c_str(), params.plate_index);
+             params.dev_id.c_str(), opts.file_path.c_str(), params.plate_index);
     return 0;
 }
 

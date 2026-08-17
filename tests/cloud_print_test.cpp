@@ -560,6 +560,128 @@ static void test_project_file_cfg_bitmask()
     #endif
 }
 
+static int seq_id_as_int(const std::string& json)
+{
+    const std::string s = field(json, "print.sequence_id");
+    if (s.empty()) return -1;
+    return std::stoi(s);
+}
+
+static void test_project_file_sequence_id_in_studio_range()
+{
+    BBL::PrintParams p = default_params();
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "slot.3mf";
+    opts.url       = "ftp:///slot.3mf";
+    const std::string a = obn::print_job::build_project_file_json(p, opts);
+    const std::string b = obn::print_job::build_project_file_json(p, opts);
+    const int sa = seq_id_as_int(a);
+    const int sb = seq_id_as_int(b);
+    CHECK(sa >= 20000 && sa < 30000);
+    CHECK(sb >= 20000 && sb < 30000);
+    CHECK(sa != sb);
+}
+
+static void test_project_file_ams_mapping_empty_is_array_even_with_use_ams()
+{
+    // Stock 02.08.02.54 / 02.05.03.63 both emit [] when the string is
+    // empty, including with task_use_ams=true. The old [0] fallback was
+    // a guess.
+    BBL::PrintParams p = default_params();
+    p.ams_mapping.clear();
+    p.task_use_ams = true;
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "slot.3mf";
+    opts.md5       = "from_sd_card";
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(json.find("\"ams_mapping\":[]") != std::string::npos);
+    CHECK(json.find("\"use_ams\":true") != std::string::npos);
+}
+
+static void test_project_file_omits_url_when_empty_and_md5_is_literal()
+{
+    BBL::PrintParams p = default_params();
+    p.project_name = "obn-probe-L2";
+    p.ams_mapping.clear();
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "obn-probe-L2.gcode.3mf";
+    opts.url       = "";
+    opts.md5       = "from_sd_card";
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(json.find("\"url\"") == std::string::npos);
+    CHECK(json.find("\"url_enc\"") == std::string::npos);
+    CHECK(field(json, "print.md5") == "from_sd_card");
+    CHECK(field(json, "print.file") == "obn-probe-L2.gcode.3mf");
+}
+
+#if ABI_VERSION >= 0x020400
+// Field-level pin against the stock 02.08.02.54 L1 sdcard_print capture
+// (max sentinel). sequence_id is excluded: we seed it randomly in the
+// same 20000–29999 window rather than hardcoding 20001.
+static void test_project_file_matches_stock_l1()
+{
+    BBL::PrintParams p = default_params();
+    p.project_name                = "obn-probe-L1";
+    p.plate_index                 = 2;
+    p.ams_mapping                 = "[3,-1]";
+    p.ams_mapping2                = R"([{"ams_id":2,"slot_id":3},{"ams_id":255,"slot_id":0}])";
+    p.task_bed_type               = "textured_plate";
+    p.task_bed_leveling           = true;
+    p.task_flow_cali              = true;
+    p.task_vibration_cali         = true;
+    p.task_layer_inspect          = true;
+    p.task_record_timelapse       = true;
+    p.task_use_ams                = true;
+    p.task_ext_change_assist      = true;
+    p.auto_bed_leveling           = 2;
+    p.auto_flow_cali              = 3;
+    p.auto_offset_cali            = 4;
+    p.extruder_cali_manual_mode   = 1;
+#if ABI_VERSION >= 0x020503
+    p.task_timelapse_use_internal = true;
+#endif
+#if ABI_VERSION >= 0x020801
+    p.slicer_uid                  = "OBNUIDAAAA1111";
+#endif
+
+    obn::print_job::ProjectFileOpts opts;
+    opts.file_path = "obn-probe-L1.gcode.3mf";
+    opts.url       = "";
+    opts.md5       = "from_sd_card";
+
+    const std::string json = obn::print_job::build_project_file_json(p, opts);
+    CHECK(field(json, "print.command") == "project_file");
+    CHECK(field(json, "print.file") == "obn-probe-L1.gcode.3mf");
+    CHECK(field(json, "print.md5") == "from_sd_card");
+    CHECK(field(json, "print.param") == "Metadata/plate_2.gcode");
+    CHECK(field(json, "print.bed_type") == "textured_plate");
+#if ABI_VERSION >= 0x020503
+    CHECK(field(json, "print.cfg") == "5");
+#else
+    CHECK(field(json, "print.cfg") == "1");
+#endif
+    CHECK(json.find("\"ams_mapping\":[3,-1]") != std::string::npos);
+    CHECK(json.find("\"ams_mapping2\":[{\"ams_id\":2,\"slot_id\":3},{\"ams_id\":255,\"slot_id\":0}]")
+          != std::string::npos);
+    CHECK(json.find("\"bed_leveling\":true") != std::string::npos);
+    CHECK(json.find("\"flow_cali\":true") != std::string::npos);
+    CHECK(json.find("\"vibration_cali\":true") != std::string::npos);
+    CHECK(json.find("\"layer_inspect\":true") != std::string::npos);
+    CHECK(json.find("\"timelapse\":true") != std::string::npos);
+    CHECK(json.find("\"use_ams\":true") != std::string::npos);
+    CHECK(json.find("\"auto_bed_leveling\":2") != std::string::npos);
+    CHECK(json.find("\"extrude_cali_flag\":3") != std::string::npos);
+    CHECK(json.find("\"nozzle_offset_cali\":4") != std::string::npos);
+    CHECK(json.find("\"extrude_cali_manual_mode\":1") != std::string::npos);
+    CHECK(json.find("\"url\"") == std::string::npos);
+#if ABI_VERSION >= 0x020801
+    CHECK(field(json, "print.slicer_uid") == "OBNUIDAAAA1111");
+#endif
+    const int seq = seq_id_as_int(json);
+    CHECK(seq >= 20000 && seq < 30000);
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // slicer_uid / queue_plate_id / svc_context routing
 //
@@ -701,6 +823,12 @@ int main()
     test_lan_project_file_is_plaintext();
     test_cloud_project_file_builder_also_plaintext();
     test_project_file_cfg_bitmask();
+    test_project_file_sequence_id_in_studio_range();
+    test_project_file_ams_mapping_empty_is_array_even_with_use_ams();
+    test_project_file_omits_url_when_empty_and_md5_is_literal();
+#if ABI_VERSION >= 0x020400
+    test_project_file_matches_stock_l1();
+#endif
 
 #if ABI_VERSION >= 0x020801
     test_slicer_uid_in_project_file();

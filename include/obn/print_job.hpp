@@ -76,7 +76,7 @@ int ftp_upload(const BBL::PrintParams& p,
 struct ProjectFileOpts {
     std::string file_path;    // basename or absolute path on printer FS
     std::string url;          // brtc://emmc/, file://, ftp://, or presigned https
-    std::string md5;          // hex MD5 of the uploaded file; "" if unknown
+    std::string md5;          // stock emits the literal "from_sd_card"
     std::string project_id{"0"};
     std::string profile_id{"0"};
     std::string task_id{"0"};

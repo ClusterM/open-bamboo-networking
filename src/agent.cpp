@@ -19,6 +19,7 @@
 #include "obn/cover_server.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/mqtt_seq.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
 #include "obn/signing.hpp"
 #include "obn/ssdp.hpp"
@@ -55,14 +56,7 @@ std::string trim_ip_string(std::string s)
     return s;
 }
 
-// Millisecond epoch as MQTT sequence_id — same style as print_job::now_seq_id.
-std::string now_seq_id()
-{
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-    return std::to_string(ms);
-}
+std::string now_seq_id() { return next_mqtt_seq_id(); }
 
 } // namespace
 

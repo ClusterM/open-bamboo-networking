@@ -13,12 +13,11 @@ namespace obn::signing {
 //
 // When `device_pub` is non-null, device-cert field encryption is applied to
 // the `print` object *before* signing (so the signature covers the encrypted
-// form that goes on the wire). Cleartext fields `url` and `param` are each
-// REPLACED by `url_enc` / `param_enc` when present (stock sends only the
-// encrypted field on the wire). Transforms are idempotent (skipped when the
-// `_enc` field already exists) and no-ops when `device_pub` is null or
-// encryption fails, in which case the cleartext field is kept (pure-LAN
-// ftp:// path without a device key).
+// form that goes on the wire). Cleartext `url` / `param` stay in place and
+// `url_enc` / `param_enc` are added when present. Transforms are idempotent
+// (skipped when the `_enc` field already exists) and no-ops when
+// `device_pub` is null or encryption fails, in which case the cleartext
+// field is kept (pure-LAN ftp:// path without a device key).
 std::string maybe_sign(const std::string& payload_json,
                        EVP_PKEY* device_pub = nullptr);
 
