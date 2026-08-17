@@ -47,11 +47,22 @@ std::string build_ftp_url(const std::string& stored_path);
 std::string build_ftp_remote_path(const BBL::PrintParams& p,
                                   const std::string&      remote_name);
 
+// Stock plugin upload `info` string: "0.0K/1.1M", "0.1M/1.1M", …
+// `code` is still the 0–100 percent; Studio appends `info` in parentheses.
+std::string format_upload_info(std::uint64_t sent, std::uint64_t total);
+
+// Stock plugin end-of-job countdown: Finished with info "3", "2", "1"
+// one second apart. The ABI call does not return until this finishes
+// (Studio's "jump to device page in Ns" text). Cancel interrupts it.
+void emit_finished_countdown(BBL::OnUpdateStatusFn update_fn,
+                             BBL::WasCancelledFn   cancel_fn);
+
 // Performs the actual FTPS STOR of params.filename to remote_path,
-// streaming progress through update_fn as PrintingStageUpload. Obeys
-// cancel_fn. Returns 0 on success or a BAMBU_NETWORK_ERR_* code
-// (err_code_on_failure is used for generic transport/upload errors; a
-// cancellation is always reported as BAMBU_NETWORK_ERR_CANCELED).
+// streaming progress through update_fn as `progress_stage` (Upload on
+// LAN / hybrid FTPS). Obeys cancel_fn. Returns 0 on success or a
+// BAMBU_NETWORK_ERR_* code (err_code_on_failure is used for generic
+// transport/upload errors; a cancellation is always reported as
+// BAMBU_NETWORK_ERR_CANCELED).
 //
 // When `remote_path` starts with `/sdcard/` or `/usb/`, we transparently
 // probe the printer with CWD across `{sdcard, usb, root}` and rewrite
@@ -68,7 +79,8 @@ int ftp_upload(const BBL::PrintParams& p,
                BBL::WasCancelledFn     cancel_fn,
                int                     err_code_on_failure,
                std::uint64_t&          total_bytes_out,
-               std::string*            selected_remote_path = nullptr);
+               std::string*            selected_remote_path = nullptr,
+               int                     progress_stage = BBL::PrintingStageUpload);
 
 // Options controlling the project_file payload we publish over MQTT.
 // Cloud print fills in the real ids/url; LAN print uses "0" for ids

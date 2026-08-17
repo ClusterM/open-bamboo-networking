@@ -11,13 +11,15 @@
 //   [D]  GET    /v1/iot-service/api/user/notification?action=upload&ticket=..
 //
 //   use_lan_channel=true  (_with_record):
-//   [E]  FTPS STOR main .3mf to printer (PrintParams.ftp_folder)
+//   [E]  FTPS STOR main .3mf first (Upload; WR_UPLOAD_FTP on fail)
+//   [A–D] then project + config S3 (Record) + notify
 //   [F]  PATCH  /v1/iot-service/api/user/project/<pid>            url=ftp://...
 //   [G]  POST   /v1/user-service/my/task                          mode=lan_file
 //
 //   use_lan_channel=false (start_print):
+//   Create, then [A–D], then:
 //   [E]  GET    /v1/iot-service/api/user/upload?models=...
-//   [F]  PUT    <presigned>                                       main 3mf
+//   [F]  PUT    <presigned>                                       main 3mf (Upload)
 //   [G]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3
 //   [H]  POST   /v1/user-service/my/task                          mode=cloud_file
 //
@@ -373,8 +375,7 @@ int create_project(const std::string& api, const std::string& token,
 int s3_put(const std::string& url, const std::string& body,
            BBL::OnUpdateStatusFn update_fn,
            BBL::WasCancelledFn   cancel_fn,
-           int                   stage_start_pct,
-           int                   stage_end_pct,
+           int                   progress_stage,
            int                   err_code)
 {
     (void)cancel_fn; // libcurl synchronous path: we observe cancel on the
@@ -402,9 +403,9 @@ int s3_put(const std::string& url, const std::string& body,
     req.body      = body;
     req.timeout_s = 120;
 
-    if (update_fn && stage_start_pct >= 0)
-        update_fn(BBL::PrintingStageUpload, stage_start_pct,
-                  std::to_string(stage_start_pct) + "%");
+    const auto total = static_cast<std::uint64_t>(body.size());
+    if (update_fn)
+        update_fn(progress_stage, 0, print_job::format_upload_info(0, total));
 
     auto resp = obn::http::perform(req);
     if (!resp.error.empty() || !status_ok(resp.status_code))
@@ -413,9 +414,8 @@ int s3_put(const std::string& url, const std::string& body,
     OBN_DEBUG("cloud_print: s3 PUT ok http=%ld bytes=%zu url=%s",
               resp.status_code, body.size(), redact_url(url).c_str());
 
-    if (update_fn && stage_end_pct >= 0)
-        update_fn(BBL::PrintingStageUpload, stage_end_pct,
-                  std::to_string(stage_end_pct) + "%");
+    if (update_fn)
+        update_fn(progress_stage, 100, print_job::format_upload_info(total, total));
     return 0;
 }
 
@@ -816,8 +816,63 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     const std::string token = session.access_token;
     const std::string uid   = session.user_id;
 
-    if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
+    // Stock start_print emits Create; start_local_print_with_record does
+    // not (stock_hybrid / stock_block_lan Studio logs, 2026-07-19).
+    if (!use_lan_channel && update_fn)
+        update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
+
+    std::string remote_name = print_job::pick_remote_name(p);
+    std::string md5         = p.ftp_file_md5;
+    // Schema placeholder when Studio left ftp_file_md5 empty.
+    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: compute real md5
+
+    std::string project_url; // ftp://… or S3 https — registered via PATCH
+
+    // Hybrid stock does FTPS of the main .3mf first (Upload), then the
+    // cloud bookkeeping. A blocked LAN therefore fails with WR_UPLOAD_FTP
+    // before Create — matching stock_block_lan.log.
+    if (use_lan_channel) {
+        if (p.dev_ip.empty() || p.password.empty()) {
+            OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
+            if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
+                                     "no dev_ip/access_code for LAN print");
+            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
+        }
+
+        publish_peer_cert_pin(p.dev_ip, p.dev_id);
+
+        std::string lan_remote_path =
+            print_job::build_ftp_remote_path(p, remote_name);
+        OBN_INFO("cloud_print: upload path=ftps :990 remote=%s ftp_folder='%s'",
+                 lan_remote_path.c_str(), p.ftp_folder.c_str());
+
+        print_params_set_use_ssl_for_ftp(p.use_ssl_for_ftp);
+
+        std::uint64_t total = 0;
+        std::string ca_file = bambu_ca_bundle_path();
+        std::string stored_path;
+        if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
+                                           update_fn, cancel_fn,
+                                           BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_FTP_FAILED,
+                                           total, &stored_path);
+            rc != 0) return rc;
+        if (!stored_path.empty()) lan_remote_path = stored_path;
+        project_url = print_job::build_ftp_url(lan_remote_path);
+        OBN_INFO("cloud_print: lan-ftps uploaded %llu bytes to %s (url=%s)",
+                 static_cast<unsigned long long>(total),
+                 lan_remote_path.c_str(), project_url.c_str());
+    }
+
+    // Hybrid stock switches to Record as soon as FTPS finishes, covering
+    // POST /user/project + the config S3 PUT. start_print stays on Upload.
+    if (update_fn) {
+        if (use_lan_channel)
+            update_fn(BBL::PrintingStageRecord, 0, "");
+        else
+            update_fn(BBL::PrintingStageUpload, 0, "");
+    }
 
     // -------------------------------------------------------------
     // [A] Create the cloud project and get the first presigned URL
@@ -831,6 +886,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // -------------------------------------------------------------
     // [B] Upload the config 3mf (small). Required for Print History
     // thumbnails even when the main model is delivered over FTPS.
+    // Hybrid stock reports this as Record; start_print as Upload.
     // -------------------------------------------------------------
     std::string config_path = p.config_filename;
     if (p.config_filename.empty()) {
@@ -848,9 +904,12 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                  "config_filename not readable");
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
-    OBN_INFO("cloud_print: uploading config %s to S3", config_path.c_str());
+    const int config_stage = use_lan_channel ? BBL::PrintingStageRecord
+                                             : BBL::PrintingStageUpload;
+    OBN_INFO("cloud_print: uploading config %s to S3 (stage=%d)",
+             config_path.c_str(), config_stage);
     if (int rc = s3_put(info.upload_url, config_bytes, update_fn, cancel_fn,
-                        /*stage_start_pct=*/0, /*stage_end_pct=*/10,
+                        config_stage,
                         BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_CONFIG_TO_OSS_FAILED);
         rc != 0) return rc;
 
@@ -865,49 +924,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                              update_fn, cancel_fn);
         rc != 0) return rc;
 
-    std::string remote_name = print_job::pick_remote_name(p);
-    std::string md5         = p.ftp_file_md5;
-    // Schema placeholder when Studio left ftp_file_md5 empty.
-    if (md5.empty()) md5 = "00000000000000000000000000000000"; // TODO: compute real md5
-
-    std::string project_url; // ftp://… or S3 https — registered via PATCH
-
     if (use_lan_channel) {
-        // ---------------------------------------------------------
-        // LAN delivery: FTPS STOR + PATCH ftp:// (no main S3 upload).
-        // ---------------------------------------------------------
-        if (p.dev_ip.empty() || p.password.empty()) {
-            OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
-            if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                     BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED,
-                                     "no dev_ip/access_code for LAN print");
-            return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
-        }
-
-        // Peer pin for FTPS TLS hostname verify when no prior connect_printer.
-        publish_peer_cert_pin(p.dev_ip, p.dev_id);
-
-        std::string lan_remote_path =
-            print_job::build_ftp_remote_path(p, remote_name);
-        OBN_INFO("cloud_print: upload path=ftps :990 remote=%s ftp_folder='%s'",
-                 lan_remote_path.c_str(), p.ftp_folder.c_str());
-
-        print_params_set_use_ssl_for_ftp(p.use_ssl_for_ftp);
-
-        std::uint64_t total = 0;
-        std::string ca_file = bambu_ca_bundle_path();
-        std::string stored_path;
-        if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
-                                           update_fn, cancel_fn,
-                                           BAMBU_NETWORK_ERR_PRINT_LP_UPLOAD_FTP_FAILED,
-                                           total, &stored_path);
-            rc != 0) return rc;
-        if (!stored_path.empty()) lan_remote_path = stored_path;
-        project_url = print_job::build_ftp_url(lan_remote_path);
-        OBN_INFO("cloud_print: lan-ftps uploaded %llu bytes to %s (url=%s)",
-                 static_cast<unsigned long long>(total),
-                 lan_remote_path.c_str(), project_url.c_str());
-
         if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
                                    md5, p.plate_index, project_url, update_fn);
             rc != 0) return rc;
@@ -934,7 +951,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
             return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
         }
         if (int rc = s3_put(main_upload_url, main_bytes, update_fn, cancel_fn,
-                            /*stage_start_pct=*/10, /*stage_end_pct=*/95,
+                            BBL::PrintingStageUpload,
                             BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
             rc != 0) return rc;
 
@@ -955,7 +972,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
 
-    if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+    print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
              p.dev_id.c_str(), info.project_id.c_str(), task_id.c_str(),
              use_lan_channel ? "ftps" : "s3",

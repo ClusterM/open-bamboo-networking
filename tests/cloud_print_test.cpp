@@ -781,6 +781,16 @@ static void test_queue_plate_id_absent_from_project_file()
 }
 #endif
 
+static void test_format_upload_info_matches_stock()
+{
+    // Values from stock_hybrid.mitm (2026-07-19): main 1195684, config 241613.
+    CHECK(obn::print_job::format_upload_info(0, 1195684) == "0.0K/1.1M");
+    CHECK(obn::print_job::format_upload_info(1195684, 1195684) == "1.1M/1.1M");
+    CHECK(obn::print_job::format_upload_info(0, 241613) == "0.0K/0.2M");
+    CHECK(obn::print_job::format_upload_info(241613, 241613) == "0.2M/0.2M");
+    CHECK(obn::print_job::format_upload_info(104857, 1195684) == "0.1M/1.1M");
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -843,6 +853,8 @@ int main()
     test_queue_plate_id_dropped_when_unusable();
     test_queue_plate_id_absent_from_project_file();
 #endif
+
+    test_format_upload_info_matches_stock();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

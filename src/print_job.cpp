@@ -3,13 +3,11 @@
 // The flow we implement mirrors what Studio's original plugin does on the
 // `connection_type == "lan"` branch of PrintJob::process():
 //
-//   1. Tell Studio we started (PrintingStageCreate).
-//   2. Upload the .3mf to the printer (:6000 emmc cache when
-//      try_emmc_print, else FTPS STOR on N7-class hardware).
-//      Progress is streamed back as PrintingStageUpload with code=percent.
-//   3. Publish a `{"print":{"command":"project_file",...}}` MQTT message
-//      to the existing LanSession (PrintingStageSending).
-//   4. Notify the user that we're done (PrintingStageFinished).
+//   1. Upload the .3mf (PrintingStageUpload). LAN-only stock on P2S
+//      reports a single Upload(0,"") for the :6000 path; FTPS (hybrid
+//      and N7) streams percent + "0.1M/1.1M" size info.
+//   2. PrintingStageWaiting, then MQTT project_file.
+//   3. Finished countdown "3","2","1" (1 s apart) before return.
 //
 // We deliberately keep this synchronous: Studio invokes
 // start_local_print() from its own PrintJob worker thread, so spawning
@@ -29,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -36,8 +35,41 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace obn::print_job {
+
+std::string format_upload_info(std::uint64_t sent, std::uint64_t total)
+{
+    auto one = [](std::uint64_t n) {
+        char buf[32];
+        if (n < 100ull * 1024) {
+            std::snprintf(buf, sizeof(buf), "%.1fK",
+                          static_cast<double>(n) / 1024.0);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%.1fM",
+                          static_cast<double>(n) / (1024.0 * 1024.0));
+        }
+        return std::string{buf};
+    };
+    return one(sent) + "/" + one(total);
+}
+
+void emit_finished_countdown(BBL::OnUpdateStatusFn update_fn,
+                             BBL::WasCancelledFn   cancel_fn)
+{
+    if (!update_fn) return;
+    static constexpr const char* kTicks[] = {"3", "2", "1"};
+    for (int i = 0; i < 3; ++i) {
+        if (cancel_fn && cancel_fn()) return;
+        update_fn(BBL::PrintingStageFinished, 0, kTicks[i]);
+        if (i == 2) break;
+        for (int s = 0; s < 10; ++s) {
+            if (cancel_fn && cancel_fn()) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Remote filename normalisation (plate_0 → plate_1 rename in the name only)
@@ -225,7 +257,8 @@ int ftp_upload(const BBL::PrintParams&    p,
                BBL::WasCancelledFn        cancel_fn,
                int                        err_code_on_failure,
                std::uint64_t&             total_bytes_out,
-               std::string*               selected_remote_path)
+               std::string*               selected_remote_path,
+               int                        progress_stage)
 {
     std::error_code ec;
     auto sz = std::filesystem::file_size(p.filename, ec);
@@ -254,6 +287,10 @@ int ftp_upload(const BBL::PrintParams&    p,
     cfg.tls_verify_hostname  = p.dev_id;
     cfg.use_tls              = p.use_ssl_for_ftp;
 
+    // Stock emits empty-info Upload ticks while the control channel
+    // comes up, then switches to "0.0K/1.1M" once STOR has a size.
+    if (update_fn) update_fn(progress_stage, 0, "");
+
     obn::ftps::Client cli;
     if (std::string err = cli.connect(cfg); !err.empty()) {
         OBN_ERROR("print_job: ftps connect %s: %s", p.dev_ip.c_str(), err.c_str());
@@ -269,8 +306,7 @@ int ftp_upload(const BBL::PrintParams&    p,
         if (update_fn) {
             int pct = total > 0 ? static_cast<int>(sent * 100 / total) : 0;
             if (pct > 100) pct = 100;
-            update_fn(BBL::PrintingStageUpload, pct,
-                      std::to_string(pct) + "%");
+            update_fn(progress_stage, pct, format_upload_info(sent, total));
         }
         return true;
     };
@@ -455,7 +491,6 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
 
-    if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
     // Stock plugin parity: when `ftp_folder` is empty (which it always
@@ -506,6 +541,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         cb.cancelled = [&]() {
             return cancel_fn && cancel_fn();
         };
+        if (update_fn) update_fn(BBL::PrintingStageUpload, 0, "");
         cb.progress = [&](int pct) {
             if (update_fn) update_fn(BBL::PrintingStageUpload, pct, "");
         };
@@ -531,7 +567,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_CANCELED;
     }
 
-    if (update_fn) update_fn(BBL::PrintingStageSending, 0, "");
+    if (update_fn) update_fn(BBL::PrintingStageWaiting, 0, "");
 
     print_job::ProjectFileOpts opts;
     opts.file_path = stored_path;
@@ -556,10 +592,7 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
-    // Studio shows the countdown message before navigating to the device
-    // page. "3" below is the number of seconds it displays; matches Bambu
-    // plugin behaviour.
-    if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+    print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("local_print dev=%s: queued for printing (uploaded %llu bytes, plate=%d)",
              params.dev_id.c_str(), static_cast<unsigned long long>(total),
              params.plate_index);
@@ -596,8 +629,6 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
     }
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
-    if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
-
     // Stock ignores dst_file on the wire: `file` is the project_name
     // basename (pick_remote_name), there is no url/url_enc key, and
     // md5 is the literal "from_sd_card". dst_file is still required
@@ -626,7 +657,7 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
-    if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+    print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("sdcard_print dev=%s: queued for printing (file=%s, plate=%d)",
              params.dev_id.c_str(), opts.file_path.c_str(), params.plate_index);
     return 0;
@@ -648,8 +679,6 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
         return BAMBU_NETWORK_ERR_CONNECTION_TO_PRINTER_FAILED;
     }
 
-    if (update_fn) update_fn(BBL::PrintingStageCreate, 0, "");
-
     std::string remote_name = print_job::dest_name_for_send_gcode(params);
     if (remote_name.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
@@ -668,7 +697,7 @@ int Agent::run_send_gcode_to_sdcard(const BBL::PrintParams& params,
     int rc = print_job::ftp_upload(params, remote_path, ca_file, update_fn, cancel_fn,
                                    BAMBU_NETWORK_ERR_PRINT_SG_UPLOAD_FTP_FAILED, total);
     if (rc != 0) return rc;
-    if (update_fn) update_fn(BBL::PrintingStageFinished, 0, "3");
+    print_job::emit_finished_countdown(update_fn, cancel_fn);
     return 0;
 }
 
