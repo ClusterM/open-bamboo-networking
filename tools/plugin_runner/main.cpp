@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <sys/stat.h>
@@ -48,6 +49,22 @@ namespace {
 
 std::mutex g_log_mu;
 std::ofstream g_log_file;
+
+// Ephemeral data_dir, if any. The fast-exit path below bypasses destructors,
+// so it has to remove the directory itself.
+std::string g_ephemeral_data_dir;
+
+[[noreturn]] void fast_exit(int code)
+{
+    std::cout.flush();
+    if (g_log_file) g_log_file.flush();
+    if (!g_ephemeral_data_dir.empty()) {
+        std::string cmd = "rm -rf -- '" + g_ephemeral_data_dir + "'";
+        int rc = std::system(cmd.c_str());
+        (void)rc;
+    }
+    std::_Exit(code);
+}
 
 std::string iso8601_now()
 {
@@ -537,11 +554,33 @@ std::string default_cache_dir()
 // ---------------------------------------------------------------------------
 namespace {
 
+// Move-only: a copy would let the source's destructor rm -rf a directory the
+// destination still owns.
 struct Tmpdir {
     std::string path;
     bool        keep = false;
 
-    ~Tmpdir() {
+    Tmpdir() = default;
+    Tmpdir(const Tmpdir&)            = delete;
+    Tmpdir& operator=(const Tmpdir&) = delete;
+
+    Tmpdir(Tmpdir&& other) noexcept
+        : path(std::move(other.path)), keep(other.keep) { other.path.clear(); }
+
+    Tmpdir& operator=(Tmpdir&& other) noexcept {
+        if (this != &other) {
+            wipe();
+            path = std::move(other.path);
+            keep = other.keep;
+            other.path.clear();
+        }
+        return *this;
+    }
+
+    ~Tmpdir() { wipe(); }
+
+  private:
+    void wipe() {
         if (!keep && !path.empty()) {
             std::string cmd = "rm -rf -- '" + path + "'";
             int rc = std::system(cmd.c_str());
@@ -778,6 +817,7 @@ try {
         }
     } else {
         tmpdir = make_tmpdir(args.keep_tmpdir);
+        if (!args.keep_tmpdir) g_ephemeral_data_dir = tmpdir.path;
         write_min_studio_conf(tmpdir.path, args.country);
     }
     emit_event("data_dir", {
@@ -1234,9 +1274,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(rc == 0 ? 0 : 1);
+            fast_exit(rc == 0 ? 0 : 1);
         }
         rc_action = rc;
     } else if (args.action == "bind_detect") {
@@ -1264,9 +1302,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(rc == 0 ? 0 : 1);
+            fast_exit(rc == 0 ? 0 : 1);
         }
         rc_action = rc;
     } else if (args.action == "account_bind") {
@@ -1315,9 +1351,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(rc == 0 ? 0 : 1);
+            fast_exit(rc == 0 ? 0 : 1);
         }
         rc_action = rc;
     } else if (args.action == "gap_probe") {
@@ -1503,9 +1537,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         rc_action = 0;
     } else if (args.action == "cert_probe") {
@@ -1535,9 +1567,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         rc_action = 0;
     } else if (args.action == "update_cert") {
@@ -1555,7 +1585,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::_Exit(rc == 0 ? 0 : 1);
+            fast_exit(rc == 0 ? 0 : 1);
         }
         rc_action = rc;
     } else if (args.action == "http_probe") {
@@ -1642,9 +1672,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         guard.a = nullptr;
         if (exports.disconnect_printer) exports.disconnect_printer(agent);
@@ -1794,9 +1822,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         guard.a = nullptr;
         if (exports.disconnect_printer) exports.disconnect_printer(agent);
@@ -1943,9 +1969,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         guard.a = nullptr;
         if (exports.disconnect_printer) exports.disconnect_printer(agent);
@@ -1961,9 +1985,7 @@ try {
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
-            std::cout.flush();
-            if (g_log_file) g_log_file.flush();
-            std::_Exit(0);
+            fast_exit(0);
         }
         guard.a = nullptr;
         exports.disconnect_printer(agent);
@@ -2101,9 +2123,7 @@ try {
     bool fast = args.fast_exit.value_or(false);
     if (fast) {
         emit_event("shutdown", { {"finished", finished}, {"fast_exit", true} });
-        std::cout.flush();
-        if (g_log_file) g_log_file.flush();
-        std::_Exit(exit_code);
+        fast_exit(exit_code);
     }
     guard.a = nullptr;
     exports.disconnect_printer(agent);
