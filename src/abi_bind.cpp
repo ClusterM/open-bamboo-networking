@@ -30,7 +30,10 @@ OBN_ABI int bambu_network_bind_detect(void*       agent,
     (void)sec_link;
     // Stock: plaintext TCP dev_ip:3000 framed login.command=detect
     // (research/08.06-bind.md). SSDP NOTIFY is a separate channel.
-    return obn::lan_bind_tcp::detect(dev_ip, detect);
+    const int rc = obn::lan_bind_tcp::detect(dev_ip, detect);
+    if (rc == BAMBU_NETWORK_SUCCESS) return rc;
+    // Map Bambu error code to Orca error codes so it can fall back to manual flow
+    return rc == BAMBU_NETWORK_ERR_BIND_PUBLISH_LOGIN_REQUEST ? -2 : -1;
 }
 
 OBN_ABI int bambu_network_bind(void*       agent,
