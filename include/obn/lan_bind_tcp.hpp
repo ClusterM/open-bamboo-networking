@@ -28,7 +28,8 @@ std::string encode_frame(const std::string& json);
 // leaves any trailing partial bytes in `buf`. Returns JSON payloads.
 std::vector<std::string> drain_frames(std::string& buf);
 
-// TCP detect → fill Studio detectResult. Returns 0 or BAMBU_NETWORK_ERR_BIND_*.
+// TCP detect → fill Studio detectResult. Returns 0 or BAMBU_NETWORK_ERR_BIND_*;
+// the ABI layer narrows those to the -1/-2/-3 space Studio understands.
 int detect(const std::string& dev_ip,
            BBL::detectResult& out,
            int                timeout_ms = 5000);

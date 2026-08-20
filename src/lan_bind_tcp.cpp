@@ -277,6 +277,7 @@ int detect(const std::string& dev_ip, BBL::detectResult& out, int timeout_ms)
     auto fd = connect_tcp(dev_ip, 3000, timeout_ms);
     if (!obn::os::socket_valid(fd)) {
         OBN_WARN("bind_detect: connect %s:3000 failed", dev_ip.c_str());
+        out.result_msg = "socket connect failed";
         return BAMBU_NETWORK_ERR_BIND_SOCKET_CONNECT_FAILED;
     }
 
@@ -284,6 +285,7 @@ int detect(const std::string& dev_ip, BBL::detectResult& out, int timeout_ms)
         encode_frame(R"({"login":{"command":"detect","sequence_id":"20000"}})");
     if (req.empty() || !send_all(fd, req, timeout_ms)) {
         obn::os::close_socket(fd);
+        out.result_msg = "publish login request failed";
         return BAMBU_NETWORK_ERR_BIND_PUBLISH_LOGIN_REQUEST;
     }
 
@@ -304,7 +306,22 @@ int detect(const std::string& dev_ip, BBL::detectResult& out, int timeout_ms)
             if (!root) continue;
             const auto& login = root->find("login");
             if (!login.is_object()) continue;
-            if (login.find("command").as_string() != "detect") continue;
+            const std::string cmd = login.find("command").as_string();
+            if (cmd == "login_report") {
+                // P1 firmware in LAN-only mode rejects the detect probe with a
+                // login_report FAILURE instead of the identity reply (OBN #38).
+                LoginReport rep = parse_login_report(payload);
+                if (rep.status != "FAILURE") continue;
+                obn::os::close_socket(fd);
+                OBN_WARN("bind_detect: %s refused detect: %s",
+                         dev_ip.c_str(),
+                         obn::log::redact(rep.reason, 160).c_str());
+                out.result_msg = "login report failed";
+                return rep.has_err_code
+                           ? BAMBU_NETWORK_ERR_BIND_ECODE_LOGIN_REPORT_FAILED
+                           : BAMBU_NETWORK_ERR_BIND_PARSE_LOGIN_REPORT_FAILED;
+            }
+            if (cmd != "detect") continue;
 
             out.command      = "detect";
             out.result_msg   = "success";
@@ -317,6 +334,7 @@ int detect(const std::string& dev_ip, BBL::detectResult& out, int timeout_ms)
             obn::os::close_socket(fd);
             if (out.dev_id.empty()) {
                 OBN_WARN("bind_detect: empty id from %s", dev_ip.c_str());
+                out.result_msg = "parse login report failed";
                 return BAMBU_NETWORK_ERR_BIND_PARSE_LOGIN_REPORT_FAILED;
             }
             OBN_INFO("bind_detect %s -> id=%s bind=%s connect=%s",
@@ -330,6 +348,7 @@ int detect(const std::string& dev_ip, BBL::detectResult& out, int timeout_ms)
     obn::os::close_socket(fd);
     OBN_WARN("bind_detect: timeout waiting for detect reply from %s",
              dev_ip.c_str());
+    out.result_msg = "receive login report timeout";
     return BAMBU_NETWORK_ERR_BIND_RECEIVE_LOGIN_REPORT_TIMEOUT;
 }
 

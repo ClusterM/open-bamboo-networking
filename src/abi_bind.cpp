@@ -10,6 +10,33 @@
 
 using obn::as_agent;
 
+namespace {
+
+// Studio / Orca only understand a compact code space from bind_detect
+// (research/08.06-bind.md): -1 "Failed to connect to printer.",
+// -2 "Failed to publish login request.", -3 switches the Input IP dialog to
+// manual serial entry (the same path Studio hardcodes on macOS). Any other
+// negative value clears the dialog message and hides the "Manual Setup"
+// button, leaving the user with no way forward — see OBN #38.
+int studio_detect_rc(int rc)
+{
+    switch (rc) {
+    case BAMBU_NETWORK_SUCCESS:
+        return BAMBU_NETWORK_SUCCESS;
+    case BAMBU_NETWORK_ERR_BIND_CREATE_SOCKET_FAILED:
+    case BAMBU_NETWORK_ERR_BIND_SOCKET_CONNECT_FAILED:
+        return -1;
+    case BAMBU_NETWORK_ERR_BIND_PUBLISH_LOGIN_REQUEST:
+        return -2;
+    default:
+        // Printer answered but gave us no usable identity (LAN-only refusal,
+        // unparsable reply, timeout) — let Studio ask for the serial instead.
+        return -3;
+    }
+}
+
+} // namespace
+
 OBN_ABI int bambu_network_ping_bind(void* agent, std::string ping_code)
 {
     auto* a = as_agent(agent);
@@ -30,7 +57,11 @@ OBN_ABI int bambu_network_bind_detect(void*       agent,
     (void)sec_link;
     // Stock: plaintext TCP dev_ip:3000 framed login.command=detect
     // (research/08.06-bind.md). SSDP NOTIFY is a separate channel.
-    return obn::lan_bind_tcp::detect(dev_ip, detect);
+    const int rc     = obn::lan_bind_tcp::detect(dev_ip, detect);
+    const int mapped = studio_detect_rc(rc);
+    if (rc != mapped)
+        OBN_INFO("bind_detect rc=%d -> studio rc=%d", rc, mapped);
+    return mapped;
 }
 
 OBN_ABI int bambu_network_bind(void*       agent,
