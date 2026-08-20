@@ -102,8 +102,8 @@ private:
     // libmosquitto's loop thread retries a failed connect on its own but
     // reports nothing while it does, so a printer that refuses :8883 for half
     // a minute leaves an unexplained silent gap in the log. This supervisor
-    // makes the wait visible and re-tunes the retry cadence as the outage
-    // grows (see connect() for the tier table).
+    // measures the outage and logs it, at a cadence that thins out as the
+    // outage grows.
     void start_reconnect_watch_(std::string endpoint);
     void stop_reconnect_watch_();
 

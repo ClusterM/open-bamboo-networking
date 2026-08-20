@@ -19,11 +19,13 @@ namespace {
 //
 // This is also how fast the printer reaps a ghost session: a broker declares a
 // client dead after 1.5x keepalive with no traffic, and P1-series firmware
-// accepts only a couple of concurrent LAN sessions, so a half-open session left
-// behind by a hard exit blocks the next connect until that timer expires. At
-// the old 60s that meant up to ~90s of "connection failed, works on the second
-// try" (#34, #38); 20s brings it down to ~30s. The cost is one 2-byte PINGREQ
-// every 20s, and faster detection of a dropped link is a bonus.
+// accepts only a couple of concurrent LAN sessions, so a session left behind
+// blocks the next connect until that timer expires. A clean shutdown sends
+// DISCONNECT (see Agent::shutdown_lan_session) and frees the slot at once, so
+// this only covers hard exits — crash, kill, PC sleep — where the DISCONNECT
+// never goes out. At the old 60s that was up to ~90s of "connection failed,
+// works on the second try" (#34); 20s brings it down to ~30s. The cost is one
+// 2-byte PINGREQ every 20s, and faster detection of a dropped link is a bonus.
 constexpr int kLanKeepaliveSeconds = 20;
 
 // Bambu printers accept any MQTT client ID but Studio itself uses something

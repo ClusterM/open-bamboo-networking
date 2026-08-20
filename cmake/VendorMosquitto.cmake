@@ -62,6 +62,8 @@ function(obn_vendor_mosquitto_setup)
         obn_patch_mosquitto_tls_verify_host("${eclipse_mosquitto_SOURCE_DIR}")
         include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoEmbedPatch.cmake")
         obn_patch_mosquitto_common_object("${eclipse_mosquitto_SOURCE_DIR}")
+        include("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/VendorMosquittoWinSslErrno.cmake")
+        obn_patch_mosquitto_win_ssl_errno("${eclipse_mosquitto_SOURCE_DIR}")
     endif()
 
     set(_obn_saved_skip_install "${CMAKE_SKIP_INSTALL_RULES}")
