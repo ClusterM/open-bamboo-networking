@@ -506,6 +506,21 @@ void Agent::lan_watchdog_loop()
 
 void Agent::notify_local_connected(int status, const std::string& dev_id, const std::string& msg)
 {
+    // Studio may have called disconnect_printer() while we were still
+    // handshaking; mqtt_keep_connection then arms a 3s teardown. If CONNACK
+    // (or a reuse) arrives in that window, the session is live and in use —
+    // disarm the teardown so we do not drop the printer we just connected.
+    // Do not join the deferred thread here: this callback often runs on the
+    // MQTT loop, and that thread is what loop_stop() would wait for.
+    if (status == BBL::ConnectStatusOk) {
+        std::lock_guard<std::mutex> lk(deferred_dc_mu_);
+        if (deferred_dc_active_) {
+            deferred_dc_active_ = false;
+            deferred_dc_cv_.notify_all();
+            OBN_INFO("mqtt_keep_connection: CONNACK, cancelling deferred disconnect");
+        }
+    }
+
     BBL::OnLocalConnectedFn   cb;
     BBL::QueueOnMainFn        queue;
     {

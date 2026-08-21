@@ -100,6 +100,7 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
             // Subscribe to the printer's report topic as soon as we are
             // connected; the printer answers LAN command requests by pushing
             // status updates to this topic.
+            ever_connected_.store(true, std::memory_order_release);
             OBN_INFO("LanSession connected, subscribing to %s", report_topic_().c_str());
             client_->subscribe(report_topic_(), 0);
             if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
@@ -115,6 +116,17 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
 
     client_->set_on_disconnect([this](int rc) {
         OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
+        // libmosquitto uses keepalive as a connect timeout. On a P1 that is
+        // still holding a ghost session the first TLS handshake sits there
+        // until that timer fires (MOSQ_ERR_KEEPALIVE), then the library
+        // reconnects on its own and CONNACK succeeds a couple of seconds
+        // later. Reporting Lost here makes Studio call disconnect_printer,
+        // and mqtt_keep_connection then tears the just-established session
+        // down (#38).
+        if (!ever_connected_.load(std::memory_order_acquire)) {
+            OBN_INFO("LanSession: ignoring disconnect before first CONNACK");
+            return;
+        }
         if (on_connected_) {
             on_connected_(rc == 0 ? BBL::ConnectStatusOk : BBL::ConnectStatusLost,
                           std::string("mqtt disconnect rc=") + mqtt::Client::err_str(rc));

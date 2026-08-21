@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -73,6 +74,10 @@ private:
     std::unique_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
+    // Set on the first successful CONNACK. Disconnects before that are
+    // mosquitto retry noise (e.g. MOSQ_ERR_KEEPALIVE while the TLS
+    // handshake is still mid-flight) and must not be reported to Studio.
+    std::atomic<bool>             ever_connected_{false};
 };
 
 // The Agent object is created per Studio call to bambu_network_create_agent().
