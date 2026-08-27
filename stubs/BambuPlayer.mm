@@ -690,8 +690,32 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
     }
 
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+        // Layer stalled, reset it before we try again.
+        NSError* err = layer.error;
+        if (err) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "layer failed, flushing: %s",
+                     err.localizedDescription.UTF8String);
+            [self logAt:1 message:buf];
+        }
         [layer flush];
+        [layer stopRequestingMediaData];
     }
+
+    // Don't enqueue into a full layer - wait briefly, then drop the frame.
+    if (!layer.isReadyForMoreMediaData) {
+        for (int i = 0; i < 50 && !layer.isReadyForMoreMediaData; ++i) {
+            if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!layer.isReadyForMoreMediaData) {
+            [self logAt:0 message:"layer not ready, dropping frame"];
+            CFRelease(sample);
+            [layer release];
+            return NO;
+        }
+    }
+
     [layer enqueueSampleBuffer:sample];
     CFRelease(sample);
     [layer release];
