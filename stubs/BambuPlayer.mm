@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -161,14 +162,45 @@ struct BambuPlayerImpl {
     double   jitterSumMs = 0.0;
     float    maxJitterMs = 0.f;
 
+    // Render queue and pending frames.
+    dispatch_queue_t renderQueue =
+        dispatch_queue_create("com.obn.bambuplayer.render", DISPATCH_QUEUE_SERIAL);
+    std::mutex                    pendingMu;
+    std::deque<CMSampleBufferRef> pending;
+    bool                          mediaRequested = false;
+    uint64_t                      droppedFrames  = 0;
+    std::chrono::steady_clock::time_point lastDropLog{};
+    std::chrono::steady_clock::time_point lastFailLog{};
+
     ~BambuPlayerImpl()
     {
         if (formatDesc) {
             CFRelease(formatDesc);
             formatDesc = nullptr;
         }
+        for (CMSampleBufferRef s : pending) CFRelease(s);
+        pending.clear();
+        if (renderQueue) {
+            dispatch_release(renderQueue);
+            renderQueue = nullptr;
+        }
     }
 };
+
+// Buffer up to one second at 30 fps.
+static constexpr size_t kMaxPendingFrames = 30;
+
+// Limit backpressure diagnostics to once per second.
+static bool throttle_ready(std::chrono::steady_clock::time_point& last)
+{
+    auto const now = std::chrono::steady_clock::now();
+    if (last.time_since_epoch().count() != 0 &&
+        now - last < std::chrono::seconds(1)) {
+        return false;
+    }
+    last = now;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // BambuPlayer
@@ -534,6 +566,8 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         Bambu_Destroy(tunnel);
     }
 
+    [self shutdownRenderPump];
+
     AVSampleBufferDisplayLayer* layer = _displayLayer;
     if (layer) {
         void (^flush)(void) = ^{
@@ -690,36 +724,133 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
     }
 
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-        // Layer stalled, reset it before we try again.
-        NSError* err = layer.error;
-        if (err) {
-            char buf[160];
-            snprintf(buf, sizeof(buf), "layer failed, flushing: %s",
-                     err.localizedDescription.UTF8String);
-            [self logAt:1 message:buf];
-        }
-        [layer flush];
-        [layer stopRequestingMediaData];
+        // Reset the failed layer; the next frame restarts the pump.
+        [self recoverFailedLayer:layer];
+        CFRelease(sample);
+        [layer release];
+        return NO;
     }
 
-    // Don't enqueue into a full layer - wait briefly, then drop the frame.
-    if (!layer.isReadyForMoreMediaData) {
-        for (int i = 0; i < 50 && !layer.isReadyForMoreMediaData; ++i) {
-            if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        }
-        if (!layer.isReadyForMoreMediaData) {
-            [self logAt:0 message:"layer not ready, dropping frame"];
-            CFRelease(sample);
-            [layer release];
-            return NO;
-        }
-    }
-
-    [layer enqueueSampleBuffer:sample];
+    [self queueSampleForDisplay:sample layer:layer];
     CFRelease(sample);
     [layer release];
     return YES;
+}
+
+// Queue a frame without blocking the reader.
+- (void)queueSampleForDisplay:(CMSampleBufferRef)sample
+                        layer:(AVSampleBufferDisplayLayer*)layer
+{
+    CMSampleBufferRef dropped = nullptr;
+    uint64_t dropTotal = 0;
+    bool     logDrop   = false;
+    bool     startPump = false;
+    {
+        std::lock_guard<std::mutex> lk(_impl->pendingMu);
+        if (_impl->pending.size() >= kMaxPendingFrames) {
+            dropped = _impl->pending.front();
+            _impl->pending.pop_front();
+            _impl->droppedFrames += 1;
+            dropTotal = _impl->droppedFrames;
+            logDrop   = throttle_ready(_impl->lastDropLog);
+        }
+        CFRetain(sample);
+        _impl->pending.push_back(sample);
+        startPump = !_impl->mediaRequested;
+        _impl->mediaRequested = true;
+    }
+
+    if (dropped) CFRelease(dropped);
+    if (logDrop) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "renderer behind, dropped %llu frame(s)",
+                 (unsigned long long)dropTotal);
+        [self logAt:0 message:buf];
+    }
+    if (startPump) [self startRenderPumpForLayer:layer];
+}
+
+- (void)startRenderPumpForLayer:(AVSampleBufferDisplayLayer*)layer
+{
+    if (!_impl->renderQueue) return;
+    // Avoid a layer-block-self retain cycle.
+    __unsafe_unretained BambuPlayer* me = self;
+    __unsafe_unretained AVSampleBufferDisplayLayer* l = layer;
+    [layer requestMediaDataWhenReadyOnQueue:_impl->renderQueue usingBlock:^{
+        [me pumpLayer:l];
+    }];
+}
+
+// Pump frames while the layer has capacity.
+- (void)pumpLayer:(AVSampleBufferDisplayLayer*)layer
+{
+    while (layer.isReadyForMoreMediaData) {
+        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            [self recoverFailedLayer:layer];
+            return;
+        }
+
+        CMSampleBufferRef sample = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(_impl->pendingMu);
+            if (_impl->pending.empty()) {
+                // Stop until another frame arrives.
+                [layer stopRequestingMediaData];
+                _impl->mediaRequested = false;
+                return;
+            }
+            sample = _impl->pending.front();
+            _impl->pending.pop_front();
+        }
+
+        [layer enqueueSampleBuffer:sample];
+        CFRelease(sample);
+    }
+}
+
+// Flush the failed layer; the reader restarts the pump.
+- (void)recoverFailedLayer:(AVSampleBufferDisplayLayer*)layer
+{
+    bool logFail = false;
+    {
+        std::lock_guard<std::mutex> lk(_impl->pendingMu);
+        logFail = throttle_ready(_impl->lastFailLog);
+    }
+    if (logFail) {
+        NSError*    err   = layer.error;
+        NSString*   desc  = err ? err.localizedDescription : nil;
+        char const* cdesc = desc ? desc.UTF8String : nullptr;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "layer failed, flushing: %s",
+                 cdesc ? cdesc : "(no description)");
+        [self logAt:1 message:buf];
+    }
+
+    [layer flush];
+
+    std::deque<CMSampleBufferRef> stale;
+    {
+        std::lock_guard<std::mutex> lk(_impl->pendingMu);
+        stale.swap(_impl->pending);
+        if (_impl->mediaRequested) [layer stopRequestingMediaData];
+        _impl->mediaRequested = false;
+    }
+    for (CMSampleBufferRef s : stale) CFRelease(s);
+}
+
+// Stop the pump before destroying _impl.
+- (void)shutdownRenderPump
+{
+    AVSampleBufferDisplayLayer* layer = _displayLayer;
+    std::deque<CMSampleBufferRef> stale;
+    {
+        std::lock_guard<std::mutex> lk(_impl->pendingMu);
+        stale.swap(_impl->pending);
+        if (_impl->mediaRequested && layer) [layer stopRequestingMediaData];
+        _impl->mediaRequested = false;
+    }
+    for (CMSampleBufferRef s : stale) CFRelease(s);
+    if (_impl->renderQueue) dispatch_sync(_impl->renderQueue, ^{});
 }
 
 - (void)readerLoop
