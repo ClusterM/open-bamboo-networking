@@ -1704,6 +1704,12 @@ void Agent::set_config_dir(std::string dir)
         }
         OBN_INFO("state: restored selected machine %s",
                  selected.empty() ? "<none>" : selected.c_str());
+        // Discovery / cloud printer-info callbacks may already have populated
+        // the LAN IP and access-code caches before set_config_dir completes.
+        // Re-run the normal selection hook now so restoring the UI selection
+        // also reconnects telemetry. If either value is not ready yet this is
+        // a harmless no-op; the existing SSDP/access-code hooks retry later.
+        autostart_lan_if_selected(selected);
     }
 }
 
