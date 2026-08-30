@@ -1692,6 +1692,18 @@ void Agent::set_config_dir(std::string dir)
             obn::config::path_in_dir("obn.auth.json"));
         auth_store_->load();
         hydrate_session();
+
+        auto state = std::make_unique<obn::state::Store>(
+            obn::config::path_in_dir("obn.state.json"));
+        state->load();
+        const std::string selected = state->selected_machine();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            user_selected_machine_ = selected;
+            state_store_ = std::move(state);
+        }
+        OBN_INFO("state: restored selected machine %s",
+                 selected.empty() ? "<none>" : selected.c_str());
     }
 }
 
@@ -1724,6 +1736,7 @@ void Agent::set_user_selected_machine(std::string dev_id)
         std::lock_guard<std::mutex> lk(mu_);
         user_selected_machine_ = std::move(dev_id);
         selected = user_selected_machine_;
+        if (state_store_) state_store_->set_selected_machine(selected);
     }
     // The user switched active printer: bring LAN up for the newly selected one
     // if its IP + access code are already known. connect_printer() inside
