@@ -343,6 +343,7 @@ add_library(bambu_networking SHARED
     src/os_compat.cpp
     src/oss_sign.cpp
     src/print_job.cpp
+    src/state.cpp
     src/print_job_naming.cpp
     src/signing.cpp
     src/ssdp.cpp
@@ -775,6 +776,17 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(auth_persist_test PRIVATE include)
     add_test(NAME auth_persist COMMAND auth_persist_test)
 
+    # Hermetic regression test for issue #78: the selected printer must
+    # survive destruction and recreation of the networking Agent.
+    add_executable(state_persist_test tests/state_persist_test.cpp
+        tests/config_stub.cpp
+        src/state.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(state_persist_test PRIVATE include)
+    add_test(NAME state_persist COMMAND state_persist_test)
+
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
@@ -794,6 +806,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/mqtt_client.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
         src/tls_dial.cpp
@@ -854,6 +867,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/print_job_naming.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
         src/tls_dial.cpp

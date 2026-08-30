@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "obn/auth.hpp"
+#include "obn/state.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -527,6 +528,10 @@ private:
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.
     std::unique_ptr<obn::auth::Store> auth_store_;
+
+    // Holds small non-sensitive UI state. Orca expects the plugin to return
+    // the last selected printer after a process restart (#78).
+    std::unique_ptr<obn::state::Store> state_store_;
 
     // Tracks which printers we've already snapshotted a server cert for in
     // the current process. Keyed by dev_id. Studio's refresh timer calls
