@@ -284,6 +284,7 @@ struct ParsedUrl {
     std::string user = "bblp";
     std::string passwd;
     std::string path = "/streaming/live/1";
+    std::string lv;
 };
 
 std::string url_decode(const std::string& s)
@@ -402,9 +403,24 @@ bool parse_bambu_url(const std::string& url, ParsedUrl* out)
             else if (k == "port") {
                 try { out->port = std::stoi(v); } catch (...) {}
             }
+            else if (k == "lv") out->lv = v;
         }
         if (e == std::string::npos) break;
         i = e + 1;
+    }
+
+    // OBN's get_camera_url fallback intentionally uses one local URL for
+    // both the file-browser/control path and live video. H-series and
+    // other H.264 printers carry an lv=rtsps/rtsp hint on that URL.
+    // DirectShow is the Windows video path, so honor that hint here.
+    if (out->scheme == UrlScheme::Local) {
+        if (out->lv == "rtsps") {
+            out->scheme = UrlScheme::Rtsps;
+            out->port   = 322;
+        } else if (out->lv == "rtsp") {
+            out->scheme = UrlScheme::Rtsp;
+            out->port   = 554;
+        }
     }
 
     return !out->host.empty();
