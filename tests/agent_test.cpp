@@ -365,6 +365,32 @@ static void test_selection_without_config_dir_is_session_only()
     CHECK(a.user_selected_machine() == "00M00A000000003");
 }
 
+static void test_selection_before_config_dir_is_persisted()
+{
+    // Studio can select a printer before it hands us the config dir. That
+    // live choice must survive, and must outrank whatever the previous
+    // session left on disk.
+    const std::filesystem::path dir = fresh_config_dir("early");
+    {
+        obn::Agent seed(".");
+        seed.set_config_dir(dir.string());
+        seed.set_user_selected_machine("00M00A000000005");
+    }
+    {
+        obn::Agent a(".");
+        a.set_user_selected_machine("00M00A000000006");
+        a.set_config_dir(dir.string());
+        CHECK(a.user_selected_machine() == "00M00A000000006");
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000006");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 static void test_replayed_config_dir_keeps_store()
 {
     // Orca calls set_config_dir twice on the same handle. The second call
@@ -409,6 +435,7 @@ int main()
     test_deselect_keeps_remembered_printer();
     test_live_selection_replaces_remembered_printer();
     test_selection_without_config_dir_is_session_only();
+    test_selection_before_config_dir_is_persisted();
     test_replayed_config_dir_keeps_store();
 
     if (fail_count) {

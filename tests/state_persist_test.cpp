@@ -114,19 +114,25 @@ void test_rewrite_replaces_existing_file(Result& r)
 
 void test_failed_persist_retries(Result& r)
 {
-    // persist_locked writes path+".tmp" then renames onto path. Occupying
-    // `path` with a directory makes the rename fail so we can see a retry.
-    const fs::path path = tmp_path("retry");
-    fs::remove_all(path);
-    fs::create_directory(path);
+    // persist_locked writes path+".tmp" and renames it onto path. A directory
+    // sitting on the temporary name fails the open on every platform, whereas
+    // blocking `path` itself would not: the Windows branch removes the
+    // destination before renaming, so the write would succeed there.
+    const fs::path path    = tmp_path("retry");
+    const fs::path blocker = path.string() + ".tmp";
+    fs::remove(path);
+    fs::remove_all(blocker);
+    fs::create_directory(blocker);
     {
         obn::state::Store store(path.string());
         store.remember_machine("printer-a");
         EXPECT(r, store.remembered_machine() == "printer-a");
-        EXPECT(r, fs::is_directory(path));
-        fs::remove_all(path);
+        EXPECT(r, !fs::exists(path));
+        // Same id again: without the dirty flag this would be a no-op and the
+        // selection would never reach the disk.
+        fs::remove_all(blocker);
         store.remember_machine("printer-a");
-        EXPECT(r, store.remembered_machine() == "printer-a");
+        EXPECT(r, fs::exists(path));
     }
     {
         obn::state::Store restarted(path.string());
