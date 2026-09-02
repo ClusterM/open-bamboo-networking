@@ -33,12 +33,20 @@ public:
 
     std::string remembered_machine() const;
 
+    // Immutable after construction; used to reuse the store when the
+    // slicer replays set_config_dir on the same directory.
+    const std::string& path() const { return path_; }
+
 private:
-    void persist_locked() const;
+    // Returns false when the file could not be written, so the next
+    // remember_machine() of the same id retries instead of treating
+    // the in-memory value as committed.
+    bool persist_locked() const;
 
     std::string        path_;
     mutable std::mutex mu_;
     std::string        remembered_machine_;
+    bool               persisted_ = true;
 };
 
 } // namespace obn::state

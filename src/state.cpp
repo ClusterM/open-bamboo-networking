@@ -35,9 +35,9 @@ void Store::load()
     remembered_machine_ = root->find("selected_machine").as_string();
 }
 
-void Store::persist_locked() const
+bool Store::persist_locked() const
 {
-    if (path_.empty()) return;
+    if (path_.empty()) return true;
     namespace fs = std::filesystem;
     std::error_code ec;
     const fs::path parent = fs::path(path_).parent_path();
@@ -49,7 +49,7 @@ void Store::persist_locked() const
         if (!out.good()) {
             OBN_ERROR("state: open(%s) failed: %s", tmp.c_str(),
                       std::strerror(errno));
-            return;
+            return false;
         }
         const std::string body =
             "{\n  \"selected_machine\": " +
@@ -60,7 +60,7 @@ void Store::persist_locked() const
             OBN_ERROR("state: partial write on %s", tmp.c_str());
             out.close();
             fs::remove(tmp, ec);
-            return;
+            return false;
         }
     }
 
@@ -75,7 +75,9 @@ void Store::persist_locked() const
                   tmp.c_str(), path_.c_str(), ec.message().c_str());
         std::error_code rmec;
         fs::remove(tmp, rmec);
+        return false;
     }
+    return true;
 }
 
 void Store::remember_machine(const std::string& dev_id)
@@ -84,9 +86,10 @@ void Store::remember_machine(const std::string& dev_id)
     // Ignore deselection, and don't rewrite the file for a value we already
     // hold: the slicer re-asserts the current selection on every cloud
     // reconnect, and this runs on its UI thread.
-    if (dev_id.empty() || dev_id == remembered_machine_) return;
+    if (dev_id.empty()) return;
+    if (dev_id == remembered_machine_ && persisted_) return;
     remembered_machine_ = dev_id;
-    persist_locked();
+    persisted_          = persist_locked();
 }
 
 std::string Store::remembered_machine() const

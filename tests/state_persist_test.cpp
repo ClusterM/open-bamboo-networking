@@ -112,6 +112,30 @@ void test_rewrite_replaces_existing_file(Result& r)
     fs::remove(path);
 }
 
+void test_failed_persist_retries(Result& r)
+{
+    // persist_locked writes path+".tmp" then renames onto path. Occupying
+    // `path` with a directory makes the rename fail so we can see a retry.
+    const fs::path path = tmp_path("retry");
+    fs::remove_all(path);
+    fs::create_directory(path);
+    {
+        obn::state::Store store(path.string());
+        store.remember_machine("printer-a");
+        EXPECT(r, store.remembered_machine() == "printer-a");
+        EXPECT(r, fs::is_directory(path));
+        fs::remove_all(path);
+        store.remember_machine("printer-a");
+        EXPECT(r, store.remembered_machine() == "printer-a");
+    }
+    {
+        obn::state::Store restarted(path.string());
+        restarted.load();
+        EXPECT(r, restarted.remembered_machine() == "printer-a");
+    }
+    fs::remove(path);
+}
+
 int main()
 {
     Result r;
@@ -120,6 +144,7 @@ int main()
     test_malformed_state_is_safe(r);
     test_json_escaping_round_trip(r);
     test_rewrite_replaces_existing_file(r);
+    test_failed_persist_retries(r);
     std::printf("state_persist_test: %d passed, %d failed\n",
                 r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;

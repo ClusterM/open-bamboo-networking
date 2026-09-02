@@ -365,6 +365,20 @@ static void test_selection_without_config_dir_is_session_only()
     CHECK(a.user_selected_machine() == "00M00A000000003");
 }
 
+static void test_replayed_config_dir_keeps_store()
+{
+    // Orca calls set_config_dir twice on the same handle. The second call
+    // must not drop a selection that landed between them.
+    const std::filesystem::path dir = fresh_config_dir("replay");
+    obn::Agent a(".");
+    a.set_config_dir(dir.string());
+    a.set_user_selected_machine("00M00A000000004");
+    a.set_config_dir(dir.string());
+    CHECK(a.user_selected_machine() == "00M00A000000004");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -395,6 +409,7 @@ int main()
     test_deselect_keeps_remembered_printer();
     test_live_selection_replaces_remembered_printer();
     test_selection_without_config_dir_is_session_only();
+    test_replayed_config_dir_keeps_store();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

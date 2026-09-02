@@ -510,9 +510,11 @@ finishes.
 Alongside `obn.conf` the plugin keeps its own state in the same directory:
 `obn.auth.json` (cloud session — **contains tokens, treat as a secret**),
 `obn.state.json` (last selected printer, so the Device tab comes back
-selected after a restart) and `obn.env` (TLS and log settings handed to
-`libBambuSource`, which has its own config loader). All three are recreated
-as needed; deleting them only signs you out and forgets the selection.
+selected after a restart) and `obn.env` (TLS / FTPS / camera / log settings
+mirrored to `libBambuSource`, which has its own config loader). All three
+are rewritten as needed. Deleting `obn.auth.json` signs you out, deleting
+`obn.state.json` forgets the last printer, and deleting `obn.env` only lasts
+until the next start — the plugin recreates it from `obn.conf`.
 
 ## Logging
 

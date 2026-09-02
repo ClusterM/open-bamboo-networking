@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <thread>
 #include <utility>
 
@@ -1695,19 +1696,36 @@ void Agent::set_config_dir(std::string dir)
         auth_store_->load();
         hydrate_session();
 
-        auto state = std::make_unique<obn::state::Store>(
-            obn::config::path_in_dir("obn.state.json"));
-        state->load();
-        const std::string remembered = state->remembered_machine();
+        const std::string state_path =
+            obn::config::path_in_dir("obn.state.json");
+        std::shared_ptr<obn::state::Store> existing;
         {
+            std::lock_guard<std::mutex> lk(mu_);
+            existing = state_store_;
+        }
+        std::string remembered;
+        // Orca replays set_config_dir on the same handle. Replacing the
+        // store would leave a concurrent remember_machine() writing the
+        // same .tmp through a different mutex.
+        if (existing && existing->path() == state_path) {
+            std::lock_guard<std::mutex> lk(mu_);
+            remembered = remembered_machine_;
+        } else {
+            auto state = std::make_shared<obn::state::Store>(state_path);
+            state->load();
+            remembered = state->remembered_machine();
             std::lock_guard<std::mutex> lk(mu_);
             // Deliberately not user_selected_machine_: the slicer has not
             // selected anything yet in this session, and treating a
             // remembered id as a live selection would make the SSDP and
             // access-code hooks open a LAN session to a printer nobody asked
             // for (one of the two MQTT slots on P1-series boards, see #38).
-            remembered_machine_ = remembered;
-            state_store_        = std::move(state);
+            if (!state_store_ || state_store_->path() != state_path) {
+                remembered_machine_ = remembered;
+                state_store_        = std::move(state);
+            } else {
+                remembered = remembered_machine_;
+            }
         }
         OBN_INFO("state: remembered printer %s",
                  remembered.empty() ? "<none>" : remembered.c_str());
