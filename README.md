@@ -507,6 +507,15 @@ Typical paths: `~/.config/BambuStudio/obn.conf`, `~/.config/OrcaSlicer/obn.conf`
 have to guess — the installer prints the exact path for your slicer when it
 finishes.
 
+Alongside `obn.conf` the plugin keeps its own state in the same directory:
+`obn.auth.json` (cloud session — **contains tokens, treat as a secret**),
+`obn.state.json` (last selected printer, so the Device tab comes back
+selected after a restart) and `obn.env` (TLS / FTPS / camera / log settings
+mirrored to `libBambuSource`, which has its own config loader). All three
+are rewritten as needed. Deleting `obn.auth.json` signs you out, deleting
+`obn.state.json` forgets the last printer, and deleting `obn.env` only lasts
+until the next start — the plugin recreates it from `obn.conf`.
+
 ## Logging
 
 The plugin writes a printf-style log of ABI calls and MQTT / FTPS /

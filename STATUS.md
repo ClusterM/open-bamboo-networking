@@ -156,8 +156,8 @@ Sources: [src/abi_user.cpp](src/abi_user.cpp), [src/abi_bind.cpp](src/abi_bind.c
 | Function | Status | Notes |
 | --- | :--: | --- |
 | `bambu_network_get_bambulab_host` | ✅ | Returns the region-appropriate portal host (ends with `/`, as stock does). |
-| `bambu_network_get_user_selected_machine` | ✅ | Agent-side selection state. |
-| `bambu_network_set_user_selected_machine` | ✅ | Agent-side selection state. |
+| `bambu_network_get_user_selected_machine` | ✅ | Agent-side selection state, hydrated from `obn.state.json` at startup so the Device tab comes back selected — the slicers clear their own copy of the id before the printer list exists ([#78](https://github.com/ClusterM/open-bambu-networking/issues/78), [§8.7](research/08.07-printer-selection.md)). |
+| `bambu_network_set_user_selected_machine` | ✅ | Agent-side selection state; non-empty ids are persisted. Deselection is kept in memory only, because the slicers deselect on logout, on agent swap and on any refresh tick that finds the printer missing. |
 | `bambu_network_modify_printer_name` | ✅ | Cloud rename call. |
 | `bambu_network_get_printer_firmware` | ✨ | Stock calls Bambu's cloud firmware catalogue. This plugin re-synthesises the JSON envelope locally from the MQTT frames the printer already sends (`info.command=get_version` replies and `push_status.upgrade_state.new_ver_list`). That populates the Update panel and lights up the "update available" badge without any cloud roundtrip. The "Update" button itself is a plain LAN MQTT passthrough; the printer fetches the binary from Bambu's CDN directly. Trade-off: no cross-version history — only the advertised version is flashable. |
 
@@ -234,7 +234,7 @@ Source: [src/abi_lan.cpp](src/abi_lan.cpp).
 Studio only calls `connect_printer` for LAN-mode devices, so a cloud-paired printer would otherwise never get a LAN MQTT session — yet the LAN-priority subscription (§8.3) and the LAN-first print path (§8.8) both need one. The plugin therefore brings the session up proactively whenever it knows the IP and access code. Implemented in [src/agent.cpp](src/agent.cpp):
 
 - **`ensure_lan_session(dev_id, ip_hint, code_hint)`** — idempotent session opener. Fast-paths to `true` when already connected to `dev_id`; otherwise resolves the IP / access code from the hints or the cached `dev_id → {dev_ip, access_code}` maps (SSDP IP + cloud `dev_access_code`, per [research §10.6](research/10.06-lan-tls-and-access-codes.md)), calls `connect_printer`, and polls up to 3 s for the MQTT `CONNACK`. Returns `false` (caller degrades gracefully) when credentials are missing or the broker never accepts.
-- **`autostart_lan_if_selected(dev_id)`** — spawns a detached thread that calls `ensure_lan_session` for the currently `user_selected_machine_` when its IP and code are known, guarded by `lan_autostart_inflight_` against duplicate attempts. Hooked into the three points where new credentials/selection become known:
+- **`autostart_lan_if_selected(dev_id)`** — spawns a detached thread that calls `ensure_lan_session` for the currently `user_selected_machine_` when its IP and code are known, guarded by `lan_autostart_inflight_` against duplicate attempts. Only a selection made in the current session counts: the id restored from `obn.state.json` answers the startup query (§8.7 `get_user_selected_machine`) but never opens a session by itself, because P1-series boards have two MQTT slots and one of them must stay free for the printer's own cloud link. Hooked into the three points where new credentials/selection become known:
   - `note_device_access_code` (a fresh access code arrived),
   - `set_user_selected_machine` (the user switched active printer),
   - `cache_ssdp_json_for_bind` (SSDP produced/refreshed an IP).

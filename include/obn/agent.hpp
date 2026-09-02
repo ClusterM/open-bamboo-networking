@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "obn/auth.hpp"
+#include "obn/state.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -461,7 +462,12 @@ private:
     std::string        cert_folder_;
     std::string        cert_filename_;
     std::string        country_code_{"US"};
+    // Printer the slicer selected in this session. Empty until it tells us,
+    // and only this value may start a LAN session.
     std::string        user_selected_machine_;
+    // Last non-empty selection read back from obn.state.json. Answers the
+    // slicer's startup query while user_selected_machine_ is still empty.
+    std::string        remembered_machine_;
     std::map<std::string, std::string> extra_http_headers_;
 
     std::unique_ptr<LanSession> lan_session_;
@@ -527,6 +533,12 @@ private:
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.
     std::unique_ptr<obn::auth::Store> auth_store_;
+
+    // Holds small non-sensitive UI state. Orca expects the plugin to return
+    // the last selected printer after a process restart (#78). Shared, not
+    // unique: set_config_dir() can be replayed on the same handle and would
+    // otherwise free the store under a concurrent writer.
+    std::shared_ptr<obn::state::Store> state_store_;
 
     // Tracks which printers we've already snapshotted a server cert for in
     // the current process. Keyed by dev_id. Studio's refresh timer calls

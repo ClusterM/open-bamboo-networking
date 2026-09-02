@@ -343,6 +343,7 @@ add_library(bambu_networking SHARED
     src/os_compat.cpp
     src/oss_sign.cpp
     src/print_job.cpp
+    src/state.cpp
     src/print_job_naming.cpp
     src/signing.cpp
     src/ssdp.cpp
@@ -683,6 +684,24 @@ if(OBN_BUILD_TESTS)
     endif()
     add_test(NAME plugin_symbols
         COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
+
+    # Hermetic regression test for issue #78: the selected printer must
+    # survive destruction and recreation of the networking Agent. Kept
+    # cross-platform on purpose — the file-replace path in state.cpp is
+    # Windows-specific, so Windows CI is the only place it gets covered.
+    add_executable(state_persist_test tests/state_persist_test.cpp
+        tests/config_stub.cpp
+        src/state.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(state_persist_test PRIVATE include)
+    if(WIN32)
+        # log.cpp needs os_compat.cpp for strcasecmp_portable, and that
+        # translation unit also holds the Winsock wrappers.
+        target_link_libraries(state_persist_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME state_persist COMMAND state_persist_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
@@ -794,6 +813,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/mqtt_client.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
         src/tls_dial.cpp
@@ -854,6 +874,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/print_job_naming.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
         src/tls_dial.cpp
@@ -879,6 +900,25 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME cloud_print COMMAND cloud_print_test)
+
+    # In-process tests for obn::Agent itself: SSDP bind-detect lookup,
+    # firmware JSON rendering, synthetic subtask ids and the selected-printer
+    # memory from issue #78. No sockets are opened.
+    add_executable(agent_test tests/agent_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(agent_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(agent_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(agent_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME agent COMMAND agent_test)
 
     # Pins the Filament Manager request bodies (ams/sync, slot-mappings/sync)
     # byte-for-byte against MITM captures of the stock plugin.

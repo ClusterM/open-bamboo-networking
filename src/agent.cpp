@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <thread>
 #include <utility>
 
@@ -1694,6 +1695,47 @@ void Agent::set_config_dir(std::string dir)
             obn::config::path_in_dir("obn.auth.json"));
         auth_store_->load();
         hydrate_session();
+
+        const std::string state_path =
+            obn::config::path_in_dir("obn.state.json");
+        std::shared_ptr<obn::state::Store> store;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            store = state_store_;
+        }
+        // Orca replays set_config_dir on the same handle. Reuse the store for
+        // a directory we already track, or two Store instances would write
+        // the same .tmp through independent mutexes.
+        if (!store || store->path() != state_path) {
+            auto fresh = std::make_shared<obn::state::Store>(state_path);
+            fresh->load();
+            const std::string on_disk = fresh->remembered_machine();
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!state_store_ || state_store_->path() != state_path) {
+                state_store_ = fresh;
+                // Studio may select a printer before it tells us where to
+                // keep state, and that live choice outranks the previous
+                // session's file. Note this fills remembered_machine_, not
+                // user_selected_machine_: a restored id must not look like a
+                // live selection, or the SSDP and access-code hooks would
+                // open a LAN session to a printer nobody asked for (one of
+                // the two MQTT slots on P1-series boards, see #38).
+                if (remembered_machine_.empty()) remembered_machine_ = on_disk;
+            }
+            store = state_store_;
+        }
+
+        std::string live;
+        std::string remembered;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            live       = user_selected_machine_;
+            remembered = remembered_machine_;
+        }
+        // Outside mu_: writing the file must not block the session threads.
+        if (store) store->remember_machine(live);
+        OBN_INFO("state: remembered printer %s",
+                 remembered.empty() ? "<none>" : remembered.c_str());
     }
 }
 
@@ -1721,12 +1763,18 @@ void Agent::set_extra_http_headers(std::map<std::string, std::string> headers)
 
 void Agent::set_user_selected_machine(std::string dev_id)
 {
-    std::string selected;
+    std::string                        selected;
+    std::shared_ptr<obn::state::Store> store;
     {
         std::lock_guard<std::mutex> lk(mu_);
         user_selected_machine_ = std::move(dev_id);
-        selected = user_selected_machine_;
+        selected               = user_selected_machine_;
+        if (!selected.empty()) remembered_machine_ = selected;
+        store = state_store_;
     }
+    // Persist outside mu_: this runs on the slicer's UI thread, and mu_ also
+    // guards the LAN/cloud bookkeeping the session threads need.
+    if (store) store->remember_machine(selected);
     // The user switched active printer: bring LAN up for the newly selected one
     // if its IP + access code are already known. connect_printer() inside
     // ensure_lan_session tears down any LanSession that targeted the previous
@@ -1787,7 +1835,10 @@ std::string Agent::bambu_ca_bundle_path() const
 std::string Agent::user_selected_machine() const
 {
     std::lock_guard<std::mutex> lk(mu_);
-    return user_selected_machine_;
+    // The live selection wins; the remembered id exists only to answer the
+    // startup query, where the slicer has nothing of its own left (#78).
+    return user_selected_machine_.empty() ? remembered_machine_
+                                          : user_selected_machine_;
 }
 
 bool Agent::start_discovery(bool enable, bool sending)

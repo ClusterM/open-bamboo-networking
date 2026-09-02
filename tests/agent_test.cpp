@@ -7,6 +7,7 @@
 #include "obn/json_lite.hpp"
 
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -274,6 +275,137 @@ static void test_synthetic_subtask_id_varies_with_timestamp()
 }
 
 // ---------------------------------------------------------------------------
+// Selected-printer memory (issue #78)
+// ---------------------------------------------------------------------------
+
+// Fresh, empty config dir; each caller gets its own so the state file from one
+// test can't leak into the next.
+static std::filesystem::path fresh_config_dir(const char* tag)
+{
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() /
+        (std::string("obn_agent_test_") + tag);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+static void test_selection_survives_agent_restart()
+{
+    const std::filesystem::path dir = fresh_config_dir("restart");
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        CHECK(a.user_selected_machine() == "");
+        a.set_user_selected_machine("00M00A000000001");
+        CHECK(a.user_selected_machine() == "00M00A000000001");
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000001");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static void test_deselect_keeps_remembered_printer()
+{
+    const std::filesystem::path dir = fresh_config_dir("deselect");
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        a.set_user_selected_machine("00M00A000000001");
+        // Orca deselects on logout, on its 5 s refresh tick when the printer
+        // is momentarily missing, and while installing its printer agent at
+        // startup. None of that means the user gave up the printer, and the
+        // plugin's copy is the last one standing.
+        a.set_user_selected_machine("");
+        CHECK(a.user_selected_machine() == "00M00A000000001");
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000001");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static void test_live_selection_replaces_remembered_printer()
+{
+    const std::filesystem::path dir = fresh_config_dir("switch");
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        a.set_user_selected_machine("00M00A000000001");
+    }
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        a.set_user_selected_machine("00M00A000000002");
+        CHECK(a.user_selected_machine() == "00M00A000000002");
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000002");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static void test_selection_without_config_dir_is_session_only()
+{
+    // Studio can select a printer before it tells us where to keep state; that
+    // must not crash, and must not resurrect an older id either.
+    obn::Agent a(".");
+    a.set_user_selected_machine("00M00A000000003");
+    CHECK(a.user_selected_machine() == "00M00A000000003");
+}
+
+static void test_selection_before_config_dir_is_persisted()
+{
+    // Studio can select a printer before it hands us the config dir. That
+    // live choice must survive, and must outrank whatever the previous
+    // session left on disk.
+    const std::filesystem::path dir = fresh_config_dir("early");
+    {
+        obn::Agent seed(".");
+        seed.set_config_dir(dir.string());
+        seed.set_user_selected_machine("00M00A000000005");
+    }
+    {
+        obn::Agent a(".");
+        a.set_user_selected_machine("00M00A000000006");
+        a.set_config_dir(dir.string());
+        CHECK(a.user_selected_machine() == "00M00A000000006");
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000006");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static void test_replayed_config_dir_keeps_store()
+{
+    // Orca calls set_config_dir twice on the same handle. The second call
+    // must not drop a selection that landed between them.
+    const std::filesystem::path dir = fresh_config_dir("replay");
+    obn::Agent a(".");
+    a.set_config_dir(dir.string());
+    a.set_user_selected_machine("00M00A000000004");
+    a.set_config_dir(dir.string());
+    CHECK(a.user_selected_machine() == "00M00A000000004");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -297,6 +429,14 @@ int main()
     test_synthetic_subtask_not_created_for_sentinel_name();
     test_synthetic_subtask_id_is_deterministic();
     test_synthetic_subtask_id_varies_with_timestamp();
+
+    // Selected-printer memory.
+    test_selection_survives_agent_restart();
+    test_deselect_keeps_remembered_printer();
+    test_live_selection_replaces_remembered_printer();
+    test_selection_without_config_dir_is_session_only();
+    test_selection_before_config_dir_is_persisted();
+    test_replayed_config_dir_keeps_store();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
