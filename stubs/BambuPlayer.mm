@@ -181,7 +181,14 @@ struct BambuPlayerImpl {
         for (CMSampleBufferRef s : pending) CFRelease(s);
         pending.clear();
         if (renderQueue) {
+#if OS_OBJECT_USE_OBJC
+            // libdispatch objects are ObjC objects on every SDK we build
+            // against, where dispatch_release is unavailable. This file is
+            // MRC, so the queue is released like any other object.
+            [renderQueue release];
+#else
             dispatch_release(renderQueue);
+#endif
             renderQueue = nullptr;
         }
     }
@@ -725,7 +732,7 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
 
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         // Reset the failed layer; the next frame restarts the pump.
-        [self recoverFailedLayer:layer];
+        [self recoverFailedLayer:layer onRenderQueue:NO];
         CFRelease(sample);
         [layer release];
         return NO;
@@ -772,21 +779,36 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
 
 - (void)startRenderPumpForLayer:(AVSampleBufferDisplayLayer*)layer
 {
-    if (!_impl->renderQueue) return;
-    // Avoid a layer-block-self retain cycle.
+    dispatch_queue_t q = _impl->renderQueue;
+    if (!q) return;
+    // Arming happens on renderQueue, like every stop below: AVFoundation does
+    // not serialise the request/stop pair for us, and the pump parks itself
+    // from inside its own block. Queueing the arm behind that block is what
+    // stops a park from cancelling a request the reader installed after it,
+    // which would wedge playback for good.
+    //
+    // Unretained on purpose: the layer owns the pump block and the player owns
+    // the layer, so a strong capture both cycles and, because Studio calls
+    // -dealloc directly (see the file header), can release a player that is
+    // already being destroyed. close -> shutdownRenderPump parks the pump and
+    // drains renderQueue before _impl dies, so neither pointer outlives its
+    // block.
     __unsafe_unretained BambuPlayer* me = self;
     __unsafe_unretained AVSampleBufferDisplayLayer* l = layer;
-    [layer requestMediaDataWhenReadyOnQueue:_impl->renderQueue usingBlock:^{
-        [me pumpLayer:l];
-    }];
+    dispatch_async(q, ^{
+        [l requestMediaDataWhenReadyOnQueue:q usingBlock:^{
+            [me pumpLayer:l];
+        }];
+    });
 }
 
-// Pump frames while the layer has capacity.
+// Pump frames while the layer has capacity. Runs on renderQueue.
 - (void)pumpLayer:(AVSampleBufferDisplayLayer*)layer
 {
-    while (layer.isReadyForMoreMediaData) {
+    bool park = false;
+    while (!park && layer.isReadyForMoreMediaData) {
         if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-            [self recoverFailedLayer:layer];
+            [self recoverFailedLayer:layer onRenderQueue:YES];
             return;
         }
 
@@ -794,22 +816,28 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         {
             std::lock_guard<std::mutex> lk(_impl->pendingMu);
             if (_impl->pending.empty()) {
-                // Stop until another frame arrives.
-                [layer stopRequestingMediaData];
                 _impl->mediaRequested = false;
-                return;
+                park = true;
+            } else {
+                sample = _impl->pending.front();
+                _impl->pending.pop_front();
             }
-            sample = _impl->pending.front();
-            _impl->pending.pop_front();
         }
 
-        [layer enqueueSampleBuffer:sample];
-        CFRelease(sample);
+        if (sample) {
+            [layer enqueueSampleBuffer:sample];
+            CFRelease(sample);
+        }
     }
+    // Nothing left to show: park until the reader arms us again. Outside
+    // pendingMu, since stopRequestingMediaData is entitled to wait for this
+    // very block and the reader takes that lock for every frame.
+    if (park) [layer stopRequestingMediaData];
 }
 
 // Flush the failed layer; the reader restarts the pump.
 - (void)recoverFailedLayer:(AVSampleBufferDisplayLayer*)layer
+             onRenderQueue:(BOOL)onRenderQueue
 {
     bool logFail = false;
     {
@@ -826,31 +854,58 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         [self logAt:1 message:buf];
     }
 
-    [layer flush];
-
     std::deque<CMSampleBufferRef> stale;
+    bool park = false;
     {
         std::lock_guard<std::mutex> lk(_impl->pendingMu);
         stale.swap(_impl->pending);
-        if (_impl->mediaRequested) [layer stopRequestingMediaData];
+        park = _impl->mediaRequested;
         _impl->mediaRequested = false;
     }
     for (CMSampleBufferRef s : stale) CFRelease(s);
+
+    __unsafe_unretained AVSampleBufferDisplayLayer* l = layer;
+    [self onRenderQueue:onRenderQueue perform:^{
+        [l flush];
+        if (park) [l stopRequestingMediaData];
+    }];
 }
 
 // Stop the pump before destroying _impl.
 - (void)shutdownRenderPump
 {
     AVSampleBufferDisplayLayer* layer = _displayLayer;
+    bool park = false;
+    {
+        std::lock_guard<std::mutex> lk(_impl->pendingMu);
+        park = _impl->mediaRequested && layer != nil;
+        _impl->mediaRequested = false;
+    }
+    if (park) {
+        __unsafe_unretained AVSampleBufferDisplayLayer* l = layer;
+        [self onRenderQueue:NO perform:^{ [l stopRequestingMediaData]; }];
+    }
+
     std::deque<CMSampleBufferRef> stale;
     {
         std::lock_guard<std::mutex> lk(_impl->pendingMu);
         stale.swap(_impl->pending);
-        if (_impl->mediaRequested && layer) [layer stopRequestingMediaData];
-        _impl->mediaRequested = false;
     }
     for (CMSampleBufferRef s : stale) CFRelease(s);
+    // Wait out a pump that is already running: close() and -dealloc free
+    // _impl the moment this returns. The reader thread is joined by then, so
+    // nothing can arm the pump behind our back.
     if (_impl->renderQueue) dispatch_sync(_impl->renderQueue, ^{});
+}
+
+// Layer control (flush, stopRequestingMediaData) belongs to renderQueue: the
+// pump enqueues from there, and AVFoundation serialises none of it against
+// that. Callers on the reader thread hop over; the pump is already there.
+// Never call this while holding pendingMu — the pump takes it.
+- (void)onRenderQueue:(BOOL)already perform:(void (^)(void))work
+{
+    if (already || !_impl->renderQueue) work();
+    else dispatch_sync(_impl->renderQueue, work);
 }
 
 - (void)readerLoop
