@@ -1680,8 +1680,10 @@ void Agent::set_config_dir(std::string dir)
         config_dir_ = std::move(dir);
     }
     // Swap the auth store to a real on-disk file as soon as Studio
-    // tells us where to keep it. Studio calls set_config_dir() exactly
-    // once during plugin init, before any user-facing ABI.
+    // tells us where to keep it. This runs during plugin init, before any
+    // user-facing ABI, but not necessarily once per agent: Orca installs its
+    // printer agent twice on startup and replays set_config_dir + start on the
+    // same handle, so everything below has to stay idempotent.
     std::string cfg = config_dir();
     if (!cfg.empty()) {
         obn::lan_tls::registry_set_config_dir(cfg);

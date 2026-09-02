@@ -92,7 +92,7 @@ public:
     // "No error" because Winsock failures land in WSAGetLastError, not
     // CRT errno. Capture the WSA code explicitly via this helper at the
     // failure site so the log actually points to the underlying problem.
-    static std::string detailed_err(int rc, int wsa_err = 0);
+    static std::string detailed_err(int rc, int wsa_err = 0, int sys_errno = 0);
 
 private:
     static void s_on_connect(::mosquitto* m, void* obj, int rc);

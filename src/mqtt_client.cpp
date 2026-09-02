@@ -1,6 +1,7 @@
 #include "obn/mqtt_client.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -82,9 +83,15 @@ const char* Client::connack_str(int rc)
     return connack_reason(rc);
 }
 
-std::string Client::detailed_err(int rc, int wsa_err)
+std::string Client::detailed_err(int rc, int wsa_err, int sys_errno)
 {
     std::string s = ::mosquitto_strerror(rc);
+    if (rc == MOSQ_ERR_ERRNO) {
+        // mosquitto_strerror(MOSQ_ERR_ERRNO) is strerror(errno) with the
+        // number dropped, which makes two different failures print the same
+        // text. Keep the raw value so logs stay comparable across platforms.
+        s += " [errno=" + std::to_string(sys_errno) + "]";
+    }
 #if defined(_WIN32)
     if (rc == MOSQ_ERR_ERRNO) {
         if (wsa_err == 0) {
@@ -107,6 +114,13 @@ std::string Client::detailed_err(int rc, int wsa_err)
         }
         s += " [WSA=" + std::to_string(wsa_err) + ": "
              + (len > 0 ? buf : "<unknown>") + "]";
+        if (wsa_err == 0) {
+            // No socket error behind MOSQ_ERR_ERRNO means the TLS path threw
+            // the real Winsock code away — see
+            // cmake/VendorMosquittoWinSslErrno.cmake. A patched libmosquitto
+            // never gets here, so this points at the build, not the network.
+            s += " [unpatched libmosquitto?]";
+        }
     }
 #else
     (void)wsa_err;
@@ -367,6 +381,7 @@ int Client::connect(const ConnectConfig& cfg)
     // MOSQ_ERR_ERRNO with WSA=0 is the signature of the upstream Windows+TLS
     // bug that cmake/VendorMosquittoWinSslErrno.cmake patches out: seeing it in
     // a log means the plugin was built against an unpatched libmosquitto.
+    const int sys_errno = (rc == MOSQ_ERR_ERRNO) ? errno : 0;
 #if defined(_WIN32)
     const int wsa_err = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
 #else
@@ -379,23 +394,25 @@ int Client::connect(const ConnectConfig& cfg)
         // the loop thread's reconnect logic.
         if (rc == MOSQ_ERR_INVAL || rc == MOSQ_ERR_NOMEM) {
             OBN_ERROR("mqtt connect_async rc=%d (%s)",
-                      rc, detailed_err(rc, wsa_err).c_str());
+                      rc, detailed_err(rc, wsa_err, sys_errno).c_str());
             return rc;
         }
         OBN_INFO("mqtt connect_async to %s:%d rc=%d (%s); loop will reconnect "
                  "in background",
                  cfg.host.c_str(), cfg.port, rc,
-                 detailed_err(rc, wsa_err).c_str());
+                 detailed_err(rc, wsa_err, sys_errno).c_str());
     }
 
     rc = ::mosquitto_loop_start(mosq_);
     if (rc != MOSQ_ERR_SUCCESS) {
+        const int loop_errno = (rc == MOSQ_ERR_ERRNO) ? errno : 0;
 #if defined(_WIN32)
-        int wsa = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
-        OBN_ERROR("mqtt loop_start rc=%d (%s)", rc, detailed_err(rc, wsa).c_str());
+        const int loop_wsa = (rc == MOSQ_ERR_ERRNO) ? ::WSAGetLastError() : 0;
 #else
-        OBN_ERROR("mqtt loop_start rc=%d (%s)", rc, err_str(rc));
+        const int loop_wsa = 0;
 #endif
+        OBN_ERROR("mqtt loop_start rc=%d (%s)", rc,
+                  detailed_err(rc, loop_wsa, loop_errno).c_str());
         return rc;
     }
     loop_started_.store(true, std::memory_order_release);

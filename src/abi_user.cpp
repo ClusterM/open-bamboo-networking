@@ -242,12 +242,20 @@ OBN_ABI std::string bambu_network_get_bambulab_host(void* agent)
 OBN_ABI std::string bambu_network_get_user_selected_machine(void* agent)
 {
     auto* a = as_agent(agent);
-    return a ? a->user_selected_machine() : std::string{};
+    std::string v = a ? a->user_selected_machine() : std::string{};
+    // Studio and Orca both fall back to this when their own remembered
+    // printer id is empty, so what we answer here decides whether the Device
+    // tab comes up selected after a restart (GitHub issue #78).
+    OBN_DEBUG("get_user_selected_machine -> %s",
+              v.empty() ? "<none>" : v.c_str());
+    return v;
 }
 
 OBN_ABI int bambu_network_set_user_selected_machine(void* agent, std::string dev_id)
 {
     if (auto* a = as_agent(agent)) {
+        OBN_INFO("set_user_selected_machine %s",
+                 dev_id.empty() ? "<none>" : dev_id.c_str());
         a->set_user_selected_machine(std::move(dev_id));
         return BAMBU_NETWORK_SUCCESS;
     }
