@@ -1698,20 +1698,19 @@ void Agent::set_config_dir(std::string dir)
         auto state = std::make_unique<obn::state::Store>(
             obn::config::path_in_dir("obn.state.json"));
         state->load();
-        const std::string selected = state->selected_machine();
+        const std::string remembered = state->remembered_machine();
         {
             std::lock_guard<std::mutex> lk(mu_);
-            user_selected_machine_ = selected;
-            state_store_ = std::move(state);
+            // Deliberately not user_selected_machine_: the slicer has not
+            // selected anything yet in this session, and treating a
+            // remembered id as a live selection would make the SSDP and
+            // access-code hooks open a LAN session to a printer nobody asked
+            // for (one of the two MQTT slots on P1-series boards, see #38).
+            remembered_machine_ = remembered;
+            state_store_        = std::move(state);
         }
-        OBN_INFO("state: restored selected machine %s",
-                 selected.empty() ? "<none>" : selected.c_str());
-        // Discovery / cloud printer-info callbacks may already have populated
-        // the LAN IP and access-code caches before set_config_dir completes.
-        // Re-run the normal selection hook now so restoring the UI selection
-        // also reconnects telemetry. If either value is not ready yet this is
-        // a harmless no-op; the existing SSDP/access-code hooks retry later.
-        autostart_lan_if_selected(selected);
+        OBN_INFO("state: remembered printer %s",
+                 remembered.empty() ? "<none>" : remembered.c_str());
     }
 }
 
@@ -1739,13 +1738,18 @@ void Agent::set_extra_http_headers(std::map<std::string, std::string> headers)
 
 void Agent::set_user_selected_machine(std::string dev_id)
 {
-    std::string selected;
+    std::string                        selected;
+    std::shared_ptr<obn::state::Store> store;
     {
         std::lock_guard<std::mutex> lk(mu_);
         user_selected_machine_ = std::move(dev_id);
-        selected = user_selected_machine_;
-        if (state_store_) state_store_->set_selected_machine(selected);
+        selected               = user_selected_machine_;
+        if (!selected.empty()) remembered_machine_ = selected;
+        store = state_store_;
     }
+    // Persist outside mu_: this runs on the slicer's UI thread, and mu_ also
+    // guards the LAN/cloud bookkeeping the session threads need.
+    if (store) store->remember_machine(selected);
     // The user switched active printer: bring LAN up for the newly selected one
     // if its IP + access code are already known. connect_printer() inside
     // ensure_lan_session tears down any LanSession that targeted the previous
@@ -1806,7 +1810,10 @@ std::string Agent::bambu_ca_bundle_path() const
 std::string Agent::user_selected_machine() const
 {
     std::lock_guard<std::mutex> lk(mu_);
-    return user_selected_machine_;
+    // The live selection wins; the remembered id exists only to answer the
+    // startup query, where the slicer has nothing of its own left (#78).
+    return user_selected_machine_.empty() ? remembered_machine_
+                                          : user_selected_machine_;
 }
 
 bool Agent::start_discovery(bool enable, bool sending)

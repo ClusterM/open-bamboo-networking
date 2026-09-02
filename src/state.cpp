@@ -17,7 +17,7 @@ Store::Store(std::string path) : path_(std::move(path)) {}
 void Store::load()
 {
     std::lock_guard<std::mutex> lk(mu_);
-    selected_machine_.clear();
+    remembered_machine_.clear();
     if (path_.empty()) return;
 
     std::ifstream in(path_, std::ios::binary);
@@ -32,7 +32,7 @@ void Store::load()
         OBN_WARN("state: failed to parse %s: %s", path_.c_str(), err.c_str());
         return;
     }
-    selected_machine_ = root->find("selected_machine").as_string();
+    remembered_machine_ = root->find("selected_machine").as_string();
 }
 
 void Store::persist_locked() const
@@ -53,7 +53,7 @@ void Store::persist_locked() const
         }
         const std::string body =
             "{\n  \"selected_machine\": " +
-            obn::json::escape(selected_machine_) + "\n}\n";
+            obn::json::escape(remembered_machine_) + "\n}\n";
         out.write(body.data(), static_cast<std::streamsize>(body.size()));
         out.flush();
         if (!out.good()) {
@@ -65,7 +65,8 @@ void Store::persist_locked() const
     }
 
 #if defined(_WIN32)
-    // std::filesystem::rename does not replace an existing Windows file.
+    // Remove the destination first; see the rationale in auth.cpp's
+    // persist_locked(), which uses the same pattern.
     fs::remove(path_, ec);
 #endif
     fs::rename(tmp, path_, ec);
@@ -77,17 +78,21 @@ void Store::persist_locked() const
     }
 }
 
-void Store::set_selected_machine(std::string dev_id)
+void Store::remember_machine(const std::string& dev_id)
 {
     std::lock_guard<std::mutex> lk(mu_);
-    selected_machine_ = std::move(dev_id);
+    // Ignore deselection, and don't rewrite the file for a value we already
+    // hold: the slicer re-asserts the current selection on every cloud
+    // reconnect, and this runs on its UI thread.
+    if (dev_id.empty() || dev_id == remembered_machine_) return;
+    remembered_machine_ = dev_id;
     persist_locked();
 }
 
-std::string Store::selected_machine() const
+std::string Store::remembered_machine() const
 {
     std::lock_guard<std::mutex> lk(mu_);
-    return selected_machine_;
+    return remembered_machine_;
 }
 
 } // namespace obn::state

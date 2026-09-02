@@ -33,30 +33,31 @@ void test_selection_survives_restart(Result& r)
     {
         obn::state::Store store(path.string());
         store.load();
-        EXPECT(r, store.selected_machine().empty());
-        store.set_selected_machine("31B8AP5C0101591");
+        EXPECT(r, store.remembered_machine().empty());
+        store.remember_machine("31B8AP5C0101591");
     }
     {
         obn::state::Store restarted(path.string());
         restarted.load();
-        EXPECT(r, restarted.selected_machine() == "31B8AP5C0101591");
+        EXPECT(r, restarted.remembered_machine() == "31B8AP5C0101591");
     }
     fs::remove(path);
 }
 
-void test_deselection_survives_restart(Result& r)
+void test_deselection_keeps_last_printer(Result& r)
 {
     const fs::path path = tmp_path("deselect");
     fs::remove(path);
     {
         obn::state::Store store(path.string());
-        store.set_selected_machine("printer-a");
-        store.set_selected_machine("");
+        store.remember_machine("printer-a");
+        store.remember_machine("");
+        EXPECT(r, store.remembered_machine() == "printer-a");
     }
     {
         obn::state::Store restarted(path.string());
         restarted.load();
-        EXPECT(r, restarted.selected_machine().empty());
+        EXPECT(r, restarted.remembered_machine() == "printer-a");
     }
     fs::remove(path);
 }
@@ -70,7 +71,7 @@ void test_malformed_state_is_safe(Result& r)
     }
     obn::state::Store store(path.string());
     store.load();
-    EXPECT(r, store.selected_machine().empty());
+    EXPECT(r, store.remembered_machine().empty());
     fs::remove(path);
 }
 
@@ -81,13 +82,33 @@ void test_json_escaping_round_trip(Result& r)
     const std::string unusual = "printer-\"test\\id";
     {
         obn::state::Store store(path.string());
-        store.set_selected_machine(unusual);
+        store.remember_machine(unusual);
     }
     {
         obn::state::Store restarted(path.string());
         restarted.load();
-        EXPECT(r, restarted.selected_machine() == unusual);
+        EXPECT(r, restarted.remembered_machine() == unusual);
     }
+    fs::remove(path);
+}
+
+void test_rewrite_replaces_existing_file(Result& r)
+{
+    // Windows std::filesystem::rename refuses an existing destination, so the
+    // second write is the one that catches a broken replace path.
+    const fs::path path = tmp_path("rewrite");
+    fs::remove(path);
+    {
+        obn::state::Store store(path.string());
+        store.remember_machine("printer-a");
+        store.remember_machine("printer-b");
+    }
+    {
+        obn::state::Store restarted(path.string());
+        restarted.load();
+        EXPECT(r, restarted.remembered_machine() == "printer-b");
+    }
+    EXPECT(r, !fs::exists(path.string() + ".tmp"));
     fs::remove(path);
 }
 
@@ -95,9 +116,10 @@ int main()
 {
     Result r;
     test_selection_survives_restart(r);
-    test_deselection_survives_restart(r);
+    test_deselection_keeps_last_printer(r);
     test_malformed_state_is_safe(r);
     test_json_escaping_round_trip(r);
+    test_rewrite_replaces_existing_file(r);
     std::printf("state_persist_test: %d passed, %d failed\n",
                 r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;
