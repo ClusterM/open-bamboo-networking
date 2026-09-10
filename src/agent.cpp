@@ -1103,6 +1103,16 @@ int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
 {
+    // Signed print commands: a secured printer verifies the signature against
+    // the app cert it installed *this session*. Publishing a signature before
+    // app_cert_install is acknowledged is rejected with 84033545 ("need reset
+    // device pub key"), so wait for that ack first. Do this before capturing the
+    // session pointer (the wait may span a reconnect), and never for
+    // security/pushing/info frames (would_sign() is false for them), so the
+    // install path itself is never gated. See research/08.04-lan.md §8.4.7.
+    if (obn::signing::would_sign(json_str))
+        wait_for_app_cert(dev_id, std::chrono::seconds(8));
+
     LanSession* session = nullptr;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1114,7 +1124,41 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
     std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
     if (dev_pub) EVP_PKEY_free(dev_pub);
+    if (obn::signing::would_sign(json_str))
+        OBN_DEBUG("SIGNED-ENVELOPE dev=%s bytes=%zu json=%s",
+                  dev_id.c_str(), signed_json.size(), signed_json.c_str());
     return session->publish_json(signed_json, qos);
+}
+
+bool Agent::wait_for_app_cert(const std::string&        dev_id,
+                              std::chrono::milliseconds timeout)
+{
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (app_cert_install_sent_.count(dev_id)) return true;
+    }
+    // No shared app cert configured -> nothing to install, so don't stall the
+    // publish; maybe_sign will pass the payload through unsigned anyway.
+    if (!obn::signing::slicer_app_cert_usable()) return false;
+
+    // Kick an install if none is in flight (idempotent: install_device_cert
+    // skips once app_cert_install_sent_ is latched). Uses the MQTT
+    // security.app_cert_install path regardless of the lan_only argument.
+    install_device_cert(dev_id, /*lan_only=*/false);
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::lock_guard<std::mutex> lk(mu_);
+        if (app_cert_install_sent_.count(dev_id)) return true;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    const bool ok = app_cert_install_sent_.count(dev_id) != 0;
+    if (!ok)
+        OBN_WARN("send: app_cert_install not acknowledged for %s within %lldms; "
+                 "signing anyway (printer may reject with 84033545)",
+                 dev_id.c_str(), static_cast<long long>(timeout.count()));
+    return ok;
 }
 
 int Agent::send_message(const std::string& dev_id,

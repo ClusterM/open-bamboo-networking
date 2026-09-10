@@ -21,6 +21,13 @@ namespace obn::signing {
 std::string maybe_sign(const std::string& payload_json,
                        EVP_PKEY* device_pub = nullptr);
 
+// True when maybe_sign() would actually sign `payload_json` — i.e. it carries a
+// top-level "print" object and a slicer key is configured. Callers use this to
+// gate a signed publish on the printer having installed the app cert this
+// session (a secured printer rejects a signature made before install with
+// 84033545 "need reset device pub key").
+bool would_sign(const std::string& payload_json);
+
 // Blockwise RSA-PKCS#1 v1.5 encryption of `plaintext` under `pub`, returned as
 // base64. The plaintext is split into <=245-byte chunks (the RSA-2048 PKCS#1
 // v1.5 ceiling = keylen - 11), each chunk encrypts to one key-sized block, and

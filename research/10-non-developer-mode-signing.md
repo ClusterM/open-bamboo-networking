@@ -14,5 +14,6 @@ When **Developer Mode** is off, the printer and (for cloud-dispatched prints) Ba
 | 10.4 MQTT message signing | [10.04-mqtt-signing.md](10.04-mqtt-signing.md) |
 | 10.5 HTTP proof-of-possession | [10.05-http-pop.md](10.05-http-pop.md) |
 | 10.6 LAN TLS and Studio certificate files | [10.06-lan-tls-and-access-codes.md](10.06-lan-tls-and-access-codes.md) |
+| 10.7 The BearSSL crypto island (app-key handling) | [10.07-bearssl-crypto-island.md](10.07-bearssl-crypto-island.md) |
 
 Cross-references from the ABI chapters (§8, including print [§8.8](08.08-print-abi.md)) and Studio-forwarded MQTT ([§12](12-mqtt.md)) point here for detail.
