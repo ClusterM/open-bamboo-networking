@@ -200,6 +200,12 @@ PluginExports load(const std::string& so_path)
     out.sync_slot_mappings = resolve<func_sync_slot_mappings>(
         out.dl_handle, "bambu_network_sync_slot_mappings");
 #endif
+#if ABI_VERSION >= 0x020803
+    out.get_soft_match_pending = resolve<func_get_soft_match_pending>(
+        out.dl_handle, "bambu_network_get_soft_match_pending");
+    out.post_soft_match_pending = resolve<func_post_soft_match_pending>(
+        out.dl_handle, "bambu_network_post_soft_match_pending");
+#endif
 
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }

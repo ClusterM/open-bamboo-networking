@@ -192,6 +192,10 @@ const char* kBambuNetworkSymbols[] = {
 #if ABI_VERSION >= 0x020802
     "bambu_network_sync_slot_mappings",
 #endif
+#if ABI_VERSION >= 0x020803
+    "bambu_network_get_soft_match_pending",
+    "bambu_network_post_soft_match_pending",
+#endif
     "bambu_network_get_printer_firmware",
     "bambu_network_get_task_plate_index",
     "bambu_network_get_subtask_info",

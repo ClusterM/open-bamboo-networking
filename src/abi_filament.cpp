@@ -81,3 +81,25 @@ OBN_ABI int bambu_network_sync_slot_mappings(void* agent,
 }
 
 #endif
+
+#if ABI_VERSION >= 0x020803
+
+OBN_ABI int bambu_network_get_soft_match_pending(void* agent,
+                                                 BBL::SoftMatchPendingParams params,
+                                                 std::string* http_body)
+{
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return obn::cloud_filament::get_soft_match_pending(a, params, http_body);
+}
+
+OBN_ABI int bambu_network_post_soft_match_pending(void* agent,
+                                                  BBL::SoftMatchPendingActionParams params,
+                                                  std::string* http_body)
+{
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    return obn::cloud_filament::post_soft_match_pending(a, params, http_body);
+}
+
+#endif

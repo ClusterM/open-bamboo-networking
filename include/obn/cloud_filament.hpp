@@ -43,6 +43,10 @@ struct AmsSyncParams;
 #if ABI_VERSION >= 0x020802
 struct SlotMappingsSyncParams;
 #endif
+#if ABI_VERSION >= 0x020803
+struct SoftMatchPendingParams;
+struct SoftMatchPendingActionParams;
+#endif
 }
 
 namespace obn {
@@ -103,6 +107,24 @@ int sync_slot_mappings(Agent* agent, const BBL::SlotMappingsSyncParams& params,
                        std::string* out_body);
 #endif
 
+#if ABI_VERSION >= 0x020803
+// GET /my/filament/v2/soft-match/pending?devId=…&amsSn=…. Studio asks for
+// the spools the cloud queued for manual arbitration when an AMS reported a
+// new official RFID tag. Response (stock 02.08.03.52, empty queue):
+//   {"hits":[],"candidates":[]}
+// `hits` are the queued spools, `candidates` pairs a `pendingId` with the
+// merge targets the cloud proposes. Forwarded verbatim; Studio parses it in
+// `SoftMatchPendingResponse::from_json`.
+int get_soft_match_pending(Agent* agent, const BBL::SoftMatchPendingParams& params,
+                           std::string* out_body);
+
+// POST /my/filament/v2/soft-match/pending with the user's verdict for one
+// queued spool. Studio does not parse the response; it only logs it.
+int post_soft_match_pending(Agent* agent,
+                            const BBL::SoftMatchPendingActionParams& params,
+                            std::string* out_body);
+#endif
+
 // Request-body serializers, exposed for tests that pin the wire format
 // against MITM captures of the stock plugin.
 namespace detail {
@@ -122,6 +144,17 @@ std::string build_slot_mappings_body(const BBL::SlotMappingsSyncParams& params);
 // BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED without issuing a request.
 // An empty devId or an empty mappings array both pass — stock posts those.
 bool slot_mappings_valid(const BBL::SlotMappingsSyncParams& params);
+#endif
+#if ABI_VERSION >= 0x020803
+// "?devId=…&amsSn=…", percent-encoded, skipping either key when its value
+// is empty — an all-empty params struct yields no query string at all, and
+// stock still issues that request (the cloud answers with the whole queue).
+std::string build_soft_match_pending_query(const BBL::SoftMatchPendingParams& params);
+
+// {"action":…,"spoolId":…,"targetSpoolId":…} — all three keys always
+// present, in that order. Stock emits `targetSpoolId` as a literal 0 for
+// the actions that don't use it, rather than dropping the key.
+std::string build_soft_match_action_body(const BBL::SoftMatchPendingActionParams& params);
 #endif
 } // namespace detail
 

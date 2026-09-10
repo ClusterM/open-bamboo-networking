@@ -1,7 +1,8 @@
 // Wire-format tests for the Filament Manager request bodies.
 //
 // Every expected string below is a verbatim copy of a request captured
-// from the stock plugin 02.08.02.54 under mitmproxy, so a regression here
+// under mitmproxy from the stock plugin — 02.08.02.54 for the AMS and
+// slot-mapping syncs, 02.08.03.52 for soft match — so a regression here
 // means we have drifted from what the cloud expects.
 
 #include "obn/cloud_filament.hpp"
@@ -180,6 +181,69 @@ static void test_ams_sync_keeps_empty_strings()
 
 #endif // ABI_VERSION >= 0x020801
 
+#if ABI_VERSION >= 0x020803
+
+// Capture S1 (stock 02.08.03.52): both keys present, percent-encoded, in
+// devId-then-amsSn order.
+static void test_soft_match_query()
+{
+    BBL::SoftMatchPendingParams p;
+    p.devId = "22E8BJ610801473";
+    p.amsSn = "OBNPROBEAMSSN";
+
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_pending_query(p),
+             "?devId=22E8BJ610801473&amsSn=OBNPROBEAMSSN");
+}
+
+// Capture S2: an empty value drops its key entirely, so a params struct
+// with nothing set produces no query string at all — and stock still
+// issues that request (the cloud answers 200 with the whole queue).
+static void test_soft_match_query_skips_empty()
+{
+    BBL::SoftMatchPendingParams none;
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_pending_query(none), "");
+
+    // Capture S3: only amsSn set, so it takes the '?' separator. The value
+    // is RFC3986-encoded (space, '+' and '&' all escaped).
+    BBL::SoftMatchPendingParams ams_only;
+    ams_only.amsSn = "A B+C&d";
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_pending_query(ams_only),
+             "?amsSn=A%20B%2BC%26d");
+}
+
+// Capture S1: all three keys always go out, in declaration order.
+static void test_soft_match_action_bodies()
+{
+    BBL::SoftMatchPendingActionParams p;
+    p.action        = "accept";
+    p.spoolId       = 999000001;
+    p.targetSpoolId = 999000002;
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_action_body(p),
+             R"({"action":"accept","spoolId":999000001,"targetSpoolId":999000002})");
+
+    p.action = "link_other";
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_action_body(p),
+             R"({"action":"link_other","spoolId":999000001,"targetSpoolId":999000002})");
+
+    p.action = "create_new";
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_action_body(p),
+             R"({"action":"create_new","spoolId":999000001,"targetSpoolId":999000002})");
+}
+
+// Capture S2: the actions that don't use targetSpoolId still carry it as a
+// literal 0 — stock neither drops the key nor renders it as null.
+static void test_soft_match_zero_target_stays()
+{
+    BBL::SoftMatchPendingActionParams p;
+    p.action  = "accept";
+    p.spoolId = 999000001;
+
+    CHECK_EQ(obn::cloud_filament::detail::build_soft_match_action_body(p),
+             R"({"action":"accept","spoolId":999000001,"targetSpoolId":0})");
+}
+
+#endif // ABI_VERSION >= 0x020803
+
 int main()
 {
 #if ABI_VERSION >= 0x020802
@@ -191,6 +255,12 @@ int main()
 #endif
 #if ABI_VERSION >= 0x020801
     test_ams_sync_keeps_empty_strings();
+#endif
+#if ABI_VERSION >= 0x020803
+    test_soft_match_query();
+    test_soft_match_query_skips_empty();
+    test_soft_match_action_bodies();
+    test_soft_match_zero_target_stays();
 #endif
 
     if (fail_count) {

@@ -247,6 +247,34 @@ bool slot_mappings_valid(const BBL::SlotMappingsSyncParams& params)
 
 #endif
 
+#if ABI_VERSION >= 0x020803
+
+std::string build_soft_match_pending_query(const BBL::SoftMatchPendingParams& p)
+{
+    std::ostringstream os;
+    char sep = '?';
+    auto append = [&](const char* k, const std::string& v) {
+        if (v.empty()) return;
+        os << sep << k << '=' << obn::http::url_encode(v);
+        sep = '&';
+    };
+    append("devId", p.devId);
+    append("amsSn", p.amsSn);
+    return os.str();
+}
+
+std::string build_soft_match_action_body(const BBL::SoftMatchPendingActionParams& p)
+{
+    std::ostringstream os;
+    os << "{\"action\":"        << json_str(p.action)
+       << ",\"spoolId\":"       << p.spoolId
+       << ",\"targetSpoolId\":" << p.targetSpoolId
+       << '}';
+    return os.str();
+}
+
+#endif
+
 } // namespace detail
 
 int list(Agent* a, const BBL::FilamentQueryParams& params, std::string* out_body)
@@ -441,6 +469,67 @@ int sync_slot_mappings(Agent* a, const BBL::SlotMappingsSyncParams& params,
         OBN_WARN("cloud_filament::sync_slot_mappings failed: http=%ld err=%s body=%s",
                  resp.status_code, resp.error.c_str(), resp.body.c_str());
         return BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED;
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+#endif
+
+#if ABI_VERSION >= 0x020803
+
+int get_soft_match_pending(Agent* a, const BBL::SoftMatchPendingParams& params,
+                           std::string* out_body)
+{
+    std::map<std::string, std::string> hdrs;
+    if (!prepare(a, out_body, &hdrs)) {
+        OBN_WARN("cloud_filament::get_soft_match_pending: not logged in");
+        return BAMBU_NETWORK_ERR_GET_SOFT_MATCH_PENDING_FAILED;
+    }
+    // Unlike `list`, stock keeps Content-Type on this GET; mirrored.
+    // Empty devId / amsSn are not rejected either: stock drops the key from
+    // the query and asks for the whole queue.
+
+    const std::string url = base_v2(a) + "/soft-match/pending"
+                          + detail::build_soft_match_pending_query(params);
+    auto resp = obn::http::get_json(url, hdrs);
+    OBN_INFO("cloud_filament::get_soft_match_pending dev='%s' ams_sn='%s' "
+             "http=%ld bytes=%zu",
+             params.devId.c_str(), params.amsSn.c_str(),
+             resp.status_code, resp.body.size());
+
+    if (out_body) *out_body = resp.body;
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
+        OBN_WARN("cloud_filament::get_soft_match_pending failed: http=%ld err=%s body=%s",
+                 resp.status_code, resp.error.c_str(), resp.body.c_str());
+        return BAMBU_NETWORK_ERR_GET_SOFT_MATCH_PENDING_FAILED;
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+int post_soft_match_pending(Agent* a, const BBL::SoftMatchPendingActionParams& params,
+                            std::string* out_body)
+{
+    std::map<std::string, std::string> hdrs;
+    if (!prepare(a, out_body, &hdrs)) {
+        OBN_WARN("cloud_filament::post_soft_match_pending: not logged in");
+        return BAMBU_NETWORK_ERR_POST_SOFT_MATCH_PENDING_FAILED;
+    }
+    // No local validation of `action` or the spool ids: stock forwards
+    // whatever Studio hands it and lets the server answer (404 for a spool
+    // that isn't queued).
+
+    const std::string body = detail::build_soft_match_action_body(params);
+    auto resp = obn::http::post_json(base_v2(a) + "/soft-match/pending", body, hdrs);
+    OBN_INFO("cloud_filament::post_soft_match_pending action='%s' spool=%d "
+             "target=%d http=%ld bytes=%zu",
+             params.action.c_str(), params.spoolId, params.targetSpoolId,
+             resp.status_code, resp.body.size());
+
+    if (out_body) *out_body = resp.body;
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300) {
+        OBN_WARN("cloud_filament::post_soft_match_pending failed: http=%ld err=%s body=%s",
+                 resp.status_code, resp.error.c_str(), resp.body.c_str());
+        return BAMBU_NETWORK_ERR_POST_SOFT_MATCH_PENDING_FAILED;
     }
     return BAMBU_NETWORK_SUCCESS;
 }

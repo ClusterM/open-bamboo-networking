@@ -182,6 +182,17 @@ struct CliArgs {
     // serializers can be diffed on the wire. Off by default: it writes
     // real mount state onto the cloud catalogue.
     bool        probe_ams_sync = false;
+    // AMS soft match (ABI >= 02.08.03). The GET is read-only and always
+    // runs; each name in --soft-match-actions adds one POST, which is a
+    // catalogue write, so the list is empty by default. Point the spool ids
+    // at rows that do not exist to capture the request shape without
+    // touching the account.
+    std::string soft_match_dev_id;
+    std::string soft_match_ams_sn;
+    std::string soft_match_actions;
+    int         soft_match_spool_id        = 0;
+    int         soft_match_target_spool_id = 0;
+    bool        soft_match_only = false;
 
     // --action account_bind extras (Studio BindJob defaults).
     std::string dev_model = "N7";
@@ -277,7 +288,10 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--slot-spool-id N] [--slot-rfid HEX]
                      [--slot-ams-id N] [--slot-ams-type N]
                      [--slot-mappings-json JSON|@path] [--fil-sync-only]
-                     [--country US]
+                     [--soft-match-dev-id ID] [--soft-match-ams-sn SN]
+                     [--soft-match-actions accept,link_other,create_new]
+                     [--soft-match-spool-id N] [--soft-match-target-spool-id N]
+                     [--soft-match-only] [--country US]
 
        plugin_runner --action update_cert --plugin-path PATH
                      [--user-info @session.json] [--data-dir DIR]
@@ -347,6 +361,12 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   zeroes both and keeps the pre-eject amsSn/slotId/amsId/amsType. Use
   --slot-mappings-json to send a batch or an empty array; --fil-sync-only
   skips the catalogue read. Run under MITM to capture the request body.
+  With ABI >= 02.08.03 it also calls get_soft_match_pending (read-only,
+  --soft-match-dev-id / --soft-match-ams-sn, falling back to the slot and
+  device flags). Each name in --soft-match-actions adds one
+  post_soft_match_pending call — that one writes to the cloud catalogue,
+  so pass spool ids that do not exist to capture the shape safely.
+  --soft-match-only skips the catalogue read and the slot-mapping sync.
 
   update_cert: no printer. Mirrors Studio GUI_App::check_cert →
   bambu_network_update_cert. Under MITM this should be the shared app
@@ -446,6 +466,14 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--slot-mappings-json") c.slot_mappings_json = require(a, ++i, f);
         else if (f == "--fil-sync-only")     c.fil_sync_only = true;
         else if (f == "--probe-ams-sync")    c.probe_ams_sync = true;
+        else if (f == "--soft-match-dev-id") c.soft_match_dev_id = require(a, ++i, f);
+        else if (f == "--soft-match-ams-sn") c.soft_match_ams_sn = require(a, ++i, f);
+        else if (f == "--soft-match-actions") c.soft_match_actions = require(a, ++i, f);
+        else if (f == "--soft-match-spool-id")
+            c.soft_match_spool_id = std::stoi(require(a, ++i, f));
+        else if (f == "--soft-match-target-spool-id")
+            c.soft_match_target_spool_id = std::stoi(require(a, ++i, f));
+        else if (f == "--soft-match-only")   c.soft_match_only = true;
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--dev-model")         c.dev_model = require(a, ++i, f);
         else if (f == "--timezone")          c.timezone  = require(a, ++i, f);
@@ -1848,9 +1876,17 @@ try {
 #else
             {"have_sync_slot_mappings", false},
 #endif
+#if ABI_VERSION >= 0x020803
+            {"have_get_soft_match_pending", exports.get_soft_match_pending != nullptr},
+            {"have_post_soft_match_pending", exports.post_soft_match_pending != nullptr},
+#else
+            {"have_get_soft_match_pending", false},
+            {"have_post_soft_match_pending", false},
+#endif
         });
 
-        if (!args.fil_sync_only && exports.get_filament_spools) {
+        const bool skip_catalogue_reads = args.fil_sync_only || args.soft_match_only;
+        if (!skip_catalogue_reads && exports.get_filament_spools) {
             BBL::FilamentQueryParams q{};
             q.offset = 0;
             q.limit  = 20;
@@ -1859,7 +1895,7 @@ try {
             emit_event("get_filament_spools", {
                 {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
             });
-        } else if (!args.fil_sync_only) {
+        } else if (!skip_catalogue_reads) {
             emit_event("get_filament_spools", { {"missing", true} });
         }
 
@@ -1887,7 +1923,9 @@ try {
 #endif
 
 #if ABI_VERSION >= 0x020802
-        if (exports.sync_slot_mappings) {
+        if (args.soft_match_only) {
+            emit_event("sync_slot_mappings", { {"skipped", true} });
+        } else if (exports.sync_slot_mappings) {
             BBL::SlotMappingsSyncParams p{};
             p.devId = args.slot_dev_id.empty() ? args.dev_id : args.slot_dev_id;
 
@@ -1962,6 +2000,57 @@ try {
         }
 #else
         emit_event("sync_slot_mappings", { {"unsupported_abi", true} });
+#endif
+
+#if ABI_VERSION >= 0x020803
+        if (exports.get_soft_match_pending) {
+            BBL::SoftMatchPendingParams p{};
+            p.devId = !args.soft_match_dev_id.empty() ? args.soft_match_dev_id
+                    : (!args.slot_dev_id.empty() ? args.slot_dev_id : args.dev_id);
+            p.amsSn = !args.soft_match_ams_sn.empty() ? args.soft_match_ams_sn
+                                                      : args.slot_ams_sn;
+            emit_event("get_soft_match_pending_request", {
+                {"devId", p.devId}, {"amsSn", p.amsSn},
+            });
+
+            std::string body;
+            int rc = exports.get_soft_match_pending(agent, p, &body);
+            emit_event("get_soft_match_pending", {
+                {"rc", rc}, {"body_bytes", body.size()}, {"body", trunc(body)},
+            });
+        } else {
+            emit_event("get_soft_match_pending", { {"missing", true} });
+        }
+
+        if (exports.post_soft_match_pending && !args.soft_match_actions.empty()) {
+            std::stringstream as(args.soft_match_actions);
+            std::string action;
+            while (std::getline(as, action, ',')) {
+                if (action.empty()) continue;
+                BBL::SoftMatchPendingActionParams p{};
+                p.action        = action;
+                p.spoolId       = args.soft_match_spool_id;
+                p.targetSpoolId = args.soft_match_target_spool_id;
+                emit_event("post_soft_match_pending_request", {
+                    {"action", p.action}, {"spoolId", p.spoolId},
+                    {"targetSpoolId", p.targetSpoolId},
+                });
+
+                std::string body;
+                int rc = exports.post_soft_match_pending(agent, p, &body);
+                emit_event("post_soft_match_pending", {
+                    {"action", p.action}, {"rc", rc},
+                    {"body_bytes", body.size()}, {"body", trunc(body)},
+                });
+            }
+        } else {
+            emit_event("post_soft_match_pending", {
+                {"skipped", args.soft_match_actions.empty()},
+                {"missing", exports.post_soft_match_pending == nullptr},
+            });
+        }
+#else
+        emit_event("get_soft_match_pending", { {"unsupported_abi", true} });
 #endif
 
         std::this_thread::sleep_for(std::chrono::seconds(2));

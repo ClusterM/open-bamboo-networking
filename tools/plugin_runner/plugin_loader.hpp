@@ -138,6 +138,14 @@ using func_sync_ams_filaments = int (*)(void* agent, BBL::AmsSyncParams params,
 using func_sync_slot_mappings = int (*)(void* agent, BBL::SlotMappingsSyncParams params,
                                         std::string* http_body);
 #endif
+#if ABI_VERSION >= 0x020803
+using func_get_soft_match_pending = int (*)(void* agent,
+                                            BBL::SoftMatchPendingParams params,
+                                            std::string* http_body);
+using func_post_soft_match_pending = int (*)(void* agent,
+                                             BBL::SoftMatchPendingActionParams params,
+                                             std::string* http_body);
+#endif
 
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
@@ -257,6 +265,10 @@ struct PluginExports {
 #endif
 #if ABI_VERSION >= 0x020802
     func_sync_slot_mappings          sync_slot_mappings          = nullptr;
+#endif
+#if ABI_VERSION >= 0x020803
+    func_get_soft_match_pending      get_soft_match_pending      = nullptr;
+    func_post_soft_match_pending     post_soft_match_pending     = nullptr;
 #endif
 };
 

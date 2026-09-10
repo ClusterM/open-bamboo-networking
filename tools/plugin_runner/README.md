@@ -143,6 +143,16 @@ per ABI). Plugin downloads are cached in
                                "mappings":[…]}), overrides the flags above;
                                the only way to send a batch or an empty array
 --fil-sync-only                skip get_filament_spools, only run the syncs
+--soft-match-dev-id ID         devId for get_soft_match_pending (falls back
+                               to --slot-dev-id, then --dev-id)
+--soft-match-ams-sn SN         amsSn for the same (falls back to --slot-ams-sn)
+--soft-match-actions LIST      comma-separated post_soft_match_pending calls:
+                               accept | link_other | create_new. Empty by
+                               default — each one writes to the catalogue
+--soft-match-spool-id N        spoolId carried by those POSTs
+--soft-match-target-spool-id N targetSpoolId (only link_other uses it)
+--soft-match-only              skip the catalogue read and the slot-mapping
+                               sync, leaving just the soft-match calls
 ```
 
 `http_probe` calls `get_studio_info_url`, `get_my_message`, `check_user_task_report`,
@@ -156,6 +166,14 @@ needs `--abi 02.08.02` or newer). Studio drives `sync_slot_mappings` from the
 Filament Manager AMS sync in two flavours: a *bind* carries `spoolId` + `rfid`,
 an *unbind* zeroes both and keeps the pre-eject mount fields. Both hit
 `POST /my/filament/v2/slot-mappings/sync` ([research §8.15](../../research/08.15-filament.md)).
+
+With `--abi 02.08.03` or newer it also calls `get_soft_match_pending`, the
+read-only AMS auto-match queue, and — for every name in
+`--soft-match-actions` — `post_soft_match_pending`. The POST is a catalogue
+write, so point `--soft-match-spool-id` at a row that does not exist to
+capture the request shape without touching the account; the server answers
+404 and the plugin returns −35
+([research §8.15.10](../../research/08.15-filament.md#81510-bambu_network_get_soft_match_pending)).
 
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch
