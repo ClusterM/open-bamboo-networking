@@ -148,6 +148,7 @@ every feature is verified against Studio. Supported ABI series:
 - Bambu Studio **02.08.00**._xx_
 - Bambu Studio **02.08.01**._xx_
 - Bambu Studio **02.08.02**._xx_
+- Bambu Studio **02.08.03**._xx_
 
 Compatibility with plugin ABI depends on the first three numbers in the version number, e.g.
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
