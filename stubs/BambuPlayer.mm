@@ -144,6 +144,7 @@ struct BambuPlayerImpl {
     CMVideoFormatDescriptionRef formatDesc = nullptr;
     std::vector<uint8_t> sps;
     std::vector<uint8_t> pps;
+    bool isMjpeg = false;
     int videoW = 0;
     int videoH = 0;
 
@@ -196,6 +197,32 @@ struct BambuPlayerImpl {
 
 // Buffer up to one second at 30 fps.
 static constexpr size_t kMaxPendingFrames = 30;
+
+// Frame dimensions from a JPEG's SOFn segment. The JPEG format
+// description fed to ASBDL must match the coded size exactly —
+// VideoToolbox rejects the frame (kVTParameterErr) on a mismatch.
+static bool jpeg_dimensions(const uint8_t* p, size_t n, int* w, int* h)
+{
+    if (n < 4 || p[0] != 0xFF || p[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 3 < n) {
+        if (p[i] != 0xFF)   { ++i; continue; }
+        const uint8_t m = p[i + 1];
+        if (m == 0xFF)      { ++i; continue; }      // fill byte
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD9)) { i += 2; continue; }
+        const size_t seg = (static_cast<size_t>(p[i + 2]) << 8) | p[i + 3];
+        if (seg < 2 || i + 2 + seg > n) return false;
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            if (seg < 7) return false;              // SOFn: len prec H H W W
+            *h = (p[i + 5] << 8) | p[i + 6];
+            *w = (p[i + 7] << 8) | p[i + 8];
+            return *w > 0 && *h > 0;
+        }
+        if (m == 0xDA) return false;                // SOS before any SOF
+        i += 2 + seg;
+    }
+    return false;
+}
 
 // Limit backpressure diagnostics to once per second.
 static bool throttle_ready(std::chrono::steady_clock::time_point& last)
@@ -463,18 +490,15 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         return rc < 0 ? rc : -1;
     }
 
+    bool mjpeg = false;
     Bambu_StreamInfo info{};
     if (Bambu_GetStreamInfo(tunnel, 0, &info) == Bambu_success) {
         if (info.format.video.width > 0)  _impl->videoW = info.format.video.width;
         if (info.format.video.height > 0) _impl->videoH = info.format.video.height;
-        // format_type 2 = video_jpeg — ASBDL cannot display JPEG samples.
-        if (info.format_type == 2 /*video_jpeg*/) {
-            Bambu_Close(tunnel);
-            Bambu_Destroy(tunnel);
-            [self logAt:1 message:"open: MJPEG not supported by BambuPlayer [-3]"];
-            [self emitTrack:"liveview_open" phase:"format" result:"fail" error:"mjpeg"];
-            return -3;
-        }
+        // format_type 2 = video_jpeg: A1/P1-family MJPEG on :6000. Rendered
+        // via enqueueJpeg — VideoToolbox decodes kCMVideoCodecType_JPEG
+        // samples natively, so ASBDL displays them like any other codec.
+        mjpeg = (info.format_type == 2 /*video_jpeg*/);
     }
 
     {
@@ -495,6 +519,7 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         _impl->maxJitterMs     = 0.f;
         _impl->sps.clear();
         _impl->pps.clear();
+        _impl->isMjpeg = mjpeg;
         if (_impl->formatDesc) {
             CFRelease(_impl->formatDesc);
             _impl->formatDesc = nullptr;
@@ -744,6 +769,110 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
     return YES;
 }
 
+- (BOOL)ensureJpegFormatDescWidth:(int)w height:(int)h
+{
+    // Caller holds _impl->mu.
+    if (_impl->formatDesc && _impl->videoW == w && _impl->videoH == h)
+        return YES;
+    CMVideoFormatDescriptionRef desc = nullptr;
+    OSStatus st = CMVideoFormatDescriptionCreate(
+        kCFAllocatorDefault, kCMVideoCodecType_JPEG, w, h, nullptr, &desc);
+    if (st != noErr || !desc) {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "jpeg formatDesc create failed status=%d", (int)st);
+        [self logAt:1 message:buf];
+        return NO;
+    }
+    if (_impl->formatDesc) CFRelease(_impl->formatDesc);
+    _impl->formatDesc = desc;
+    _impl->videoW = w;
+    _impl->videoH = h;
+    return YES;
+}
+
+// MJPEG (A1/P1-family, TLS :6000): each Bambu_ReadSample payload is one
+// complete JPEG. Same display path as enqueueAnnexB, minus the Annex-B
+// repackaging — ASBDL's VideoToolbox decoder consumes JPEG directly.
+- (BOOL)enqueueJpeg:(const uint8_t*)data size:(size_t)size
+{
+    CMVideoFormatDescriptionRef fmt = nullptr;
+    AVSampleBufferDisplayLayer* layer = nil;
+    {
+        std::lock_guard<std::recursive_mutex> lk(_impl->mu);
+        int w = 0;
+        int h = 0;
+        if (!jpeg_dimensions(data, size, &w, &h)) {
+            // Header did not parse: keep the current (or stream-info)
+            // geometry rather than dropping the frame.
+            w = _impl->videoW;
+            h = _impl->videoH;
+        }
+        if (w <= 0 || h <= 0) return NO;
+        if (![self ensureJpegFormatDescWidth:w height:h]) return NO;
+        fmt   = _impl->formatDesc;
+        layer = _displayLayer;
+        if (!fmt || !layer) return NO;
+        CFRetain(fmt);
+        [layer retain];
+    }
+
+    CMBlockBufferRef block = nullptr;
+    OSStatus st = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault, nullptr, size,
+        kCFAllocatorDefault, nullptr, 0, size,
+        kCMBlockBufferAssureMemoryNowFlag, &block);
+    if (st != noErr || !block) {
+        CFRelease(fmt);
+        [layer release];
+        return NO;
+    }
+    st = CMBlockBufferReplaceDataBytes(data, block, 0, size);
+    if (st != noErr) {
+        CFRelease(block);
+        CFRelease(fmt);
+        [layer release];
+        return NO;
+    }
+
+    CMSampleBufferRef sample = nullptr;
+    size_t sampleSize = size;
+    CMSampleTimingInfo timing;
+    timing.duration              = kCMTimeInvalid;
+    timing.presentationTimeStamp = kCMTimeInvalid;
+    timing.decodeTimeStamp       = kCMTimeInvalid;
+    st = CMSampleBufferCreateReady(
+        kCFAllocatorDefault, block, fmt, 1, 1, &timing, 1, &sampleSize, &sample);
+    CFRelease(block);
+    CFRelease(fmt);
+    if (st != noErr || !sample) {
+        [layer release];
+        return NO;
+    }
+
+    // Every JPEG frame is self-contained, so no NotSync marking.
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
+    if (attachments && CFArrayGetCount(attachments) > 0) {
+        CFMutableDictionaryRef dict =
+            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+        CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately,
+                             kCFBooleanTrue);
+    }
+
+    if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+        // Reset the failed layer; the next frame restarts the pump.
+        [self recoverFailedLayer:layer onRenderQueue:NO];
+        CFRelease(sample);
+        [layer release];
+        return NO;
+    }
+
+    [self queueSampleForDisplay:sample layer:layer];
+    CFRelease(sample);
+    [layer release];
+    return YES;
+}
+
 // Queue a frame without blocking the reader.
 - (void)queueSampleForDisplay:(CMSampleBufferRef)sample
                         layer:(AVSampleBufferDisplayLayer*)layer
@@ -911,6 +1040,11 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
 - (void)readerLoop
 {
     [self logAt:0 message:"reader: start"];
+    bool mjpeg = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(_impl->mu);
+        mjpeg = _impl->isMjpeg;
+    }
     while (_impl->running.load()) {
         Bambu_Tunnel tunnel = nullptr;
         {
@@ -962,17 +1096,22 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
             _impl->byteCount += static_cast<uint64_t>(sample.size);
         }
 
-        const bool isSync = (sample.flags & 1) != 0 ||
-            obn::h264::contains_idr(sample.buffer,
-                                    static_cast<size_t>(sample.size));
-
         // sample.buffer is borrowed until the next Bambu_ReadSample; we
-        // consume it synchronously here (and enqueueAnnexB copies into a
+        // consume it synchronously here (both enqueue paths copy into a
         // CMBlockBuffer), so no intermediate std::vector is needed.
         auto decode_start = std::chrono::steady_clock::now();
-        BOOL ok = [self enqueueAnnexB:sample.buffer
-                                 size:static_cast<size_t>(sample.size)
-                                 sync:isSync ? YES : NO];
+        BOOL ok;
+        if (mjpeg) {
+            ok = [self enqueueJpeg:sample.buffer
+                              size:static_cast<size_t>(sample.size)];
+        } else {
+            const bool isSync = (sample.flags & 1) != 0 ||
+                obn::h264::contains_idr(sample.buffer,
+                                        static_cast<size_t>(sample.size));
+            ok = [self enqueueAnnexB:sample.buffer
+                                size:static_cast<size_t>(sample.size)
+                                sync:isSync ? YES : NO];
+        }
         auto decode_end = std::chrono::steady_clock::now();
         if (!ok) continue;
 
