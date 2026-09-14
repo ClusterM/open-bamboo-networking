@@ -59,6 +59,28 @@ std::string trim_ip_string(std::string s)
 
 std::string now_seq_id() { return next_mqtt_seq_id(); }
 
+// "rtsps://10.0.0.5/streaming/live/1" -> "10.0.0.5"; "" unless the host is IPv4.
+std::string ipv4_host_of_url(const std::string& url)
+{
+    const auto start = url.find("://");
+    if (start == std::string::npos) return {};
+    const auto end  = url.find_first_of(":/", start + 3);
+    std::string host = url.substr(start + 3, end == std::string::npos ? end : end - start - 3);
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char tail = 0;
+    if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4 ||
+        a > 255 || b > 255 || c > 255 || d > 255)
+        return {};
+    return host;
+}
+
+// push_status net.info[].ip is little-endian (inverse of try_override_net_ip).
+std::string ipv4_from_le_int(std::int64_t v)
+{
+    return std::to_string(v & 0xFF) + "." + std::to_string((v >> 8) & 0xFF) + "." +
+           std::to_string((v >> 16) & 0xFF) + "." + std::to_string((v >> 24) & 0xFF);
+}
+
 } // namespace
 
 Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
@@ -1159,15 +1181,39 @@ void Agent::harvest_media_caps(const std::string& dev_id,
     std::string proto;
     if (url.rfind("rtsps", 0) == 0)     proto = "rtsps";
     else if (url.rfind("rtsp", 0) == 0) proto = "rtsp";
-    else return;
-
-    std::lock_guard<std::mutex> lk(mu_);
-    std::string& latched = lan_lv_proto_by_dev_[dev_id];
-    if (latched != proto) {
-        latched = proto;
-        OBN_INFO("dev=%s LAN liveview protocol: %s", dev_id.c_str(),
-                 proto.c_str());
+    if (!proto.empty()) {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string& latched = lan_lv_proto_by_dev_[dev_id];
+        if (latched != proto) {
+            latched = proto;
+            OBN_INFO("dev=%s LAN liveview protocol: %s", dev_id.c_str(),
+                     proto.c_str());
+        }
     }
+
+    // SSDP is the usual LAN IP source but is often firewalled or not routed
+    // across subnets; the report carries the same address.
+    if (obn::config::current().override_lan_ip) return;
+    std::string ip = ipv4_host_of_url(url);
+    if (ip.empty()) {
+        const obn::json::Value infos = root->find("print.net.info");
+        for (const auto& e : infos.as_array()) {
+            if (const std::int64_t raw = e.find("ip").as_int(0); raw > 0) {
+                ip = ipv4_from_le_int(raw);
+                break;
+            }
+        }
+    }
+    if (ip.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // A live LAN session's dial IP is authoritative (may be NAT'd).
+        if (lan_session_ && lan_session_->dev_id() == dev_id) return;
+        auto it = lan_ip_by_dev_.find(dev_id);
+        if (it != lan_ip_by_dev_.end() && it->second == ip) return;
+    }
+    OBN_INFO("dev=%s LAN ip from report: %s", dev_id.c_str(), ip.c_str());
+    note_device_lan_ip(dev_id, ip);
 }
 
 void Agent::note_device_access_code(const std::string& dev_id,
@@ -1180,6 +1226,23 @@ void Agent::note_device_access_code(const std::string& dev_id,
     }
     // The access code is the second half of the LAN credential pair; if the IP
     // (from SSDP) is already known for the selected printer, bring LAN up now.
+    autostart_lan_if_selected(dev_id);
+}
+
+void Agent::note_device_lan_ip(const std::string& dev_id,
+                               const std::string& ip)
+{
+    if (dev_id.empty() || ip.empty()) return;
+    obn::lan_tls::registry_put_ip_serial(ip, dev_id);
+    // Without the pin the :6000 tunnel / RTSPS liveview fail certificate
+    // verification even though certs/<serial>.pem exists on disk.
+    publish_peer_cert_pin(ip, dev_id);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        lan_ip_by_dev_[dev_id] = ip;
+    }
+    // Completes the credential pair if the access code is already known.
+    // No-op when not selected, already connected, or an attempt is inflight.
     autostart_lan_if_selected(dev_id);
 }
 
@@ -2068,25 +2131,11 @@ void Agent::cache_ssdp_json_for_bind(const std::string& json)
     if (!root) return;
     std::string ip = trim_ip_string(root->find("dev_ip").as_string());
     if (ip.empty()) return;
-    const std::string dev_id = root->find("dev_id").as_string();
-    if (!dev_id.empty()) {
-        obn::lan_tls::registry_put_ip_serial(ip, dev_id);
-        // SSDP is the only place a cloud-only session learns the printer's
-        // LAN IP<->serial, so pin the cached device cert here too. Without
-        // it the :6000 FileTransfer tunnel (file browser / upload) has no
-        // peer cert to verify against and fails with certificate verify
-        // failed even though certs/<serial>.pem exists on disk.
-        publish_peer_cert_pin(ip, dev_id);
-    }
     {
         std::lock_guard<std::mutex> lk(mu_);
         ssdp_json_by_ip_[ip] = json;
-        if (!dev_id.empty()) lan_ip_by_dev_[dev_id] = ip;
     }
-    // SSDP just supplied (or refreshed) the LAN IP; if the access code for the
-    // selected printer is already known, this completes the credential pair and
-    // LAN can come up. No-op when already connected or an attempt is inflight.
-    if (!dev_id.empty()) autostart_lan_if_selected(dev_id);
+    note_device_lan_ip(root->find("dev_id").as_string(), ip);
 }
 
 namespace {
