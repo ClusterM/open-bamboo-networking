@@ -388,6 +388,11 @@ public:
     // MQTT connect ever ran.
     void note_device_access_code(const std::string& dev_id,
                                  const std::string& access_code);
+    // Remember the LAN IP <-> serial pair (SSDP, or push_status when SSDP is
+    // firewalled / cross-subnet). Pins the peer cert and brings LAN up for
+    // the selected printer once the access code is known too.
+    void note_device_lan_ip(const std::string& dev_id,
+                            const std::string& ip);
     // LAN fallback for bambu_network_get_camera_url: stock plugin mints a
     // bambu:///tutk?... URL via the proprietary TUTK/Agora SDK, which we
     // don't ship. When the printer's LAN IP (SSDP / connect_printer) and
@@ -443,6 +448,7 @@ private:
     // liveview protocol ("rtsps"/"rtsp") per device. camera_url_for()
     // forwards it as the lv= hint so libBambuSource knows to fetch video
     // over RTSP(S) instead of MJPEG :6000 on X1/P1S/P2S-class printers.
+    // Also learns the LAN IP from the same frame (see note_device_lan_ip).
     void harvest_media_caps(const std::string& dev_id,
                             const std::string& json);
 
