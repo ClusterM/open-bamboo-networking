@@ -802,12 +802,7 @@ static void bambu_logger_bridge(void* context, int level, char const* msg)
         std::lock_guard<std::recursive_mutex> lk(_impl->mu);
         int w = 0;
         int h = 0;
-        if (!jpeg_dimensions(data, size, &w, &h)) {
-            // Header did not parse: keep the current (or stream-info)
-            // geometry rather than dropping the frame.
-            w = _impl->videoW;
-            h = _impl->videoH;
-        }
+        if (!jpeg_dimensions(data, size, &w, &h)) return NO;
         if (w <= 0 || h <= 0) return NO;
         if (![self ensureJpegFormatDescWidth:w height:h]) return NO;
         fmt   = _impl->formatDesc;
