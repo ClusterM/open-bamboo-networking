@@ -4,7 +4,16 @@
 # the slicer conf, and registers the DirectShow filter.
 
 [CmdletBinding()]
-param()
+param(
+    # Path to the slicer executable (e.g. the bambu-studio.exe of a manually
+    # unzipped/portable build). Its FileVersion is used for ABI detection —
+    # preferred over the registry, which is stale/absent for such installs.
+    [string]$StudioExe = "",
+
+    # Force the ABI version literally instead of auto-detecting, e.g.
+    # -Version 02.08.03 . Use -StudioExe instead when you can point at the exe.
+    [string]$Version = ""
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -20,6 +29,11 @@ function Wait-And-Exit {
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     }
     exit $code
+}
+
+function IsValidVersion {
+    param([string]$v)
+    return $v -match '^\d+(\.\d+){2,3}$'
 }
 
 # -- Client selection ------------------------------------------------------
@@ -132,7 +146,7 @@ if ($Client -eq "orca_slicer") {
             'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
         )
         $entries = Get-ItemProperty -Path $regPaths -ErrorAction SilentlyContinue |
-                   Where-Object { $_.DisplayName -eq $Name }
+                   Where-Object { $_.PSObject.Properties['DisplayName'] -and $_.DisplayName -eq $Name }
         foreach ($e in $entries) {
             $exe = $null
             if ($e.DisplayIcon) {
@@ -146,7 +160,7 @@ if ($Client -eq "orca_slicer") {
             }
             if ($exe) {
                 $fv = (Get-Item $exe).VersionInfo.FileVersion
-                if ($fv -match '^\d+(\.\d+){2,3}$') {
+                if (IsValidVersion $fv) {
                     return $fv
                 }
             }
@@ -156,6 +170,27 @@ if ($Client -eq "orca_slicer") {
 
     $confVer = Detect-VersionFromConf -ConfPath $ConfPath -Key $VersionKey
     $exeVer  = Detect-VersionFromExe -Name $DisplayName
+
+    # -StudioExe / -Version override detection (manual/unzipped Studio not in
+    # the registry, or a stale registry entry from an older installed build).
+    if ($StudioExe) {
+        if (-not (Test-Path $StudioExe)) {
+            Write-Err "-StudioExe not found: $StudioExe"; Wait-And-Exit
+        }
+        $fv = (Get-Item $StudioExe).VersionInfo.FileVersion
+        if (-not (IsValidVersion $fv)) {
+            Write-Err "Cannot read a version from -StudioExe (FileVersion='$fv'): $StudioExe"
+            Wait-And-Exit
+        }
+        Write-Info "Using version $fv from $StudioExe"
+        $exeVer = $fv; $confVer = ""
+    } elseif ($Version) {
+        if (-not (IsValidVersion $Version)) {
+             Write-Err "Cannot parse -Version: $Version (expected 3 or 4 dotted numeric components)."
+             Wait-And-Exit
+        }
+        $exeVer = $Version; $confVer = ""
+    }
 
     $detected = ""
     if (-not [string]::IsNullOrEmpty($exeVer)) {
