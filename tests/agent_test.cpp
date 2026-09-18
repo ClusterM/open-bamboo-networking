@@ -274,6 +274,25 @@ static void test_synthetic_subtask_id_varies_with_timestamp()
     CHECK(id1 != id2);
 }
 
+static void test_cloud_subtask_id_is_not_mapped_to_local_cover()
+{
+    // Cloud / "print with record" already has a real task id and an S3
+    // cover. We must not register it as a synthetic lan cover, or
+    // get_subtask_info would intercept the cloud fetch.
+    obn::Agent a(".");
+    run_local_msg(a, "dev_cloud", R"({
+        "print":{
+            "subtask_name":"SwitchMount-Test_plate_1",
+            "task_id":"1261510494",
+            "subtask_id":"1261510494",
+            "project_id":"1024742067",
+            "profile_id":"1008100615"
+        }
+    })");
+    obn::Agent::SubtaskCoverInfo info{};
+    CHECK(!a.lookup_synthetic_subtask("1261510494", &info));
+}
+
 // ---------------------------------------------------------------------------
 // Selected-printer memory (issue #78)
 // ---------------------------------------------------------------------------
@@ -429,6 +448,7 @@ int main()
     test_synthetic_subtask_not_created_for_sentinel_name();
     test_synthetic_subtask_id_is_deterministic();
     test_synthetic_subtask_id_varies_with_timestamp();
+    test_cloud_subtask_id_is_not_mapped_to_local_cover();
 
     // Selected-printer memory.
     test_selection_survives_agent_restart();

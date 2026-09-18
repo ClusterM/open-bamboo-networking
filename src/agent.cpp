@@ -1389,36 +1389,22 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     std::string synth_id;
     bool rewrote_ids = try_rewrite_print_ids(patched, version, &synth_id);
 
-    // Cover-cache trigger. Two cases feed this path:
-    //  * LAN-only prints: ids were "0", rewrite_print_ids swapped them
-    //    for a synthetic "lan-<fnv>" id that we have to publish.
-    //  * Cloud-initiated prints (subtask from Bambu cloud, even when
-    //    Studio is now unbound): ids already carry real values like
-    //    "893120535", Studio sends those to get_subtask_info. We need
-    //    to map them onto the same cover PNG.
-    // In both cases we pull `/cache/<subtask_name>.gcode.3mf` over
-    // FTPS, which is what start_local_print_with_record / start_sdcard_
-    // print deposit (cloud prints land there via the printer's own
-    // cloud-download path too).
+    // Cover-cache trigger — LAN-only. rewrite_print_ids swapped the
+    // printer's "0" ids for a synthetic "lan-<fnv>" that Studio will
+    // send to get_subtask_info; we publish that mapping and pull the
+    // PNG from `/cache/<subtask_name>.gcode.3mf` over :6000.
+    // Cloud / "print with record" jobs already carry a real task id
+    // and an S3 cover on the iot-service record — do not intercept
+    // those with a localhost URL.
     std::string subtask_name;
     json_peek_string_field(patched, "subtask_name", &subtask_name);
-    std::string real_subtask_id;
-    json_peek_string_field(patched, "subtask_id", &real_subtask_id);
 
     std::string cover_id;
-    // The `version` participates in the cache key only for the LAN /
-    // synthetic branch. Real cloud subtask ids are already unique per
-    // print on the server side, so a same-named reprint there gets a
-    // brand-new subtask_id and the old cache key naturally retires —
-    // mixing gcode_start_time in would just orphan PNGs faster.
     std::string cover_version;
-    if (!subtask_name.empty() && subtask_name != "-1") {
-        if (rewrote_ids && !synth_id.empty()) {
-            cover_id      = synth_id;
-            cover_version = version;
-        } else if (!real_subtask_id.empty() && real_subtask_id != "0") {
-            cover_id = real_subtask_id;
-        }
+    if (rewrote_ids && !synth_id.empty() &&
+        !subtask_name.empty() && subtask_name != "-1") {
+        cover_id      = synth_id;
+        cover_version = version;
     }
 
     if (!cover_id.empty()) {

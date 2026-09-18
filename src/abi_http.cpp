@@ -500,14 +500,20 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_SUCCESS;
 
-    // Synthetic-subtask short-circuit. notify_local_message rewrites
+    // Local cover_server is LAN-only. notify_local_message rewrites
     // zero ids in LAN push_status frames to "lan-<fnv>"; Studio then
     // calls us here to resolve that id. We hand back a minimal
     // "cloud subtask" JSON whose only interesting field is the
     // context.plates[0].thumbnail.url pointing at our local
     // cover_server, which in turn serves the PNG extracted from the
     // printer's /cache/<name>.3mf.
-    {
+    //
+    // Real cloud / "print with record" ids (numeric task/subtask) must
+    // NOT take this path: the iot-service record already has a
+    // presigned S3 thumbnail, and intercepting them with a name-keyed
+    // localhost PNG is how a same-named reprint showed the previous
+    // plate forever.
+    if (subtask_id.rfind("lan-", 0) == 0) {
         obn::Agent::SubtaskCoverInfo info;
         if (a->lookup_synthetic_subtask(subtask_id, &info) &&
             !info.url.empty()) {
