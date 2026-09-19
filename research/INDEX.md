@@ -51,6 +51,7 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [10.4. MQTT message signing](10.04-mqtt-signing.md)
   - [10.5. HTTP proof-of-possession](10.05-http-pop.md)
   - [10.6. LAN TLS and Studio certificate files](10.06-lan-tls-and-access-codes.md)
+  - [10.7. The BearSSL crypto island (app-key handling)](10.07-bearssl-crypto-island.md)
 - [12. MQTT wire format (Studio-forwarded)](12-mqtt.md)
   - [12.1. Status / `push_status`](12.01-status.md)
     - [12.1.1. Fields — job / progress](12.01.01-fields-job.md)
