@@ -13,13 +13,19 @@ namespace obn::signing {
 //
 // When `device_pub` is non-null, device-cert field encryption is applied to
 // the `print` object *before* signing (so the signature covers the encrypted
-// form that goes on the wire). Cleartext `url` / `param` stay in place and
-// `url_enc` / `param_enc` are added when present. Transforms are idempotent
-// (skipped when the `_enc` field already exists) and no-ops when
-// `device_pub` is null or encryption fails, in which case the cleartext
-// field is kept (pure-LAN ftp:// path without a device key).
+// form that goes on the wire): `url_enc` / `param_enc` are added for the one
+// field the command carries (url for project_file, param for gcode_line).
+// `developer_mode` selects what happens to the cleartext field afterwards:
+//   false (secured) — the cleartext is DROPPED (secured firmware reads only
+//     *_enc and rejects a message carrying both — research/§10.3);
+//   true  (Developer Mode) — the cleartext is KEPT (firmware ignores *_enc).
+// Callers derive `developer_mode` per printer from push_status print.fun bit
+// 29. Transforms are idempotent (skipped when the `_enc` field already exists)
+// and no-ops when `device_pub` is null or encryption fails, in which case the
+// cleartext field is kept (pure-LAN ftp:// path without a device key).
 std::string maybe_sign(const std::string& payload_json,
-                       EVP_PKEY* device_pub = nullptr);
+                       EVP_PKEY* device_pub = nullptr,
+                       bool developer_mode = false);
 
 // True when maybe_sign() would actually sign `payload_json` — i.e. it carries a
 // top-level "print" object and a slicer key is configured. Callers use this to
@@ -81,5 +87,10 @@ std::string slicer_crl_pem();
 // (no private key needed). Hot path: callers should skip this after a
 // successful install for the device (Studio polls ~1 Hz).
 bool slicer_app_cert_usable();
+
+// True when a slicer private key (slicer_key.pem or obn.conf slicer_key_pem)
+// is loaded, i.e. maybe_sign() can actually produce a signature. Cheap: the
+// key is parsed once and cached.
+bool slicer_signing_key_present();
 
 } // namespace obn::signing

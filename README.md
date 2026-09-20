@@ -497,7 +497,6 @@ Spaces around `=` are optional.
 | `slicer_cert_pem` | *(empty)* | (new in v2.0.0) Path to the slicer certificate (PEM). Empty = look for `slicer_cert.pem` in the config directory. |
 | `slicer_key_pem` | *(empty)* | (new in v2.0.0) Path to the slicer private key (PEM) used to sign print commands. Empty = look for `slicer_key.pem` in the config directory. |
 | `slicer_crl_pem` | *(empty)* | (new in v2.0.0) Path to the certificate revocation list (PEM). Empty = look for `slicer_crl.pem` in the config directory. |
-| `developer_mode` | `0` | Matches the printer's on-screen Developer Mode toggle. `0` (secured, the default) drops the cleartext `url`/`param` after adding `url_enc`/`param_enc`, because a secured printer reads only `*_enc` and rejects a message carrying both (`gcode_line` → err `84033545`). Set to `1` only when the printer is in Developer Mode, where firmware ignores `*_enc` and needs the cleartext kept. |
 | `client_name` | `OpenBambooNetworking` | (new in v2.0.0) Name the plugin presents to Bambu's cloud. Cloud printing only accepts the stock name `BambuStudio`; leave the default and it is refused. Set to `BambuStudio` for cloud mode. |
 
 **These credential files are private and are not shipped with this project;

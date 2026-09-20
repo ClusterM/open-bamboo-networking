@@ -1048,6 +1048,8 @@ void Agent::harvest_security_report(const std::string& dev_id,
             std::lock_guard<std::mutex> lk(mu_);
             app_cert_install_sent_.insert(dev_id);
         }
+        // Wake any wait_for_app_cert() blocked on this ack.
+        app_cert_cv_.notify_all();
         // Stock ABI path: Studio process_network_msg on this string.
         notify_message(dev_id, "device_cert_installed");
         return;
@@ -1104,6 +1106,58 @@ bool Agent::printer_supports_new_auth(const std::string& dev_id) const
     return it != sec_new_auth_by_dev_.end() && it->second;
 }
 
+void Agent::harvest_developer_mode(const std::string& dev_id,
+                                   const std::string& json)
+{
+    // Prefilter: fun is a push_status/pushall field. The closing quote keeps
+    // this from matching "fun2".
+    if (json.find("\"fun\"") == std::string::npos) return;
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+    const auto& fun = root->find("print.fun");
+    if (!fun.is_string()) return;
+    const std::string& hex = fun.as_string();
+    if (hex.empty()) return;
+
+    unsigned long long bits = 0;
+    try { bits = std::stoull(hex, nullptr, 16); }
+    catch (...) { return; }
+
+    // print.fun bit 29: clear = Developer Mode on, set = secured
+    // (research/10.03-mqtt-field-encryption.md). Tracked live rather than
+    // latched: the on-printer toggle can flip mid-session, and every frame
+    // that carries fun reflects the current state.
+    const bool dev_on = ((bits >> 29) & 1ULL) == 0;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = dev_mode_on_by_dev_.find(dev_id);
+    const bool changed = it == dev_mode_on_by_dev_.end() || it->second != dev_on;
+    dev_mode_on_by_dev_[dev_id] = dev_on;
+    if (changed)
+        OBN_INFO("dev=%s Developer Mode %s (print.fun bit29 %s)",
+                 dev_id.c_str(), dev_on ? "on" : "off (secured)",
+                 dev_on ? "clear" : "set");
+}
+
+bool Agent::developer_mode_effective(const std::string& dev_id) const
+{
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = dev_mode_on_by_dev_.find(dev_id);
+        if (it != dev_mode_on_by_dev_.end()) return it->second;
+    }
+    // No fun frame seen yet. Assume secured (Developer Mode off, drop
+    // cleartext) only when the full signing material is present, because
+    // that is the only mode we can actually drive; without keys we can
+    // neither sign nor field-encrypt, so cleartext must be kept. Computed
+    // outside the lock (slicer_app_cert_usable re-parses PEM/CRL).
+    const bool have_material = obn::signing::slicer_signing_key_present()
+                            && obn::signing::slicer_app_cert_usable();
+    return !have_material;
+}
+
 void Agent::maybe_install_app_cert(const std::string& dev_id)
 {
     if (dev_id.empty()) return;
@@ -1132,7 +1186,8 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     // session pointer (the wait may span a reconnect), and never for
     // security/pushing/info frames (would_sign() is false for them), so the
     // install path itself is never gated. See research/08.04-lan.md §8.4.7.
-    if (obn::signing::would_sign(json_str))
+    const bool sign = obn::signing::would_sign(json_str);
+    if (sign)
         wait_for_app_cert(dev_id, std::chrono::seconds(8));
 
     LanSession* session = nullptr;
@@ -1144,9 +1199,10 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
     EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
-    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
+    std::string signed_json =
+        obn::signing::maybe_sign(json_str, dev_pub, developer_mode_effective(dev_id));
     if (dev_pub) EVP_PKEY_free(dev_pub);
-    if (obn::signing::would_sign(json_str))
+    if (sign)
         OBN_DEBUG("SIGNED-ENVELOPE dev=%s bytes=%zu json=%s",
                   dev_id.c_str(), signed_json.size(), signed_json.c_str());
     return session->publish_json(signed_json, qos);
@@ -1168,14 +1224,13 @@ bool Agent::wait_for_app_cert(const std::string&        dev_id,
     // security.app_cert_install path regardless of the lan_only argument.
     install_device_cert(dev_id, /*lan_only=*/false);
 
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        std::lock_guard<std::mutex> lk(mu_);
-        if (app_cert_install_sent_.count(dev_id)) return true;
-    }
-    std::lock_guard<std::mutex> lk(mu_);
-    const bool ok = app_cert_install_sent_.count(dev_id) != 0;
+    // Block until harvest_security_report latches the SUCCESS ack (which
+    // notifies app_cert_cv_) or the timeout elapses. cv release of mu_ lets
+    // the MQTT report thread take mu_ and insert the ack.
+    std::unique_lock<std::mutex> lk(mu_);
+    const bool ok = app_cert_cv_.wait_for(lk, timeout, [&] {
+        return app_cert_install_sent_.count(dev_id) != 0;
+    });
     if (!ok)
         OBN_WARN("send: app_cert_install not acknowledged for %s within %lldms; "
                  "signing anyway (printer may reject with 84033545)",
@@ -1365,6 +1420,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
 {
     harvest_security_report(dev_id, json);
     harvest_security_flags(dev_id, json);
+    harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
@@ -2525,6 +2581,7 @@ int Agent::connect_cloud()
     {
         harvest_security_report(dev_id, json);
         harvest_security_flags(dev_id, json);
+        harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
@@ -2679,7 +2736,8 @@ int Agent::cloud_send_message(const std::string& dev_id,
     }
 
     EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
-    std::string signed_json = obn::signing::maybe_sign(json_str, dev_pub);
+    std::string signed_json =
+        obn::signing::maybe_sign(json_str, dev_pub, developer_mode_effective(dev_id));
     if (dev_pub) EVP_PKEY_free(dev_pub);
     return sess->publish(dev_id, signed_json, qos);
 }

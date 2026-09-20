@@ -454,6 +454,21 @@ private:
     void harvest_security_flags(const std::string& dev_id,
                                 const std::string& json);
 
+    // Scans a push_status frame for print.fun (a hex-string capability
+    // bitmask) and records the printer's Developer Mode from bit 29 (clear =
+    // on, set = secured) into dev_mode_on_by_dev_. Cheap substring prefilter;
+    // full JSON parse only on candidate frames. See research/10.03.
+    void harvest_developer_mode(const std::string& dev_id,
+                                const std::string& json);
+
+    // Whether outbound signed print fields should be treated as Developer
+    // Mode (keep cleartext url/param) vs secured (drop cleartext, *_enc only).
+    // Uses the harvested print.fun bit 29 when seen; before the first fun
+    // frame, defaults to secured only when full signing material is present
+    // (slicer key + app cert + CRL), because without it we can neither sign
+    // nor operate a secured printer, so cleartext must be kept.
+    bool developer_mode_effective(const std::string& dev_id) const;
+
     // Scans a push_status frame for ipcam.rtsp_url and latches the LAN
     // liveview protocol ("rtsps"/"rtsp") per device. camera_url_for()
     // forwards it as the lv= hint so libBambuSource knows to fetch video
@@ -540,6 +555,15 @@ private:
     std::map<std::string, bool>                 sec_new_auth_by_dev_;
     std::map<std::string, std::set<std::string>> app_certs_by_dev_;
 
+    // Printer Developer Mode, harvested from push_status print.fun bit 29
+    // (clear = Developer Mode on, set = secured). Presence of a key means we
+    // have seen a fun bitmask for that dev_id this session; the value is
+    // "Developer Mode on". NOT latch-once: the on-screen toggle is live, so
+    // every frame carrying fun updates it. Guarded by mu_. Read via
+    // developer_mode_effective(), which falls back to a key-material default
+    // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
+    std::map<std::string, bool>                 dev_mode_on_by_dev_;
+
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")
     // notification. Cleared on disconnect/resubscribe so reconnects
@@ -565,6 +589,10 @@ private:
     // this MQTT session. Set in harvest_security_report, not at publish.
     // Cleared on LAN disconnect so Studio can re-provision. Guarded by mu_.
     std::set<std::string> app_cert_install_sent_;
+    // Signalled when a dev_id is inserted into app_cert_install_sent_ (i.e. the
+    // printer acknowledged security.app_cert_install). wait_for_app_cert()
+    // waits on this instead of polling. Waits on mu_.
+    std::condition_variable app_cert_cv_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.
