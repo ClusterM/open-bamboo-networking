@@ -37,7 +37,6 @@ Writes into --out-dir (default: cwd):
 from __future__ import annotations
 
 import argparse
-import base64
 import mmap
 import struct
 import sys
@@ -47,16 +46,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fetch_slicer_credentials as F  # noqa: E402
 
-SKEY = b"\x59\x45\x4b\x53"  # little-endian 0x534b4559
+# Blob/plaintext layout constants live in the crypto module (single source of truth,
+# shared with its own decode_key_blob); import the ones the scan below needs.
+from fetch_slicer_credentials import (  # noqa: E402
+    BLOB_HEADER_LEN,
+    CRT_LIMB_COUNT,
+    CT_LEN_OFFSET,
+    FIRST_CT_BLOCK_COUNTER,
+    NONCE_LEN,
+    PT_HEADER_LEN,
+    SKEY,
+    SKEY_LEN,
+)
+
+# Sanity bounds for the PEM/heap-string scans below, so a stray BEGIN marker without
+# a nearby END doesn't make us slurp megabytes.
+MAX_CERT_PEM_LEN = 8000     # an RSA leaf/intermediate PEM is well under this
+MAX_CRL_PEM_LEN = 20000     # app-chain CRLs are larger but still bounded
+CLIENT_AUTH_SECRET_HEX_LEN = 16  # hex chars following the leaf-CN prefix (§10.2)
+
+DEFAULT_RSA_KEY_SIZES = (2048, 3072, 4096, 1024)  # app key is 2048; rest are probes
+EXPECTED_APP_CHAIN_LEN = 3   # leaf -> intermediate -> application_root
+TEST_SIGN_PAYLOAD = b"open-bamboo-networking"  # sign/verify roundtrip proof message
 
 
 def ct_len_for(bits: int) -> int:
     """Ciphertext length carried in the blob's u32le field for an RSA-`bits` key.
 
-    plaintext = SKEY(4)+ver(4)+bitlen(4)+5*limblen(20) + 5*(bits/16) CRT bytes;
-    CTR ciphertext is the same length.
+    Each of the 5 CRT limbs is half the modulus, i.e. bits/2 bits == bits/16 bytes;
+    CTR ciphertext is the same length as the plaintext.
     """
-    return 32 + 5 * (bits // 16)
+    return PT_HEADER_LEN + CRT_LIMB_COUNT * (bits // 16)
 
 
 def find_key_blob(mem: mmap.mmap, key_sizes: list[int]) -> tuple[int, bytes] | None:
@@ -68,8 +88,10 @@ def find_key_blob(mem: mmap.mmap, key_sizes: list[int]) -> tuple[int, bytes] | N
     field at offset +28 for each plausible RSA key size.
     """
     rk = F.key_expand(F.APPCERT_KEY)
+    counter = struct.pack(">I", FIRST_CT_BLOCK_COUNTER)  # fixed; same for every candidate
     for bits in key_sizes:
         ct_len = ct_len_for(bits)
+        blob_len = BLOB_HEADER_LEN + ct_len
         marker = struct.pack("<I", ct_len)
         pos = 0
         while True:
@@ -77,14 +99,16 @@ def find_key_blob(mem: mmap.mmap, key_sizes: list[int]) -> tuple[int, bytes] | N
             if k < 0:
                 break
             pos = k + 1
-            start = k - 28  # length field sits at blob offset 28
-            if start < 0 or start + 32 + ct_len > len(mem):
+            start = k - CT_LEN_OFFSET  # rewind from the length field to the blob start
+            if start < 0:
                 continue
-            nonce = mem[start : start + 12]
-            ct0 = mem[start + 32 : start + 36]
-            ks0 = F.aes_encrypt_block(nonce + struct.pack(">I", 2), rk)
-            if bytes(a ^ b for a, b in zip(ct0, ks0[:4])) == SKEY:
-                return start, bytes(mem[start : start + 32 + ct_len])
+            if start + blob_len > len(mem):
+                break  # matches only grow; the blob can no longer fit before EOF
+            nonce = mem[start : start + NONCE_LEN]
+            ct0 = mem[start + BLOB_HEADER_LEN : start + BLOB_HEADER_LEN + SKEY_LEN]
+            ks0 = F.aes_encrypt_block(nonce + counter, rk)
+            if bytes(a ^ b for a, b in zip(ct0, ks0[:SKEY_LEN])) == SKEY:
+                return start, bytes(mem[start : start + blob_len])
     return None
 
 
@@ -110,7 +134,7 @@ def collect_resident_certs(mem: mmap.mmap) -> list:
             break
         pos = a + 1
         b = mem.find(end, a)
-        if b < 0 or b - a > 8000:
+        if b < 0 or b - a > MAX_CERT_PEM_LEN:
             continue
         try:
             cert = x509.load_pem_x509_certificate(bytes(mem[a : b + len(end)]))
@@ -223,9 +247,16 @@ def find_client_auth_secret(mem: mmap.mmap, leaf) -> str | None:
         if k < 0:
             break
         pos = k + 1
-        tail = mem[k + len(prefix) : k + len(prefix) + 16]
-        if len(tail) == 16 and all(c in hexset for c in tail):
-            return (prefix + bytes(tail)).decode()
+        tstart = k + len(prefix)
+        tail = mem[tstart : tstart + CLIENT_AUTH_SECRET_HEX_LEN]
+        if len(tail) != CLIENT_AUTH_SECRET_HEX_LEN or not all(c in hexset for c in tail):
+            continue
+        # The secret is a fixed 16-hex-char field (null-terminated heap string); if the
+        # next byte is also hex this is a longer token (hash/UUID), not our secret.
+        nxt = tstart + CLIENT_AUTH_SECRET_HEX_LEN
+        if nxt < len(mem) and mem[nxt] in hexset:
+            continue
+        return (prefix + bytes(tail)).decode()
     return None
 
 
@@ -244,7 +275,7 @@ def find_app_crls(mem: mmap.mmap) -> list[bytes]:
             break
         pos = a + 1
         b = mem.find(end, a)
-        if b < 0 or b - a > 20000:
+        if b < 0 or b - a > MAX_CRL_PEM_LEN:
             continue
         pem = bytes(mem[a : b + len(end)])
         try:
@@ -262,7 +293,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dump", type=Path, help="memory dump file (procdump -ma / raw / core)")
     ap.add_argument("--out-dir", type=Path, default=Path("."), help="output directory")
-    ap.add_argument("--key-sizes", default="2048,3072,4096,1024",
+    ap.add_argument("--key-sizes", default=",".join(map(str, DEFAULT_RSA_KEY_SIZES)),
                     help="comma-separated RSA sizes to look for (default covers all common)")
     ap.add_argument("--include-root", action="store_true",
                     help="also append the self-signed root (BBL CA) to slicer_cert.pem; "
@@ -286,7 +317,7 @@ def main() -> int:
 
         off, blob = hit
         print(f"found encrypted key blob at file offset 0x{off:x} ({len(blob)} bytes)")
-        p, q, dp, dq, qinv = F.decode_key_blob(base64.b64encode(blob).decode())
+        p, q, dp, dq, qinv = F.decode_key_blob(blob)  # decode_key_blob takes raw bytes
         key = F.rsa_from_crt(p, q, dp, dq, qinv)
         n = key.private_numbers().public_numbers.n
         pi = int.from_bytes(p, "big")
@@ -311,7 +342,7 @@ def main() -> int:
             for i, c in enumerate(chain):
                 role = "leaf" if i == 0 else ("root" if c.subject == c.issuer else "intermediate")
                 print(f"    [{i}] {role:12s} subject {c.subject.rfc4514_string()}")
-            if len(chain) < 3 and not args.include_root:
+            if len(chain) < EXPECTED_APP_CHAIN_LEN and not args.include_root:
                 print("    note: expected leaf -> intermediate -> application_root (3 PEMs); "
                       "some chain certs were not resident. app_cert_install may reject a "
                       "partial chain -- re-dump after Studio has fetched the cert, or fill "
@@ -330,8 +361,8 @@ def main() -> int:
             try:
                 from cryptography.hazmat.primitives import hashes
                 from cryptography.hazmat.primitives.asymmetric import padding
-                sig = key.sign(b"open-bamboo-networking", padding.PKCS1v15(), hashes.SHA256())
-                leaf.public_key().verify(sig, b"open-bamboo-networking",
+                sig = key.sign(TEST_SIGN_PAYLOAD, padding.PKCS1v15(), hashes.SHA256())
+                leaf.public_key().verify(sig, TEST_SIGN_PAYLOAD,
                                          padding.PKCS1v15(), hashes.SHA256())
                 print("sign/verify roundtrip against leaf: OK")
             except Exception as e:  # pragma: no cover
