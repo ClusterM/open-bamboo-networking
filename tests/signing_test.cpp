@@ -399,18 +399,16 @@ static int test_gcode_line_param_encrypted()
     return 0;
 }
 
-namespace obn::config { Settings& test_settings(); } // defined in config_stub.cpp
-
 static int test_developer_mode_keeps_cleartext()
 {
-    // developer_mode=1: firmware ignores *_enc and reads cleartext, so the
-    // cleartext param must be KEPT alongside param_enc.
-    obn::config::test_settings().developer_mode = true;
+    // Developer Mode (maybe_sign developer_mode=true): firmware ignores *_enc
+    // and reads cleartext, so the cleartext param must be KEPT alongside
+    // param_enc.
     const std::string gcode   = "G28\n";
     const std::string payload =
         R"({"print":{"command":"gcode_line","param":"G28\n","sequence_id":"7b"}})";
-    const std::string env = obn::signing::maybe_sign(payload, g_test_key);
-    obn::config::test_settings().developer_mode = false; // reset for later tests
+    const std::string env =
+        obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/true);
     auto val = obn::json::parse(env);
     CHECK(val);
     CHECK(val->find("print.param").as_string()     == gcode);       // kept

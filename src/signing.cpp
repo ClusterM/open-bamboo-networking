@@ -267,15 +267,17 @@ const char* encrypted_field_for(const obn::json::Object& obj)
 }
 
 // Applies device-cert field encryption to the parsed `print` object in place:
-// adds `<field>_enc` (RSA). On a secured printer (the default; obn.conf
-// `developer_mode = 0`) the cleartext field is then DROPPED, because secured
-// firmware reads only *_enc and rejects a message carrying both (gcode_line ->
-// err 84033545 "mqtt message verify failed"; research/§10.3). When
-// `developer_mode = 1` the cleartext is kept, because Developer Mode firmware
-// ignores *_enc and reads the cleartext instead.
+// adds `<field>_enc` (RSA). On a secured printer (`developer_mode == false`)
+// the cleartext field is then DROPPED, because secured firmware reads only
+// *_enc and rejects a message carrying both (gcode_line -> err 84033545
+// "mqtt message verify failed"; research/§10.3). When `developer_mode == true`
+// the cleartext is kept, because Developer Mode firmware ignores *_enc and
+// reads the cleartext instead. The caller derives `developer_mode` per printer
+// from push_status print.fun bit 29 (Agent::developer_mode_effective).
 // Idempotent when `*_enc` already exists. Without a device key (or when RSA
 // fails) logs ERROR and leaves the cleartext.
-void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
+void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub,
+                          bool developer_mode)
 {
     const char* field = encrypted_field_for(obj);
     if (!field) return;
@@ -287,7 +289,7 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
                   "(printer will reject if secured)", field);
         return;
     }
-        std::string enc_err;
+    std::string enc_err;
     std::string enc = rsa_pkcs1v15_encrypt_b64(device_pub, it->second.as_string(),
                                                &enc_err);
     if (enc.empty()) {
@@ -296,20 +298,21 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
         return;
     }
     obj[enc_key] = obn::json::Value(std::move(enc));
-    if (!obn::config::current().developer_mode)
+    if (!developer_mode)
         obj.erase(it);
 }
 
 // Builds the print dump ({...sorted keys...}) after optional field encryption.
 // Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
-std::string build_print_dump(const std::string& payload, EVP_PKEY* device_pub)
+std::string build_print_dump(const std::string& payload, EVP_PKEY* device_pub,
+                             bool developer_mode)
 {
     auto root = obn::json::parse(payload);
     if (!root) return {};
     const obn::json::Value& print = root->find("print");
     if (print.kind() != obn::json::Value::Kind::Object) return {};
     obn::json::Object obj = print.as_object(); // copy for mutation
-    encrypt_print_fields(obj, device_pub);
+    encrypt_print_fields(obj, device_pub, developer_mode);
     return obn::json::Value(std::move(obj)).dump();
 }
 
@@ -356,7 +359,13 @@ bool would_sign(const std::string& payload_json)
     return is_print_payload(payload_json) && slicer_pkey() != nullptr;
 }
 
-std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub)
+bool slicer_signing_key_present()
+{
+    return slicer_pkey() != nullptr;
+}
+
+std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
+                       bool developer_mode)
 {
     if (!is_print_payload(payload_json)) return payload_json;
 
@@ -365,7 +374,8 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub)
 
     // Encrypt url/param into url_enc/param_enc (when a device key is given)
     // BEFORE signing, so the signature covers exactly what goes on the wire.
-    const std::string print_dump = build_print_dump(payload_json, device_pub);
+    const std::string print_dump =
+        build_print_dump(payload_json, device_pub, developer_mode);
     if (print_dump.empty()) return payload_json; // malformed; pass through
 
     const std::string to_sign = std::string("{\"print\":") + print_dump + '}';
