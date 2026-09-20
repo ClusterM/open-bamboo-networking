@@ -29,7 +29,8 @@ def on_message(c, u, m):
     print(f"\n=== {m.topic} ===\n{txt}", flush=True)
 
 
-def on_disconnect(c, u, rc, *a):
+def on_disconnect(c, u, *args):
+    rc = args[1] if len(args) >= 2 else args[0]
     print(f"# disconnected rc={rc}", flush=True)
 
 
