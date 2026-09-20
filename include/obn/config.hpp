@@ -79,6 +79,17 @@ struct Settings {
     std::string slicer_cert_pem;
     std::string slicer_crl_pem;
 
+    // Printer Developer Mode (the on-printer toggle, not Studio's "Develop
+    // mode"). Governs device-cert field encryption of url/param:
+    //   false (default, "secured") — printer verifies signatures and reads
+    //     only url_enc/param_enc; the cleartext url/param is DROPPED after
+    //     encryption (a secured printer rejects gcode_line carrying both,
+    //     err 84033545 "mqtt message verify failed" — research/§10.3).
+    //   true ("Developer Mode on") — firmware ignores *_enc and reads the
+    //     cleartext url/param, so it is KEPT and *_enc is harmless.
+    // Detect the printer's actual state from print.fun bit 29 (clear = on).
+    bool developer_mode = false;
+
     // Value sent in the `X-BBL-Client-Name` HTTP header on cloud REST calls.
     // The MakerWorld `POST /my/task` endpoint authorizes access to the
     // uploaded print content ONLY for the stock client name "BambuStudio";

@@ -168,6 +168,16 @@ public:
     // printer's self-signed server certificate into <config_dir>/certs/.
     void install_device_cert(const std::string& dev_id, bool lan_only);
 
+    // Blocks (up to `timeout`) until the printer has acknowledged
+    // security.app_cert_install for `dev_id` this session (app_cert_install_sent_
+    // latched from a SUCCESS report), kicking an install if none is in flight.
+    // Returns true when acknowledged. Used to gate signed `print` publishes so a
+    // secured printer does not reject an early signature with 84033545
+    // ("need reset device pub key"). Never called for security/pushing/info
+    // frames (they are unsigned), so it cannot block the install itself.
+    bool wait_for_app_cert(const std::string&        dev_id,
+                           std::chrono::milliseconds timeout);
+
     // Publishes the security.app_cert_install MQTT command (see
     // reverse-networking "Authorization Control/5. MQTT.md"): sends the
     // slicer/app certificate chain + CRL (config_dir/slicer_cert.pem,
