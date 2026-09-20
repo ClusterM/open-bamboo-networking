@@ -72,6 +72,28 @@ SBOX = bytes(
 APPCERT_KEY = bytes(range(32))  # 00 01 … 1f
 RCON = bytes([0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C, 0xD8, 0xAB, 0x4D])
 
+# ---------------------------------------------------------------------------
+# Shared binary layout (also imported by extract_key_from_dump.py)
+# ---------------------------------------------------------------------------
+# Encrypted key blob (cloud cert `key` field == the at-rest blob):
+#     nonce(12) ‖ tag(16) ‖ u32le(ct_len) ‖ ciphertext
+NONCE_LEN = 12                                      # AES-CTR nonce
+TAG_LEN = 16                                        # GCM tag (carried, unused here)
+CT_LEN_FIELD_LEN = 4                                # u32le ciphertext-length field
+CT_LEN_OFFSET = NONCE_LEN + TAG_LEN                 # 28: where that length field sits
+BLOB_HEADER_LEN = CT_LEN_OFFSET + CT_LEN_FIELD_LEN  # 32: bytes before the ciphertext
+
+# The CTR keystream numbers plaintext blocks from 2 (counter 1 reserved); block i
+# uses counter 2 + i, so the first ciphertext block is recovered with counter 2.
+FIRST_CT_BLOCK_COUNTER = 2
+
+# Decrypted plaintext (length == ciphertext length):
+#     SKEY(4) ‖ version(4) ‖ bitlen(4) ‖ 5 limb-length u32 fields(20) ‖ CRT limbs
+SKEY = b"\x59\x45\x4b\x53"   # LE 0x534b4559 ("SKEY"); magic at the plaintext start
+SKEY_LEN = len(SKEY)
+PT_HEADER_LEN = 32           # 4 + 4 + 4 + 5*4, the fixed header before the CRT limbs
+CRT_LIMB_COUNT = 5           # p, q, dp, dq, qinv -- equal-width big-endian limbs
+
 
 def _xtime(a: int) -> int:
     return ((a << 1) ^ (0x1B if (a & 0x80) else 0)) & 0xFF
@@ -140,11 +162,11 @@ def aes_encrypt_block(block: bytes, rk: list[bytes]) -> bytes:
 
 def ctr_xor(key: bytes, nonce: bytes, data: bytes) -> bytes:
     """CTR keystream XOR; block i uses counter (2 + i)."""
-    assert len(key) == 32 and len(nonce) == 12
+    assert len(key) == 32 and len(nonce) == NONCE_LEN
     rk = key_expand(key)
     out = bytearray(len(data))
     for i in range((len(data) + 15) // 16):
-        ctr = bytearray(nonce) + struct.pack(">I", 2 + i)
+        ctr = bytearray(nonce) + struct.pack(">I", FIRST_CT_BLOCK_COUNTER + i)
         ks = aes_encrypt_block(bytes(ctr), rk)
         base = i * 16
         n = min(16, len(data) - base)
@@ -167,23 +189,29 @@ def b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii")  # keeps padding
 
 
-def decode_key_blob(key_b64: str) -> tuple[bytes, bytes, bytes, bytes, bytes]:
-    """Return (p, q, dp, dq, qinv) big-endian 128-byte limbs from response key."""
-    blob = b64decode_any(key_b64)
-    if len(blob) < 32 + 288:
+def decode_key_blob(key_data: str | bytes) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    """Return (p, q, dp, dq, qinv) big-endian CRT limbs from the response `key`.
+
+    Accepts the raw blob bytes or its base64 text. The five CRT limbs are equal
+    width (modulus bits / 16 bytes each); the width is derived from the framed
+    ciphertext length rather than hardcoded to 128, so a non-2048 key unwraps too.
+    """
+    blob = bytes(key_data) if isinstance(key_data, (bytes, bytearray)) else b64decode_any(key_data)
+    if len(blob) < BLOB_HEADER_LEN + PT_HEADER_LEN + CRT_LIMB_COUNT:
         raise ValueError(f"key blob too short: {len(blob)} bytes")
-    nonce = blob[:12]
-    ct_len = struct.unpack_from("<I", blob, 28)[0]
-    if 32 + ct_len > len(blob):
-        ct_len = len(blob) - 32
-    pt = ctr_xor(APPCERT_KEY, nonce, blob[32 : 32 + ct_len])
+    nonce = blob[:NONCE_LEN]
+    ct_len = struct.unpack_from("<I", blob, CT_LEN_OFFSET)[0]
+    if BLOB_HEADER_LEN + ct_len > len(blob):
+        ct_len = len(blob) - BLOB_HEADER_LEN
+    pt = ctr_xor(APPCERT_KEY, nonce, blob[BLOB_HEADER_LEN : BLOB_HEADER_LEN + ct_len])
     # Magic is little-endian uint32 0x534b4559 ("SKEY") → bytes 59 45 4b 53 ("YEKS").
-    if pt[:4] != b"\x59\x45\x4b\x53":
+    if pt[:SKEY_LEN] != SKEY:
         raise ValueError("SKEY magic missing (wrong cipher / framing)")
-    h, limb = 32, 128
-    if len(pt) < h + 5 * limb:
-        raise ValueError(f"SKEY plaintext too short: {len(pt)}")
-    parts = [pt[h + i * limb : h + (i + 1) * limb] for i in range(5)]
+    body = len(pt) - PT_HEADER_LEN
+    if body <= 0 or body % CRT_LIMB_COUNT != 0:
+        raise ValueError(f"SKEY plaintext is not {CRT_LIMB_COUNT} equal CRT limbs: {len(pt)} bytes")
+    limb = body // CRT_LIMB_COUNT
+    parts = [pt[PT_HEADER_LEN + i * limb : PT_HEADER_LEN + (i + 1) * limb] for i in range(CRT_LIMB_COUNT)]
     return parts[0], parts[1], parts[2], parts[3], parts[4]
 
 
