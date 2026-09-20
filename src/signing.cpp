@@ -251,52 +251,53 @@ bool is_print_payload(const std::string& payload) noexcept
     return true;
 }
 
-// Applies device-cert field encryption to the parsed `print` object in place.
-// For each cleartext field in kEncryptFields, adds `<field>_enc` (RSA) and
-// keeps the cleartext (Developer Mode firmware reads only url/param).
-// Idempotent when `*_enc` already exists. If a field needs encryption but
-// there is no device key (or RSA fails), logs ERROR and leaves the cleartext.
+// The one field each command carries as device-cert ciphertext
+// (research/10.03): project_file's model url, gcode_line's raw G-code.
+// project_file's `param` is the plate path the firmware reads in cleartext;
+// encrypting (and dropping) it makes the printer fail with 0500-4003
+// (cannot parse file).
+const char* encrypted_field_for(const obn::json::Object& obj)
+{
+    auto cmd = obj.find("command");
+    if (cmd == obj.end() || !cmd->second.is_string()) return nullptr;
+    const std::string c = cmd->second.as_string();
+    if (c == "project_file") return "url";
+    if (c == "gcode_line")   return "param";
+    return nullptr;
+}
+
+// Applies device-cert field encryption to the parsed `print` object in place:
+// adds `<field>_enc` (RSA). On a secured printer (the default; obn.conf
+// `developer_mode = 0`) the cleartext field is then DROPPED, because secured
+// firmware reads only *_enc and rejects a message carrying both (gcode_line ->
+// err 84033545 "mqtt message verify failed"; research/§10.3). When
+// `developer_mode = 1` the cleartext is kept, because Developer Mode firmware
+// ignores *_enc and reads the cleartext instead.
+// Idempotent when `*_enc` already exists. Without a device key (or when RSA
+// fails) logs ERROR and leaves the cleartext.
 void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub)
 {
-    static constexpr const char* kEncryptFields[] = {"url", "param"};
-
-    bool needs_encrypt = false;
-    for (const char* field : kEncryptFields) {
-        if (!obj.count(field)) continue;
-        const std::string enc_key = std::string(field) + "_enc";
-        if (!obj.count(enc_key)) {
-            needs_encrypt = true;
-            break;
-        }
-    }
-    if (!needs_encrypt) return;
-
+    const char* field = encrypted_field_for(obj);
+    if (!field) return;
+    const std::string enc_key = std::string(field) + "_enc";
+    auto it = obj.find(field);
+    if (it == obj.end() || !it->second.is_string() || obj.count(enc_key)) return;
     if (!device_pub) {
-        OBN_ERROR("no device public key; leaving url/param cleartext "
-                  "(printer will reject if secured)");
+        OBN_ERROR("no device public key; leaving %s cleartext "
+                  "(printer will reject if secured)", field);
         return;
     }
-
-    for (const char* field : kEncryptFields) {
-        if (!obj.count(field)) continue;
-        const std::string enc_key = std::string(field) + "_enc";
-        if (obj.count(enc_key)) continue; // already encrypted
-
-        auto it = obj.find(field);
-        if (it == obj.end() || !it->second.is_string()) continue;
         std::string enc_err;
-        std::string enc = rsa_pkcs1v15_encrypt_b64(device_pub,
-                                                   it->second.as_string(),
-                                                   &enc_err);
-        if (enc.empty()) {
-            OBN_ERROR("RSA encrypt of '%s' failed: %s; leaving cleartext",
-                      field, enc_err.empty() ? "unknown" : enc_err.c_str());
-            continue;
-        }
-        obj[enc_key] = obn::json::Value(std::move(enc));
-        // Keep cleartext: Developer Mode firmware ignores *_enc and only
-        // reads url/param. See research/10.03-mqtt-field-encryption.md.
+    std::string enc = rsa_pkcs1v15_encrypt_b64(device_pub, it->second.as_string(),
+                                               &enc_err);
+    if (enc.empty()) {
+        OBN_ERROR("RSA encrypt of '%s' failed: %s; leaving cleartext",
+                  field, enc_err.empty() ? "unknown" : enc_err.c_str());
+        return;
     }
+    obj[enc_key] = obn::json::Value(std::move(enc));
+    if (!obn::config::current().developer_mode)
+        obj.erase(it);
 }
 
 // Builds the print dump ({...sorted keys...}) after optional field encryption.
@@ -349,6 +350,11 @@ std::string build_envelope(const std::string& to_sign,
 }
 
 } // namespace
+
+bool would_sign(const std::string& payload_json)
+{
+    return is_print_payload(payload_json) && slicer_pkey() != nullptr;
+}
 
 std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub)
 {
