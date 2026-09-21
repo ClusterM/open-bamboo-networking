@@ -380,6 +380,37 @@ PYEOF
 
 patch_conf
 
+# ── Remove com.apple.quarantine attribute ────────────────────────────────
+
+unmark_quarantine() {
+  if xattr -p com.apple.quarantine "$DEST_DIR/$PLUGIN_DEST_NAME" &>/dev/null; then
+    xattr -d com.apple.quarantine "$DEST_DIR/$PLUGIN_DEST_NAME" &>/dev/null
+    info "Removed com.apple.quarantine attribute from $DEST_DIR/$PLUGIN_DEST_NAME"
+  fi
+
+  if xattr -p com.apple.quarantine "$DEST_DIR/$BAMBUSOURCE_NAME" &>/dev/null; then
+    xattr -d com.apple.quarantine "$DEST_DIR/$BAMBUSOURCE_NAME" &>/dev/null
+    info "Removed com.apple.quarantine attribute from $DEST_DIR/$BAMBUSOURCE_NAME"
+  fi
+
+  if xattr -p com.apple.quarantine "$DEST_DIR/$LIVE555_NAME" &>/dev/null; then
+    xattr -d com.apple.quarantine "$DEST_DIR/$LIVE555_NAME" &>/dev/null
+    info "Removed com.apple.quarantine attribute from $DEST_DIR/$LIVE555_NAME"
+  fi
+}
+
+if [[ "$OS" == "Darwin" ]]; then
+  echo ""
+  warn "The installed libraries might be quarantined by macOS."
+  echo ""
+  printf "Do you want to remove the quarantine attribute from the installed libraries?\n"
+  echo ""
+  if prompt_yn "Proceed?"; then
+    echo ""
+    unmark_quarantine
+  fi
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────
 
 OBN_CONF="$PREFIX/obn.conf"
