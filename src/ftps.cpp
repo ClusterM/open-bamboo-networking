@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -169,6 +170,76 @@ int drive_ssl(SSL* ssl, socket_t fd, int (*op)(SSL*), int timeout_ms)
     }
 }
 
+// A quiet printer must not stall teardown for the full data timeout. Five
+// seconds is long enough to drain a full send buffer and exchange
+// close_notify on a LAN link, short enough that a dead peer is obvious.
+constexpr int kTlsShutdownTimeoutMs      = 5000;
+constexpr int kTlsShutdownAbortTimeoutMs = 1000;
+
+// Drives SSL_shutdown to completion (our close_notify sent and the peer's
+// received), bounded by timeout_ms. Returns true on a clean bidirectional
+// shutdown; false if the deadline hit or the peer dropped the TCP link.
+//
+// A single SSL_shutdown on a non-blocking socket is not enough: right after
+// a large write it commonly returns WANT_WRITE because the kernel send
+// buffer is still full, and the close_notify alert never leaves OpenSSL.
+// vsftpd with strict_ssl_read_eof then answers 426 "Failure reading network
+// stream" and the upload is reported as failed even though every file byte
+// arrived (GitHub #56).
+bool shutdown_ssl(SSL* ssl, socket_t fd, int timeout_ms)
+{
+    using clock = std::chrono::steady_clock;
+    const auto t0       = clock::now();
+    const auto deadline = t0 + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
+    // SSL_shutdown returns 0 exactly once, after our alert is queued, and
+    // the follow-up call either finishes, asks for I/O, or fails. Cap the
+    // immediate 0-returns so a misbehaving library cannot spin here.
+    //
+    // Do not trust SSL_SENT_SHUTDOWN for "flushed": OpenSSL sets that bit
+    // before the write completes, so a WANT_WRITE timeout still has the bit
+    // set while the alert sits in the library buffer. rc == 0 or rc == 1 is
+    // the signal that the write actually finished.
+    int  zero_spins = 0;
+    bool flushed    = false;
+
+    for (;;) {
+        const int rc = SSL_shutdown(ssl);
+        if (rc == 1) { flushed = true; break; }
+        // 0: our close_notify is on the wire; call again to read the peer's.
+        if (rc == 0) {
+            flushed = true;
+            if (++zero_spins > 2) break;
+            continue;
+        }
+        zero_spins = 0;
+
+        const int err = SSL_get_error(ssl, rc);
+        short ev = 0;
+        if (err == SSL_ERROR_WANT_READ)       ev = POLLIN;
+        else if (err == SSL_ERROR_WANT_WRITE) ev = POLLOUT;
+        else break; // SYSCALL / ZERO_RETURN / SSL: peer already gone
+
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              deadline - clock::now())
+                              .count();
+        if (left <= 0 || wait_fd(fd, ev, static_cast<int>(left)) <= 0) break;
+    }
+
+    const bool got_peer = (SSL_get_shutdown(ssl) & SSL_RECEIVED_SHUTDOWN) != 0;
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                clock::now() - t0)
+                                .count();
+    OBN_DEBUG("ftps: tls shutdown sent_close_notify=%d got_peer_close_notify=%d "
+              "elapsed_ms=%lld",
+              flushed ? 1 : 0, got_peer ? 1 : 0,
+              static_cast<long long>(elapsed_ms));
+    if (!flushed) {
+        OBN_WARN("ftps: tls shutdown: close_notify was not flushed "
+                 "(peer will see a bare FIN)");
+    }
+    return flushed && got_peer;
+}
+
 bool ssl_write_all(SSL* ssl, socket_t fd, const void* buf, std::size_t len, int timeout_ms)
 {
     const char* p   = static_cast<const char*>(buf);
@@ -256,7 +327,11 @@ struct Client::Impl {
 
     ~Impl()
     {
-        if (ctrl_ssl) { SSL_shutdown(ctrl_ssl); SSL_free(ctrl_ssl); ctrl_ssl = nullptr; }
+        if (ctrl_ssl) {
+            shutdown_ssl(ctrl_ssl, ctrl_fd, kTlsShutdownAbortTimeoutMs);
+            SSL_free(ctrl_ssl);
+            ctrl_ssl = nullptr;
+        }
         if (obn::os::socket_valid(ctrl_fd)) {
             obn::os::close_socket(ctrl_fd);
             ctrl_fd = kInvalidSocket;
@@ -574,10 +649,17 @@ std::string Client::stor(const std::string& local_path,
             : plain_write_all(data_fd, buf.data(), static_cast<std::size_t>(n),
                               p_->data_timeout_ms);
         if (!write_ok) {
-            if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+            // Snapshot before shutdown_ssl: it drives the same SSL object
+            // and would clobber the OpenSSL error queue.
+            std::string why = data_ssl
+                ? "data write: " + openssl_last_error()
+                : "data write: " + std::string(std::strerror(obn::os::last_socket_error()));
+            if (data_ssl) {
+                shutdown_ssl(data_ssl, data_fd, kTlsShutdownAbortTimeoutMs);
+                SSL_free(data_ssl);
+            }
             obn::os::close_socket(data_fd);
-            return data_ssl ? "data write: " + openssl_last_error()
-                            : "data write: " + std::string(std::strerror(obn::os::last_socket_error()));
+            return why;
         }
         sent += static_cast<std::uint64_t>(n);
         if (progress) {
@@ -587,7 +669,10 @@ std::string Client::stor(const std::string& local_path,
             if (pct != last_progress) {
                 last_progress = pct;
                 if (!progress(sent, total)) {
-                    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+                    if (data_ssl) {
+                        shutdown_ssl(data_ssl, data_fd, kTlsShutdownAbortTimeoutMs);
+                        SSL_free(data_ssl);
+                    }
                     obn::os::close_socket(data_fd);
                     return "upload cancelled";
                 }
@@ -597,12 +682,27 @@ std::string Client::stor(const std::string& local_path,
 
     // Close the data channel politely. Some printers block on the final 226
     // until the data socket is fully closed, so we do it before reading reply.
-    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+    // The TLS shutdown has to actually deliver close_notify; a bare FIN is
+    // what makes vsftpd answer 426 (see shutdown_ssl).
+    bool tls_shutdown_ok = true;
+    if (data_ssl) {
+        tls_shutdown_ok = shutdown_ssl(data_ssl, data_fd, kTlsShutdownTimeoutMs);
+        SSL_free(data_ssl);
+    }
     obn::os::close_socket(data_fd);
 
     std::string body;
     int done = p_->read_reply(&body);
-    if (done != 226 && done != 250) return "STOR finish code=" + std::to_string(done) + ": " + body;
+    if (done != 226 && done != 250) {
+        std::string msg = "STOR finish code=" + std::to_string(done) + ": " + body
+            + " (sent " + std::to_string(sent) + "/" + std::to_string(total) + " bytes";
+        if (p_->use_tls) {
+            msg += std::string(", tls_shutdown=")
+                 + (tls_shutdown_ok ? "complete" : "incomplete");
+        }
+        msg += ")";
+        return msg;
+    }
     OBN_INFO("ftps: STOR %s ok (%llu bytes)", remote_path.c_str(),
              static_cast<unsigned long long>(sent));
     if (progress) progress(sent, total);
@@ -637,7 +737,10 @@ std::string Client::list(const std::string& path, std::string& err_out)
         if (n <= 0) break;
         body.append(buf, buf + n);
     }
-    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+    if (data_ssl) {
+        shutdown_ssl(data_ssl, data_fd, kTlsShutdownTimeoutMs);
+        SSL_free(data_ssl);
+    }
     obn::os::close_socket(data_fd);
 
     int done = p_->read_reply(nullptr);
@@ -712,7 +815,11 @@ std::string Client::retr(const std::string& remote_path, DataSinkFn sink)
             break;
         }
     }
-    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+    if (data_ssl) {
+        shutdown_ssl(data_ssl, data_fd,
+                     aborted ? kTlsShutdownAbortTimeoutMs : kTlsShutdownTimeoutMs);
+        SSL_free(data_ssl);
+    }
     obn::os::close_socket(data_fd);
 
     std::string body;
@@ -758,7 +865,10 @@ std::string Client::list_entries(const std::string& path,
         if (n <= 0) break;
         body.append(buf, buf + n);
     }
-    if (data_ssl) { SSL_shutdown(data_ssl); SSL_free(data_ssl); }
+    if (data_ssl) {
+        shutdown_ssl(data_ssl, data_fd, kTlsShutdownTimeoutMs);
+        SSL_free(data_ssl);
+    }
     obn::os::close_socket(data_fd);
     int done = p_->read_reply(nullptr);
     if (done != 226 && done != 250) return "LIST finish code=" + std::to_string(done);
@@ -794,12 +904,13 @@ std::string Client::cwd(const std::string& path)
 void Client::quit()
 {
     if (!p_) return;
+    // Best-effort: send QUIT and drain the 221 reply. Use a short timeout
+    // so an unresponsive peer cannot stall teardown for the full
+    // control_timeout_ms used during transfers. The same bound covers the
+    // TLS close_notify that follows.
+    constexpr int kQuitTimeoutMs = 1000;
     if (obn::os::socket_valid(p_->ctrl_fd)) {
-        // Best-effort: send QUIT and drain the 221 reply. Use a short
-        // timeout so an unresponsive peer cannot stall teardown for the
-        // full control_timeout_ms used during transfers.
-        constexpr int kQuitTimeoutMs  = 1000;
-        const int     prev_timeout_ms = p_->control_timeout_ms;
+        const int prev_timeout_ms = p_->control_timeout_ms;
         p_->control_timeout_ms        = kQuitTimeoutMs;
         std::string wire              = "QUIT\r\n";
         p_->ctrl_write(wire.data(), wire.size());
@@ -808,7 +919,7 @@ void Client::quit()
         p_->control_timeout_ms = prev_timeout_ms;
     }
     if (p_->ctrl_ssl) {
-        SSL_shutdown(p_->ctrl_ssl);
+        shutdown_ssl(p_->ctrl_ssl, p_->ctrl_fd, kQuitTimeoutMs);
         SSL_free(p_->ctrl_ssl);
         p_->ctrl_ssl = nullptr;
     }
