@@ -396,7 +396,7 @@ unmark_quarantine() {
   fi
 }
 
-if [[ "$OS" == "Darwin" ]]; then
+if [ "$OS" = "Darwin" ]; then
   echo ""
   warn "The installed libraries might be quarantined by macOS."
   echo ""
