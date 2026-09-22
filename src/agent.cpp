@@ -2594,6 +2594,11 @@ int Agent::connect_cloud()
             std::lock_guard<std::mutex> lk(mu_);
             first = cloud_connected_devs_.insert(dev_id).second;
         }
+        if (first) {
+            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
+            cloud_send_message(dev_id, pushall, 0);
+            OBN_INFO("cloud on_msg_cb: first message for dev=%s, dispatched proactive pushall", dev_id.c_str());
+        }
         if (first && on_printer_connected) {
             BBL::OnPrinterConnectedFn cb = on_printer_connected;
             BBL::QueueOnMainFn        q;
@@ -2702,7 +2707,15 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
     if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    return sess->add_subscribe(filtered);
+    int rc = sess->add_subscribe(filtered);
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        for (const auto& d : filtered) {
+            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
+            cloud_send_message(d, pushall, 0);
+            OBN_INFO("cloud_add_subscribe: dispatched proactive pushall to dev=%s", d.c_str());
+        }
+    }
+    return rc;
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
