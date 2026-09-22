@@ -1175,6 +1175,87 @@ void Agent::maybe_install_app_cert(const std::string& dev_id)
     (void)request_app_cert_install(dev_id);
 }
 
+// Rescue pattern for Option B (cloud-paired, Developer Mode OFF):
+// When Bambu Cloud dispatches project_file to the printer unsigned, firmware
+// rejects it with err_code 84033543 / HMS 0500-0500-0001-0007 and publishes
+// the rejection back on device/<id>/report. We intercept that frame here,
+// strip err_code, bump sequence_id, and re-publish through send_message which
+// runs maybe_sign (encrypts url->url_enc, param->param_enc, RSA-signs header).
+// The printer then receives the same cloud-dispatched command — same S3 GET URL,
+// same AMS mapping — but now signed by the trusted slicer key, and executes it.
+void Agent::rescue_cloud_project_file(const std::string& dev_id,
+                                       const std::string& json)
+{
+    // Fast prefilter: must contain both the command and the rejection code.
+    if (json.find("\"project_file\"") == std::string::npos) return;
+    if (json.find("84033543") == std::string::npos) return;
+
+    auto root = obn::json::parse(json);
+    if (!root) return;
+    const obn::json::Value& print_val = root->find("print");
+    if (print_val.kind() != obn::json::Value::Kind::Object) return;
+
+    obn::json::Object print_obj = print_val.as_object();
+
+    // Confirm command == "project_file"
+    auto cmd_it = print_obj.find("command");
+    if (cmd_it == print_obj.end() || !cmd_it->second.is_string()) return;
+    if (cmd_it->second.as_string() != "project_file") return;
+
+    // Confirm err_code == 84033543
+    auto err_it = print_obj.find("err_code");
+    if (err_it == print_obj.end()) return;
+    {
+        bool is_rejection = false;
+        if (err_it->second.is_number()) {
+            is_rejection = (err_it->second.as_int() == 84033543LL);
+        }
+        if (!is_rejection) return;
+    }
+
+    // Extract task_id for deduplication.
+    std::string task_id;
+    auto tid_it = print_obj.find("task_id");
+    if (tid_it != print_obj.end() && tid_it->second.is_string())
+        task_id = tid_it->second.as_string();
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!task_id.empty()) {
+            if (!rescued_tasks_.insert(task_id).second) {
+                OBN_DEBUG("rescue_cloud_project_file dev=%s task=%s: already rescued, skip",
+                          dev_id.c_str(), task_id.c_str());
+                return;
+            }
+        }
+    }
+
+    OBN_INFO("rescue_cloud_project_file dev=%s task=%s: intercepting unsigned rejection",
+             dev_id.c_str(), task_id.c_str());
+
+    // Build cleaned command: remove err_code, refresh sequence_id.
+    print_obj.erase("err_code");
+    print_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+
+    // Reconstruct: {"print": {...}}
+    obn::json::Object new_root;
+    new_root["print"] = obn::json::Value(std::move(print_obj));
+    const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+    // Fire on background thread so we don't block the MQTT receive callback.
+    std::string dev_id_copy = dev_id;
+    std::thread([this, dev_id_copy, req_json]() mutable {
+        int rc = send_message(dev_id_copy, req_json, /*qos=*/0);
+        if (rc == BAMBU_NETWORK_SUCCESS) {
+            OBN_INFO("rescue_cloud_project_file dev=%s: signed project_file dispatched OK",
+                     dev_id_copy.c_str());
+        } else {
+            OBN_WARN("rescue_cloud_project_file dev=%s: send_message failed rc=%d",
+                     dev_id_copy.c_str(), rc);
+        }
+    }).detach();
+}
+
 int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
@@ -1422,10 +1503,12 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_security_flags(dev_id, json);
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
+    rescue_cloud_project_file(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
     // defer-close the cloud report subscription for this device.
     maybe_prefer_lan_subscription(dev_id);
+
 
     BBL::OnMessageFn cb;
     std::string connect_ip;
@@ -2583,6 +2666,7 @@ int Agent::connect_cloud()
         harvest_security_flags(dev_id, json);
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
+        rescue_cloud_project_file(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")

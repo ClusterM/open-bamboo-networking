@@ -31,9 +31,20 @@
 name: Build
 
 on:
-  push:
   workflow_dispatch:
-  pull_request:
+    inputs:
+      abi:
+        description: 'ABI version (default: 02.08.02, or "all")'
+        required: false
+        default: '02.08.02'
+      arch:
+        description: 'Architecture (x64, arm64, all)'
+        required: false
+        default: 'x64'
+      target_os:
+        description: 'Target OS (windows, linux, macos, all)'
+        required: false
+        default: 'windows'
 
 permissions:
   contents: read
@@ -55,14 +66,19 @@ jobs:
       - name: List ABI versions from abi_snapshot dirs
         id: list
         run: |
-          VERSIONS=$(ls -d tools/abi_snapshot/v*/ \
-            | sed 's|.*/v||; s|/$||' \
-            | jq -Rnc '[inputs]')
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.abi }}" != "all" ] && [ -n "${{ inputs.abi }}" ]; then
+            VERSIONS=$(jq -nc --arg v "${{ inputs.abi }}" '[$v]')
+          else
+            VERSIONS=$(ls -d tools/abi_snapshot/v*/ \
+              | sed 's|.*/v||; s|/$||' \
+              | jq -Rnc '[inputs]')
+          fi
           echo "matrix=$VERSIONS" >> "$GITHUB_OUTPUT"
           echo "Discovered ABI versions: $VERSIONS"
 
   build:
     name: v${{ matrix.abi }}.xx-linux-${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'linux'
     needs: [discover-abi]
     runs-on: ${{ matrix.arch == 'x64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     strategy:
@@ -129,15 +145,14 @@ jobs:
 
   build-windows:
     name: v${{ matrix.abi }}.xx-windows-${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'windows'
     needs: [discover-abi]
     runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-2022' }}
     strategy:
       fail-fast: false
       matrix:
         abi: ${{ fromJSON(needs.discover-abi.outputs.abi-matrix) }}
-        arch:
-          - x64
-          - arm64
+        arch: ${{ (github.event_name == 'workflow_dispatch' && inputs.arch == 'x64') && fromJSON('["x64"]') || (github.event_name == 'workflow_dispatch' && inputs.arch == 'arm64') && fromJSON('["arm64"]') || fromJSON('["x64", "arm64"]') }}
 
     steps:
       - name: Checkout
@@ -205,6 +220,7 @@ jobs:
 
   build-macos:
     name: v${{ matrix.abi }}.xx-macos-arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.target_os == 'all' || inputs.target_os == 'macos'
     needs: [discover-abi]
     runs-on: macos-latest
     strategy:

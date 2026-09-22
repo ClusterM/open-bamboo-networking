@@ -1,5 +1,6 @@
 #include "obn/cert_store.hpp"
 
+#include "obn/config.hpp"
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
 
@@ -275,11 +276,34 @@ bool capture_peer_cert_pem(const std::string& host,
 
 EVP_PKEY* get_printer_pub_key(const std::string& dev_id)
 {
-    std::lock_guard<std::mutex> lk(g_pubkey_mu);
-    auto it = g_pubkey_map.find(dev_id);
-    if (it == g_pubkey_map.end()) return nullptr;
-    ::EVP_PKEY_up_ref(it->second); // caller must EVP_PKEY_free
-    return it->second;
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        auto it = g_pubkey_map.find(dev_id);
+        if (it != g_pubkey_map.end()) {
+            ::EVP_PKEY_up_ref(it->second); // caller must EVP_PKEY_free
+            return it->second;
+        }
+    }
+
+    // Disk fallback: in pure cloud mode or when LAN wasn't connected yet,
+    // look for certs/<dev_id>.pem in config_dir so signed commands
+    // have url_enc/param_enc populated.
+    const std::string& cdir = obn::config::dir();
+    if (!cdir.empty()) {
+        std::string cert_file = device_cert_path(cdir, dev_id);
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(cert_file, ec)) {
+            if (prime_pub_key_from_cert_file(dev_id, cert_file)) {
+                std::lock_guard<std::mutex> lk(g_pubkey_mu);
+                auto it = g_pubkey_map.find(dev_id);
+                if (it != g_pubkey_map.end()) {
+                    ::EVP_PKEY_up_ref(it->second);
+                    return it->second;
+                }
+            }
+        }
+    }
+    return nullptr;
 }
 
 void set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey)

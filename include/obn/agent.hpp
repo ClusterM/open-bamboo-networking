@@ -587,12 +587,24 @@ private:
     std::set<std::string> certified_devs_;
     // Devices whose app_cert_install got result=SUCCESS (+ printer_cert)
     // this MQTT session. Set in harvest_security_report, not at publish.
-    // Cleared on LAN disconnect so Studio can re-provision. Guarded by mu_.
     std::set<std::string> app_cert_install_sent_;
     // Signalled when a dev_id is inserted into app_cert_install_sent_ (i.e. the
     // printer acknowledged security.app_cert_install). wait_for_app_cert()
     // waits on this instead of polling. Waits on mu_.
     std::condition_variable app_cert_cv_;
+
+    // task_ids for which we already re-dispatched a rescued project_file.
+    // Prevents duplicate rescues when both LAN and cloud report arrive.
+    // Guarded by mu_.
+    std::set<std::string> rescued_tasks_;
+
+    // Intercepts a Bambu Cloud unsigned project_file rejection (err_code
+    // 84033543 / HMS 0500-0500-0001-0007) and re-publishes it signed+encrypted
+    // via send_message so the printer accepts it under Option B (Dev Mode OFF).
+    // `json` is the raw MQTT report frame from device/<dev_id>/report.
+    // No-op when: key unavailable, err_code != 84033543, already rescued.
+    void rescue_cloud_project_file(const std::string& dev_id,
+                                   const std::string& json);
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.
