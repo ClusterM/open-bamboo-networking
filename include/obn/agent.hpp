@@ -89,6 +89,8 @@ private:
 // itself.
 class Agent {
 public:
+    static Agent* active_instance() noexcept;
+
     explicit Agent(std::string log_dir);
     ~Agent();
 

@@ -517,6 +517,7 @@ else()
     set_target_properties(BambuSource PROPERTIES OUTPUT_NAME "BambuSource" PREFIX "lib")
     target_link_libraries(BambuSource PRIVATE
         OpenSSL::SSL OpenSSL::Crypto
+        ${CMAKE_DL_LIBS}
     )
 endif()
 

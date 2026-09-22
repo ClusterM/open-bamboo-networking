@@ -82,11 +82,22 @@ std::string ipv4_from_le_int(std::int64_t v)
            std::to_string((v >> 16) & 0xFF) + "." + std::to_string((v >> 24) & 0xFF);
 }
 
-} // namespace
+static std::atomic<Agent*> s_active_agent{nullptr};
 
-Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
+Agent* Agent::active_instance() noexcept
+{
+    return s_active_agent.load(std::memory_order_acquire);
+}
+
+Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir))
+{
+    s_active_agent.store(this, std::memory_order_release);
+}
+
 Agent::~Agent()
 {
+    Agent* expected = this;
+    s_active_agent.compare_exchange_strong(expected, nullptr);
     shutdown_lan_session();
     {
         std::lock_guard<std::mutex> lk(lan_watchdog_mu_);

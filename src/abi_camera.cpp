@@ -65,3 +65,24 @@ OBN_ABI int bambu_network_get_hms_snapshot(void* /*agent*/,
     if (callback) callback(std::string{}, -1);
     return BAMBU_NETWORK_SUCCESS;
 }
+
+OBN_ABI const char* obn_get_tutk_camera_url(const char* dev_id)
+{
+    static thread_local std::string s_last_url;
+    s_last_url.clear();
+    if (!dev_id || !*dev_id) return nullptr;
+
+    auto* a = obn::Agent::active_instance();
+    if (!a) {
+        OBN_WARN("obn_get_tutk_camera_url: no active agent for dev=%s", dev_id);
+        return nullptr;
+    }
+
+    s_last_url = a->remote_camera_url(dev_id);
+    if (s_last_url.empty()) {
+        OBN_WARN("obn_get_tutk_camera_url: remote_camera_url returned empty for dev=%s", dev_id);
+        return nullptr;
+    }
+    OBN_INFO("obn_get_tutk_camera_url: dev=%s -> %.80s", dev_id, s_last_url.c_str());
+    return s_last_url.c_str();
+}

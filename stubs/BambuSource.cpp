@@ -113,6 +113,10 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include <filesystem>
+#if !defined(_WIN32)
+#  include <dlfcn.h>
+#endif
 
 #include "obn/config.hpp"
 #include "obn/ftps.hpp"
@@ -774,6 +778,8 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     t->height = si.height;
     t->frame_rate = si.fps;
     t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+    t->t0 = std::chrono::steady_clock::now();
+    t->started = true;
     log_fmt(t->logger, t->log_ctx, "open_tutk: stream ready (%dx%d @ %d fps, subtype=%d)",
             t->width, t->height, t->frame_rate, t->sub_type);
     return Bambu_success;
@@ -788,13 +794,16 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
         return Bambu_would_block;
     }
 
+    auto now = std::chrono::steady_clock::now();
+    auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t->t0).count();
+
     t->tutk_current_frame = std::move(frame_opt->nal_data);
     sample->itrack      = 0;
     sample->size        = static_cast<int>(t->tutk_current_frame.size());
     sample->flags       = frame_opt->is_keyframe ? 1 : 0;
     sample->buffer      = t->tutk_current_frame.data();
     sample->decode_time = static_cast<unsigned long long>(
-        frame_opt->pts_us > 0 ? frame_opt->pts_us / 1000ULL : 0ULL);
+        frame_opt->pts_us > 0 ? frame_opt->pts_us * 10ULL : (ns / 100));
 
     ++t->frame_count;
     if ((t->frame_count & 0x3F) == 1) {
@@ -805,6 +814,114 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     }
     return Bambu_success;
 }
+
+using GetTutkUrlFn = const char* (*)(const char*);
+
+static std::string query_tutk_url(const std::string& dev_id)
+{
+    if (dev_id.empty()) return {};
+#if defined(_WIN32)
+    static const char* const kModNames[] = {
+        "bambu_networking.dll",
+        "bambu_networking_02.07.01.dll",
+        "bambu_networking_02.07.01.99.dll",
+        "bambu_networking_02.07.01.51.dll",
+        "bambu_networking_01.10.01.09.dll",
+        "libbambu_networking.dll",
+        nullptr
+    };
+    GetTutkUrlFn fn = nullptr;
+    for (int i = 0; kModNames[i]; ++i) {
+        HMODULE h = GetModuleHandleA(kModNames[i]);
+        if (h) {
+            fn = reinterpret_cast<GetTutkUrlFn>(GetProcAddress(h, "obn_get_tutk_camera_url"));
+            if (fn) break;
+        }
+    }
+
+    if (!fn) {
+        HMODULE hSelf = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(&query_tutk_url), &hSelf) && hSelf) {
+            char selfPath[1024];
+            if (GetModuleFileNameA(hSelf, selfPath, sizeof(selfPath)) > 0) {
+                std::filesystem::path dir = std::filesystem::path(selfPath).parent_path();
+                std::error_code ec;
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    if (!entry.is_regular_file()) continue;
+                    auto filename = entry.path().filename().string();
+                    if (filename.find("bambu_networking") != std::string::npos &&
+                        entry.path().extension() == ".dll") {
+                        HMODULE h = GetModuleHandleA(filename.c_str());
+                        if (h) {
+                            fn = reinterpret_cast<GetTutkUrlFn>(GetProcAddress(h, "obn_get_tutk_camera_url"));
+                            if (fn) break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#else
+    GetTutkUrlFn fn = reinterpret_cast<GetTutkUrlFn>(dlsym(RTLD_DEFAULT, "obn_get_tutk_camera_url"));
+#endif
+    if (!fn) return {};
+    const char* u = fn(dev_id.c_str());
+    return u ? std::string(u) : std::string{};
+}
+
+static bool fallback_to_tutk(Tunnel* t)
+{
+    if (!t) return false;
+    std::string dev_id = t->url.device;
+    if (dev_id.empty()) return false;
+
+    log_fmt(t->logger, t->log_ctx,
+            "fallback_to_tutk: querying TUTK URL for dev=%s",
+            dev_id.c_str());
+    std::string tutk_url = query_tutk_url(dev_id);
+    if (tutk_url.empty()) {
+        log_fmt(t->logger, t->log_ctx,
+                "fallback_to_tutk: failed to resolve TUTK URL for dev=%s",
+                dev_id.c_str());
+        return false;
+    }
+
+    log_fmt(t->logger, t->log_ctx,
+            "fallback_to_tutk: resolved TUTK URL: %.120s",
+            tutk_url.c_str());
+    TunnelUrl new_url;
+    if (!parse_url(tutk_url, &new_url)) {
+        log_fmt(t->logger, t->log_ctx,
+                "fallback_to_tutk: failed to parse resolved TUTK URL");
+        return false;
+    }
+
+    if (new_url.device.empty()) new_url.device = dev_id;
+
+    // Clean up LAN/TLS resources before switching to TUTK
+    {
+        std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+        if (t->ssl) {
+            SSL_shutdown(t->ssl);
+            SSL_free(t->ssl);
+            t->ssl = nullptr;
+        }
+        if (obn::os::socket_valid(t->fd)) {
+            obn::os::close_socket(t->fd);
+            t->fd = obn::os::kInvalidSocket;
+        }
+    }
+    if (t->rtsp_pass) {
+        t->rtsp_pass->stop();
+        t->rtsp_pass.reset();
+    }
+
+    t->url = std::move(new_url);
+    return true;
+}
+
 
 
 // -----------------------------------------------------------------------
@@ -1767,7 +1884,17 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     // hand raw H.264 byte-stream back to gstbambusrc, so this path is
     // gated only on the URL scheme.
     if (t->url.scheme == Scheme::Rtsps || t->url.scheme == Scheme::Rtsp) {
-        return open_rtsp(t);
+        int rc = open_rtsp(t);
+        if (rc == Bambu_success) return rc;
+        if (!t->url.device.empty()) {
+            log_fmt(t->logger, t->log_ctx,
+                    "Bambu_Open: RTSP open failed, attempting TUTK cloud fallback for dev=%s",
+                    t->url.device.c_str());
+            if (fallback_to_tutk(t)) {
+                return open_tutk(t);
+            }
+        }
+        return rc;
     }
 
     // TUTK cloud / relay liveview (off-LAN or remote)
@@ -1784,6 +1911,14 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
                            &t->fd, &t->ssl, serial) != 0) {
         log_fmt(t->logger, t->log_ctx, "Bambu_Open: TLS dial failed: %s",
                 obn::source::get_last_error());
+        if (!t->url.device.empty()) {
+            log_fmt(t->logger, t->log_ctx,
+                    "Bambu_Open: attempting TUTK cloud fallback for dev=%s",
+                    t->url.device.c_str());
+            if (fallback_to_tutk(t)) {
+                return open_tutk(t);
+            }
+        }
         return -1;
     }
 
@@ -1830,7 +1965,16 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
         t->url.scheme = (t->url.lv == "rtsps") ? Scheme::Rtsps : Scheme::Rtsp;
         t->url.port   = (t->url.lv == "rtsps") ? 322 : 554;
         t->url.path   = "/streaming/live/1";
-        return open_rtsp(t);
+        int rc = open_rtsp(t);
+        if (rc != Bambu_success && !t->url.device.empty()) {
+            log_fmt(t->logger, t->log_ctx,
+                    "Bambu_StartStream: RTSP redirect failed, attempting TUTK cloud fallback for dev=%s",
+                    t->url.device.c_str());
+            if (fallback_to_tutk(t)) {
+                return open_tutk(t);
+            }
+        }
+        return rc;
     }
 
     if (t->url.scheme == Scheme::Tutk) return Bambu_success;
@@ -1841,9 +1985,23 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
     if (t->url.scheme == Scheme::Local && !t->ctrl_mode && !t->mjpg_authed) {
         uint8_t auth[80];
         build_auth_packet(t->url, auth);
-        std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
-        if (obn::tls::ssl_write_all(t->ssl, auth, sizeof(auth)) != 0) {
+        bool write_failed = false;
+        {
+            std::lock_guard<std::mutex> lk(t->mjpg_io_mu);
+            if (obn::tls::ssl_write_all(t->ssl, auth, sizeof(auth)) != 0) {
+                write_failed = true;
+            }
+        }
+        if (write_failed) {
             set_last_error("MJPEG auth write failed");
+            if (!t->url.device.empty()) {
+                log_fmt(t->logger, t->log_ctx,
+                        "Bambu_StartStream: MJPEG auth failed, attempting TUTK cloud fallback for dev=%s",
+                        t->url.device.c_str());
+                if (fallback_to_tutk(t)) {
+                    return open_tutk(t);
+                }
+            }
             return -1;
         }
         t->mjpg_authed = true;
