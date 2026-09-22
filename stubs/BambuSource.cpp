@@ -773,7 +773,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     t->width = si.width;
     t->height = si.height;
     t->frame_rate = si.fps;
-    t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+    t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
     log_fmt(t->logger, t->log_ctx, "open_tutk: stream ready (%dx%d @ %d fps, subtype=%d)",
             t->width, t->height, t->frame_rate, t->sub_type);
     return Bambu_success;
