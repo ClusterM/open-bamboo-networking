@@ -235,24 +235,31 @@ std::string rsa_pkcs1_sign_raw_b64(EVP_PKEY* pkey,
     return base64_encode(sig.data(), siglen);
 }
 
-// Returns true if the payload's first JSON key is "print".
-bool is_print_payload(const std::string& payload) noexcept
+// Returns "print", "liveview" (only for prepare commands), or empty if neither.
+std::string signable_root_key(const std::string& payload) noexcept
 {
     const char* p   = payload.data();
     const char* end = p + payload.size();
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
-    if (p >= end || *p != '{') return false;
+    if (p >= end || *p != '{') return {};
     ++p;
     while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
-    const char kKey[] = "\"print\"";
-    if (p + 7 > end) return false;
-    for (int i = 0; i < 7; ++i)
-        if (p[i] != kKey[i]) return false;
-    return true;
+    if (p >= end || *p != '"') return {};
+    ++p;
+    const char* kstart = p;
+    while (p < end && *p != '"') ++p;
+    if (p >= end) return {};
+    std::string key(kstart, p - kstart);
+    if (key == "print") return key;
+    if (key == "liveview") {
+        if (payload.find("\"prepare\"") != std::string::npos) return key;
+    }
+    return {};
 }
 
 // The one field each command carries as device-cert ciphertext
-// (research/10.03): project_file's model url, gcode_line's raw G-code.
+// (research/10.03): project_file's model url, gcode_line's raw G-code,
+// prepare's liveview ttcode.
 // project_file's `param` is the plate path the firmware reads in cleartext;
 // encrypting (and dropping) it makes the printer fail with 0500-4003
 // (cannot parse file).
@@ -263,6 +270,7 @@ const char* encrypted_field_for(const obn::json::Object& obj)
     const std::string c = cmd->second.as_string();
     if (c == "project_file") return "url";
     if (c == "gcode_line")   return "param";
+    if (c == "prepare")      return "ttcode";
     return nullptr;
 }
 
@@ -302,16 +310,18 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub,
         obj.erase(it);
 }
 
-// Builds the print dump ({...sorted keys...}) after optional field encryption.
+// Builds the command dump ({...sorted keys...}) after optional field encryption.
 // Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
-std::string build_print_dump(const std::string& payload, EVP_PKEY* device_pub,
-                             bool developer_mode)
+std::string build_command_dump(const std::string& root_key,
+                               const std::string& payload,
+                               EVP_PKEY*          device_pub,
+                               bool               developer_mode)
 {
     auto root = obn::json::parse(payload);
     if (!root) return {};
-    const obn::json::Value& print = root->find("print");
-    if (print.kind() != obn::json::Value::Kind::Object) return {};
-    obn::json::Object obj = print.as_object(); // copy for mutation
+    const obn::json::Value& cmd = root->find(root_key.c_str());
+    if (cmd.kind() != obn::json::Value::Kind::Object) return {};
+    obn::json::Object obj = cmd.as_object(); // copy for mutation
     encrypt_print_fields(obj, device_pub, developer_mode);
     return obn::json::Value(std::move(obj)).dump();
 }
@@ -332,7 +342,8 @@ static std::string json_str_escape(const std::string& s)
 // Builds the complete signed envelope JSON string.
 std::string build_envelope(const std::string& to_sign,
                            const std::string& sig_b64,
-                           const std::string& print_dump)
+                           const std::string& root_key,
+                           const std::string& dump)
 {
     std::string out;
     out.reserve(to_sign.size() + sig_b64.size() + 200);
@@ -346,8 +357,8 @@ std::string build_envelope(const std::string& to_sign,
     out += json_str_escape(sig_b64);
     out += "\",\"sign_ver\":\"";
     out += kSignVer;
-    out += "\"},\"print\":";
-    out += print_dump;
+    out += "\"},\"" + root_key + "\":";
+    out += dump;
     out += '}';
     return out;
 }
@@ -356,7 +367,7 @@ std::string build_envelope(const std::string& to_sign,
 
 bool would_sign(const std::string& payload_json)
 {
-    return is_print_payload(payload_json) && slicer_pkey() != nullptr;
+    return !signable_root_key(payload_json).empty() && slicer_pkey() != nullptr;
 }
 
 bool slicer_signing_key_present()
@@ -367,24 +378,23 @@ bool slicer_signing_key_present()
 std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
                        bool developer_mode)
 {
-    if (!is_print_payload(payload_json)) return payload_json;
+    const std::string root_key = signable_root_key(payload_json);
+    if (root_key.empty()) return payload_json;
 
     EVP_PKEY* pkey = slicer_pkey();
     if (!pkey) return payload_json;
 
-    // Encrypt url/param into url_enc/param_enc (when a device key is given)
-    // BEFORE signing, so the signature covers exactly what goes on the wire.
-    const std::string print_dump =
-        build_print_dump(payload_json, device_pub, developer_mode);
-    if (print_dump.empty()) return payload_json; // malformed; pass through
+    const std::string dump =
+        build_command_dump(root_key, payload_json, device_pub, developer_mode);
+    if (dump.empty()) return payload_json; // malformed; pass through
 
-    const std::string to_sign = std::string("{\"print\":") + print_dump + '}';
+    const std::string to_sign = "{\"" + root_key + "\":" + dump + "}";
 
     const std::string sig_b64 = rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
 
-    return build_envelope(to_sign, sig_b64, print_dump);
+    return build_envelope(to_sign, sig_b64, root_key, dump);
 }
 
 std::string sign_bytes(const std::string& data)

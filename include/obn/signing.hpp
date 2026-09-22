@@ -8,13 +8,14 @@ typedef struct evp_pkey_st EVP_PKEY;
 
 namespace obn::signing {
 
-// Returns a signed envelope JSON for {"print":{...}} payloads.
+// Returns a signed envelope JSON for {"print":{...}} or {"liveview":{"command":"prepare",...}} payloads.
 // All other message types pass through unchanged.
 //
 // When `device_pub` is non-null, device-cert field encryption is applied to
-// the `print` object *before* signing (so the signature covers the encrypted
-// form that goes on the wire): `url_enc` / `param_enc` are added for the one
-// field the command carries (url for project_file, param for gcode_line).
+// the payload object *before* signing (so the signature covers the encrypted
+// form that goes on the wire): `url_enc` / `param_enc` / `ttcode_enc` are added
+// for the field the command carries (url for project_file, param for gcode_line,
+// ttcode for prepare).
 // `developer_mode` selects what happens to the cleartext field afterwards:
 //   false (secured) — the cleartext is DROPPED (secured firmware reads only
 //     *_enc and rejects a message carrying both — research/§10.3);
@@ -28,10 +29,10 @@ std::string maybe_sign(const std::string& payload_json,
                        bool developer_mode = false);
 
 // True when maybe_sign() would actually sign `payload_json` — i.e. it carries a
-// top-level "print" object and a slicer key is configured. Callers use this to
-// gate a signed publish on the printer having installed the app cert this
-// session (a secured printer rejects a signature made before install with
-// 84033545 "need reset device pub key").
+// top-level "print" or signable "liveview" object and a slicer key is configured.
+// Callers use this to gate a signed publish on the printer having installed the
+// app cert this session (a secured printer rejects a signature made before install
+// with 84033545 "need reset device pub key").
 bool would_sign(const std::string& payload_json);
 
 // Blockwise RSA-PKCS#1 v1.5 encryption of `plaintext` under `pub`, returned as

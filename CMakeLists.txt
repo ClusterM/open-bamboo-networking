@@ -325,6 +325,7 @@ add_library(bambu_networking SHARED
     src/abi_ft.cpp
     src/agent.cpp
     src/auth.cpp
+    src/camera_url.cpp
     src/cert_store.cpp
     src/config.cpp
     src/cloud_auth.cpp
@@ -802,6 +803,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
         src/auth.cpp
+        src/camera_url.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -872,6 +874,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
         src/auth.cpp
+        src/camera_url.cpp
         src/cert_store.cpp
         src/config.cpp
         src/cloud_auth.cpp
@@ -999,5 +1002,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(lan_bind_tcp_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME lan_bind_tcp COMMAND lan_bind_tcp_test)
+
+    # Unit tests for packed key parsing, ttcode body/response, and URL minting.
+    add_executable(camera_url_test tests/camera_url_test.cpp
+        src/camera_url.cpp
+        src/json_lite.cpp)
+    target_include_directories(camera_url_test PRIVATE include)
+    add_test(NAME camera_url COMMAND camera_url_test)
 
 endif()
