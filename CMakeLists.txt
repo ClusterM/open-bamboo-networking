@@ -350,9 +350,18 @@ add_library(bambu_networking SHARED
     src/tunnel_local.cpp
     src/tunnel_upload.cpp
     src/tls_dial.cpp
+    src/camera.cpp
+    src/camera/AgoraUrl.cpp
+    src/camera/CameraSourceFactory.cpp
+    src/camera/JpegCameraSource.cpp
+    src/camera/OssTutkCameraSource.cpp
+    src/camera/oss_agora/OssAgoraBambuSource.cpp
+    src/camera/oss_agora/OssAgoraEngine.cpp
+    src/camera/oss_agora/OssAgoraSignaling.cpp
+    src/camera/oss_tutk/IotcClient.cpp
 )
 
-target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
+target_include_directories(bambu_networking PRIVATE include src ${OBN_GENERATED_DIR})
 set(_obn_git_compile_defs "")
 if(OBN_GIT_COMMIT)
     list(APPEND _obn_git_compile_defs OBN_GIT_COMMIT="${OBN_GIT_COMMIT}")
@@ -456,6 +465,12 @@ set(_obn_bambusource_sources
     src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp
+    src/camera/AgoraUrl.cpp
+    src/camera/OssTutkCameraSource.cpp
+    src/camera/oss_agora/OssAgoraBambuSource.cpp
+    src/camera/oss_agora/OssAgoraEngine.cpp
+    src/camera/oss_agora/OssAgoraSignaling.cpp
+    src/camera/oss_tutk/IotcClient.cpp
 )
 if(WIN32)
     list(APPEND _obn_bambusource_sources

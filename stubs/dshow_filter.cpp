@@ -65,6 +65,8 @@
 #include "source_log.hpp"
 #include "tls_socket.hpp"
 #include "obn/os_compat.hpp"
+#include "camera/OssTutkCameraSource.hpp"
+#include "camera/ICameraSource.hpp"
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -275,14 +277,19 @@ enum class UrlScheme {
     Local, // MJPG over TCP/TLS on <port> (default 6000), A1/P1/P1P
     Rtsps, // RTSPS on <port> (default 322), X1/P1S/P2S/H-series/X2D
     Rtsp,  // plain RTSP, dev/test only
+    Tutk,  // TUTK off-LAN / relay camera
 };
 
 struct ParsedUrl {
     UrlScheme   scheme = UrlScheme::Local;
+    std::string raw_url;
     std::string host;
     int         port = 6000;
     std::string user = "bblp";
     std::string passwd;
+    std::string authkey;
+    std::string region;
+    std::string tutk_uid;
     std::string path = "/streaming/live/1";
     std::string lv;
 };
@@ -328,12 +335,34 @@ bool parse_bambu_url(const std::string& url, ParsedUrl* out)
     while (p < url.size() && url[p] == '/') ++p;
     std::string body = url.substr(p);
 
+    static const std::string p_tutk  = "tutk?";
     static const std::string p_local = "local/";
     static const std::string p_rtsps = "rtsps___";
     static const std::string p_rtsp  = "rtsp___";
 
     std::string rest;
-    if (body.compare(0, p_local.size(), p_local) == 0) {
+    if (body.compare(0, p_tutk.size(), p_tutk) == 0 || body.find("tutk?") != std::string::npos) {
+        out->scheme  = UrlScheme::Tutk;
+        out->raw_url = url;
+        auto q_pos = url.find('?');
+        std::string query = (q_pos == std::string::npos) ? "" : url.substr(q_pos + 1);
+        std::size_t i = 0;
+        while (i < query.size()) {
+            auto amp = query.find('&', i);
+            if (amp == std::string::npos) amp = query.size();
+            auto kv = query.substr(i, amp - i);
+            auto eq = kv.find('=');
+            std::string key = (eq == std::string::npos) ? kv : kv.substr(0, eq);
+            std::string val = (eq == std::string::npos) ? "" : url_decode(kv.substr(eq + 1));
+            if      (key == "uid")     out->tutk_uid = val;
+            else if (key == "passwd")  out->passwd   = val;
+            else if (key == "authkey") out->authkey  = val;
+            else if (key == "region")  out->region   = val;
+            i = amp + 1;
+        }
+        if (out->host.empty()) out->host = "tutk-relay";
+        return !out->tutk_uid.empty();
+    } else if (body.compare(0, p_local.size(), p_local) == 0) {
         out->scheme = UrlScheme::Local;
         out->port   = 6000;
         rest = body.substr(p_local.size());
@@ -1521,6 +1550,46 @@ void BambuSourceOutPin::worker_main()
             if (input) input->Release();
         }
         pass.stop();
+    } else if (url.scheme == UrlScheme::Tutk) {
+        // ---- TUTK off-LAN / relay branch ----
+        obn::camera::OssTutkCameraSource tutk_src(url.raw_url);
+        if (!tutk_src.open()) {
+            log_at(LL_ERROR, kNoLogger, nullptr, "dshow: TUTK open failed");
+            return;
+        }
+        log_at(LL_INFO, kNoLogger, nullptr, "dshow: TUTK play started");
+        while (!worker_stop_.load(std::memory_order_acquire)) {
+            auto frame = tutk_src.next_frame(100);
+            if (!frame) continue;
+            IMemAllocator* alloc = nullptr;
+            IMemInputPin*  input = nullptr;
+            borrow_targets(&alloc, &input);
+            if (alloc && input) {
+                bool first_push = (pushed == 0);
+                HRESULT hr = push_sample_into(alloc, input, frame->nal_data.data(),
+                                              frame->nal_data.size(),
+                                              now_dt_100ns(),
+                                              frame->is_keyframe,
+                                              first_push,
+                                              333333);
+                if (FAILED(hr) && hr != S_FALSE) {
+                    log_at(LL_WARN, kNoLogger, nullptr,
+                           "dshow: TUTK push failed hr=0x%08lx size=%zu key=%d",
+                           static_cast<unsigned long>(hr), frame->nal_data.size(),
+                           frame->is_keyframe ? 1 : 0);
+                }
+                ++pushed;
+                if (first_push) {
+                    log_at(LL_INFO, kNoLogger, nullptr,
+                           "dshow: TUTK first sample pushed (size=%zu key=%d hr=0x%08lx)",
+                           frame->nal_data.size(), frame->is_keyframe ? 1 : 0,
+                           static_cast<unsigned long>(hr));
+                }
+            }
+            if (alloc) alloc->Release();
+            if (input) input->Release();
+        }
+        tutk_src.close();
     } else {
         // ---- Local / framed-JPEG (MJPG) branch ----
         // Studio negotiates a 16-byte length-prefixed frame stream over

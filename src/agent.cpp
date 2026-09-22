@@ -1367,10 +1367,10 @@ std::string Agent::camera_url_for(const std::string& dev_id)
             lv = it->second;
     }
     if (ip.empty() || code.empty()) {
-        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
+        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s) — trying remote TUTK",
                  dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
                  code.empty() ? "unknown" : "known");
-        return {};
+        return remote_camera_url(dev_id);
     }
 
     // The :6000 tunnel (and a possible RTSPS liveview redirect) verify the
@@ -1384,6 +1384,10 @@ std::string Agent::camera_url_for(const std::string& dev_id)
     return url;
 }
 
+// Remote (cloud/off-LAN) camera URL: mint bambu:///tutk?... from the
+// iot-service ttcode endpoint, which returns the per-device TUTK credentials
+// (uid + authkey/passwd/region). Studio then hands this to BambuSource, which
+// runs the TUTK rendezvous (OssTutkCameraSource / IotcClient).
 std::string Agent::remote_camera_url(const std::string& dev_id)
 {
     auto hdrs = cloud_api_http_headers();

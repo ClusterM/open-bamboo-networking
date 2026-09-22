@@ -124,6 +124,8 @@
 #include "source_log.hpp"
 #include "rtsp_passthrough.hpp"
 #include "tls_socket.hpp"
+#include "camera/OssTutkCameraSource.hpp"
+#include "camera/ICameraSource.hpp"
 
 #if defined(_WIN32)
 #    define OBN_EXPORT extern "C" __declspec(dllexport)
@@ -229,14 +231,20 @@ enum class Scheme {
     Local, // MJPG over TCP/TLS on <port> (default 6000)
     Rtsps, // RTSPS on <port> (default 322)
     Rtsp,  // plain RTSP on <port> (default 554)
+    Tutk,  // TUTK off-LAN / relay camera
 };
 
 struct TunnelUrl {
     Scheme      scheme = Scheme::Local;
+    std::string raw_url;
     std::string host;
     int         port = 6000;
     std::string user = "bblp";
     std::string passwd;
+    std::string authkey;
+    std::string region;
+    std::string tutk_uid;
+    std::string channel;
     std::string device;
     std::string cli_id;
     std::string cli_ver;
@@ -294,12 +302,36 @@ bool parse_url(const std::string& url, TunnelUrl* out)
         body = url;
     }
 
+    static const std::string p_tutk  = "tutk?";
     static const std::string p_local = "local/";
     static const std::string p_rtsps = "rtsps___";
     static const std::string p_rtsp  = "rtsp___";
 
     std::string rest;
-    if (body.compare(0, p_local.size(), p_local) == 0) {
+    if (body.compare(0, p_tutk.size(), p_tutk) == 0 || body.find("tutk?") != std::string::npos) {
+        out->scheme  = Scheme::Tutk;
+        out->raw_url = url;
+        auto q_pos = url.find('?');
+        std::string query = (q_pos == std::string::npos) ? "" : url.substr(q_pos + 1);
+        size_t i = 0;
+        while (i < query.size()) {
+            auto amp = query.find('&', i);
+            if (amp == std::string::npos) amp = query.size();
+            auto kv = query.substr(i, amp - i);
+            auto eq = kv.find('=');
+            std::string key = (eq == std::string::npos) ? kv : kv.substr(0, eq);
+            std::string val = (eq == std::string::npos) ? "" : url_decode(kv.substr(eq + 1));
+            if      (key == "uid")     { out->tutk_uid = val; }
+            else if (key == "passwd")  { out->passwd = val; }
+            else if (key == "authkey") { out->authkey = val; }
+            else if (key == "region")  { out->region = val; }
+            else if (key == "device")  { out->device = val; }
+            else if (key == "channel") { out->channel = val; }
+            i = amp + 1;
+        }
+        if (out->host.empty()) out->host = "tutk-relay";
+        return !out->tutk_uid.empty();
+    } else if (body.compare(0, p_local.size(), p_local) == 0) {
         out->scheme = Scheme::Local;
         out->port   = 6000;
         rest = body.substr(p_local.size());
@@ -548,12 +580,20 @@ struct Tunnel {
     // Bambu_ReadSample's `sample->buffer`. We keep it alive until the
     // NEXT ReadSample call (same contract as frame_buf above).
     std::string                ctrl_current_reply;
+
+    // ---- TUTK off-LAN / relay camera state (Scheme::Tutk) ----
+    std::unique_ptr<obn::camera::OssTutkCameraSource> tutk_source;
+    std::vector<uint8_t>       tutk_current_frame;
 };
 
 void tunnel_close(Tunnel* t)
 {
     if (!t) return;
     t->closing.store(true, std::memory_order_release);
+    if (t->tutk_source) {
+        t->tutk_source->close();
+        t->tutk_source.reset();
+    }
     log_at(LL_DEBUG, t->logger, t->log_ctx,
            "tunnel_close: shutting down (fd=%lld ssl=%p frames=%llu)",
            static_cast<long long>(t->fd), static_cast<void*>(t->ssl),
@@ -710,6 +750,59 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     sample->flags       = flags;
     sample->buffer      = buf;
     sample->decode_time = static_cast<unsigned long long>(dt_100ns);
+    return Bambu_success;
+}
+
+// -----------------------------------------------------------------------
+// TUTK off-LAN / relay video source.
+// Uses obn::camera::OssTutkCameraSource to connect to ThroughTek
+// master/relay server and stream H.264 / MJPEG frames.
+// -----------------------------------------------------------------------
+
+[[maybe_unused]] int open_tutk(Tunnel* t)
+{
+    log_fmt(t->logger, t->log_ctx, "open_tutk: starting TUTK session url=%.160s", t->url.raw_url.c_str());
+    t->tutk_source = std::make_unique<obn::camera::OssTutkCameraSource>(t->url.raw_url);
+    if (!t->tutk_source->open()) {
+        log_fmt(t->logger, t->log_ctx, "open_tutk: failed to open TUTK stream");
+        set_last_error("TUTK stream open failed");
+        t->tutk_source.reset();
+        return -1;
+    }
+    auto si = t->tutk_source->info();
+    t->width = si.width;
+    t->height = si.height;
+    t->frame_rate = si.fps;
+    t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+    log_fmt(t->logger, t->log_ctx, "open_tutk: stream ready (%dx%d @ %d fps, subtype=%d)",
+            t->width, t->height, t->frame_rate, t->sub_type);
+    return Bambu_success;
+}
+
+[[maybe_unused]] int read_tutk(Tunnel* t, Bambu_Sample* sample)
+{
+    if (!t->tutk_source || !t->tutk_source->is_open()) return -1;
+
+    auto frame_opt = t->tutk_source->next_frame(100);
+    if (!frame_opt) {
+        return Bambu_would_block;
+    }
+
+    t->tutk_current_frame = std::move(frame_opt->nal_data);
+    sample->itrack      = 0;
+    sample->size        = static_cast<int>(t->tutk_current_frame.size());
+    sample->flags       = frame_opt->is_keyframe ? 1 : 0;
+    sample->buffer      = t->tutk_current_frame.data();
+    sample->decode_time = static_cast<unsigned long long>(
+        frame_opt->pts_us > 0 ? frame_opt->pts_us / 1000ULL : 0ULL);
+
+    ++t->frame_count;
+    if ((t->frame_count & 0x3F) == 1) {
+        log_fmt(t->logger, t->log_ctx,
+                "read_tutk: frame %llu size=%d key=%d pts=%llu",
+                static_cast<unsigned long long>(t->frame_count),
+                sample->size, sample->flags, sample->decode_time);
+    }
     return Bambu_success;
 }
 
@@ -1640,6 +1733,7 @@ OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
     }
     const char* scheme_name = (t->url.scheme == Scheme::Rtsps) ? "rtsps"
                             : (t->url.scheme == Scheme::Rtsp)  ? "rtsp"
+                            : (t->url.scheme == Scheme::Tutk)  ? "tutk"
                             :                                    "local";
     log_fmt(t->logger, t->log_ctx,
             "Bambu_Create: parsed scheme=%s host=%s port=%d path=%s "
@@ -1674,6 +1768,11 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     // gated only on the URL scheme.
     if (t->url.scheme == Scheme::Rtsps || t->url.scheme == Scheme::Rtsp) {
         return open_rtsp(t);
+    }
+
+    // TUTK cloud / relay liveview (off-LAN or remote)
+    if (t->url.scheme == Scheme::Tutk) {
+        return open_tutk(t);
     }
 
     log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing tls://%s:%d",
@@ -1734,6 +1833,7 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
         return open_rtsp(t);
     }
 
+    if (t->url.scheme == Scheme::Tutk) return Bambu_success;
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return -1;
@@ -1769,6 +1869,9 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return 0;
+    if (t->url.scheme == Scheme::Tutk) {
+        return (t->tutk_source && t->tutk_source->is_open()) ? 1 : 0;
+    }
     if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return 0;
@@ -1780,6 +1883,21 @@ OBN_EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index,
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t || !info || index != 0) return -1;
+    if (t->url.scheme == Scheme::Tutk) {
+        std::memset(info, 0, sizeof(*info));
+        info->type                    = VIDE;
+        info->sub_type                = t->sub_type;
+        info->format.video.width      = t->width;
+        info->format.video.height     = t->height;
+        info->format.video.frame_rate = t->frame_rate;
+        info->format_type             = (t->sub_type == MJPG)
+                                            ? video_jpeg
+                                            : video_avc_byte_stream;
+        info->format_size             = 0;
+        info->max_frame_size          = static_cast<int>(kMaxFrameSize);
+        info->format_buffer           = nullptr;
+        return Bambu_success;
+    }
     std::memset(info, 0, sizeof(*info));
     info->type                    = VIDE;
     info->sub_type                = t->sub_type;
@@ -1838,6 +1956,11 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
     // RTSP: pull from the IVideoPipeline. MJPG path continues below.
     if (t->url.scheme == Scheme::Rtsps || t->url.scheme == Scheme::Rtsp) {
         return read_rtsp(t, sample);
+    }
+
+    // TUTK: pull from OssTutkCameraSource.
+    if (t->url.scheme == Scheme::Tutk) {
+        return read_tutk(t, sample);
     }
 
     if (!t->ssl) return -1;
