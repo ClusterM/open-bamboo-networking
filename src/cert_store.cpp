@@ -1,7 +1,11 @@
 #include "obn/cert_store.hpp"
 
+#include "obn/config.hpp"
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
+
+#include <chrono>
+#include <filesystem>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -53,6 +57,12 @@ std::once_flag g_ssl_init;
 // ref-bumped pointer so the caller can safely use it after unlock.
 std::mutex                       g_pubkey_mu;
 std::map<std::string, EVP_PKEY*> g_pubkey_map;
+// Negative cache: remember dev_ids with missing or unparseable on-disk certs
+// to avoid repeated filesystem stats on high-frequency publish paths.
+std::map<std::string, std::chrono::steady_clock::time_point> g_pubkey_neg_cache;
+// Mtime cache: track file modification time of loaded certs to detect rotation.
+std::map<std::string, std::filesystem::file_time_type>        g_pubkey_disk_mtime;
+constexpr auto                                                kNegCacheTtl = std::chrono::seconds(10);
 
 void init_openssl_once()
 {
@@ -275,11 +285,69 @@ bool capture_peer_cert_pem(const std::string& host,
 
 EVP_PKEY* get_printer_pub_key(const std::string& dev_id)
 {
-    std::lock_guard<std::mutex> lk(g_pubkey_mu);
-    auto it = g_pubkey_map.find(dev_id);
-    if (it == g_pubkey_map.end()) return nullptr;
-    ::EVP_PKEY_up_ref(it->second); // caller must EVP_PKEY_free
-    return it->second;
+    if (dev_id.empty()) return nullptr;
+
+    const auto now = std::chrono::steady_clock::now();
+    const std::string& cdir = obn::config::dir();
+    const std::string cert_file = cdir.empty() ? "" : device_cert_path(cdir, dev_id);
+
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        auto it = g_pubkey_map.find(dev_id);
+        if (it != g_pubkey_map.end()) {
+            // Check whether on-disk certificate was rotated / modified
+            if (!cert_file.empty()) {
+                std::error_code ec;
+                auto disk_mtime = std::filesystem::last_write_time(cert_file, ec);
+                if (!ec) {
+                    auto mt_it = g_pubkey_disk_mtime.find(dev_id);
+                    if (mt_it != g_pubkey_disk_mtime.end() && disk_mtime > mt_it->second) {
+                        ::EVP_PKEY_free(it->second);
+                        g_pubkey_map.erase(it);
+                        g_pubkey_disk_mtime.erase(mt_it);
+                        goto disk_fallback;
+                    }
+                }
+            }
+            ::EVP_PKEY_up_ref(it->second); // caller must EVP_PKEY_free
+            return it->second;
+        }
+
+        // Consult negative cache to prevent repeated filesystem stats on every publish
+        auto neg_it = g_pubkey_neg_cache.find(dev_id);
+        if (neg_it != g_pubkey_neg_cache.end() && (now - neg_it->second) < kNegCacheTtl) {
+            return nullptr;
+        }
+    }
+
+disk_fallback:
+    // Disk fallback: in pure cloud mode or when LAN wasn't connected yet,
+    // look for certs/<dev_id>.pem in config_dir so signed commands
+    // have url_enc/param_enc populated.
+    if (!cert_file.empty()) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(cert_file, ec)) {
+            auto disk_mtime = std::filesystem::last_write_time(cert_file, ec);
+            if (prime_pub_key_from_cert_file(dev_id, cert_file)) {
+                std::lock_guard<std::mutex> lk(g_pubkey_mu);
+                if (!ec) {
+                    g_pubkey_disk_mtime[dev_id] = disk_mtime;
+                }
+                g_pubkey_neg_cache.erase(dev_id);
+                auto it = g_pubkey_map.find(dev_id);
+                if (it != g_pubkey_map.end()) {
+                    ::EVP_PKEY_up_ref(it->second);
+                    return it->second;
+                }
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        g_pubkey_neg_cache[dev_id] = now;
+    }
+    return nullptr;
 }
 
 void set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey)
@@ -287,6 +355,7 @@ void set_printer_pub_key(const std::string& dev_id, EVP_PKEY* pkey)
     if (!pkey) return; // refuse null — malformed cert should be caught upstream
     ::EVP_PKEY_up_ref(pkey); // take our own reference before acquiring the lock
     std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    g_pubkey_neg_cache.erase(dev_id);
     auto result = g_pubkey_map.emplace(dev_id, pkey);
     if (!result.second) {
         // Entry already present — drop the new ref and keep the existing key.
@@ -315,13 +384,25 @@ bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
     }
     // The device cert is authoritative, so replace any existing entry (e.g. a
     // TLS-leaf TOFU fallback) rather than keeping it like set_printer_pub_key.
-    std::lock_guard<std::mutex> lk(g_pubkey_mu);
-    auto it = g_pubkey_map.find(dev_id);
-    if (it != g_pubkey_map.end()) {
-        ::EVP_PKEY_free(it->second);
-        it->second = pk;
-    } else {
-        g_pubkey_map.emplace(dev_id, pk);
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        g_pubkey_neg_cache.erase(dev_id);
+        auto it = g_pubkey_map.find(dev_id);
+        if (it != g_pubkey_map.end()) {
+            ::EVP_PKEY_free(it->second);
+            it->second = pk;
+        } else {
+            g_pubkey_map.emplace(dev_id, pk);
+        }
+    }
+    const std::string& cdir = obn::config::dir();
+    if (!cdir.empty()) {
+        std::error_code ec;
+        auto mt = std::filesystem::last_write_time(device_cert_path(cdir, dev_id), ec);
+        if (!ec) {
+            std::lock_guard<std::mutex> lk(g_pubkey_mu);
+            g_pubkey_disk_mtime[dev_id] = mt;
+        }
     }
     return true;
 }
@@ -329,13 +410,7 @@ bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
 bool prime_pub_key_from_cert_file(const std::string& dev_id,
                                   const std::string& pem_path)
 {
-    if (dev_id.empty()) return false;
-    {
-        // Already cached (e.g. app_cert_install / capture) — nothing to do.
-        std::lock_guard<std::mutex> lk(g_pubkey_mu);
-        if (g_pubkey_map.count(dev_id)) return true;
-    }
-    if (pem_path.empty()) return false;
+    if (dev_id.empty() || pem_path.empty()) return false;
 
     FILE* f = std::fopen(pem_path.c_str(), "rb");
     if (!f) return false;
@@ -352,14 +427,25 @@ bool prime_pub_key_from_cert_file(const std::string& dev_id,
         OBN_WARN("cert_store: X509_get_pubkey failed for dev=%s", dev_id.c_str());
         return false;
     }
-    set_printer_pub_key(dev_id, pk); // idempotent; takes its own ref
-    ::EVP_PKEY_free(pk);
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        g_pubkey_neg_cache.erase(dev_id);
+        auto it = g_pubkey_map.find(dev_id);
+        if (it != g_pubkey_map.end()) {
+            ::EVP_PKEY_free(it->second);
+            it->second = pk;
+        } else {
+            g_pubkey_map.emplace(dev_id, pk);
+        }
+    }
     return true;
 }
 
 void forget_printer(const std::string& dev_id)
 {
     std::lock_guard<std::mutex> lk(g_pubkey_mu);
+    g_pubkey_neg_cache.erase(dev_id);
+    g_pubkey_disk_mtime.erase(dev_id);
     auto it = g_pubkey_map.find(dev_id);
     if (it != g_pubkey_map.end()) {
         ::EVP_PKEY_free(it->second);
