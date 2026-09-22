@@ -1023,10 +1023,16 @@ void Agent::harvest_security_report(const std::string& dev_id,
             const std::string out_path =
                 cert_store::device_cert_path(cfg_dir, dev_id);
             if (cert_store::ensure_parent_dir(out_path)) {
-                std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
+                const std::string tmp_path = out_path + ".tmp";
+                std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
                 if (ofs) {
                     ofs << printer_cert;
                     ofs.close();
+                    std::error_code ec;
+                    std::filesystem::rename(tmp_path, out_path, ec);
+                    if (ec) {
+                        std::filesystem::remove(tmp_path, ec);
+                    }
                     std::string ip;
                     {
                         std::lock_guard<std::mutex> lk(mu_);
