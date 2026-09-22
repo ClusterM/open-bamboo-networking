@@ -2449,37 +2449,51 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     memset(out, 0, sizeof(*out));
     out->sock = -1;
 
-    char hostname[256];
-    snprintf(hostname, sizeof(hostname), "%s-c-master-%s.iotcplatform.com",
-             region_str, relay_id);
+    std::vector<std::string> candidate_hosts;
+    if (region_str && region_str[0]) {
+        candidate_hosts.push_back(std::string(region_str) + "-m1.iotcplatform.com");
+        candidate_hosts.push_back(std::string(region_str) + "-m2.iotcplatform.com");
+    }
+    candidate_hosts.push_back("m1.iotcplatform.com");
+    candidate_hosts.push_back("m2.iotcplatform.com");
+    candidate_hosts.push_back("m3.iotcplatform.com");
 
-    OBN_DEBUG("[relay] connecting to %s:10240", hostname);
+    struct sockaddr_in masters[4];
+    int nmasters = 0;
+    char resolved_host[256] = "";
 
-    struct addrinfo hints{}, *res = nullptr;
+    struct addrinfo hints{};
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", 10240);
-    int rc = getaddrinfo(hostname, port_str, &hints, &res);
-    if (rc != 0 || !res) {
-        OBN_ERROR("[relay] DNS failed for %s: %s", hostname, gai_strerror_portable(rc));
-        return -1;
+
+    for (const auto& host : candidate_hosts) {
+        struct addrinfo* res = nullptr;
+        int rc = getaddrinfo(host.c_str(), port_str, &hints, &res);
+        if (rc == 0 && res) {
+            for (struct addrinfo* ai = res; ai && nmasters < 4; ai = ai->ai_next) {
+                if (ai->ai_family == AF_INET) {
+                    masters[nmasters++] = *reinterpret_cast<struct sockaddr_in*>(ai->ai_addr);
+                }
+            }
+            freeaddrinfo(res);
+            if (nmasters > 0) {
+                snprintf(resolved_host, sizeof(resolved_host), "%s", host.c_str());
+                break;
+            }
+        }
     }
-    struct sockaddr_in masters[4];
-    int nmasters = 0;
-    for (struct addrinfo* ai = res; ai && nmasters < 4; ai = ai->ai_next)
-        if (ai->ai_family == AF_INET)
-            masters[nmasters++] = *reinterpret_cast<struct sockaddr_in*>(ai->ai_addr);
-    freeaddrinfo(res);
+
     if (nmasters == 0) {
-        OBN_ERROR("[relay] no IPv4 master address for %s", hostname);
+        OBN_ERROR("[relay] no IPv4 master address found for region %s", region_str);
         return -1;
     }
     struct sockaddr_in relay_addr = masters[0];
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &relay_addr.sin_addr, ip_str, sizeof(ip_str));
-    OBN_DEBUG("[relay] resolved %s -> %s:10240", hostname, ip_str);
+    OBN_DEBUG("[relay] resolved %s -> %s:10240", resolved_host, ip_str);
 
     obn::net::socket_t sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == obn::net::kInvalid) {
