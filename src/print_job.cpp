@@ -448,9 +448,9 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
 std::string build_project_file_json(const BBL::PrintParams& p,
                                     const ProjectFileOpts&  opts)
 {
-    std::string plate_param = "Metadata/plate_" +
-                              std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
-                              ".gcode";
+    std::string plate_idx_str =
+        std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
+    std::string plate_param = "Metadata/plate_" + plate_idx_str + ".gcode";
     // sdcard_print has no url/url_enc at all — stock 02.05.00–02.08.02
     // omit the key and the firmware looks the file up by basename +
     // md5="from_sd_card". An empty opts.url is how we signal that.
@@ -459,7 +459,7 @@ std::string build_project_file_json(const BBL::PrintParams& p,
         : ",\"url\":" + json_escape(opts.url);
     return build_project_file_json_impl(
         p, opts,
-        ",\"param\":" + json_escape(plate_param),
+        ",\"param\":" + json_escape(plate_param) + ",\"plate_idx\":" + json_escape(plate_idx_str),
         url_field);
 }
 

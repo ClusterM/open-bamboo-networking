@@ -739,11 +739,13 @@ int create_task(const std::string& api, const std::string& token,
     // here gets the write rejected with 403.
     const std::string cert_id  = obn::signing::app_certification_id();
     const std::string sec_sign = obn::signing::device_security_sign();
-    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) "
-              "sec_sign_len=%zu",
+    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) sec_sign_len=%zu",
               cert_id.c_str(), cert_id.size(), sec_sign.size());
-    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
-    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
+    // Signing headers: Bambu Cloud user-service verifies Bearer token + client identity.
+    // Presenting third-party app certs on /my/task causes 403 ("The client does not have access rights to the content").
+    // Omit PoP headers on cloud /my/task dispatch so server authorizes with standard bearer + client identity.
+    (void)cert_id;
+    (void)sec_sign;
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
@@ -881,6 +883,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     OBN_INFO("cloud_print: file md5=%s", md5.c_str());
 
     std::string project_url; // ftp://… or S3 https — registered via PATCH
+    std::string stored_path;
 
     // Hybrid stock does FTPS of the main .3mf first (Upload), then the
     // cloud bookkeeping. A blocked LAN therefore fails with WR_UPLOAD_FTP
@@ -905,7 +908,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
 
         std::uint64_t total = 0;
         std::string ca_file = bambu_ca_bundle_path();
-        std::string stored_path;
         if (int rc = print_job::ftp_upload(p, lan_remote_path, ca_file,
                                            update_fn, cancel_fn,
                                            BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_FTP_FAILED,
@@ -1024,6 +1026,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     std::string task_id;
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
+
 
     print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
