@@ -414,6 +414,11 @@ public:
     // the printer is cloud-paired. Returns "" when either piece is missing;
     // Studio then shows its normal "connection failed" state.
     std::string camera_url_for(const std::string& dev_id);
+    // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
+    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode,
+    // proactively dispatches signed/encrypted prepare command to the printer,
+    // and returns "bambu:///tutk?uid=...".
+    std::string remote_camera_url(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
