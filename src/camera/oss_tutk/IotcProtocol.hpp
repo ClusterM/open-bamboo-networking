@@ -475,8 +475,13 @@ struct DtlsSession {
     uint8_t  master_secret[48];
     uint8_t  client_write_key[32];
     uint8_t  server_write_key[32];
-    uint8_t  client_write_iv[12];
-    uint8_t  server_write_iv[12];
+    uint8_t  client_write_iv[16];
+    uint8_t  server_write_iv[16];
+    uint8_t  client_write_mac_key[48];
+    uint8_t  server_write_mac_key[48];
+    uint16_t cipher_suite;         // 0xC038 or 0xCCAC
+    bool     use_ems;              // RFC 7627 Extended Master Secret
+    bool     use_etm;              // RFC 7366 Encrypt-then-MAC
     uint32_t epoch;               // session epoch (0 for relay path)
     uint64_t tx_seq;
     uint64_t rx_seq;

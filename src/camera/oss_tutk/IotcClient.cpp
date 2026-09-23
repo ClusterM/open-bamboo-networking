@@ -69,6 +69,7 @@
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 #include "obn/log.hpp"
 
 namespace bambu_net {
@@ -612,7 +613,7 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
                               (struct sockaddr*)&src, &src_len);
         if (n < 28) return -1;
 
-        reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+        reverse_trans_code_partial(raw, (size_t)n);
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
 
@@ -779,46 +780,58 @@ static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
 // DtlsSession is declared in IotcProtocol.hpp (moved to header so relay code
 // in OssAgoraSignaling.cpp can use it via RelayConn).
 
-// TLS 1.2 PRF: P_SHA256 expansion.
+// TLS 1.2 PRF: P_hash expansion (generic for SHA-256 or SHA-384).
 // label_seed = label_bytes || seed_bytes
-static bool tls12_prf(const uint8_t* secret, size_t secret_len,
-                       const char* label,
-                       const uint8_t* seed, size_t seed_len,
-                       uint8_t* out, size_t out_len)
+static bool tls12_prf_generic(const EVP_MD* md,
+                               const uint8_t* secret, size_t secret_len,
+                               const char* label,
+                               const uint8_t* seed, size_t seed_len,
+                               uint8_t* out, size_t out_len)
 {
-    // A(0) = label || seed
-    // A(i) = HMAC-SHA256(secret, A(i-1))
-    // P_SHA256 = HMAC-SHA256(secret, A(1)||label||seed) || HMAC-SHA256(secret, A(2)||label||seed) || ...
-
     size_t llen = strlen(label);
     std::vector<uint8_t> label_seed(llen + seed_len);
     memcpy(label_seed.data(), label, llen);
     memcpy(label_seed.data() + llen, seed, seed_len);
 
-    uint8_t a[32]; // A(i), starts as A(1)
-    unsigned int hmac_len = 32;
-    HMAC(EVP_sha256(), secret, (int)secret_len,
+    uint8_t a[EVP_MAX_MD_SIZE];
+    unsigned int md_len = (unsigned int)EVP_MD_size(md);
+    unsigned int hmac_len = md_len;
+    HMAC(md, secret, (int)secret_len,
          label_seed.data(), label_seed.size(), a, &hmac_len);
 
     size_t done = 0;
     while (done < out_len) {
-        // HMAC(secret, A(i) || label || seed)
-        std::vector<uint8_t> hmac_in(32 + label_seed.size());
-        memcpy(hmac_in.data(), a, 32);
-        memcpy(hmac_in.data() + 32, label_seed.data(), label_seed.size());
+        std::vector<uint8_t> hmac_in(md_len + label_seed.size());
+        memcpy(hmac_in.data(), a, md_len);
+        memcpy(hmac_in.data() + md_len, label_seed.data(), label_seed.size());
 
-        uint8_t block[32];
-        HMAC(EVP_sha256(), secret, (int)secret_len,
+        uint8_t block[EVP_MAX_MD_SIZE];
+        HMAC(md, secret, (int)secret_len,
              hmac_in.data(), hmac_in.size(), block, &hmac_len);
 
-        size_t copy = std::min((size_t)32, out_len - done);
+        size_t copy = std::min((size_t)md_len, out_len - done);
         memcpy(out + done, block, copy);
         done += copy;
 
-        // A(i+1) = HMAC(secret, A(i))
-        HMAC(EVP_sha256(), secret, (int)secret_len, a, 32, a, &hmac_len);
+        HMAC(md, secret, (int)secret_len, a, md_len, a, &hmac_len);
     }
     return true;
+}
+
+static bool tls12_prf(const uint8_t* secret, size_t secret_len,
+                       const char* label,
+                       const uint8_t* seed, size_t seed_len,
+                       uint8_t* out, size_t out_len)
+{
+    return tls12_prf_generic(EVP_sha256(), secret, secret_len, label, seed, seed_len, out, out_len);
+}
+
+static bool tls12_prf_sha384(const uint8_t* secret, size_t secret_len,
+                              const char* label,
+                              const uint8_t* seed, size_t seed_len,
+                              uint8_t* out, size_t out_len)
+{
+    return tls12_prf_generic(EVP_sha384(), secret, secret_len, label, seed, seed_len, out, out_len);
 }
 
 // Build a 12-byte DTLS nonce for the TUTK ChaCha20-Poly1305 AEAD format:
@@ -877,6 +890,257 @@ static void build_dtls_hs_hdr(uint8_t* buf, uint8_t hs_type,
     buf[11]= (uint8_t)(body_len      );
 }
 
+// RFC 7366 Encrypt-then-MAC (EtM) + AES-256-CBC record protection
+static bool encrypt_record_cbc_etm(const uint8_t* key, const uint8_t* mac_key,
+                                   uint8_t content_type, uint16_t epoch, uint64_t seq,
+                                   const uint8_t* plain, size_t plain_len,
+                                   std::vector<uint8_t>& out_rec)
+{
+    uint8_t iv[16];
+    if (RAND_bytes(iv, sizeof(iv)) != 1) return false;
+
+    size_t pad_len = 16 - (plain_len % 16);
+    uint8_t pad_val = (uint8_t)(pad_len - 1);
+    std::vector<uint8_t> padded(plain_len + pad_len);
+    if (plain_len > 0) memcpy(padded.data(), plain, plain_len);
+    memset(padded.data() + plain_len, pad_val, pad_len);
+
+    std::vector<uint8_t> ciphertext(padded.size());
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return false;
+    int outl = 0;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) <= 0 ||
+        EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0 ||
+        EVP_EncryptUpdate(ctx, ciphertext.data(), &outl, padded.data(), (int)padded.size()) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    int total_cipher = outl;
+    EVP_EncryptFinal_ex(ctx, ciphertext.data() + total_cipher, &outl);
+    total_cipher += outl;
+    EVP_CIPHER_CTX_free(ctx);
+
+    uint16_t frag_len = (uint16_t)(16 + total_cipher);
+    uint8_t mac_in_hdr[13];
+    mac_in_hdr[0] = (uint8_t)(epoch >> 8);
+    mac_in_hdr[1] = (uint8_t)(epoch);
+    mac_in_hdr[2] = (uint8_t)(seq >> 40);
+    mac_in_hdr[3] = (uint8_t)(seq >> 32);
+    mac_in_hdr[4] = (uint8_t)(seq >> 24);
+    mac_in_hdr[5] = (uint8_t)(seq >> 16);
+    mac_in_hdr[6] = (uint8_t)(seq >> 8);
+    mac_in_hdr[7] = (uint8_t)(seq);
+    mac_in_hdr[8] = content_type;
+    mac_in_hdr[9] = 0xfe; mac_in_hdr[10] = 0xfd;
+    mac_in_hdr[11]= (uint8_t)(frag_len >> 8);
+    mac_in_hdr[12]= (uint8_t)(frag_len);
+
+    std::vector<uint8_t> mac_in;
+    mac_in.reserve(13 + 16 + total_cipher);
+    mac_in.insert(mac_in.end(), mac_in_hdr, mac_in_hdr + 13);
+    mac_in.insert(mac_in.end(), iv, iv + 16);
+    mac_in.insert(mac_in.end(), ciphertext.begin(), ciphertext.begin() + total_cipher);
+
+    uint8_t mac[48];
+    unsigned int mac_len = 48;
+    HMAC(EVP_sha384(), mac_key, 48, mac_in.data(), mac_in.size(), mac, &mac_len);
+
+    uint16_t wire_len = (uint16_t)(frag_len + mac_len);
+    uint8_t rec_hdr[13];
+    build_dtls_record_hdr(rec_hdr, content_type, epoch, seq, wire_len);
+
+    out_rec.clear();
+    out_rec.reserve(13 + wire_len);
+    out_rec.insert(out_rec.end(), rec_hdr, rec_hdr + 13);
+    out_rec.insert(out_rec.end(), iv, iv + 16);
+    out_rec.insert(out_rec.end(), ciphertext.begin(), ciphertext.begin() + total_cipher);
+    out_rec.insert(out_rec.end(), mac, mac + 48);
+    return true;
+}
+
+static int decrypt_record_cbc_etm(const uint8_t* key, const uint8_t* mac_key,
+                                  const uint8_t* rec_hdr,
+                                  const uint8_t* payload, size_t payload_len,
+                                  uint8_t* plain_out, size_t plain_max)
+{
+    uint8_t content_type = rec_hdr[0];
+    uint16_t epoch = read_be16(rec_hdr + 3);
+    uint64_t seq   = read_be48(rec_hdr + 5);
+    uint16_t wire_len = read_be16(rec_hdr + 11);
+
+    if (payload_len < wire_len || wire_len < 16 + 16 + 48) {
+        OBN_WARN("[dtls-etm] payload too short (have %zu, wire_len %u)", payload_len, wire_len);
+        return -1;
+    }
+
+    uint16_t frag_len = wire_len - 48;
+    const uint8_t* iv = payload;
+    const uint8_t* ciphertext = payload + 16;
+    size_t cipher_len = frag_len - 16;
+    const uint8_t* received_mac = payload + frag_len;
+
+    uint8_t mac_in_hdr[13];
+    mac_in_hdr[0] = (uint8_t)(epoch >> 8);
+    mac_in_hdr[1] = (uint8_t)(epoch);
+    mac_in_hdr[2] = (uint8_t)(seq >> 40);
+    mac_in_hdr[3] = (uint8_t)(seq >> 32);
+    mac_in_hdr[4] = (uint8_t)(seq >> 24);
+    mac_in_hdr[5] = (uint8_t)(seq >> 16);
+    mac_in_hdr[6] = (uint8_t)(seq >> 8);
+    mac_in_hdr[7] = (uint8_t)(seq);
+    mac_in_hdr[8] = content_type;
+    mac_in_hdr[9] = 0xfe; mac_in_hdr[10] = 0xfd;
+    mac_in_hdr[11]= (uint8_t)(frag_len >> 8);
+    mac_in_hdr[12]= (uint8_t)(frag_len);
+
+    std::vector<uint8_t> mac_in;
+    mac_in.reserve(13 + frag_len);
+    mac_in.insert(mac_in.end(), mac_in_hdr, mac_in_hdr + 13);
+    mac_in.insert(mac_in.end(), payload, payload + frag_len);
+
+    uint8_t calc_mac[48];
+    unsigned int calc_mac_len = 48;
+    HMAC(EVP_sha384(), mac_key, 48, mac_in.data(), mac_in.size(), calc_mac, &calc_mac_len);
+
+    if (CRYPTO_memcmp(calc_mac, received_mac, 48) != 0) {
+        OBN_ERROR("[dtls-etm] bad_record_mac (epoch=%u seq=%llu)", epoch, (unsigned long long)seq);
+        return -1;
+    }
+
+    std::vector<uint8_t> decrypted(cipher_len);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+    int outl = 0;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, key, iv) <= 0 ||
+        EVP_CIPHER_CTX_set_padding(ctx, 0) <= 0 ||
+        EVP_DecryptUpdate(ctx, decrypted.data(), &outl, ciphertext, (int)cipher_len) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    int total = outl;
+    EVP_DecryptFinal_ex(ctx, decrypted.data() + total, &outl);
+    total += outl;
+    EVP_CIPHER_CTX_free(ctx);
+
+    if (total == 0) return -1;
+
+    uint8_t pad_val = decrypted[total - 1];
+    if (pad_val >= 16 || pad_val >= total) {
+        OBN_ERROR("[dtls-etm] invalid padding 0x%02x (total=%d)", pad_val, total);
+        return -1;
+    }
+    size_t pad_count = (size_t)pad_val + 1;
+    for (size_t i = 0; i < pad_count; ++i) {
+        if (decrypted[total - 1 - i] != pad_val) {
+            OBN_ERROR("[dtls-etm] padding byte mismatch");
+            return -1;
+        }
+    }
+
+    size_t plain_len = (size_t)total - pad_count;
+    if (plain_len > plain_max) {
+        OBN_ERROR("[dtls-etm] plain_len %zu > plain_max %zu", plain_len, plain_max);
+        return -1;
+    }
+
+    if (plain_len > 0)
+        memcpy(plain_out, decrypted.data(), plain_len);
+    return (int)plain_len;
+}
+
+static bool dtls_encrypt_record(DtlsSession* ds, uint8_t content_type,
+                                const uint8_t* plain, size_t plain_len,
+                                std::vector<uint8_t>& out_rec)
+{
+    if (ds->cipher_suite == 0xC038) {
+        bool ok = encrypt_record_cbc_etm(ds->client_write_key, ds->client_write_mac_key,
+                                         content_type, (uint16_t)ds->epoch, ds->tx_seq,
+                                         plain, plain_len, out_rec);
+        if (ok) ds->tx_seq++;
+        return ok;
+    } else {
+        uint8_t nonce[12];
+        build_relay_nonce(nonce, ds->client_write_iv, (uint16_t)ds->epoch, ds->tx_seq);
+
+        uint8_t rec_hdr[13];
+        build_dtls_record_hdr(rec_hdr, content_type, (uint16_t)ds->epoch, ds->tx_seq, (uint16_t)plain_len);
+
+        std::vector<uint8_t> ciphertext(plain_len + 16);
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        int outl = 0;
+        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, ds->client_write_key, nonce);
+        EVP_EncryptUpdate(ctx, nullptr, &outl, rec_hdr, 13);
+        if (plain_len > 0)
+            EVP_EncryptUpdate(ctx, ciphertext.data(), &outl, plain, (int)plain_len);
+        int total = outl;
+        EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &outl);
+        total += outl;
+        uint8_t tag[16];
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
+        memcpy(ciphertext.data() + total, tag, 16);
+        EVP_CIPHER_CTX_free(ctx);
+
+        uint16_t cipher_len = (uint16_t)(plain_len + 16);
+        build_dtls_record_hdr(rec_hdr, content_type, (uint16_t)ds->epoch, ds->tx_seq, cipher_len);
+        ds->tx_seq++;
+
+        out_rec.clear();
+        out_rec.reserve(13 + cipher_len);
+        out_rec.insert(out_rec.end(), rec_hdr, rec_hdr + 13);
+        out_rec.insert(out_rec.end(), ciphertext.begin(), ciphertext.begin() + cipher_len);
+        return true;
+    }
+}
+
+static int dtls_decrypt_record(DtlsSession* ds,
+                               const uint8_t* dtls_rec, size_t rec_len,
+                               uint8_t* plain_out, size_t plain_max)
+{
+    if (rec_len < 13) return -1;
+    const uint8_t* rec_hdr = dtls_rec;
+    const uint8_t* payload = dtls_rec + 13;
+    size_t payload_len = rec_len - 13;
+
+    if (ds->cipher_suite == 0xC038) {
+        return decrypt_record_cbc_etm(ds->server_write_key, ds->server_write_mac_key,
+                                      rec_hdr, payload, payload_len,
+                                      plain_out, plain_max);
+    } else {
+        uint16_t rec_epoch  = read_be16(rec_hdr + 3);
+        uint64_t rec_seq    = read_be48(rec_hdr + 5);
+        uint16_t cipher_len = read_be16(rec_hdr + 11);
+        if (payload_len < cipher_len || cipher_len < 16) return -1;
+        uint16_t plain_len = cipher_len - 16;
+        if (plain_len > plain_max) return -1;
+
+        uint8_t nonce[12];
+        build_relay_nonce(nonce, ds->server_write_iv, rec_epoch, rec_seq);
+
+        const uint8_t* aad = rec_hdr;
+        const uint8_t* ciphertext = payload;
+        const uint8_t* tag = payload + plain_len;
+
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        int outl = 0;
+        EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag));
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, ds->server_write_key, nonce);
+        EVP_DecryptUpdate(ctx, nullptr, &outl, aad, 13);
+        if (plain_len > 0)
+            EVP_DecryptUpdate(ctx, plain_out, &outl, ciphertext, (int)plain_len);
+        int total = outl;
+        int ok = EVP_DecryptFinal_ex(ctx, plain_out + total, &outl);
+        EVP_CIPHER_CTX_free(ctx);
+
+        if (ok > 0) return (int)plain_len;
+        OBN_ERROR("[dtls-chacha] AEAD auth failed (epoch=%u seq=%llu)", rec_epoch, (unsigned long long)rec_seq);
+        return -1;
+    }
+}
+
 // Full DTLS-PSK handshake over a connected UDP socket.
 // initial_epoch: the TUTK session epoch (client-generated, embedded in LAN_SEARCH3).
 //   Used for ALL records including ClientHello (confirmed from captures).
@@ -916,8 +1180,9 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     //       + cookie_len(1)=0 + cipher_suites_len(2) + cipher_suites
     //       + compression_len(1)=1 + compression(1)=0
 
-    // Cipher suites: 0xCCAC (ECDHE-PSK-CHACHA20) + 0x00FF (EMPTY-RENEGOTIATION)
+    // Cipher suites: 0xC038 (ECDHE-PSK-AES256-CBC-SHA384) + 0xCCAC (ECDHE-PSK-CHACHA20) + 0x00FF (EMPTY-RENEGOTIATION)
     static const uint8_t kCipherSuites[] = {
+        0xC0, 0x38,   // TLS_ECDHE_PSK_WITH_AES_256_CBC_SHA384
         0xCC, 0xAC,   // TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256
         0x00, 0xFF,   // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
@@ -926,10 +1191,12 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     // 1. ec_point_formats (0x000b): uncompressed, compressed prime/char2
     // 2. supported_groups (0x000a): X25519 (0x001d), secp256r1 (0x0017), x448, secp521r1, secp384r1
     // 3. session_ticket (0x0023): len 0
-    // 4. signature_algorithms (0x000d): SHA256/384/512 with ECDSA/RSA/DSA
+    // 4. encrypt_then_mac (0x0016): len 0 (RFC 7366)
+    // 5. extended_master_secret (0x0017): len 0 (RFC 7627)
+    // 6. signature_algorithms (0x000d): SHA256/384/512 with ECDSA/RSA/DSA
     static const uint8_t kExtensions[] = {
-        // Total extensions length: 74 bytes (0x004a)
-        0x00, 0x4a,
+        // Total extensions length: 82 bytes (0x0052)
+        0x00, 0x52,
         // ec_point_formats (0x000b, len 4)
         0x00, 0x0b, 0x00, 0x04, 0x03, 0x00, 0x01, 0x02,
         // supported_groups (0x000a, len 12)
@@ -941,6 +1208,10 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         0x00, 0x18,  // secp384r1
         // session_ticket (0x0023, len 0)
         0x00, 0x23, 0x00, 0x00,
+        // encrypt_then_mac (0x0016, len 0)
+        0x00, 0x16, 0x00, 0x00,
+        // extended_master_secret (0x0017, len 0)
+        0x00, 0x17, 0x00, 0x00,
         // signature_algorithms (0x000d, len 42)
         0x00, 0x0d, 0x00, 0x2a, 0x00, 0x28,
         0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x07,
@@ -956,8 +1227,8 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     memcpy(ch_body + ch_off, out->client_random, 32); ch_off += 32;
     ch_body[ch_off++] = 0x00;   // session_id_len = 0
     ch_body[ch_off++] = 0x00;   // cookie_len = 0
-    ch_body[ch_off++] = 0x00; ch_body[ch_off++] = 0x04;  // cipher_suites_len = 4
-    memcpy(ch_body + ch_off, kCipherSuites, 4); ch_off += 4;
+    ch_body[ch_off++] = 0x00; ch_body[ch_off++] = 0x06;  // cipher_suites_len = 6
+    memcpy(ch_body + ch_off, kCipherSuites, 6); ch_off += 6;
     ch_body[ch_off++] = 0x01;   // compression_methods_len = 1
     ch_body[ch_off++] = 0x00;   // compression = null
     memcpy(ch_body + ch_off, kExtensions, sizeof(kExtensions));
@@ -1061,19 +1332,8 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         return -1;
     }
 
-    // Log server-selected cipher suite
-    size_t sh_cs_off = 25 + 2 + 32;
-    if ((size_t)srv_len > sh_cs_off) {
-        uint8_t sid_len = srv_raw[sh_cs_off];
-        sh_cs_off += 1 + sid_len;
-        if ((size_t)srv_len >= sh_cs_off + 2) {
-            uint16_t cs = ((uint16_t)srv_raw[sh_cs_off] << 8) | srv_raw[sh_cs_off + 1];
-            OBN_INFO("[dtls] ServerHello selected cipher suite: 0x%04x", cs);
-        }
-    }
-
-    // TUTK ServerHello body: version(2)+random(32); session_id_len may be non-standard
-    // (observed 0xcc=204 from firmware), so grab random by offset, not after session_id.
+    // TUTK ServerHello body starts at offset 25:
+    //   version(2) + random(32) + sid_len(1) + sid(N) + cipher(2) + comp(1) + [ext_len(2) + exts]
     if (srv_len >= 25 + 2 + 32) {
         memcpy(out->server_random, srv_raw + 25 + 2, 32);
         OBN_DEBUG("[dtls] server_random extracted");
@@ -1081,6 +1341,36 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         OBN_ERROR("[dtls] ServerHello body too short for random");
         return -1;
     }
+
+    out->cipher_suite = 0xCCAC;
+    out->use_ems = false;
+    out->use_etm = false;
+
+    size_t sh_cs_off = 25 + 2 + 32;
+    if ((size_t)srv_len > sh_cs_off) {
+        uint8_t sid_len = srv_raw[sh_cs_off];
+        sh_cs_off += 1 + sid_len;
+        if ((size_t)srv_len >= sh_cs_off + 2) {
+            uint16_t cs = ((uint16_t)srv_raw[sh_cs_off] << 8) | srv_raw[sh_cs_off + 1];
+            out->cipher_suite = cs;
+            OBN_INFO("[dtls] ServerHello selected cipher suite: 0x%04x", cs);
+        }
+        size_t ext_hdr_off = sh_cs_off + 2 + 1; // skip cipher_suite (2) + comp (1)
+        if ((size_t)srv_len >= ext_hdr_off + 2) {
+            uint16_t ext_total_len = read_be16(srv_raw + ext_hdr_off);
+            size_t e_off = ext_hdr_off + 2;
+            size_t e_end = std::min((size_t)srv_len, e_off + ext_total_len);
+            while (e_off + 4 <= e_end) {
+                uint16_t etype = read_be16(srv_raw + e_off);
+                uint16_t elen  = read_be16(srv_raw + e_off + 2);
+                if (etype == 0x0016) out->use_etm = true;
+                if (etype == 0x0017) out->use_ems = true;
+                e_off += 4 + elen;
+            }
+        }
+    }
+    OBN_INFO("[dtls] Negotiated params: cipher=0x%04x ems=%d etm=%d",
+             out->cipher_suite, out->use_ems, out->use_etm);
 
     transcript.insert(transcript.end(), srv_raw + 13, srv_raw + 13 + 12 + hs_body_len);
 
@@ -1194,42 +1484,72 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     memcpy(premaster + pm_off, psk, 32); pm_off += 32;
 
     // =======================================================================
-    // Compute master_secret = PRF(premaster, "master secret", client_random||server_random)
+    // Compute master_secret
     // =======================================================================
-
-    uint8_t ms_seed[64];
-    memcpy(ms_seed,      out->client_random, 32);
-    memcpy(ms_seed + 32, out->server_random, 32);
-    tls12_prf(premaster, sizeof(premaster), "master secret",
-              ms_seed, 64, out->master_secret, 48);
-    OBN_DEBUG("[dtls] master_secret derived");
+    if (out->use_ems) {
+        // RFC 7627 Extended Master Secret: PRF(premaster, "extended master secret", Hash(handshake_messages))
+        if (out->cipher_suite == 0xC038) {
+            uint8_t hs_hash[48];
+            SHA384(transcript.data(), transcript.size(), hs_hash);
+            tls12_prf_sha384(premaster, sizeof(premaster), "extended master secret",
+                             hs_hash, 48, out->master_secret, 48);
+        } else {
+            uint8_t hs_hash[32];
+            SHA256(transcript.data(), transcript.size(), hs_hash);
+            tls12_prf(premaster, sizeof(premaster), "extended master secret",
+                      hs_hash, 32, out->master_secret, 48);
+        }
+        OBN_DEBUG("[dtls] extended master_secret derived");
+    } else {
+        uint8_t ms_seed[64];
+        memcpy(ms_seed,      out->client_random, 32);
+        memcpy(ms_seed + 32, out->server_random, 32);
+        if (out->cipher_suite == 0xC038) {
+            tls12_prf_sha384(premaster, sizeof(premaster), "master secret",
+                             ms_seed, 64, out->master_secret, 48);
+        } else {
+            tls12_prf(premaster, sizeof(premaster), "master secret",
+                      ms_seed, 64, out->master_secret, 48);
+        }
+        OBN_DEBUG("[dtls] standard master_secret derived");
+    }
 
     // =======================================================================
     // Key expansion: PRF(master_secret, "key expansion", server_random||client_random)
     // =======================================================================
-    // For ChaCha20-Poly1305: key=32B, IV=12B per direction → 2*(32+12) = 88 bytes
 
     uint8_t ke_seed[64];
     memcpy(ke_seed,      out->server_random, 32);
     memcpy(ke_seed + 32, out->client_random, 32);
-    uint8_t key_block[88];
-    tls12_prf(out->master_secret, 48, "key expansion",
-              ke_seed, 64, key_block, sizeof(key_block));
 
-    memcpy(out->client_write_key, key_block,      32);
-    memcpy(out->server_write_key, key_block + 32, 32);
-    memcpy(out->client_write_iv,  key_block + 64, 12);
-    memcpy(out->server_write_iv,  key_block + 76, 12);
-    OBN_DEBUG("[dtls] key expansion done");
+    if (out->cipher_suite == 0xC038) {
+        // 0xC038: client_mac(48) + server_mac(48) + client_key(32) + server_key(32) + client_iv(16) + server_iv(16) = 192 bytes
+        uint8_t key_block[192];
+        tls12_prf_sha384(out->master_secret, 48, "key expansion",
+                         ke_seed, 64, key_block, sizeof(key_block));
+
+        memcpy(out->client_write_mac_key, key_block,       48);
+        memcpy(out->server_write_mac_key, key_block + 48,  48);
+        memcpy(out->client_write_key,     key_block + 96,  32);
+        memcpy(out->server_write_key,     key_block + 128, 32);
+        memcpy(out->client_write_iv,      key_block + 160, 16);
+        memcpy(out->server_write_iv,      key_block + 176, 16);
+        OBN_DEBUG("[dtls] key expansion (0xC038 SHA384/AES256-CBC) done");
+    } else {
+        uint8_t key_block[88];
+        tls12_prf(out->master_secret, 48, "key expansion",
+                  ke_seed, 64, key_block, sizeof(key_block));
+
+        memcpy(out->client_write_key, key_block,      32);
+        memcpy(out->server_write_key, key_block + 32, 32);
+        memcpy(out->client_write_iv,  key_block + 64, 12);
+        memcpy(out->server_write_iv,  key_block + 76, 12);
+        OBN_DEBUG("[dtls] key expansion (0xCCAC ChaCha20-Poly1305) done");
+    }
 
     // =======================================================================
     // Build ClientKeyExchange
     // =======================================================================
-    //
-    // Body: identity_len(2) + identity(N) + ec_key_len(1) + ec_pub_key(32)
-    //   identity = "AUTHPWD_" + account  (e.g. "AUTHPWD_admin")
-    //
-    // Note: RFC 5489 puts ec_key before identity; TUTK reverses this (non-standard).
 
     std::string psk_identity = std::string("AUTHPWD_") + account;
 
@@ -1246,7 +1566,7 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     uint8_t cke_rec_hdr[13], cke_hs_hdr[12];
     build_dtls_hs_hdr(cke_hs_hdr, 0x10 /*ClientKeyExchange*/,
                        (uint32_t)cke_body.size(), 1 /*msg_seq*/);
-    build_dtls_record_hdr(cke_rec_hdr, 0x16, out->epoch, 1,
+    build_dtls_record_hdr(cke_rec_hdr, 0x16, initial_epoch, 1,
                            (uint16_t)(12 + cke_body.size()));
 
     transcript.insert(transcript.end(), cke_hs_hdr, cke_hs_hdr + 12);
@@ -1257,85 +1577,58 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     // =======================================================================
 
     uint8_t ccs_rec[14];
-    build_dtls_record_hdr(ccs_rec, 0x14 /*ChangeCipherSpec*/, out->epoch, 2, 1);
+    build_dtls_record_hdr(ccs_rec, 0x14 /*ChangeCipherSpec*/, initial_epoch, 2, 1);
     ccs_rec[13] = 0x01;
 
     // =======================================================================
     // Build Finished
     // =======================================================================
-    //
-    // verify_data = PRF(master_secret, "client finished", SHA256(transcript))
-    // Finished body = verify_data (12 bytes for TLS 1.2)
-
-    uint8_t transcript_hash[32];
-    SHA256(transcript.data(), transcript.size(), transcript_hash);
 
     uint8_t verify_data[12];
-    tls12_prf(out->master_secret, 48, "client finished",
-              transcript_hash, 32, verify_data, 12);
+    if (out->cipher_suite == 0xC038) {
+        uint8_t transcript_hash[48];
+        SHA384(transcript.data(), transcript.size(), transcript_hash);
+        tls12_prf_sha384(out->master_secret, 48, "client finished",
+                         transcript_hash, 48, verify_data, 12);
+    } else {
+        uint8_t transcript_hash[32];
+        SHA256(transcript.data(), transcript.size(), transcript_hash);
+        tls12_prf(out->master_secret, 48, "client finished",
+                  transcript_hash, 32, verify_data, 12);
+    }
 
     // Finished HS header
-    uint8_t fin_hs_hdr[12], fin_rec_hdr[13];
+    uint8_t fin_hs_hdr[12];
     build_dtls_hs_hdr(fin_hs_hdr, 0x14 /*Finished*/, 12, 2 /*msg_seq*/);
-
-    // Finished is encrypted; tx_seq=0 because CCS resets the sequence counter.
-    // nonce = write_IV XOR (epoch(2B BE at [4..5]) || seq(6B BE at [6..11]))
-    uint64_t fin_seq = 0;
-    uint8_t nonce[12];
-    memcpy(nonce, out->client_write_iv, 12);
-    nonce[4] ^= (uint8_t)((uint16_t)out->epoch >> 8);
-    nonce[5] ^= (uint8_t)((uint16_t)out->epoch     );
-    for (int i = 0; i < 6; ++i)
-        nonce[6 + i] ^= (uint8_t)(fin_seq >> (40 - 8*i));
-
-    // AAD = DTLS record header (plaintext length = 12 HS hdr + 12 verify_data)
-    uint8_t fin_aad[13];
-    build_dtls_record_hdr(fin_aad, 0x16, out->epoch, (uint32_t)fin_seq,
-                           (uint16_t)(12 + 12));  // 12 HS hdr + 12 verify_data
 
     uint8_t fin_plain[12 + 12];
     memcpy(fin_plain,      fin_hs_hdr,   12);
     memcpy(fin_plain + 12, verify_data,  12);
 
-    uint8_t fin_cipher[24 + 16];  // plaintext + 16-byte Poly1305 tag
-    int fin_cipher_len = 0;
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        int outl = 0;
-        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, out->client_write_key, nonce);
-        EVP_EncryptUpdate(ctx, nullptr, &outl, fin_aad, 13);  // AAD
-        EVP_EncryptUpdate(ctx, fin_cipher, &outl, fin_plain, sizeof(fin_plain));
-        fin_cipher_len = outl;
-        EVP_EncryptFinal_ex(ctx, fin_cipher + fin_cipher_len, &outl);
-        fin_cipher_len += outl;
-        uint8_t tag[16];
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
-        memcpy(fin_cipher + fin_cipher_len, tag, 16);
-        fin_cipher_len += 16;
-        EVP_CIPHER_CTX_free(ctx);
-    }
+    transcript.insert(transcript.end(), fin_hs_hdr, fin_hs_hdr + 12);
+    transcript.insert(transcript.end(), verify_data, verify_data + 12);
 
-    build_dtls_record_hdr(fin_rec_hdr, 0x16, out->epoch, (uint32_t)fin_seq,
-                           (uint16_t)fin_cipher_len);
+    out->epoch = (initial_epoch == 0) ? 1 : (initial_epoch + 1);
+    out->tx_seq = 0;
+
+    std::vector<uint8_t> fin_rec;
+    if (!dtls_encrypt_record(out, 0x16 /*Handshake*/, fin_plain, sizeof(fin_plain), fin_rec)) {
+        OBN_ERROR("[dtls] encrypt Finished failed");
+        return -1;
+    }
 
     // =======================================================================
     // Send ClientKeyExchange + ChangeCipherSpec + Finished in one IOTC packet
     // =======================================================================
 
     std::vector<uint8_t> cke_ccs_fin;
-    // CKE record
     cke_ccs_fin.insert(cke_ccs_fin.end(), cke_rec_hdr, cke_rec_hdr + 13);
     cke_ccs_fin.insert(cke_ccs_fin.end(), cke_hs_hdr, cke_hs_hdr + 12);
     cke_ccs_fin.insert(cke_ccs_fin.end(), cke_body.begin(), cke_body.end());
-    // CCS record
     cke_ccs_fin.insert(cke_ccs_fin.end(), ccs_rec, ccs_rec + 14);
-    // Finished record (encrypted)
-    cke_ccs_fin.insert(cke_ccs_fin.end(), fin_rec_hdr, fin_rec_hdr + 13);
-    cke_ccs_fin.insert(cke_ccs_fin.end(), fin_cipher, fin_cipher + fin_cipher_len);
+    cke_ccs_fin.insert(cke_ccs_fin.end(), fin_rec.begin(), fin_rec.end());
 
-    if (send_dtls_packet(sock, dst, out->epoch, session_token,
+    if (send_dtls_packet(sock, dst, initial_epoch, session_token,
                           cke_ccs_fin.data(), cke_ccs_fin.size(), relay_tag) != 0) {
         OBN_ERROR("[dtls] CKE+CCS+Finished send failed");
         return -1;
@@ -1354,11 +1647,65 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         return -1;
     }
 
-    bool got_ccs = (srv2_raw[0] == 0x14);  // 0x14=CCS, then 0x16=Finished
-    OBN_DEBUG("[dtls] server response: got_ccs=%d len=%d", got_ccs, srv2_len);
+    const uint8_t* fin_rec_ptr = nullptr;
+    size_t fin_rec_len = 0;
 
+    if (srv2_raw[0] == 0x14) {
+        uint16_t ccs_len = read_be16(srv2_raw + 11);
+        size_t ccs_rec_len = 13 + ccs_len;
+        OBN_DEBUG("[dtls] server CCS received (%zu bytes)", ccs_rec_len);
+
+        if ((size_t)srv2_len > ccs_rec_len) {
+            fin_rec_ptr = srv2_raw + ccs_rec_len;
+            fin_rec_len = (size_t)srv2_len - ccs_rec_len;
+        } else {
+            srv2_len = recv_dtls_packet(sock, srv2_raw, sizeof(srv2_raw),
+                                        nullptr, nullptr, 5000);
+            if (srv2_len >= 13 && srv2_raw[0] == 0x16) {
+                fin_rec_ptr = srv2_raw;
+                fin_rec_len = (size_t)srv2_len;
+            }
+        }
+    } else if (srv2_raw[0] == 0x16) {
+        fin_rec_ptr = srv2_raw;
+        fin_rec_len = (size_t)srv2_len;
+    }
+
+    if (!fin_rec_ptr || fin_rec_len < 13) {
+        OBN_ERROR("[dtls] server Finished not found in response");
+        return -1;
+    }
+
+    uint8_t fin_srv_plain[64];
+    int fin_srv_len = dtls_decrypt_record(out, fin_rec_ptr, fin_rec_len,
+                                          fin_srv_plain, sizeof(fin_srv_plain));
+    if (fin_srv_len < 24) {
+        OBN_ERROR("[dtls] server Finished decryption failed (len=%d)", fin_srv_len);
+        return -1;
+    }
+
+    uint8_t exp_vdata[12];
+    if (out->cipher_suite == 0xC038) {
+        uint8_t thash[48];
+        SHA384(transcript.data(), transcript.size(), thash);
+        tls12_prf_sha384(out->master_secret, 48, "server finished",
+                         thash, 48, exp_vdata, 12);
+    } else {
+        uint8_t thash[32];
+        SHA256(transcript.data(), transcript.size(), thash);
+        tls12_prf(out->master_secret, 48, "server finished",
+                  thash, 32, exp_vdata, 12);
+    }
+
+    if (CRYPTO_memcmp(fin_srv_plain + 12, exp_vdata, 12) != 0) {
+        OBN_ERROR("[dtls] server Finished verify_data mismatch!");
+        return -1;
+    }
+
+    OBN_INFO("[dtls] server Finished verified successfully!");
+    out->epoch = (initial_epoch == 0) ? 1 : (initial_epoch + 1);
     out->tx_seq = 1;
-    out->rx_seq = 0;
+    out->rx_seq = 1;
     out->handshake_complete = true;
 
     OBN_DEBUG("[dtls] handshake complete! epoch=0x%04x", out->epoch);
@@ -2860,42 +3207,15 @@ int iotc_relay_send_app_data(RelayConn* rc,
     if (!rc || rc->sock < 0) return -1;
     DtlsSession& ds = rc->dtls;
 
-    uint8_t nonce[12];
-    build_relay_nonce(nonce, ds.client_write_iv, (uint16_t)ds.epoch, ds.tx_seq);
-
-    uint8_t rec_hdr[13];
-    build_dtls_record_hdr(rec_hdr, 0x17 /*ApplicationData*/,
-                          ds.epoch, (uint32_t)ds.tx_seq, (uint16_t)len);
-
-    std::vector<uint8_t> ciphertext(len + 16);
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        int outl = 0;
-        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, ds.client_write_key, nonce);
-        EVP_EncryptUpdate(ctx, nullptr, &outl, rec_hdr, 13);  // AAD
-        EVP_EncryptUpdate(ctx, ciphertext.data(), &outl, data, (int)len);
-        int total = outl;
-        EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &outl);
-        total += outl;
-        uint8_t tag[16];
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
-        memcpy(ciphertext.data() + total, tag, 16);
-        EVP_CIPHER_CTX_free(ctx);
+    std::vector<uint8_t> dtls_rec;
+    if (!dtls_encrypt_record(&ds, 0x17 /*ApplicationData*/, data, len, dtls_rec)) {
+        OBN_ERROR("[relay-send] encrypt ApplicationData failed");
+        return -1;
     }
-
-    uint16_t cipher_len = (uint16_t)(len + 16);
-    build_dtls_record_hdr(rec_hdr, 0x17, ds.epoch, (uint32_t)ds.tx_seq, cipher_len);
-    ds.tx_seq++;
-
-    std::vector<uint8_t> dtls_pkt(13 + cipher_len);
-    memcpy(dtls_pkt.data(), rec_hdr, 13);
-    memcpy(dtls_pkt.data() + 13, ciphertext.data(), cipher_len);
 
     return send_dtls_packet(rc->sock, &rc->relay_addr,
                              ds.epoch, rc->session_token,
-                             dtls_pkt.data(), dtls_pkt.size(),
+                             dtls_rec.data(), dtls_rec.size(),
                              rc->relay_tag);
 }
 
@@ -2923,12 +3243,11 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             return -1;
         }
 
-        if (n < 28) continue;  // too short for IOTC header
+        if (n < 28 + 13) continue;  // too short for IOTC header + DTLS record header
 
-        reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+        reverse_trans_code_partial(raw, (size_t)n);
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;
-        if (n < 28 + 13) continue;  // too short for IOTC header + DTLS record header
 
         uint8_t content_type = raw[28];
 
@@ -2938,52 +3257,12 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             continue;
         }
 
-        uint16_t rec_epoch  = read_be16(raw + 31);
-        uint64_t rec_seq    = read_be48(raw + 33);
-        uint16_t cipher_len = read_be16(raw + 39);
-
-        if (n < 28 + 13 + (ssize_t)cipher_len) {
-            OBN_WARN("[relay-recv] truncated DTLS record (have %zd, need %d)", n, 28 + 13 + cipher_len);
-            continue;
-        }
-
-        if (cipher_len < 16) {
-            OBN_WARN("[relay-recv] cipher_len %u too short for tag", cipher_len);
-            continue;
-        }
-
-        uint16_t plain_len = cipher_len - 16;
-        if (plain_len > out_size) {
-            OBN_ERROR("[relay-recv] plaintext %u > out_size %zu", plain_len, out_size);
-            return -1;
-        }
-
-        uint8_t nonce[12];
-        build_relay_nonce(nonce, ds.server_write_iv, rec_epoch, rec_seq);
-
-        const uint8_t* aad        = raw + 28;  // AAD = 13-byte DTLS record header
-        const uint8_t* ciphertext = raw + 28 + 13;
-        const uint8_t* tag = ciphertext + plain_len;
-
-        {
-            EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-            int outl = 0;
-            EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
-            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
-                                 const_cast<uint8_t*>(tag));
-            EVP_DecryptInit_ex(ctx, nullptr, nullptr, ds.server_write_key, nonce);
-            EVP_DecryptUpdate(ctx, nullptr, &outl, aad, 13);  // AAD
-            EVP_DecryptUpdate(ctx, out_buf, &outl, ciphertext, (int)plain_len);
-            int total = outl;
-            int ok = EVP_DecryptFinal_ex(ctx, out_buf + total, &outl);
-            EVP_CIPHER_CTX_free(ctx);
-
-            if (ok > 0) {
-                return (int)plain_len;
-            }
-            OBN_ERROR("[relay-recv] AEAD auth failed (epoch=%u seq=%llu)", rec_epoch, (unsigned long long)rec_seq);
-            continue;
+        const uint8_t* dtls_rec = raw + 28;
+        size_t dtls_len = (size_t)(n - 28);
+        int plain_len = dtls_decrypt_record(&ds, dtls_rec, dtls_len, out_buf, out_size);
+        if (plain_len >= 0) {
+            ds.rx_seq++;
+            return plain_len;
         }
     }
 
@@ -3171,48 +3450,21 @@ static int dtls_encrypt_and_send(DtlsSession* ds, obn::net::socket_t sock,
                                   const uint8_t* session_token,
                                   const uint8_t* data, size_t len)
 {
-    uint8_t nonce[12];
-    build_relay_nonce(nonce, ds->client_write_iv, (uint16_t)ds->epoch, ds->tx_seq);
-
-    uint8_t rec_hdr[13];
-    build_dtls_record_hdr(rec_hdr, 0x17 /*ApplicationData*/,
-                          (uint16_t)ds->epoch, ds->tx_seq, (uint16_t)len);
-
-    std::vector<uint8_t> ciphertext(len + 16);
-    {
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        int outl = 0;
-        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, ds->client_write_key, nonce);
-        EVP_EncryptUpdate(ctx, nullptr, &outl, rec_hdr, 13);  // AAD
-        EVP_EncryptUpdate(ctx, ciphertext.data(), &outl, data, (int)len);
-        int total = outl;
-        EVP_EncryptFinal_ex(ctx, ciphertext.data() + total, &outl);
-        total += outl;
-        uint8_t tag[16];
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag);
-        memcpy(ciphertext.data() + total, tag, 16);
-        EVP_CIPHER_CTX_free(ctx);
+    std::vector<uint8_t> dtls_rec;
+    if (!dtls_encrypt_record(ds, 0x17 /*ApplicationData*/, data, len, dtls_rec)) {
+        OBN_ERROR("[dtls-send] encrypt ApplicationData failed");
+        return -1;
     }
 
-    uint16_t cipher_len = (uint16_t)(len + 16);
-    build_dtls_record_hdr(rec_hdr, 0x17, (uint16_t)ds->epoch, ds->tx_seq, cipher_len);
-    ds->tx_seq++;
-
-    std::vector<uint8_t> dtls_pkt(13 + cipher_len);
-    memcpy(dtls_pkt.data(), rec_hdr, 13);
-    memcpy(dtls_pkt.data() + 13, ciphertext.data(), cipher_len);
-
     return send_dtls_packet(sock, dst, ds->epoch, session_token,
-                             dtls_pkt.data(), dtls_pkt.size(), ds->relay_tag);
+                             dtls_rec.data(), dtls_rec.size(), ds->relay_tag);
 }
 
 // Decrypt one DTLS ApplicationData record received in a raw IOTC-wrapped UDP datagram.
 // raw/raw_len: the full datagram as received from recvfrom (not yet descrambled).
 // plain_out/plain_max: output buffer for decrypted payload.
 // Returns plaintext byte count on success, 0 if not an ApplicationData record
-// (keepalive or other type — caller should retry), -1 on AEAD authentication failure.
+// (keepalive or other type — caller should retry), -1 on AEAD/EtM authentication failure.
 static int dtls_decrypt_one(DtlsSession* ds,
                              const uint8_t* raw, size_t raw_len,
                              uint8_t* plain_out, size_t plain_max)
@@ -3220,7 +3472,7 @@ static int dtls_decrypt_one(DtlsSession* ds,
     if (raw_len < 28 + 13) return 0;  // too short for IOTC header + DTLS record header
 
     std::vector<uint8_t> buf(raw, raw + raw_len);
-    reverse_trans_code_partial(buf.data(), std::min(buf.size(), (size_t)80));
+    reverse_trans_code_partial(buf.data(), buf.size());
 
     if (buf[0] != 0x04 || buf[1] != 0x02) return 0;
 
@@ -3231,49 +3483,14 @@ static int dtls_decrypt_one(DtlsSession* ds,
         return 0;
     }
 
-    uint16_t rec_epoch  = read_be16(buf.data() + 31);
-    uint64_t rec_seq    = read_be48(buf.data() + 33);
-    uint16_t cipher_len = read_be16(buf.data() + 39);
-
-    if (raw_len < 28 + 13 + (size_t)cipher_len) {
-        OBN_WARN("[dtls-decrypt] truncated record (have %zu, need %zu)", raw_len, 28 + 13 + (size_t)cipher_len);
-        return 0;
+    const uint8_t* dtls_rec = buf.data() + 28;
+    size_t dtls_len = buf.size() - 28;
+    int plain_len = dtls_decrypt_record(ds, dtls_rec, dtls_len, plain_out, plain_max);
+    if (plain_len >= 0) {
+        ds->rx_seq++;
+        return plain_len;
     }
-    if (cipher_len < 16) {
-        OBN_WARN("[dtls-decrypt] cipher_len %u too short for tag", cipher_len);
-        return 0;
-    }
-
-    uint16_t plain_len = cipher_len - 16;
-    if (plain_len > plain_max) {
-        OBN_ERROR("[dtls-decrypt] plaintext %u > plain_max %zu", plain_len, plain_max);
-        return -1;
-    }
-
-    uint8_t nonce[12];
-    build_relay_nonce(nonce, ds->server_write_iv, rec_epoch, rec_seq);
-
-    const uint8_t* aad        = buf.data() + 28;  // AAD = 13-byte DTLS record header
-    const uint8_t* ciphertext = buf.data() + 28 + 13;
-    const uint8_t* tag        = ciphertext + plain_len;
-
-    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-    int outl = 0;
-    EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), nullptr, nullptr, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, nullptr);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, const_cast<uint8_t*>(tag));
-    EVP_DecryptInit_ex(ctx, nullptr, nullptr, ds->server_write_key, nonce);
-    EVP_DecryptUpdate(ctx, nullptr, &outl, aad, 13);  // AAD
-    EVP_DecryptUpdate(ctx, plain_out, &outl, ciphertext, (int)plain_len);
-    int total = outl;
-    int ok = EVP_DecryptFinal_ex(ctx, plain_out + total, &outl);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (ok <= 0) {
-        OBN_ERROR("[dtls-decrypt] AEAD auth failed (epoch=%u seq=%llu)", rec_epoch, (unsigned long long)rec_seq);
-        return -1;
-    }
-    return (int)plain_len;
+    return -1;
 }
 
 static int av_channel_write(AvChannel* ch, const void* buf, size_t len)
