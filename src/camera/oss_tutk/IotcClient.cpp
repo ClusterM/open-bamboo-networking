@@ -2364,7 +2364,7 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
                                      const char* uid_upper, const char* authkey,
                                      const uint8_t session_token[8],
                                      const uint8_t client_random[8],
-                                     const struct sockaddr_in* reflexive,
+                                     struct sockaddr_in* reflexive,
                                      struct sockaddr_in* peer_out)
 {
     uint8_t txn[8];
@@ -2386,6 +2386,22 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
         if (n < 16) continue;
         reverse_trans_code_partial(resp, (size_t)n);
         if (resp[0] != 0x04 || resp[1] != 0x02) continue;
+        OBN_DEBUG("[rdv] reply %zd bytes type=%02x %02x %02x", n, resp[8], resp[9], resp[10]);
+
+        // Probe reply (04 80 4f): body record at [16..24) is our reflexive
+        // address as this server sees it. The master reply does NOT carry a
+        // reflexive record, so without this the punches advertise the server's
+        // own address (useless for NAT traversal).
+        if (resp[8] == 0x04 && resp[9] == 0x80) {
+            struct sockaddr_in mine{};
+            if (read_addr_rec(resp + 16, &mine) && ntohs(mine.sin_port) != 3478) {
+                *reflexive = mine;
+                char ipb[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &mine.sin_addr, ipb, sizeof(ipb));
+                OBN_DEBUG("[rdv] reflexive learned %s:%u", ipb, ntohs(mine.sin_port));
+            }
+            continue;
+        }
 
         if (resp[8] == 0x02 && resp[9] == 0x06 && resp[10] == 0x12) {   // printer rendezvous
             *peer_out = src;
@@ -2424,6 +2440,14 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
 
     struct sockaddr_in reflexive{};
     bool have_reflexive = parse_reflexive(master_reply, reply_len, &reflexive);
+    if (!have_reflexive) {
+        // Observed live: the08 10 83 master reply carries no reflexive record;
+        // the rdv server's probe reply (04 80 4f) does. Seed with the first
+        // server's address so the first punches are never empty, then let the
+        // probe reply upgrade it inside offlan_rendezvous_server.
+        OBN_DEBUG("[rdv] master reply has no reflexive record; seeding from server1");
+        if (ns > 0) reflexive = servers[0];
+    }
 
     uint8_t client_random[8];
     { uint32_t a = rand32(), b = rand32();
@@ -2432,7 +2456,7 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
     for (int s = 0; s < ns; ++s) {
         if (offlan_rendezvous_server(sock, &servers[s], uid_upper, authkey,
                                      session_token, client_random,
-                                     have_reflexive ? &reflexive : &servers[s],
+                                     &reflexive,
                                      peer_out))
             return true;
     }
