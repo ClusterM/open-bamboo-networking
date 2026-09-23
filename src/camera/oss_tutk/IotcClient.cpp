@@ -2503,11 +2503,21 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
     send_stun_probe(sock, srv, txn);
     send_rdv_authkey(sock, srv, uid_upper, authkey);
 
-    set_recv_timeout(sock, 1000);
+    set_recv_timeout(sock, 300);
     struct sockaddr_in candidates[4];
     int num_candidates = 0;
 
-    for (int attempt = 0; attempt < 20; ++attempt) {
+    for (int attempt = 0; attempt < 35; ++attempt) {
+        // If candidates are known, keep punching them periodically while waiting for printer reply
+        if (num_candidates > 0) {
+            for (int c = 0; c < num_candidates; ++c) {
+                send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+            }
+            if (attempt % 3 == 0) {
+                send_rdv_punch2(sock, srv, uid_upper, session_token);
+            }
+        }
+
         uint8_t resp[1024];
         struct sockaddr_in src{}; socklen_t sl = sizeof(src);
         ssize_t n = recvfrom(sock, resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
@@ -2570,8 +2580,10 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
         if (resp[8] == 0x01 && resp[9] == 0x03 && resp[10] == 0x43) {
             num_candidates = parse_candidates(resp, (size_t)n, candidates, 4);
             OBN_DEBUG("[rdv] received 01 03 43 with %d candidate(s)", num_candidates);
-            for (int c = 0; c < num_candidates; ++c) {
-                send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+            for (int rep = 0; rep < 3; ++rep) {
+                for (int c = 0; c < num_candidates; ++c) {
+                    send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+                }
             }
             send_rdv_punch2(sock, srv, uid_upper, session_token);
             continue;
