@@ -476,6 +476,8 @@ static void encode_block(const uint8_t* in, uint8_t* out)
     memcpy(out+12, &o3, 4);
 }
 
+static const uint8_t kTailPerm8[8] = {7, 4, 3, 2, 1, 6, 5, 0};
+
 static void reverse_trans_code_partial(uint8_t* data, size_t len)
 {
     size_t full = (len / 16) * 16;
@@ -484,8 +486,17 @@ static void reverse_trans_code_partial(uint8_t* data, size_t len)
         decode_block(data + i, tmp);
         memcpy(data + i, tmp, 16);
     }
-    for (size_t i = full; i < len; ++i)
-        data[i] ^= kTransKey[i % 16];
+    size_t rem = len - full;
+    if (rem == 8) {
+        uint8_t tail[8];
+        for (size_t k = 0; k < 8; ++k) {
+            tail[kTailPerm8[k]] = data[full + k] ^ kTransKey[kTailPerm8[k]];
+        }
+        memcpy(data + full, tail, 8);
+    } else {
+        for (size_t i = full; i < len; ++i)
+            data[i] ^= kTransKey[i % 16];
+    }
 }
 
 static void trans_code_partial(uint8_t* data, size_t len)
@@ -496,8 +507,17 @@ static void trans_code_partial(uint8_t* data, size_t len)
         encode_block(data + i, tmp);
         memcpy(data + i, tmp, 16);
     }
-    for (size_t i = full; i < len; ++i)
-        data[i] ^= kTransKey[i % 16];
+    size_t rem = len - full;
+    if (rem == 8) {
+        uint8_t tail[8];
+        for (size_t k = 0; k < 8; ++k) {
+            tail[k] = data[full + kTailPerm8[k]] ^ kTransKey[kTailPerm8[k]];
+        }
+        memcpy(data + full, tail, 8);
+    } else {
+        for (size_t i = full; i < len; ++i)
+            data[i] ^= kTransKey[i % 16];
+    }
 }
 
 #ifdef OBN_TESTING
@@ -1391,8 +1411,20 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
                           | ((uint32_t)srv_raw[pos+15] << 8)
                           |  (uint32_t)srv_raw[pos+16];
 
-            transcript.insert(transcript.end(),
-                              srv_raw + pos + 13, srv_raw + pos + 13 + 12 + hlen);
+            if (htype == 0x0e) {
+                // ServerHelloDone (RFC 6347 §4.2.2):
+                // type=0x0E (1), len=0 (3), msg_seq=2 (2), frag_off=0 (3), frag_len=0 (3) = 12 bytes.
+                static const uint8_t kCanonicalServerHelloDone[12] = {
+                    0x0e, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+                };
+                transcript.insert(transcript.end(),
+                                  kCanonicalServerHelloDone, kCanonicalServerHelloDone + 12);
+                has_server_hello_done = true;
+                OBN_DEBUG("[dtls] ServerHelloDone received");
+            } else {
+                transcript.insert(transcript.end(),
+                                  srv_raw + pos + 13, srv_raw + pos + 13 + 12 + hlen);
+            }
 
             if (htype == 0x0c) {
                 // ServerKeyExchange: RFC 5489 ECDHE-PSK body:
@@ -1409,9 +1441,6 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
                         OBN_DEBUG("[dtls] ServerKeyExchange: %u-byte EC key", key_len);
                     }
                 }
-            } else if (htype == 0x0e) {
-                has_server_hello_done = true;
-                OBN_DEBUG("[dtls] ServerHelloDone received");
             }
         }
         pos += 13 + (int)rlen;
