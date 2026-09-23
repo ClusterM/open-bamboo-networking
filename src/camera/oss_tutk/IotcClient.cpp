@@ -1484,10 +1484,36 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     memcpy(premaster + pm_off, psk, 32); pm_off += 32;
 
     // =======================================================================
+    // Build ClientKeyExchange (must be in transcript for RFC 7627 session_hash)
+    // =======================================================================
+
+    std::string psk_identity = std::string("AUTHPWD_") + account;
+
+    std::vector<uint8_t> cke_body;
+    uint16_t id_len = (uint16_t)psk_identity.size();
+    cke_body.push_back((id_len >> 8) & 0xff);
+    cke_body.push_back(id_len & 0xff);
+    cke_body.insert(cke_body.end(), psk_identity.begin(), psk_identity.end());
+    if (has_server_ec) {
+        cke_body.push_back(0x20);  // ec key length = 32
+        cke_body.insert(cke_body.end(), client_ec_pub, client_ec_pub + 32);
+    }
+
+    uint8_t cke_rec_hdr[13], cke_hs_hdr[12];
+    build_dtls_hs_hdr(cke_hs_hdr, 0x10 /*ClientKeyExchange*/,
+                       (uint32_t)cke_body.size(), 1 /*msg_seq*/);
+    build_dtls_record_hdr(cke_rec_hdr, 0x16, initial_epoch, 1,
+                           (uint16_t)(12 + cke_body.size()));
+
+    transcript.insert(transcript.end(), cke_hs_hdr, cke_hs_hdr + 12);
+    transcript.insert(transcript.end(), cke_body.begin(), cke_body.end());
+
+    // =======================================================================
     // Compute master_secret
     // =======================================================================
     if (out->use_ems) {
         // RFC 7627 Extended Master Secret: PRF(premaster, "extended master secret", Hash(handshake_messages))
+        // session_hash covers ClientHello through ClientKeyExchange.
         if (out->cipher_suite == 0xC038) {
             uint8_t hs_hash[48];
             SHA384(transcript.data(), transcript.size(), hs_hash);
@@ -1497,7 +1523,7 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
             uint8_t hs_hash[32];
             SHA256(transcript.data(), transcript.size(), hs_hash);
             tls12_prf(premaster, sizeof(premaster), "extended master secret",
-                      hs_hash, 32, out->master_secret, 48);
+                       hs_hash, 32, out->master_secret, 48);
         }
         OBN_DEBUG("[dtls] extended master_secret derived");
     } else {
@@ -1546,31 +1572,6 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         memcpy(out->server_write_iv,  key_block + 76, 12);
         OBN_DEBUG("[dtls] key expansion (0xCCAC ChaCha20-Poly1305) done");
     }
-
-    // =======================================================================
-    // Build ClientKeyExchange
-    // =======================================================================
-
-    std::string psk_identity = std::string("AUTHPWD_") + account;
-
-    std::vector<uint8_t> cke_body;
-    uint16_t id_len = (uint16_t)psk_identity.size();
-    cke_body.push_back((id_len >> 8) & 0xff);
-    cke_body.push_back(id_len & 0xff);
-    cke_body.insert(cke_body.end(), psk_identity.begin(), psk_identity.end());
-    if (has_server_ec) {
-        cke_body.push_back(0x20);  // ec key length = 32
-        cke_body.insert(cke_body.end(), client_ec_pub, client_ec_pub + 32);
-    }
-
-    uint8_t cke_rec_hdr[13], cke_hs_hdr[12];
-    build_dtls_hs_hdr(cke_hs_hdr, 0x10 /*ClientKeyExchange*/,
-                       (uint32_t)cke_body.size(), 1 /*msg_seq*/);
-    build_dtls_record_hdr(cke_rec_hdr, 0x16, initial_epoch, 1,
-                           (uint16_t)(12 + cke_body.size()));
-
-    transcript.insert(transcript.end(), cke_hs_hdr, cke_hs_hdr + 12);
-    transcript.insert(transcript.end(), cke_body.begin(), cke_body.end());
 
     // =======================================================================
     // Build ChangeCipherSpec
