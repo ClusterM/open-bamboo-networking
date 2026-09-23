@@ -922,7 +922,35 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         0x00, 0xFF,   // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
 
-    uint8_t ch_body[64];
+    // TLS 1.2 extensions required for ECDHE key exchange (RFC 8422 §5.1.1):
+    // 1. ec_point_formats (0x000b): uncompressed, compressed prime/char2
+    // 2. supported_groups (0x000a): X25519 (0x001d), secp256r1 (0x0017), x448, secp521r1, secp384r1
+    // 3. session_ticket (0x0023): len 0
+    // 4. signature_algorithms (0x000d): SHA256/384/512 with ECDSA/RSA/DSA
+    static const uint8_t kExtensions[] = {
+        // Total extensions length: 74 bytes (0x004a)
+        0x00, 0x4a,
+        // ec_point_formats (0x000b, len 4)
+        0x00, 0x0b, 0x00, 0x04, 0x03, 0x00, 0x01, 0x02,
+        // supported_groups (0x000a, len 12)
+        0x00, 0x0a, 0x00, 0x0c, 0x00, 0x0a,
+        0x00, 0x1d,  // X25519
+        0x00, 0x17,  // secp256r1
+        0x00, 0x1e,  // x448
+        0x00, 0x19,  // secp521r1
+        0x00, 0x18,  // secp384r1
+        // session_ticket (0x0023, len 0)
+        0x00, 0x23, 0x00, 0x00,
+        // signature_algorithms (0x000d, len 42)
+        0x00, 0x0d, 0x00, 0x2a, 0x00, 0x28,
+        0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x07,
+        0x08, 0x08, 0x08, 0x09, 0x08, 0x0a, 0x08, 0x0b,
+        0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01,
+        0x05, 0x01, 0x06, 0x01, 0x03, 0x03, 0x03, 0x01,
+        0x03, 0x02, 0x04, 0x02, 0x05, 0x02, 0x06, 0x02
+    };
+
+    uint8_t ch_body[256];
     size_t ch_off = 0;
     ch_body[ch_off++] = 0xfe; ch_body[ch_off++] = 0xfd;  // hello version DTLS 1.2
     memcpy(ch_body + ch_off, out->client_random, 32); ch_off += 32;
@@ -932,13 +960,17 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     memcpy(ch_body + ch_off, kCipherSuites, 4); ch_off += 4;
     ch_body[ch_off++] = 0x01;   // compression_methods_len = 1
     ch_body[ch_off++] = 0x00;   // compression = null
-    // no extensions
+    memcpy(ch_body + ch_off, kExtensions, sizeof(kExtensions));
+    ch_off += sizeof(kExtensions);
 
     uint8_t hs_hdr[12];
     build_dtls_hs_hdr(hs_hdr, 0x01, (uint32_t)ch_off, 0);
 
     uint8_t rec_hdr[13];
     build_dtls_record_hdr(rec_hdr, 0x16, initial_epoch, 0, (uint16_t)(12 + ch_off));
+    // RFC 6347 §4.2.1: DTLS 1.2 ClientHello record header uses DTLS 1.0 (0xFEFF)
+    rec_hdr[1] = 0xfe;
+    rec_hdr[2] = 0xff;
 
     std::vector<uint8_t> ch_dtls(13 + 12 + ch_off);
     memcpy(ch_dtls.data(),      rec_hdr, 13);
@@ -986,8 +1018,27 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         return -1;
     }
 
-    if (srv_raw[0] != 0x16 || srv_raw[1] != 0xfe || srv_raw[2] != 0xfd) {
-        OBN_ERROR("[dtls] unexpected record type 0x%02x", srv_raw[0]);
+    if (srv_raw[0] != 0x16 || srv_raw[1] != 0xfe || (srv_raw[2] != 0xfd && srv_raw[2] != 0xff)) {
+        if (srv_raw[0] == 0x15 && srv_len >= 15) {
+            uint8_t alert_level = srv_raw[13];
+            uint8_t alert_desc  = srv_raw[14];
+            OBN_ERROR("[dtls] received DTLS Alert: level=%u (%s) desc=%u (%s)",
+                      alert_level, (alert_level == 1 ? "warning" : "fatal"),
+                      alert_desc,
+                      (alert_desc == 10 ? "unexpected_message" :
+                       alert_desc == 20 ? "bad_record_mac" :
+                       alert_desc == 40 ? "handshake_failure" :
+                       alert_desc == 47 ? "illegal_parameter" :
+                       alert_desc == 70 ? "protocol_version" : "other"));
+        } else {
+            OBN_ERROR("[dtls] unexpected record type 0x%02x (len=%d)", srv_raw[0], srv_len);
+        }
+        char hex_dump[128] = {};
+        int dump_n = std::min(srv_len, 32);
+        for (int i = 0; i < dump_n; ++i) {
+            snprintf(hex_dump + i * 3, sizeof(hex_dump) - i * 3, "%02x ", srv_raw[i]);
+        }
+        OBN_ERROR("[dtls] server record raw: %s", hex_dump);
         return -1;
     }
     out->epoch = srv_epoch;
@@ -1008,6 +1059,17 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     if (hs_type != 0x02) {
         OBN_ERROR("[dtls] expected ServerHello (0x02), got 0x%02x", hs_type);
         return -1;
+    }
+
+    // Log server-selected cipher suite
+    size_t sh_cs_off = 25 + 2 + 32;
+    if ((size_t)srv_len > sh_cs_off) {
+        uint8_t sid_len = srv_raw[sh_cs_off];
+        sh_cs_off += 1 + sid_len;
+        if ((size_t)srv_len >= sh_cs_off + 2) {
+            uint16_t cs = ((uint16_t)srv_raw[sh_cs_off] << 8) | srv_raw[sh_cs_off + 1];
+            OBN_INFO("[dtls] ServerHello selected cipher suite: 0x%04x", cs);
+        }
     }
 
     // TUTK ServerHello body: version(2)+random(32); session_id_len may be non-standard
