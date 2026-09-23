@@ -2387,6 +2387,18 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
         reverse_trans_code_partial(resp, (size_t)n);
         if (resp[0] != 0x04 || resp[1] != 0x02) continue;
         OBN_DEBUG("[rdv] reply %zd bytes type=%02x %02x %02x", n, resp[8], resp[9], resp[10]);
+        {
+            // Body trace: handshake replies differ between a raw client and a
+            // prepared session (e.g.27 02 42 vs15 02 42) and the type alone
+            // does not say why candidates never follow.
+            std::string hx;
+            for (size_t k = 0; k < (size_t)n && k < 64; ++k) {
+                char b[3];
+                snprintf(b, sizeof(b), "%02x", resp[k]);
+                hx += b;
+            }
+            OBN_DEBUG("[rdv] reply hex %s", hx.c_str());
+        }
 
         // Probe reply (04 80 4f): body record at [16..24) is our reflexive
         // address as this server sees it. The master reply does NOT carry a
