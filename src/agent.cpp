@@ -1534,8 +1534,29 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     }
     if (region.empty()) region = "us";
 
-    // Proactively send signed prepare command so printer starts tutk_server
+    // Proactively send signed prepare command so printer starts tutk_server —
+    // but at most once per uid per12s. The video player retries
+    // get_camera_url while buffering fails, and every re-prepare restarts the
+    // printer's TUTK server before it finishes registering with the
+    // rendezvous servers, so the viewer never receives a candidate list
+    // (observed live:4 prepares in36s, zero01 03 43 replies).
+    bool prepare_recently = false;
     {
+        static std::mutex                prep_mu;
+        static std::map<std::string, std::chrono::steady_clock::time_point> last_prepare;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(prep_mu);
+        auto it = last_prepare.find(uid);
+        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(12)) {
+            prepare_recently = true;
+        } else {
+            last_prepare[uid] = now;
+        }
+    }
+    if (prepare_recently) {
+        OBN_INFO("camera_url(remote): prepare cooldown active for dev=%s uid=%.20s - not re-dispatching",
+                 serial.c_str(), uid.c_str());
+    } else {
         obn::json::Object lv_obj;
         lv_obj["command"]     = obn::json::Value(std::string("prepare"));
         lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
