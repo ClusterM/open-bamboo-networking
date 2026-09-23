@@ -390,6 +390,11 @@ static inline uint32_t read_be32(const uint8_t* p) {
 static inline uint16_t read_be16(const uint8_t* p) {
     return ((uint16_t)p[0] << 8) | p[1];
 }
+static inline uint64_t read_be48(const uint8_t* p) {
+    return ((uint64_t)p[0] << 40) | ((uint64_t)p[1] << 32)
+         | ((uint64_t)p[2] << 24) | ((uint64_t)p[3] << 16)
+         | ((uint64_t)p[4] <<  8) |  (uint64_t)p[5];
+}
 
 static void decode_block(const uint8_t* in, uint8_t* out)
 {
@@ -529,12 +534,16 @@ void reverse_trans_code_partial_test(uint8_t* data, size_t len) { reverse_trans_
 static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* dst,
                              uint32_t epoch,
                              const uint8_t session_token[8],
-                             const uint8_t* dtls_data, size_t dtls_len)
+                             const uint8_t* dtls_data, size_t dtls_len,
+                             uint32_t relay_tag = 0)
 {
     size_t total = 28 + dtls_len;
     std::vector<uint8_t> pkt(total, 0);
 
     uint16_t payload_len = (uint16_t)(12 + dtls_len);
+    bool is_relay = (dst && ntohs(dst->sin_port) == 3478);
+    static std::atomic<uint16_t> s_packet_seq{0};
+    uint16_t seq_num = s_packet_seq.fetch_add(1);
 
     // IOTC header
     pkt[0] = 0x04; pkt[1] = 0x02;
@@ -542,19 +551,38 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
     pkt[3] = 0x0b;
     pkt[4] = (uint8_t)(payload_len & 0xff);
     pkt[5] = (uint8_t)(payload_len >> 8);
-    // [6..7] = 0
-    pkt[8]  = 0x07; pkt[9]  = 0x04; pkt[10] = 0x21;
-    // [11] = 0
-    pkt[12] = session_token[0];
-    pkt[13] = session_token[1];
-    pkt[14] = 0x00; pkt[15] = 0x01;
 
-    // Sub-header
-    pkt[16] = 0x0c;
-    pkt[17] = (uint8_t)((epoch >> 8) & 0xff);  // epoch low16, big-endian
-    pkt[18] = (uint8_t)(epoch & 0xff);
-    // pkt[19] = 0x00
-    memcpy(pkt.data() + 20, session_token, 8);
+    if (is_relay) {
+        pkt[6] = (uint8_t)(seq_num & 0xff);
+        pkt[7] = (uint8_t)((seq_num >> 8) & 0xff);
+        pkt[8]  = 0x04; pkt[9]  = 0x05; pkt[10] = 0x24;
+        pkt[11] = 0x00;
+        pkt[12] = (uint8_t)(relay_tag & 0xff);
+        pkt[13] = (uint8_t)((relay_tag >> 8) & 0xff);
+        pkt[14] = (uint8_t)((relay_tag >> 16) & 0xff);
+        pkt[15] = 0x01;
+
+        // Sub-header (12 bytes)
+        pkt[16] = 0x0c;
+        pkt[17] = 0x00;
+        pkt[18] = 0x00;
+        pkt[19] = 0x00;
+        memcpy(pkt.data() + 20, session_token, 8);
+    } else {
+        pkt[6] = 0x00; pkt[7] = 0x00;
+        pkt[8]  = 0x07; pkt[9]  = 0x04; pkt[10] = 0x21;
+        pkt[11] = 0x00;
+        pkt[12] = session_token[0];
+        pkt[13] = session_token[1];
+        pkt[14] = 0x00; pkt[15] = 0x01;
+
+        // Sub-header
+        pkt[16] = 0x0c;
+        pkt[17] = (uint8_t)((epoch >> 8) & 0xff);  // epoch low16, big-endian
+        pkt[18] = (uint8_t)(epoch & 0xff);
+        pkt[19] = 0x00;
+        memcpy(pkt.data() + 20, session_token, 8);
+    }
 
     // DTLS payload
     if (dtls_len > 0)
@@ -577,35 +605,40 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
     set_recv_timeout(sock, timeout_ms);
 
     for (int attempt = 0; attempt < 8; ++attempt) {
-    uint8_t raw[2048];
-    struct sockaddr_in src{};
-    socklen_t src_len = sizeof(src);
-    ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
-                          (struct sockaddr*)&src, &src_len);
-    if (n < 28) return -1;
+        uint8_t raw[2048];
+        struct sockaddr_in src{};
+        socklen_t src_len = sizeof(src);
+        ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
+                              (struct sockaddr*)&src, &src_len);
+        if (n < 28) return -1;
 
-    reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
+        reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
 
-    if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
+        if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
 
-    // Skip non-DTLS IOTC packets (type 0x33 echoes etc.):
-    // DTLS content starts with 0x16 (Handshake), 0x14 (CCS), or 0x15 (Alert).
-    size_t dtls_len = (size_t)(n - 28);
-    if (dtls_len < 1 || (raw[28] != 0x16 && raw[28] != 0x14 && raw[28] != 0x15)) {
-        OBN_DEBUG("[dtls] recv: skipping non-DTLS IOTC pkt (n=%zd type=0x%02x)", n, dtls_len > 0 ? raw[28] : 0);
-        continue;
-    }
+        // Skip non-DTLS IOTC packets (type 0x33 echoes etc.):
+        // DTLS content starts with 0x16 (Handshake), 0x14 (CCS), or 0x15 (Alert).
+        size_t dtls_len = (size_t)(n - 28);
+        if (dtls_len < 1 || (raw[28] != 0x16 && raw[28] != 0x14 && raw[28] != 0x15)) {
+            OBN_DEBUG("[dtls] recv: skipping non-DTLS IOTC pkt (n=%zd type=0x%02x)", n, dtls_len > 0 ? raw[28] : 0);
+            continue;
+        }
 
-    if (epoch_out) {
-        uint32_t ep = ((uint32_t)raw[17] << 8) | raw[18];
-        *epoch_out = ep;
-    }
-    if (session_token_out)
-        memcpy(session_token_out, raw + 20, 8);
+        if (epoch_out) {
+            uint32_t ep = 0;
+            if (raw[8] == 0x03 && raw[9] == 0x05 && raw[10] == 0x42) {
+                if (n >= 33) ep = ((uint32_t)raw[31] << 8) | raw[32];
+            } else {
+                ep = ((uint32_t)raw[17] << 8) | raw[18];
+            }
+            *epoch_out = ep;
+        }
+        if (session_token_out)
+            memcpy(session_token_out, raw + 20, 8);
 
-    if (dtls_len > buf_size) dtls_len = buf_size;
-    memcpy(dtls_out, raw + 28, dtls_len);
-    return (int)dtls_len;
+        if (dtls_len > buf_size) dtls_len = buf_size;
+        memcpy(dtls_out, raw + 28, dtls_len);
+        return (int)dtls_len;
     }  // end for (attempt)
     return -1;
 }
@@ -788,26 +821,23 @@ static bool tls12_prf(const uint8_t* secret, size_t secret_len,
     return true;
 }
 
-// Build a 12-byte DTLS nonce for the TUTK relay format:
-//   nonce = iv XOR (epoch[4B BE] || seq[8B BE])
-// For recv paths where seq is 32-bit, pass (uint64_t)seq — high bits are 0.
+// Build a 12-byte DTLS nonce for the TUTK ChaCha20-Poly1305 AEAD format:
+//   nonce = iv XOR (0x00[4B] || epoch[2B BE] || seq[6B BE]) (RFC 7905)
 static void build_relay_nonce(uint8_t nonce[12], const uint8_t iv[12],
-                               uint32_t epoch, uint64_t seq)
+                               uint16_t epoch, uint64_t seq)
 {
     memcpy(nonce, iv, 12);
-    nonce[0] ^= (uint8_t)(epoch >> 24);
-    nonce[1] ^= (uint8_t)(epoch >> 16);
-    nonce[2] ^= (uint8_t)(epoch >>  8);
-    nonce[3] ^= (uint8_t)(epoch      );
-    for (int i = 0; i < 8; ++i)
-        nonce[4 + i] ^= (uint8_t)(seq >> (56 - 8*i));
+    nonce[4] ^= (uint8_t)(epoch >> 8);
+    nonce[5] ^= (uint8_t)(epoch     );
+    for (int i = 0; i < 6; ++i)
+        nonce[6 + i] ^= (uint8_t)(seq >> (40 - 8*i));
 }
 
 #ifdef OBN_TESTING
 void build_relay_nonce_test(uint8_t nonce[12], const uint8_t iv[12],
                              uint32_t epoch, uint64_t seq)
 {
-    build_relay_nonce(nonce, iv, epoch, seq);
+    build_relay_nonce(nonce, iv, (uint16_t)epoch, seq);
 }
 #endif
 
@@ -862,10 +892,12 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
                                const uint8_t session_token[8],
                                const char* uid_upper_str,
                                const char* passwd, const char* account,
-                               DtlsSession* out)
+                               DtlsSession* out,
+                               uint32_t relay_tag = 0)
 {
     memset(out, 0, sizeof(*out));
     out->epoch = initial_epoch;
+    out->relay_tag = relay_tag;
 
     if (RAND_bytes(out->client_random, 32) != 1) {
         OBN_ERROR("[dtls] RAND_bytes failed");
@@ -919,7 +951,7 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     transcript.insert(transcript.end(), ch_body, ch_body + ch_off);
 
     if (send_dtls_packet(sock, dst, initial_epoch, session_token,
-                          ch_dtls.data(), ch_dtls.size()) != 0) {
+                          ch_dtls.data(), ch_dtls.size(), relay_tag) != 0) {
         OBN_ERROR("[dtls] ClientHello send failed");
         return -1;
     }
@@ -1255,7 +1287,7 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     cke_ccs_fin.insert(cke_ccs_fin.end(), fin_cipher, fin_cipher + fin_cipher_len);
 
     if (send_dtls_packet(sock, dst, out->epoch, session_token,
-                          cke_ccs_fin.data(), cke_ccs_fin.size()) != 0) {
+                          cke_ccs_fin.data(), cke_ccs_fin.size(), relay_tag) != 0) {
         OBN_ERROR("[dtls] CKE+CCS+Finished send failed");
         return -1;
     }
@@ -2261,29 +2293,50 @@ static int send_rdv_token(obn::net::socket_t sock, const struct sockaddr_in* dst
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
 }
 
-// 04 08 24: punch. Carries a printer candidate address [36..44) (00 00 | port |
-// ip variant), the session token [68..76), the client random [76..84) and the
-// client's reflexive address [140..148).
+// Determine local IPv4 and bound port routed to remote address
+static bool get_local_endpoint(const struct sockaddr_in* remote, struct sockaddr_in* local_out, uint16_t local_port)
+{
+    obn::net::socket_t s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s == obn::net::kInvalid) return false;
+    bool ok = false;
+    if (connect(s, (const struct sockaddr*)remote, sizeof(*remote)) == 0) {
+        socklen_t len = sizeof(*local_out);
+        if (getsockname(s, (struct sockaddr*)local_out, &len) == 0) {
+            local_out->sin_port = htons(local_port);
+            ok = true;
+        }
+    }
+    obn::net::close_socket(s);
+    return ok;
+}
+
+// 04 08 24: Client Candidate Registration with rendezvous server (544 bytes).
+// Carries the session token [68..76), the local LAN endpoint [76..84), and the
+// client's reflexive WAN endpoint [140..148).
 static int send_rdv_punch(obn::net::socket_t sock, const struct sockaddr_in* server,
-                          const char* uid_upper, const struct sockaddr_in* cand,
-                          const uint8_t token[8], const uint8_t client_random[8],
+                          const char* uid_upper,
+                          const uint8_t token[8],
+                          const struct sockaddr_in* local_ep,
                           const struct sockaddr_in* reflexive)
 {
     uint8_t pkt[544];
+    memset(pkt, 0, sizeof(pkt));
     write_rdv_hdr(pkt, 528, 0x04, 0x08, 0x24);
-    memset(pkt + 16, 0, 528);
     memcpy(pkt + 16, uid_upper, 20);
-    pkt[36] = 0x00; pkt[37] = 0x00;
-    memcpy(pkt + 38, &cand->sin_port, 2);
-    memcpy(pkt + 40, &cand->sin_addr, 4);
     static const uint8_t kPunchConst[16] = {
-        0x02, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00,
-        0x02, 0x03, 0x03, 0x04, 0x04, 0x03, 0x03, 0x04
+        0x00, 0x02, 0xff, 0x04, 0xa6, 0xff, 0xff, 0xff,
+        0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x03, 0x04
     };
     memcpy(pkt + 52, kPunchConst, 16);
     memcpy(pkt + 68, token, 8);
-    memcpy(pkt + 76, client_random, 8);
-    write_addr_rec(pkt + 140, reflexive);
+    pkt[76] = 0x00; pkt[77] = 0x00;
+    memcpy(pkt + 78, &local_ep->sin_port, 2);
+    memcpy(pkt + 80, &local_ep->sin_addr, 4);
+    pkt[140] = 0x02; pkt[141] = 0x00;
+    memcpy(pkt + 142, &reflexive->sin_port, 2);
+    memcpy(pkt + 144, &reflexive->sin_addr, 4);
+    pkt[540] = 0x42; pkt[541] = 0x02; pkt[542] = 0x00; pkt[543] = 0x00;
+
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0, (const struct sockaddr*)server, sizeof(*server));
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
@@ -2301,26 +2354,46 @@ static int send_stun_probe(obn::net::socket_t sock, const struct sockaddr_in* ds
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
 }
 
-// 03 02 34: announce the client random. UID + client_random [20..28) +
-// session token [84..92) + a 0x02 marker [92].
+// 03 02 34: announce local endpoint, token, and authkey (288 bytes).
 static int send_rdv_random(obn::net::socket_t sock, const struct sockaddr_in* dst,
-                           const char* uid_upper, const uint8_t client_random[8],
-                           const uint8_t token[8])
+                           const char* uid_upper, const struct sockaddr_in* local_ep,
+                           const uint8_t token[8], const char* authkey)
 {
-    uint8_t pkt[112];
-    write_rdv_hdr(pkt, 96, 0x03, 0x02, 0x34);
-    memset(pkt + 16, 0, 96);
+    uint8_t pkt[288];
+    memset(pkt, 0, sizeof(pkt));
+    write_rdv_hdr(pkt, 272, 0x03, 0x02, 0x34);
     memcpy(pkt + 16, uid_upper, 20);
-    memcpy(pkt + 36, client_random, 8);
+    pkt[36] = 0x00; pkt[37] = 0x00;
+    memcpy(pkt + 38, &local_ep->sin_port, 2);
+    memcpy(pkt + 40, &local_ep->sin_addr, 4);
     memcpy(pkt + 100, token, 8);
     pkt[108] = 0x02;
+    if (authkey && authkey[0]) {
+        size_t klen = std::min(strlen(authkey), (size_t)8);
+        memcpy(pkt + 272, authkey, klen);
+    }
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0, (const struct sockaddr*)dst, sizeof(*dst));
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
 }
 
-// 09 02 24: follow-up after the punch. UID + session token [20..28) + a
-// constant trailer [32..44).
+// 01 04 33: punch directly to a printer candidate address (52 bytes).
+static int send_punch_to_candidate(obn::net::socket_t sock, const struct sockaddr_in* cand,
+                                   const char* uid_upper, const uint8_t token[8])
+{
+    uint8_t pkt[52];
+    memset(pkt, 0, sizeof(pkt));
+    write_rdv_hdr(pkt, 36, 0x01, 0x04, 0x33);
+    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 36, token, 8);
+    uint32_t r = rand32();
+    memcpy(pkt + 48, &r, 4);
+    trans_code_partial(pkt, sizeof(pkt));
+    ssize_t n = sendto(sock, pkt, sizeof(pkt), 0, (const struct sockaddr*)cand, sizeof(*cand));
+    return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
+}
+
+// 09 02 24: follow-up after candidate punch. UID + session token [20..28) + trailer [32..44).
 static int send_rdv_punch2(obn::net::socket_t sock, const struct sockaddr_in* dst,
                            const char* uid_upper, const uint8_t token[8])
 {
@@ -2338,8 +2411,7 @@ static int send_rdv_punch2(obn::net::socket_t sock, const struct sockaddr_in* ds
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
 }
 
-// 0c 03 24: acknowledge a 03 03 43 reply. UID + session token; the reply's tag
-// (03 03 43 body [20..24)) is echoed in the header field at [12..16).
+// 0c 03 24: acknowledge a 03 03 43 reply. UID + session token; tag echoed at [12..16).
 static int send_rdv_ack(obn::net::socket_t sock, const struct sockaddr_in* dst,
                         const char* uid_upper, const uint8_t token[8], uint32_t tag)
 {
@@ -2356,54 +2428,48 @@ static int send_rdv_ack(obn::net::socket_t sock, const struct sockaddr_in* dst,
 }
 
 // Full off-LAN rendezvous with one server, in the genuine message order:
-//   03 80 3f (probe) -> 14 02 24 (authkey) -> 03 02 34 (client random)
-//   -> 0a 02 24 (token) -> 01 03 43 (candidates) -> 04 08 24 (punch)
-//   -> 09 02 24 -> 03 03 43 -> 0c 03 24 (ack) -> 02 06 12 (printer rendezvous)
-// Returns true if the printer rendezvous arrives; peer_out is its source.
+//   03 80 3f (probe) -> 14 02 24 (authkey) -> 04 08 24 (candidate registration)
+//   -> 03 02 34 (random) + 0a 02 24 (token) -> 01 03 43 (candidates) -> 01 04 33 (direct punch)
+//   -> 09 02 24 (punch2) -> 03 03 43 (pairing) -> 0c 03 24 (ack) -> server relay DTLS
+// Returns true if printer rendezvous or server pairing succeeds.
 static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct sockaddr_in* srv,
                                      const char* uid_upper, const char* authkey,
                                      const uint8_t session_token[8],
-                                     const uint8_t client_random[8],
                                      struct sockaddr_in* reflexive,
-                                     struct sockaddr_in* peer_out)
+                                     struct sockaddr_in* peer_out,
+                                     uint32_t* tag_out)
 {
+    struct sockaddr_in local_ep{};
+    socklen_t local_len = sizeof(local_ep);
+    uint16_t bound_port = 0;
+    if (getsockname(sock, (struct sockaddr*)&local_ep, &local_len) == 0) {
+        bound_port = ntohs(local_ep.sin_port);
+    }
+    get_local_endpoint(srv, &local_ep, bound_port);
+
     uint8_t txn[8];
     { uint32_t a = rand32(), b = rand32();
       memcpy(txn, &a, 4); memcpy(txn + 4, &b, 4); }
 
     send_stun_probe(sock, srv, txn);
     send_rdv_authkey(sock, srv, uid_upper, authkey);
-    send_rdv_random(sock, srv, uid_upper, client_random, session_token);
-    send_rdv_token(sock, srv, uid_upper, session_token, authkey);
 
-    // Handle replies as they arrive: punch candidates, ack, and finish on the
-    // printer rendezvous.
     set_recv_timeout(sock, 1000);
-    for (int attempt = 0; attempt < 12; ++attempt) {
+    struct sockaddr_in candidates[4];
+    int num_candidates = 0;
+
+    for (int attempt = 0; attempt < 20; ++attempt) {
         uint8_t resp[1024];
         struct sockaddr_in src{}; socklen_t sl = sizeof(src);
         ssize_t n = recvfrom(sock, resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
         if (n < 16) continue;
         reverse_trans_code_partial(resp, (size_t)n);
         if (resp[0] != 0x04 || resp[1] != 0x02) continue;
-        OBN_DEBUG("[rdv] reply %zd bytes type=%02x %02x %02x", n, resp[8], resp[9], resp[10]);
-        {
-            // Body trace: handshake replies differ between a raw client and a
-            // prepared session (e.g.27 02 42 vs15 02 42) and the type alone
-            // does not say why candidates never follow.
-            std::string hx;
-            for (size_t k = 0; k < (size_t)n && k < 64; ++k) {
-                char b[3];
-                snprintf(b, sizeof(b), "%02x", resp[k]);
-                hx += b;
-            }
-            OBN_DEBUG("[rdv] reply hex %s", hx.c_str());
-        }
+        OBN_DEBUG("[rdv] reply %zd bytes type=%02x %02x %02x from %s:%u",
+                  n, resp[8], resp[9], resp[10],
+                  inet_ntoa(src.sin_addr), ntohs(src.sin_port));
 
-        // Probe reply (04 80 4f): body record at [16..24) is our reflexive
-        // address as this server sees it. The master reply does NOT carry a
-        // reflexive record, so without this the punches advertise the server's
-        // own address (useless for NAT traversal).
+        // Probe reply (04 80 4f): learn reflexive WAN address
         if (resp[8] == 0x04 && resp[9] == 0x80) {
             struct sockaddr_in mine{};
             if (read_addr_rec(resp + 16, &mine) && ntohs(mine.sin_port) != 3478) {
@@ -2415,34 +2481,66 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
             continue;
         }
 
-        if (resp[8] == 0x02 && resp[9] == 0x06 && resp[10] == 0x12) {   // printer rendezvous
+        // Direct printer rendezvous (02 06 12) from printer P2P address
+        if (resp[8] == 0x02 && resp[9] == 0x06 && resp[10] == 0x12) {
             *peer_out = src;
+            if (tag_out) *tag_out = 0;
+            OBN_INFO("[rdv] direct printer rendezvous 02 06 12 received from %s:%u",
+                     inet_ntoa(src.sin_addr), ntohs(src.sin_port));
             return true;
         }
-        if (resp[8] == 0x01 && resp[9] == 0x03 && resp[10] == 0x43) {   // candidate list
-            struct sockaddr_in cands[4];
-            int nc = parse_candidates(resp, (size_t)n, cands, 4);
-            for (int c = 0; c < nc; ++c)
-                send_rdv_punch(sock, srv, uid_upper, &cands[c],
-                               session_token, client_random, reflexive);
-            send_rdv_punch2(sock, srv, uid_upper, session_token);
+
+        // Server challenge (27 02 42): triggers candidate registration 04 08 24
+        if (resp[8] == 0x27 && resp[9] == 0x02 && resp[10] == 0x42) {
+            OBN_DEBUG("[rdv] server challenge 27 02 42 -> sending candidate registration 04 08 24");
+            send_rdv_punch(sock, srv, uid_upper, session_token, &local_ep, reflexive);
+            send_stun_probe(sock, srv, txn);
+            send_rdv_authkey(sock, srv, uid_upper, authkey);
+            continue;
         }
-        else if (resp[8] == 0x03 && resp[9] == 0x03 && resp[10] == 0x43) { // reflexive+peer
-            uint32_t tag;                 // tag is body [20..24), after the UID
-            memcpy(&tag, resp + 36, 4);
-            send_rdv_ack(sock, srv, uid_upper, session_token, le32toh(tag));
+
+        // Prepared session response (15 02 42): triggers 03 02 34 and 0a 02 24
+        if (resp[8] == 0x15 && resp[9] == 0x02 && resp[10] == 0x42) {
+            OBN_DEBUG("[rdv] prepared session 15 02 42 -> sending 03 02 34 and 0a 02 24");
+            send_rdv_random(sock, srv, uid_upper, &local_ep, session_token, authkey);
+            send_rdv_token(sock, srv, uid_upper, session_token, authkey);
+            continue;
+        }
+
+        // Candidate list from printer (01 03 43)
+        if (resp[8] == 0x01 && resp[9] == 0x03 && resp[10] == 0x43) {
+            num_candidates = parse_candidates(resp, (size_t)n, candidates, 4);
+            OBN_DEBUG("[rdv] received 01 03 43 with %d candidate(s)", num_candidates);
+            for (int c = 0; c < num_candidates; ++c) {
+                send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+            }
+            send_rdv_punch2(sock, srv, uid_upper, session_token);
+            continue;
+        }
+
+        // Pairing confirmed / relay ready (03 03 43)
+        if (resp[8] == 0x03 && resp[9] == 0x03 && resp[10] == 0x43) {
+            uint32_t tag = 0;
+            if (n >= 40) memcpy(&tag, resp + 36, 4);
+            uint32_t tag_h = le32toh(tag);
+            OBN_INFO("[rdv] pairing confirmed 03 03 43 with tag=%u", tag_h);
+            send_rdv_ack(sock, srv, uid_upper, session_token, tag_h);
+
+            *peer_out = *srv;
+            if (tag_out) *tag_out = tag_h;
+            return true;
         }
     }
     return false;
 }
 
-// Returns true if a printer rendezvous (02 06 12) arrives; peer_out is set to
-// the address it came from (the printer's P2P media address).
+// Returns true if a printer rendezvous or server relay pairing succeeds.
 static bool offlan_rendezvous(obn::net::socket_t sock,
                               const uint8_t* master_reply, size_t reply_len,
                               const char* uid_upper, const char* authkey,
                               const uint8_t session_token[8],
-                              struct sockaddr_in* peer_out)
+                              struct sockaddr_in* peer_out,
+                              uint32_t* tag_out)
 {
     if (!authkey || !authkey[0]) return false;
 
@@ -2453,23 +2551,16 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
     struct sockaddr_in reflexive{};
     bool have_reflexive = parse_reflexive(master_reply, reply_len, &reflexive);
     if (!have_reflexive) {
-        // Observed live: the08 10 83 master reply carries no reflexive record;
-        // the rdv server's probe reply (04 80 4f) does. Seed with the first
-        // server's address so the first punches are never empty, then let the
-        // probe reply upgrade it inside offlan_rendezvous_server.
         OBN_DEBUG("[rdv] master reply has no reflexive record; seeding from server1");
         if (ns > 0) reflexive = servers[0];
     }
 
-    uint8_t client_random[8];
-    { uint32_t a = rand32(), b = rand32();
-      memcpy(client_random, &a, 4); memcpy(client_random + 4, &b, 4); }
-
     for (int s = 0; s < ns; ++s) {
         if (offlan_rendezvous_server(sock, &servers[s], uid_upper, authkey,
-                                     session_token, client_random,
+                                     session_token,
                                      &reflexive,
-                                     peer_out))
+                                     peer_out,
+                                     tag_out))
             return true;
     }
     return false;
@@ -2628,16 +2719,17 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
 
     // Off-LAN fallback: the printer did not send a direct rendezvous, so run the
     // reflexive/candidate exchange with the servers the master listed. On success
-    // peer_addr is the printer's P2P media address.
+    // peer_addr is the printer's P2P media address or the rendezvous relay server.
+    uint32_t relay_tag = 0;
     if (!got_assignment && master_reply_len > 0) {
         OBN_DEBUG("[relay] no direct rendezvous; trying off-LAN candidate exchange");
         if (offlan_rendezvous(sock, master_reply, master_reply_len,
-                              uid_upper, authkey, session_token, &peer_addr)) {
+                              uid_upper, authkey, session_token, &peer_addr, &relay_tag)) {
             got_assignment = true;
             char pip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &peer_addr.sin_addr, pip, sizeof(pip));
-            OBN_DEBUG("[relay] off-LAN rendezvous succeeded; peer = %s:%u",
-                      pip, ntohs(peer_addr.sin_port));
+            OBN_DEBUG("[relay] off-LAN rendezvous succeeded; peer = %s:%u (tag=%u)",
+                      pip, ntohs(peer_addr.sin_port), relay_tag);
         }
     }
 
@@ -2648,18 +2740,23 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     }
 
     // Punch and run the session against the peer's own address (from the
-    // rendezvous), not the master server.
-    if (send_relay_knock(sock, &peer_addr, uid_upper, session_token, true) != 0) {
-        OBN_ERROR("[relay] post-assignment KNOCK failed: %s", strerror(errno));
-        obn::net::close_socket(sock);
-        return -1;
+    // rendezvous), not the master server. Only send knock if direct P2P.
+    if (ntohs(peer_addr.sin_port) != 3478) {
+        if (send_relay_knock(sock, &peer_addr, uid_upper, session_token, true) != 0) {
+            OBN_ERROR("[relay] post-assignment KNOCK failed: %s", strerror(errno));
+            obn::net::close_socket(sock);
+            return -1;
+        }
+        OBN_DEBUG("[relay] post-assignment KNOCK sent to peer");
     }
-    OBN_DEBUG("[relay] post-assignment KNOCK sent to peer");
 
     out->sock = sock;
     out->relay_addr = peer_addr;
     memcpy(out->session_token, session_token, 8);
+    out->relay_tag = relay_tag;
+    out->is_relay = (ntohs(peer_addr.sin_port) == 3478);
     memset(&out->dtls, 0, sizeof(out->dtls));
+    out->dtls.relay_tag = relay_tag;
 
     return 0;
 }
@@ -2675,7 +2772,8 @@ int iotc_relay_dtls(RelayConn* rc,
                                rc->session_token,
                                /*uid_upper_str=*/nullptr,
                                passwd, account,
-                               &rc->dtls);
+                               &rc->dtls,
+                               rc->relay_tag);
 }
 
 int iotc_relay_send_app_data(RelayConn* rc,
@@ -2685,7 +2783,7 @@ int iotc_relay_send_app_data(RelayConn* rc,
     DtlsSession& ds = rc->dtls;
 
     uint8_t nonce[12];
-    build_relay_nonce(nonce, ds.client_write_iv, ds.epoch, ds.tx_seq);
+    build_relay_nonce(nonce, ds.client_write_iv, (uint16_t)ds.epoch, ds.tx_seq);
 
     uint8_t rec_hdr[13];
     build_dtls_record_hdr(rec_hdr, 0x17 /*ApplicationData*/,
@@ -2719,7 +2817,8 @@ int iotc_relay_send_app_data(RelayConn* rc,
 
     return send_dtls_packet(rc->sock, &rc->relay_addr,
                              ds.epoch, rc->session_token,
-                             dtls_pkt.data(), dtls_pkt.size());
+                             dtls_pkt.data(), dtls_pkt.size(),
+                             rc->relay_tag);
 }
 
 int iotc_relay_recv_app_data(RelayConn* rc,
@@ -2748,7 +2847,7 @@ int iotc_relay_recv_app_data(RelayConn* rc,
 
         if (n < 28) continue;  // too short for IOTC header
 
-        reverse_trans_code_partial(raw, (size_t)n);
+        reverse_trans_code_partial(raw, std::min((size_t)n, (size_t)80));
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;
         if (n < 28 + 13) continue;  // too short for IOTC header + DTLS record header
@@ -2761,8 +2860,8 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             continue;
         }
 
-        uint32_t rec_epoch  = read_be32(raw + 31);
-        uint32_t rec_seq    = read_be32(raw + 35);
+        uint16_t rec_epoch  = read_be16(raw + 31);
+        uint64_t rec_seq    = read_be48(raw + 33);
         uint16_t cipher_len = read_be16(raw + 39);
 
         if (n < 28 + 13 + (ssize_t)cipher_len) {
@@ -2781,9 +2880,8 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             return -1;
         }
 
-        // rec_seq is 32-bit on the wire; treat as low 32 bits of the 64-bit seq counter.
         uint8_t nonce[12];
-        build_relay_nonce(nonce, ds.server_write_iv, rec_epoch, (uint64_t)rec_seq);
+        build_relay_nonce(nonce, ds.server_write_iv, rec_epoch, rec_seq);
 
         const uint8_t* aad        = raw + 28;  // AAD = 13-byte DTLS record header
         const uint8_t* ciphertext = raw + 28 + 13;
@@ -2806,7 +2904,7 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             if (ok > 0) {
                 return (int)plain_len;
             }
-            OBN_ERROR("[relay-recv] AEAD auth failed (epoch=%u seq=%u)", rec_epoch, rec_seq);
+            OBN_ERROR("[relay-recv] AEAD auth failed (epoch=%u seq=%llu)", rec_epoch, (unsigned long long)rec_seq);
             continue;
         }
     }
@@ -2996,15 +3094,11 @@ static int dtls_encrypt_and_send(DtlsSession* ds, obn::net::socket_t sock,
                                   const uint8_t* data, size_t len)
 {
     uint8_t nonce[12];
-    memcpy(nonce, ds->client_write_iv, 12);
-    nonce[4] ^= (uint8_t)((uint16_t)ds->epoch >> 8);
-    nonce[5] ^= (uint8_t)((uint16_t)ds->epoch     );
-    for (int i = 0; i < 6; ++i)
-        nonce[6 + i] ^= (uint8_t)(ds->tx_seq >> (40 - 8*i));
+    build_relay_nonce(nonce, ds->client_write_iv, (uint16_t)ds->epoch, ds->tx_seq);
 
     uint8_t rec_hdr[13];
     build_dtls_record_hdr(rec_hdr, 0x17 /*ApplicationData*/,
-                          ds->epoch, (uint32_t)ds->tx_seq, (uint16_t)len);
+                          (uint16_t)ds->epoch, ds->tx_seq, (uint16_t)len);
 
     std::vector<uint8_t> ciphertext(len + 16);
     {
@@ -3025,7 +3119,7 @@ static int dtls_encrypt_and_send(DtlsSession* ds, obn::net::socket_t sock,
     }
 
     uint16_t cipher_len = (uint16_t)(len + 16);
-    build_dtls_record_hdr(rec_hdr, 0x17, ds->epoch, (uint32_t)ds->tx_seq, cipher_len);
+    build_dtls_record_hdr(rec_hdr, 0x17, (uint16_t)ds->epoch, ds->tx_seq, cipher_len);
     ds->tx_seq++;
 
     std::vector<uint8_t> dtls_pkt(13 + cipher_len);
@@ -3033,7 +3127,7 @@ static int dtls_encrypt_and_send(DtlsSession* ds, obn::net::socket_t sock,
     memcpy(dtls_pkt.data() + 13, ciphertext.data(), cipher_len);
 
     return send_dtls_packet(sock, dst, ds->epoch, session_token,
-                             dtls_pkt.data(), dtls_pkt.size());
+                             dtls_pkt.data(), dtls_pkt.size(), ds->relay_tag);
 }
 
 // Decrypt one DTLS ApplicationData record received in a raw IOTC-wrapped UDP datagram.
@@ -3048,7 +3142,7 @@ static int dtls_decrypt_one(DtlsSession* ds,
     if (raw_len < 28 + 13) return 0;  // too short for IOTC header + DTLS record header
 
     std::vector<uint8_t> buf(raw, raw + raw_len);
-    reverse_trans_code_partial(buf.data(), buf.size());
+    reverse_trans_code_partial(buf.data(), std::min(buf.size(), (size_t)80));
 
     if (buf[0] != 0x04 || buf[1] != 0x02) return 0;
 
@@ -3059,11 +3153,9 @@ static int dtls_decrypt_one(DtlsSession* ds,
         return 0;
     }
 
-    uint32_t rec_epoch = ((uint32_t)buf[31] << 24) | ((uint32_t)buf[32] << 16)
-                       | ((uint32_t)buf[33] <<  8) |  (uint32_t)buf[34];
-    uint32_t rec_seq   = ((uint32_t)buf[35] << 24) | ((uint32_t)buf[36] << 16)
-                       | ((uint32_t)buf[37] <<  8) |  (uint32_t)buf[38];
-    uint16_t cipher_len = ((uint16_t)buf[39] << 8) | buf[40];
+    uint16_t rec_epoch  = read_be16(buf.data() + 31);
+    uint64_t rec_seq    = read_be48(buf.data() + 33);
+    uint16_t cipher_len = read_be16(buf.data() + 39);
 
     if (raw_len < 28 + 13 + (size_t)cipher_len) {
         OBN_WARN("[dtls-decrypt] truncated record (have %zu, need %zu)", raw_len, 28 + 13 + (size_t)cipher_len);
@@ -3080,13 +3172,8 @@ static int dtls_decrypt_one(DtlsSession* ds,
         return -1;
     }
 
-    // TUTK carries 4-byte epoch + 4-byte seq; treat seq as low 32 bits of 64-bit counter.
     uint8_t nonce[12];
-    memcpy(nonce, ds->server_write_iv, 12);
-    for (int i = 0; i < 4; ++i)
-        nonce[i] ^= (uint8_t)(rec_epoch >> (24 - 8*i));
-    for (int i = 0; i < 4; ++i)
-        nonce[8 + i] ^= (uint8_t)(rec_seq >> (24 - 8*i));
+    build_relay_nonce(nonce, ds->server_write_iv, rec_epoch, rec_seq);
 
     const uint8_t* aad        = buf.data() + 28;  // AAD = 13-byte DTLS record header
     const uint8_t* ciphertext = buf.data() + 28 + 13;
@@ -3105,7 +3192,7 @@ static int dtls_decrypt_one(DtlsSession* ds,
     EVP_CIPHER_CTX_free(ctx);
 
     if (ok <= 0) {
-        OBN_ERROR("[dtls-decrypt] AEAD auth failed (epoch=%u seq=%u)", rec_epoch, rec_seq);
+        OBN_ERROR("[dtls-decrypt] AEAD auth failed (epoch=%u seq=%llu)", rec_epoch, (unsigned long long)rec_seq);
         return -1;
     }
     return (int)plain_len;
