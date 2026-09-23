@@ -352,8 +352,8 @@ static constexpr uint8_t  kFrameSubtypeCtrl    = 0x02;
 static constexpr uint8_t  kFrameDirClientToP   = 0x01;
 static constexpr uint8_t  kFrameDirPrinterToC  = 0x00;
 
-static constexpr uint32_t IOTYPE_USER_IPCAM_START = 0xFF01;
-static constexpr uint32_t IOTYPE_USER_IPCAM_STOP  = 0xFF02;
+static constexpr uint32_t IOTYPE_USER_IPCAM_START = 0x01ff;
+static constexpr uint32_t IOTYPE_USER_IPCAM_STOP  = 0x02ff;
 
 // --------------------------------------------------------------------------
 // TUTK message types (from IOTC_Handler_MSG_* function names)

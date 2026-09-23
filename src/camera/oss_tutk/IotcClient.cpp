@@ -3272,9 +3272,16 @@ int iotc_relay_recv_app_data(RelayConn* rc,
                               (struct sockaddr*)&src, &src_len);
         if (n < 0) {
             // EAGAIN / timeout → return 0
+#if defined(_WIN32)
+            int err = ::WSAGetLastError();
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)
+                return 0;
+            OBN_ERROR("[relay-recv] recvfrom error: WSA %d", err);
+#else
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
                 return 0;
             OBN_ERROR("[relay-recv] recvfrom error: %s", strerror(errno));
+#endif
             return -1;
         }
 
@@ -3298,6 +3305,8 @@ int iotc_relay_recv_app_data(RelayConn* rc,
         if (plain_len >= 0) {
             ds.rx_seq++;
             return plain_len;
+        } else {
+            OBN_WARN("[relay-recv] dtls_decrypt_record failed (err=%d, dtls_len=%zu)", plain_len, dtls_len);
         }
     }
 

@@ -80,6 +80,45 @@ static void write_av_frame_hdr(uint8_t* buf, uint32_t payload_len,
     memcpy(buf + 12, &res,   4);
 }
 
+// Builds a 570-byte TUTK AV connect / login packet:
+// 24 bytes TUTK header + 546 bytes payload
+static std::vector<uint8_t> build_tutk_av_login_pkt(uint8_t type, uint32_t seq,
+                                                     const std::string& account,
+                                                     const std::string& passwd,
+                                                     const std::string& uid_upper)
+{
+    std::vector<uint8_t> pkt(570, 0);
+
+    // Header (24 bytes)
+    pkt[0] = type;              // 0x00 for pkt 1, 0x20 for pkt 2
+    pkt[1] = 0x00;              // sub_type
+    uint16_t ver = htole16(0x000b);
+    memcpy(pkt.data() + 2, &ver, 2);
+    uint16_t payload_len = htole16(546); // 0x0222
+    memcpy(pkt.data() + 16, &payload_len, 2);
+    uint32_t sq = htole32(seq);
+    memcpy(pkt.data() + 20, &sq, 4);
+
+    // Payload (546 bytes starting at offset 24)
+    uint8_t* pl = pkt.data() + 24;
+    size_t acc_len = std::min(account.size(), (size_t)256);
+    memcpy(pl, account.c_str(), acc_len);
+
+    size_t pwd_len = std::min(passwd.size(), (size_t)256);
+    memcpy(pl + 257, passwd.c_str(), pwd_len);
+
+    // pl[514..517]: channel = 0 (uint32 LE, 0)
+    size_t uid_len = std::min(uid_upper.size(), (size_t)20);
+    memcpy(pl + 518, uid_upper.c_str(), uid_len);
+
+    // pl[538..541]: flags2 = 0 (uint32 LE, 0)
+    // pl[542..545]: flags1 = 2 (uint32 LE)
+    uint32_t f1 = htole32(2);
+    memcpy(pl + 542, &f1, 4);
+
+    return pkt;
+}
+
 // =========================================================================
 // OssAgoraSignaling::Impl
 // =========================================================================
@@ -155,84 +194,87 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     }
     OBN_INFO("[oss-relay] DTLS handshake complete");
 
-    // AV LOGIN: header (16B) + "admin\0" + access_code\0; reserved=0x0b.
-    if (params.av_passwd.empty()) {
-        OBN_ERROR("[oss-agora] av_passwd is empty — caller must supply printer access code");
-        iotc_relay_close(&relay);
-        return -1;
-    }
-    static const char kAccount[] = "admin";
-    static constexpr size_t kAccLen = sizeof(kAccount) - 1;
-    size_t pwd_len = params.av_passwd.size();
-    uint32_t payload_len = (uint32_t)(kAccLen + 1 + pwd_len + 1);
-
-    std::vector<uint8_t> login_pkt(16 + payload_len, 0);
-    write_av_frame_hdr(login_pkt.data(), payload_len,
-                       kFrameSubtypeLogin, kFrameDirClientToP,
-                       /*seq=*/0, /*reserved=*/0x0b);
-    uint8_t* cred = login_pkt.data() + 16;
-    memcpy(cred, kAccount, kAccLen);                              // NUL from vector zero-init
-    memcpy(cred + kAccLen + 1, params.av_passwd.c_str(), pwd_len); // NUL from vector zero-init
-
-    OBN_INFO("[oss-relay] sending LOGIN frame (%zu bytes)", login_pkt.size());
-    if (iotc_relay_send_app_data(&relay, login_pkt.data(), login_pkt.size()) != 0) {
-        OBN_ERROR("[oss-relay] LOGIN send failed");
+    // AV LOGIN: send TUTK 570-byte packets (type 0x00 and type 0x20)
+    std::string login_pwd = params.av_passwd.empty() ? params.dtls_passwd : params.av_passwd;
+    if (login_pwd.empty()) {
+        OBN_ERROR("[oss-agora] av_passwd and dtls_passwd are both empty");
         iotc_relay_close(&relay);
         return -1;
     }
 
+    std::string account = "admin";
+    OBN_INFO("[oss-relay] building 570-byte TUTK AV LOGIN packets (acc='%s', uid='%s')...",
+             account.c_str(), uid_upper.c_str());
+
+    auto pkt1 = build_tutk_av_login_pkt(0x00, /*seq=*/1, account, login_pwd, uid_upper);
+    auto pkt2 = build_tutk_av_login_pkt(0x20, /*seq=*/2, account, login_pwd, uid_upper);
+
+    OBN_INFO("[oss-relay] sending LOGIN packet 1 (type=0x00, 570B)...");
+    if (iotc_relay_send_app_data(&relay, pkt1.data(), pkt1.size()) != 0) {
+        OBN_ERROR("[oss-relay] LOGIN packet 1 send failed");
+        iotc_relay_close(&relay);
+        return -1;
+    }
+
+    OBN_INFO("[oss-relay] sending LOGIN packet 2 (type=0x20, 570B)...");
+    if (iotc_relay_send_app_data(&relay, pkt2.data(), pkt2.size()) != 0) {
+        OBN_ERROR("[oss-relay] LOGIN packet 2 send failed");
+        iotc_relay_close(&relay);
+        return -1;
+    }
+
+    // Wait for LOGIN ACK from printer
     {
-        uint8_t ack_buf[256];
+        uint8_t ack_buf[512];
+        OBN_INFO("[oss-relay] waiting for LOGIN ACK from printer (timeout=5000ms)...");
         int n = iotc_relay_recv_app_data(&relay, ack_buf, sizeof(ack_buf), 5000);
-        if (n < 16) {
-            OBN_ERROR("[oss-relay] LOGIN ACK timeout or too short (n=%d)", n);
+        if (n < 0) {
+            OBN_ERROR("[oss-relay] LOGIN ACK error (n=%d)", n);
             iotc_relay_close(&relay);
             return -1;
         }
-
-        uint32_t ack_magic;
-        memcpy(&ack_magic, ack_buf + 4, 4);
-        ack_magic = le32toh(ack_magic);
-        if ((ack_magic & 0xffff) != bambu_net::oss_tutk::kFrameMagicMarker) {
-            OBN_WARN("[oss-relay] LOGIN ACK: bad magic 0x%08x", ack_magic);
-            // Don't bail — may be a keepalive; continue to IPCAM_START
+        if (n == 0) {
+            OBN_WARN("[oss-relay] LOGIN ACK timed out (n=0) — proceeding to IPCAM_START anyway");
         } else {
-            uint8_t sub = (ack_magic >> 16) & 0xff;
-            if (sub == bambu_net::oss_tutk::kFrameSubtypeLogin) {
-                uint32_t pl_len;
-                memcpy(&pl_len, ack_buf, 4);
-                pl_len = le32toh(pl_len);
-                if (pl_len >= 4 && n >= 20) {
-                    uint32_t result;
-                    memcpy(&result, ack_buf + 16, 4);
-                    result = le32toh(result);
-                    if (result != 0) {
-                        OBN_ERROR("[oss-relay] LOGIN rejected: result=0x%x", result);
-                        iotc_relay_close(&relay);
-                        return -1;
-                    }
-                }
-                OBN_INFO("[oss-relay] LOGIN ACK: success");
-            } else {
-                OBN_WARN("[oss-relay] LOGIN ACK: unexpected sub=0x%02x", sub);
-            }
+            OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %02x %02x %02x %02x",
+                     n, ack_buf[0], n > 1 ? ack_buf[1] : 0, n > 2 ? ack_buf[2] : 0, n > 3 ? ack_buf[3] : 0);
         }
     }
 
-    // IPCAM_START IOCtrl: header (16B) + type(4B LE=0xFF01) + data_len(4B LE=0).
+    // Send IPCAM_START IOCtrl
+    // 1. TUTK AV IOCtrl frame (32 bytes): 24-byte header + 8 bytes payload
+    {
+        std::vector<uint8_t> tutk_ioctrl(32, 0);
+        tutk_ioctrl[0] = 0x08; // TUTK AV IOCtrl
+        tutk_ioctrl[1] = 0x00;
+        uint16_t ver = htole16(0x000b);
+        memcpy(tutk_ioctrl.data() + 2, &ver, 2);
+        uint16_t plen = htole16(8);
+        memcpy(tutk_ioctrl.data() + 16, &plen, 2);
+        uint32_t sq = htole32(3);
+        memcpy(tutk_ioctrl.data() + 20, &sq, 4);
+        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
+        memcpy(tutk_ioctrl.data() + 24, &iotype, 4);
+        // data_len is 0 at [28..31]
+
+        OBN_INFO("[oss-relay] sending TUTK IPCAM_START IOCtrl (32 bytes, iotype=0x01ff)...");
+        if (iotc_relay_send_app_data(&relay, tutk_ioctrl.data(), tutk_ioctrl.size()) != 0) {
+            OBN_WARN("[oss-relay] TUTK IPCAM_START send failed");
+        }
+    }
+
+    // 2. Also send AvFrameHeader IOCtrl frame (24 bytes) for compatibility
     {
         std::vector<uint8_t> ioctrl(16 + 8, 0);
         write_av_frame_hdr(ioctrl.data(), /*payload_len=*/8,
                            kFrameSubtypeCtrl, kFrameDirClientToP,
-                           /*seq=*/1, /*reserved=*/0);
-        uint32_t iotype = htole32(IOTYPE_USER_IPCAM_START);
+                           /*seq=*/4, /*reserved=*/0);
+        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
         memcpy(ioctrl.data() + 16, &iotype, 4);
 
-        OBN_INFO("[oss-relay] sending IPCAM_START IOCtrl");
+        OBN_INFO("[oss-relay] sending AvFrame IPCAM_START IOCtrl (24 bytes, iotype=0x01ff)...");
         if (iotc_relay_send_app_data(&relay, ioctrl.data(), ioctrl.size()) != 0) {
-            OBN_ERROR("[oss-relay] IPCAM_START send failed");
-            iotc_relay_close(&relay);
-            return -1;
+            OBN_WARN("[oss-relay] AvFrame IPCAM_START send failed");
         }
     }
 
@@ -245,6 +287,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
     using namespace bambu_net::oss_tutk;
 
     OBN_INFO("[oss-relay] recv_loop started");
+    bool first_frame = true;
 
     while (joined.load()) {
         uint8_t plaintext[65536];
@@ -256,52 +299,120 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         }
         if (n == 0) continue;  // timeout, poll again
 
-        if (n < 16) continue;
+        const uint8_t* h264 = nullptr;
+        size_t payload_len = 0;
+        uint32_t seq = 0;
 
-        uint32_t magic;
-        memcpy(&magic, plaintext + 4, 4);
-        magic = le32toh(magic);
-        if ((magic & 0xffff) != kFrameMagicMarker) continue;
+        // Check Case 1: 16-byte AvFrameHeader
+        if (n >= 16) {
+            uint32_t magic;
+            memcpy(&magic, plaintext + 4, 4);
+            magic = le32toh(magic);
+            if ((magic & 0xffff) == kFrameMagicMarker) {
+                uint8_t sub_type = (magic >> 16) & 0xff;
+                uint8_t direction = (magic >> 24) & 0xff;
 
-        uint8_t sub_type = (magic >> 16) & 0xff;
+                // Skip LOGIN echo from printer
+                if (sub_type == kFrameSubtypeLogin && direction == kFrameDirPrinterToC)
+                    continue;
 
-        // Skip LOGIN echo from printer (P→C LOGIN frames are handshake artifacts).
-        uint8_t direction = (magic >> 24) & 0xff;
-        if (sub_type == kFrameSubtypeLogin && direction == kFrameDirPrinterToC)
-            continue;
+                uint32_t pl;
+                memcpy(&pl, plaintext, 4);
+                pl = le32toh(pl);
 
-        uint32_t payload_len;
-        memcpy(&payload_len, plaintext, 4);
-        payload_len = le32toh(payload_len);
+                // Small control payloads are IOCtrl responses
+                if (sub_type == kFrameSubtypeCtrl && pl <= 8)
+                    continue;
 
-        // For sub_type=CTRL (0x02): small payloads (≤8 bytes) are IOCtrl
-        // responses, not video data.  H.264 Annex-B frames are always larger.
-        if (sub_type == kFrameSubtypeCtrl && payload_len <= 8)
-            continue;
-
-        if (n < (int)(16 + payload_len)) continue;
-
-        const uint8_t* h264 = plaintext + 16;
-
-        // Detect keyframe (IDR NAL type 5, SPS type 7, or FU-A IDR)
-        bool is_keyframe = false;
-        if (payload_len >= 1) {
-            uint8_t nal_type = h264[0] & 0x1f;
-            if (nal_type == 5 || nal_type == 7) {
-                is_keyframe = true;
-            } else if (nal_type == 28 && payload_len >= 2) {
-                // FU-A: start bit set + IDR fragment
-                bool start = (h264[1] & 0x80) != 0;
-                is_keyframe = start && ((h264[1] & 0x1f) == 5);
+                if (n >= (int)(16 + pl)) {
+                    h264 = plaintext + 16;
+                    payload_len = pl;
+                    memcpy(&seq, plaintext + 8, 4);
+                    seq = le32toh(seq);
+                }
             }
         }
 
+        // Check Case 2: 24-byte TUTK packet header (ver=0x000b)
+        if (!h264 && n >= 24) {
+            uint16_t ver;
+            memcpy(&ver, plaintext + 2, 2);
+            ver = le16toh(ver);
+            if (ver == 0x000b) {
+                uint16_t pl_len;
+                memcpy(&pl_len, plaintext + 16, 2);
+                pl_len = le16toh(pl_len);
+
+                if (n >= (int)(24 + pl_len) && pl_len > 0) {
+                    const uint8_t* inner = plaintext + 24;
+                    // Check if inner payload has 16-byte AvFrameHeader
+                    if (pl_len >= 16) {
+                        uint32_t inner_magic;
+                        memcpy(&inner_magic, inner + 4, 4);
+                        inner_magic = le32toh(inner_magic);
+                        if ((inner_magic & 0xffff) == kFrameMagicMarker) {
+                            uint32_t inner_pl;
+                            memcpy(&inner_pl, inner, 4);
+                            inner_pl = le32toh(inner_pl);
+                            if (pl_len >= 16 + inner_pl) {
+                                h264 = inner + 16;
+                                payload_len = inner_pl;
+                                memcpy(&seq, inner + 8, 4);
+                                seq = le32toh(seq);
+                            }
+                        }
+                    }
+                    if (!h264) {
+                        h264 = inner;
+                        payload_len = pl_len;
+                        memcpy(&seq, plaintext + 20, 4);
+                        seq = le32toh(seq);
+                    }
+                }
+            }
+        }
+
+        // Check Case 3: Raw Annex-B start code
+        if (!h264 && n >= 4) {
+            if ((plaintext[0] == 0 && plaintext[1] == 0 && plaintext[2] == 1) ||
+                (plaintext[0] == 0 && plaintext[1] == 0 && plaintext[2] == 0 && plaintext[3] == 1)) {
+                h264 = plaintext;
+                payload_len = (size_t)n;
+            }
+        }
+
+        if (!h264 || payload_len == 0) {
+            OBN_DEBUG("[oss-relay] skipping non-video packet (n=%d)", n);
+            continue;
+        }
+
+        // Detect keyframe
+        bool is_keyframe = false;
+        size_t nal_offset = 0;
+        if (payload_len >= 4 && h264[0] == 0 && h264[1] == 0 && h264[2] == 0 && h264[3] == 1) {
+            nal_offset = 4;
+        } else if (payload_len >= 3 && h264[0] == 0 && h264[1] == 0 && h264[2] == 1) {
+            nal_offset = 3;
+        }
+
+        if (payload_len > nal_offset) {
+            uint8_t nal_type = h264[nal_offset] & 0x1f;
+            if (nal_type == 5 || nal_type == 7) {
+                is_keyframe = true;
+            } else if (nal_type == 28 && payload_len > nal_offset + 1) {
+                bool start = (h264[nal_offset + 1] & 0x80) != 0;
+                is_keyframe = start && ((h264[nal_offset + 1] & 0x1f) == 5);
+            }
+        }
+
+        if (first_frame) {
+            first_frame = false;
+            OBN_INFO("[oss-relay] FIRST VIDEO FRAME: %zu bytes (key=%d, seq=%u)",
+                     payload_len, is_keyframe ? 1 : 0, seq);
+        }
+
         if (cb && payload_len > 0) {
-            // PTS from sequence number (bytes [8..11] LE), 90 kHz clock
-            uint32_t seq;
-            memcpy(&seq, plaintext + 8, 4);
-            seq = le32toh(seq);
-            int64_t pts_us = (int64_t)seq * 1000000LL / 90000LL;
+            int64_t pts_us = (seq > 0) ? ((int64_t)seq * 1000000LL / 90000LL) : 0;
             cb(h264, (int)payload_len, pts_us, is_keyframe);
         }
     }
