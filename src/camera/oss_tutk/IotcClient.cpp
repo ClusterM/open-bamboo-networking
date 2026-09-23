@@ -589,7 +589,7 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
     if (dtls_len > 0)
         memcpy(pkt.data() + 28, dtls_data, dtls_len);
 
-    trans_code_partial(pkt.data(), std::min(total, (size_t)80));
+    trans_code_partial(pkt.data(), std::min(total, (size_t)64));
 
     ssize_t n = sendto(sock, pkt.data(), total, 0,
                        (const struct sockaddr*)dst, sizeof(*dst));
@@ -1669,10 +1669,15 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     } else if (srv2_raw[0] == 0x16) {
         fin_rec_ptr = srv2_raw;
         fin_rec_len = (size_t)srv2_len;
+    } else if (srv2_raw[0] == 0x15) {
+        OBN_ERROR("[dtls] server sent Alert record: len=%d level=%d desc=%d",
+                  srv2_len, srv2_len >= 14 ? srv2_raw[13] : -1, srv2_len >= 15 ? srv2_raw[14] : -1);
+        return -1;
     }
 
     if (!fin_rec_ptr || fin_rec_len < 13) {
-        OBN_ERROR("[dtls] server Finished not found in response");
+        OBN_ERROR("[dtls] server Finished not found in response (rec_type=0x%02x len=%d)",
+                  srv2_raw[0], srv2_len);
         return -1;
     }
 
