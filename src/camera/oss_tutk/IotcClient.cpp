@@ -2469,6 +2469,7 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     snprintf(port_str, sizeof(port_str), "%u", 10240);
 
     for (const auto& host : candidate_hosts) {
+        if (nmasters >= 4) break;
         struct addrinfo* res = nullptr;
         int rc = getaddrinfo(host.c_str(), port_str, &hints, &res);
         if (rc == 0 && res) {
@@ -2478,10 +2479,12 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
                 }
             }
             freeaddrinfo(res);
-            if (nmasters > 0) {
+            // Keep collecting instead of stopping at the first hit: regional
+            // shards like us-m1 have been observed to accept DNS but black-hole
+            // UDP (verified live: us-m1 silent, m1 replies). The SDK races every
+            // master the same way; a JOIN to a dead one is a harmless drop.
+            if (resolved_host[0] == '\0')
                 snprintf(resolved_host, sizeof(resolved_host), "%s", host.c_str());
-                break;
-            }
         }
     }
 
@@ -2493,7 +2496,7 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &relay_addr.sin_addr, ip_str, sizeof(ip_str));
-    OBN_DEBUG("[relay] resolved %s -> %s:10240", resolved_host, ip_str);
+    OBN_DEBUG("[relay] resolved %d master(s) (first: %s -> %s:10240)", nmasters, resolved_host, ip_str);
 
     obn::net::socket_t sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == obn::net::kInvalid) {
