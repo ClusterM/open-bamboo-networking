@@ -969,20 +969,7 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
             OBN_ERROR("[dtls] type 0x33 send failed");
             return -1;
         }
-        OBN_DEBUG("[dtls] type 0x33 sent, waiting for echo");
-
-        // Drain the 52-byte echo. It is a raw IOTC packet (not DTLS-wrapped).
-        uint8_t echo_buf[64];
-        struct sockaddr_in echo_src{};
-        socklen_t echo_slen = sizeof(echo_src);
-        set_recv_timeout(sock, 3000);
-        ssize_t en = recvfrom(sock, echo_buf, sizeof(echo_buf), 0,
-                               (struct sockaddr*)&echo_src, &echo_slen);
-        if (en == 52) {
-            OBN_DEBUG("[dtls] 0x33 echo received");
-        } else {
-            OBN_WARN("[dtls] 0x33 echo: unexpected size %zd (expected 52)", en);
-        }
+        OBN_DEBUG("[dtls] type 0x33 sent (echo drained by recv_dtls_packet)");
     }
 
     // =======================================================================
@@ -2490,6 +2477,16 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
             return true;
         }
 
+        // Direct printer punch / ack (01 04 33 or 02 04 33) from printer P2P candidate
+        if ((resp[8] == 0x01 || resp[8] == 0x02) && resp[9] == 0x04 && resp[10] == 0x33) {
+            send_ctrl0x33(sock, &src, uid_upper, session_token);
+            *peer_out = src;
+            if (tag_out) *tag_out = 0;
+            OBN_INFO("[rdv] direct printer punch %02x 04 33 received from %s:%u - P2P established!",
+                     resp[8], inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+            return true;
+        }
+
         // Server challenge (27 02 42): triggers candidate registration 04 08 24
         if (resp[8] == 0x27 && resp[9] == 0x02 && resp[10] == 0x42) {
             OBN_DEBUG("[rdv] server challenge 27 02 42 -> sending candidate registration 04 08 24");
@@ -2755,13 +2752,17 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     memcpy(out->session_token, session_token, 8);
     out->relay_tag = relay_tag;
     out->is_relay = (ntohs(peer_addr.sin_port) == 3478);
+    if (uid_upper) {
+        strncpy(out->uid_upper, uid_upper, sizeof(out->uid_upper) - 1);
+        out->uid_upper[sizeof(out->uid_upper) - 1] = '\0';
+    }
     memset(&out->dtls, 0, sizeof(out->dtls));
     out->dtls.relay_tag = relay_tag;
 
     return 0;
 }
 
-// epoch=0, no type-0x33 packet — relay path omits both (confirmed from captures).
+// epoch=0, type-0x33 auth packet sent only for direct P2P (omitted for relay server).
 int iotc_relay_dtls(RelayConn* rc,
                     const char* passwd, const char* account)
 {
@@ -2770,7 +2771,7 @@ int iotc_relay_dtls(RelayConn* rc,
     return dtls_psk_handshake(rc->sock, &rc->relay_addr,
                                /*initial_epoch=*/0,
                                rc->session_token,
-                               /*uid_upper_str=*/nullptr,
+                               rc->is_relay ? nullptr : rc->uid_upper,
                                passwd, account,
                                &rc->dtls,
                                rc->relay_tag);

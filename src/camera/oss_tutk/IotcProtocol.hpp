@@ -495,6 +495,7 @@ struct RelayConn {
     DtlsSession      dtls;            // filled by iotc_relay_dtls()
     uint32_t         relay_tag;
     bool             is_relay;
+    char             uid_upper[32];
 };
 
 // --------------------------------------------------------------------------
