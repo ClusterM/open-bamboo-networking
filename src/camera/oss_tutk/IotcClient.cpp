@@ -2292,14 +2292,14 @@ static bool parse_reflexive(const uint8_t* reply, size_t len, struct sockaddr_in
     return false;
 }
 
-// Printer candidate addresses from a 01 03 43 reply: records at [20], [36], ...
+// Printer candidate addresses from a 01 03 43 reply: records at [36], [52], ...
 // Candidate records use family byte 0x02 (public) or 0x00 (LAN) at [+0]; the
 // nonzero port+ip guard keeps runs of zero padding from parsing as addresses.
 static int parse_candidates(const uint8_t* reply, size_t len,
                             struct sockaddr_in* out, int max_out)
 {
     int n = 0;
-    for (size_t i = 20; i + 8 <= len && n < max_out; i += 16) {
+    for (size_t i = 36; i + 8 <= len && n < max_out; i += 16) {
         const uint8_t* p = reply + i;
         if (p[1] != 0x00 || (p[0] != 0x00 && p[0] != 0x02)) continue;
         struct sockaddr_in a; memset(&a, 0, sizeof(a));
@@ -2451,6 +2451,7 @@ static int send_rdv_punch2(obn::net::socket_t sock, const struct sockaddr_in* ds
     memset(pkt + 16, 0, 44);
     memcpy(pkt + 16, uid_upper, 20);
     memcpy(pkt + 36, token, 8);
+    pkt[44] = 0x01;  // Relay request flag: 01 00 00 00 (mandatory for NAT relay fallback)
     static const uint8_t kTrailer[12] = {
         0x04, 0x03, 0x03, 0x04, 0x1c, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00
     };
@@ -2515,6 +2516,7 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
             }
             if (attempt % 3 == 0) {
                 send_rdv_punch2(sock, srv, uid_upper, session_token);
+                send_rdv_authkey(sock, srv, uid_upper, authkey);
             }
         }
 
@@ -2586,6 +2588,7 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
                 }
             }
             send_rdv_punch2(sock, srv, uid_upper, session_token);
+            send_rdv_authkey(sock, srv, uid_upper, authkey);
             continue;
         }
 
