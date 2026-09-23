@@ -82,6 +82,8 @@ std::string ipv4_from_le_int(std::int64_t v)
            std::to_string((v >> 16) & 0xFF) + "." + std::to_string((v >> 24) & 0xFF);
 }
 
+} // namespace
+
 static std::atomic<Agent*> s_active_agent{nullptr};
 
 Agent* Agent::active_instance() noexcept
