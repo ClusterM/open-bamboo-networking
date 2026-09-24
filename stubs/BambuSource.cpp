@@ -806,7 +806,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
         frame_opt->pts_us > 0 ? frame_opt->pts_us * 10ULL : (ns / 100));
 
     ++t->frame_count;
-    if ((t->frame_count & 0x3F) == 1) {
+    if (t->frame_count <= 10 || (t->frame_count & 0x3F) == 1) {
         log_fmt(t->logger, t->log_ctx,
                 "read_tutk: frame %llu size=%d key=%d pts=%llu",
                 static_cast<unsigned long long>(t->frame_count),
