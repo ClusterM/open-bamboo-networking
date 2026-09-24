@@ -465,7 +465,7 @@ Spaces around `=` are optional.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
-| `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot (mem:/N over TLS :6000) shown in the device panel when live view is off. |
+| `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot shown in the device panel when live view is off. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
 
 **MQTT push_status patches** (all off by default; enable only if your model needs it):

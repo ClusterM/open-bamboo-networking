@@ -53,7 +53,7 @@ force_ftps = 0
 # --- Device panel camera preview ------------------------------------
 #
 # When live view is off, Studio polls a static JPEG snapshot from the
-# printer RAM (FILE_DOWNLOAD mem:/N over TLS :6000) and shows it in the
+# printer RAM (FILE_DOWNLOAD mem:/26 over TLS :6000) and shows it in the
 # large camera area ("Printer Preview …" overlay). Disable if that stale
 # snapshot annoys you — it often shows an outdated picture that does not
 # match what is actually printing.

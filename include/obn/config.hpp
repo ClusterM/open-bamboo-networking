@@ -10,6 +10,9 @@ namespace obn::config {
 
 inline constexpr const char* kConfigFileName = "obn.conf";
 
+// Idle device-panel JPEG (MediaPlayCtrl downloads this slot).
+inline constexpr const char* kCameraPreviewMemPath = "mem:/26";
+
 // How start_local_print_with_record / start_print deliver the job.
 // Orthogonal to block_cloud (background MQTT/REST).
 enum class CloudPrintMode {
@@ -50,7 +53,7 @@ struct Settings {
     // File transfer
     bool force_ftps               = false;
 
-    // Device panel: static "Printer Preview" JPEG (mem:/N over TLS :6000)
+    // Device panel: static "Printer Preview" JPEG (kCameraPreviewMemPath).
     bool disable_camera_preview      = false;
 
     // MQTT connection persistence: Orca Slicer unconditionally tears down
