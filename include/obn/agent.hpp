@@ -421,6 +421,7 @@ public:
     // proactively dispatches signed/encrypted prepare command to the printer,
     // and returns "bambu:///tutk?uid=...".
     std::string remote_camera_url(const std::string& dev_id);
+    void rescue_cloud_liveview(const std::string& dev_id, const std::string& json);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.

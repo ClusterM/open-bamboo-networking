@@ -256,6 +256,11 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
 
     bool login_acked = false;
     for (int login_attempt = 1; login_attempt <= 6; ++login_attempt) {
+        if (!joined.load()) {
+            OBN_INFO("[oss-relay] do_join aborted (leave requested)");
+            iotc_relay_close(&relay);
+            return -1;
+        }
         OBN_INFO("[oss-relay] sending LOGIN packets (attempt %d/6, seq=%u)...", login_attempt, client_out_seq);
         uint16_t seq1 = client_out_seq++;
         uint16_t seq2 = client_out_seq++;
@@ -452,15 +457,23 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
                             memcpy(&opCode, plaintext + 28, 4);
                             opCode = le32toh(opCode);
                         }
-                        OBN_INFO("[oss-relay] TUTK inner IOCtrl 0x10: seq=%u ch=%u opCode=0x%x",
+                        OBN_INFO("[oss-relay] TUTK inner IOCtrl 0x10: seq=%u ch=%u opCode=0x%x (ACKing with 0x11)",
                                  pkt_seq, channel, opCode);
+
+                        // Send IOCtrl ACK 0x11 (exact 24-byte header copy with flag=0x11, len=0)
+                        uint8_t ack11[24] = {0};
+                        memcpy(ack11, plaintext, 24);
+                        ack11[1] = 0x11;
+                        if (n >= 10) ack11[9] = 0x11;
+                        ack11[16] = 0;
+                        ack11[17] = 0;
+                        iotc_relay_send_app_data(&relay, ack11, 24);
 
                         // If transport ACK requested (flag & 8)
                         if (flag & 0x08) {
                             send_tutk_transport_ack(pkt_seq);
                         }
 
-                        // OpCode 0x40 is SET_CLIENT_MAX_BUFFER_SIZE. Official binary does NOT reply with 0x11 ACK!
                         // Reply with IPCAM_START for both channels to trigger transmission
                         if (ioc_trigger_cnt++ < 3) {
                             send_ipcam_start(channel, client_out_seq);
