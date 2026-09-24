@@ -138,6 +138,7 @@ struct OssAgoraSignaling::Impl {
     int  do_join(const AgoraJoinParams& params);
     void recv_loop(const AgoraJoinParams& params);
     void send_ipcam_start(uint16_t ch, uint16_t& out_seq);
+    void send_ipcam_stop(uint16_t ch, uint16_t& out_seq);
 };
 
 void OssAgoraSignaling::Impl::send_ipcam_start(uint16_t ch, uint16_t& out_seq)
@@ -183,6 +184,44 @@ void OssAgoraSignaling::Impl::send_ipcam_start(uint16_t ch, uint16_t& out_seq)
 
     int rc = iotc_relay_send_app_data(&relay, pkt, sizeof(pkt));
     OBN_INFO("[oss-relay] IPCAM_START sent (rc=%d, len=%zu)", rc, sizeof(pkt));
+}
+
+void OssAgoraSignaling::Impl::send_ipcam_stop(uint16_t ch, uint16_t& out_seq)
+{
+    using namespace bambu_net::oss_tutk;
+    OBN_INFO("[oss-relay] sending TUTK New AV API IPCAM_STOP (ch=%u seq=%u)...", ch, out_seq);
+
+    uint8_t pkt[40] = {0};
+
+    // Outer header (8 bytes)
+    pkt[0] = 0x00; // control
+    pkt[1] = 0x70; // OPCODE_AV_IOCTRL_USER
+    uint16_t v = htole16(0x000b);
+    memcpy(pkt + 2, &v, 2);
+    uint16_t sq = htole16(out_seq++);
+    memcpy(pkt + 4, &sq, 2);
+
+    // Inner header (20 bytes, offset 8..27)
+    pkt[8] = 0x00;
+    pkt[9] = 0x70;
+    uint16_t in_seq = htole16(0);
+    memcpy(pkt + 10, &in_seq, 2);
+    uint16_t slice_cnt = htole16(1);
+    memcpy(pkt + 12, &slice_cnt, 2);
+    uint16_t slice_idx = htole16(0);
+    memcpy(pkt + 14, &slice_idx, 2);
+    uint16_t slice_len = htole16(12); // 4 (ioType) + 8 (payload)
+    memcpy(pkt + 16, &slice_len, 2);
+
+    // ioType (4 bytes, offset 28..31)
+    uint32_t iotype = htole32(IOTYPE_USER_IPCAM_STOP); // 0x000002ff = 767
+    memcpy(pkt + 28, &iotype, 4);
+
+    // payload (8 bytes, offset 32..39)
+    uint32_t ch_le = htole32(ch);
+    memcpy(pkt + 32, &ch_le, 4);
+
+    (void)iotc_relay_send_app_data(&relay, pkt, sizeof(pkt));
 }
 
 void OssAgoraSignaling::Impl::run_test_mode(AgoraJoinParams /*params*/)
@@ -730,7 +769,12 @@ int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 
 int OssAgoraSignaling::leave()
 {
-    m_impl->joined.store(false);
+    if (m_impl->joined.exchange(false)) {
+        // Send IPCAM_STOP before closing relay connection so printer frees stream worker
+        m_impl->send_ipcam_stop(0, m_impl->client_out_seq);
+        m_impl->send_ipcam_stop(1, m_impl->client_out_seq);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     // Close the relay socket to unblock recvfrom in recv_loop
     bambu_net::oss_tutk::iotc_relay_close(&m_impl->relay);
     if (m_impl->worker_thread.joinable()) {
