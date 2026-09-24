@@ -3383,6 +3383,12 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             continue;
         }
 
+        // Relay notification: peer disconnected / channel closed (0x13 0x05 0x42)
+        if (rc->is_relay && n == 24 && raw[8] == 0x13 && raw[9] == 0x05 && raw[10] == 0x42) {
+            OBN_WARN("[relay-recv] peer disconnected by relay (type=0x13 0x05 0x42)");
+            return -2;
+        }
+
         // Verify DTLS packet encapsulation:
         // Relay: raw[8..10] == {0x03, 0x05, 0x42}
         // Direct P2P: raw[8..10] == {0x07, 0x04, 0x21}

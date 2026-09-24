@@ -1248,6 +1248,13 @@ void Agent::rescue_cloud_liveview(const std::string& dev_id,
 
     {
         std::lock_guard<std::mutex> lk(mu_);
+        auto it_ready = tutk_server_ready_by_dev_.find(dev_id);
+        if (it_ready != tutk_server_ready_by_dev_.end() && it_ready->second) {
+            OBN_INFO("rescue_cloud_liveview dev=%s: tutk_server already running (enable) - skipping prepare to prevent server restart",
+                     dev_id.c_str());
+            return;
+        }
+
         static std::map<std::string, std::chrono::steady_clock::time_point> last_rescue;
         const auto now = std::chrono::steady_clock::now();
         auto it = last_rescue.find(dev_id);

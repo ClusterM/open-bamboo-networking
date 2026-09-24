@@ -136,7 +136,7 @@ struct OssAgoraSignaling::Impl {
 
     void run_test_mode(AgoraJoinParams params);
     int  do_join(const AgoraJoinParams& params);
-    void recv_loop(const AgoraJoinParams& params);
+    int  recv_loop(const AgoraJoinParams& params);
     void send_ipcam_start(uint16_t ch, uint16_t& out_seq);
     void send_ipcam_stop(uint16_t ch, uint16_t& out_seq);
 };
@@ -272,6 +272,8 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
         return -1;
     }
     std::string account = "admin";
+    iotc_relay_close(&relay);
+    client_out_seq = 1;
 
     // Outer connection loop: retry up to 3 times with fresh relay rendezvous.
     // This handles the race where liveview.prepare restarts the printer's tutk_server,
@@ -367,7 +369,7 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     return -1;
 }
 
-void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
+int OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
 {
     using namespace bambu_net::oss_tutk;
 
@@ -420,6 +422,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
     int frame_log_cnt = 0;
     int s_pkt_log_cnt = 0;
     auto last_retry_time = std::chrono::steady_clock::now();
+    auto last_data_time = std::chrono::steady_clock::now();
 
     auto send_tutk_transport_ack = [&](uint16_t pkt_seq) {
         uint8_t ack_pkt[20] = {0};
@@ -442,12 +445,17 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
 
     while (joined.load()) {
         // Periodic LOGIN + IPCAM_START retry if no video frames have arrived yet
-        if (received_video_frames == 0 && retry_start_count < 8) {
+        if (received_video_frames == 0) {
             auto now = std::chrono::steady_clock::now();
+            if (retry_start_count >= 3) {
+                OBN_WARN("[oss-relay] no video received after %d retries (~3.6s) - exiting recv_loop to reconnect", retry_start_count);
+                iotc_relay_close(&relay);
+                return -1;
+            }
             if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_retry_time).count() >= 1200) {
                 last_retry_time = now;
                 retry_start_count++;
-                OBN_INFO("[oss-relay] no video yet, resending LOGIN + IPCAM_START (attempt %d/8)...", retry_start_count);
+                OBN_INFO("[oss-relay] no video yet, resending LOGIN + IPCAM_START (attempt %d/3)...", retry_start_count);
                 auto p1 = build_tutk_av_login_pkt(0x00, client_out_seq++, account, login_pwd, uid_upper);
                 auto p2 = build_tutk_av_login_pkt(0x20, client_out_seq++, account, login_pwd, uid_upper);
                 iotc_relay_send_app_data(&relay, p1.data(), p1.size());
@@ -455,16 +463,27 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
                 send_ipcam_start(0, client_out_seq);
                 send_ipcam_start(1, client_out_seq);
             }
+        } else {
+            // Video stream stall watchdog (5s without any incoming data)
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_data_time).count() >= 5) {
+                OBN_WARN("[oss-relay] video stream stalled for 5s - exiting recv_loop to reconnect");
+                iotc_relay_close(&relay);
+                return -4;
+            }
         }
 
         uint8_t plaintext[65536];
         int n = iotc_relay_recv_app_data(&relay, plaintext, sizeof(plaintext), 100);
 
         if (n < 0) {
-            OBN_ERROR("[oss-relay] recv error — exiting recv_loop");
-            break;
+            OBN_WARN("[oss-relay] recv error / peer disconnect (n=%d) - exiting recv_loop", n);
+            iotc_relay_close(&relay);
+            return n;
         }
         if (n == 0) continue;  // timeout, poll again
+
+        last_data_time = std::chrono::steady_clock::now();
 
         if (s_pkt_log_cnt < 60) {
             s_pkt_log_cnt++;
@@ -736,7 +755,8 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
     }
 
     iotc_relay_close(&relay);
-    OBN_INFO("[oss-relay] recv_loop exited");
+    OBN_INFO("[oss-relay] recv_loop exited (joined=%d)", joined.load() ? 1 : 0);
+    return 0;
 }
 
 OssAgoraSignaling::OssAgoraSignaling()
@@ -774,12 +794,21 @@ int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 
     AgoraJoinParams p = params;
     m_impl->worker_thread = std::thread([this, p]() {
-        if (m_impl->do_join(p) == 0) {
-            m_impl->recv_loop(p);
-        } else {
-            OBN_ERROR("[oss-relay] do_join failed");
-            m_impl->joined.store(false);
+        for (int sess_try = 1; sess_try <= 5 && m_impl->joined.load(); ++sess_try) {
+            if (m_impl->do_join(p) == 0) {
+                int recv_rc = m_impl->recv_loop(p);
+                if (recv_rc == 0 || !m_impl->joined.load()) {
+                    break;
+                }
+                OBN_WARN("[oss-relay] session ended (rc=%d), reconnecting (try %d/5)...",
+                         recv_rc, sess_try);
+            } else {
+                OBN_ERROR("[oss-relay] do_join failed (try %d/5)", sess_try);
+            }
+            if (!m_impl->joined.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
+        m_impl->joined.store(false);
     });
 
     return 0;
