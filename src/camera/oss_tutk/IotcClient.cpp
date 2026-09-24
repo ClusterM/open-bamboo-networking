@@ -2688,7 +2688,15 @@ static int parse_candidates(const uint8_t* reply, size_t len,
         a.sin_family = AF_INET;
         memcpy(&a.sin_port, p + 2, 2);
         memcpy(&a.sin_addr, p + 4, 4);
-        if (a.sin_addr.s_addr != 0 && a.sin_port != 0) out[n++] = a;
+        if (a.sin_addr.s_addr != 0 && a.sin_port != 0) {
+            bool dup = false;
+            for (int k = 0; k < n; ++k) {
+                if (out[k].sin_addr.s_addr == a.sin_addr.s_addr && out[k].sin_port == a.sin_port) {
+                    dup = true; break;
+                }
+            }
+            if (!dup) out[n++] = a;
+        }
     }
     return n;
 }
@@ -2859,52 +2867,103 @@ static int send_rdv_ack(obn::net::socket_t sock, const struct sockaddr_in* dst,
     return (n == (ssize_t)sizeof(pkt)) ? 0 : -1;
 }
 
-// Full off-LAN rendezvous with one server, in the genuine message order:
-//   03 80 3f (probe) -> 14 02 24 (authkey) -> 04 08 24 (candidate registration)
-//   -> 03 02 34 (random) + 0a 02 24 (token) -> 01 03 43 (candidates) -> 01 04 33 (direct punch)
-//   -> 09 02 24 (punch2) -> 03 03 43 (pairing) -> 0c 03 24 (ack) -> server relay DTLS
-// Returns true if printer rendezvous or server pairing succeeds.
-static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct sockaddr_in* srv,
-                                     const char* uid_upper, const char* authkey,
-                                     const uint8_t session_token[8],
-                                     struct sockaddr_in* reflexive,
-                                     struct sockaddr_in* peer_out,
-                                     uint32_t* tag_out)
+// Full off-LAN multi-server rendezvous across all rendezvous servers simultaneously.
+// Message order per genuine TUTK trace (bambu_studio_4g.pcapng):
+//   Client -> All Servers: 03 80 3f (probe) + 14 02 24 (authkey)
+//   Servers -> Client:     27 02 42 (challenge)
+//   Client -> All Servers: 04 08 24 (candidate registration) + 03 80 3f + 14 02 24
+//   Servers -> Client:     15 02 42 (prepared session)
+//   Client -> All Servers: 03 02 34 (random) + 0a 02 24 (token)
+//   Servers -> Client:     01 03 43 (candidates)
+//   Client -> Candidates:  01 04 33 (direct punch)
+//   Client -> All Servers: 09 02 24 (punch2) + 14 02 24 (authkey)
+//   Servers -> Client:     03 03 43 (pairing confirmed with relay tag)
+//   Client -> Server:      0c 03 24 (ack) -> server relay DTLS
+// Direct P2P: 02 06 12 or 01 04 33 / 02 04 33 directly from printer candidate.
+// Returns true if printer rendezvous or server relay pairing succeeds.
+static bool offlan_rendezvous(obn::net::socket_t sock,
+                              const uint8_t* master_reply, size_t reply_len,
+                              const char* uid_upper, const char* authkey,
+                              const uint8_t session_token[8],
+                              struct sockaddr_in* peer_out,
+                              uint32_t* tag_out)
 {
+    if (!authkey || !authkey[0]) return false;
+
+    struct sockaddr_in servers[4];
+    int ns = parse_rdv_servers(master_reply, reply_len, servers, 4);
+    if (ns == 0) {
+        OBN_WARN("[rdv] no rendezvous servers found in master reply");
+        return false;
+    }
+    OBN_INFO("[rdv] discovered %d rendezvous server(s)", ns);
+
+    struct sockaddr_in reflexive{};
+    bool have_reflexive = parse_reflexive(master_reply, reply_len, &reflexive);
+    if (!have_reflexive) {
+        OBN_DEBUG("[rdv] master reply has no reflexive record; seeding from server 0");
+        reflexive = servers[0];
+    }
+
     struct sockaddr_in local_ep{};
     socklen_t local_len = sizeof(local_ep);
     uint16_t bound_port = 0;
     if (getsockname(sock, (struct sockaddr*)&local_ep, &local_len) == 0) {
         bound_port = ntohs(local_ep.sin_port);
     }
-    get_local_endpoint(srv, &local_ep, bound_port);
+    get_local_endpoint(&servers[0], &local_ep, bound_port);
 
     uint8_t txn[8];
     { uint32_t a = rand32(), b = rand32();
       memcpy(txn, &a, 4); memcpy(txn + 4, &b, 4); }
 
-    send_stun_probe(sock, srv, txn);
-    send_rdv_authkey(sock, srv, uid_upper, authkey);
+    // Initial broadcast to all servers
+    for (int s = 0; s < ns; ++s) {
+        send_stun_probe(sock, &servers[s], txn);
+        send_rdv_authkey(sock, &servers[s], uid_upper, authkey);
+    }
 
-    set_recv_timeout(sock, 300);
+    set_recv_timeout(sock, 100);
     struct sockaddr_in candidates[4];
     int num_candidates = 0;
 
-    for (int attempt = 0; attempt < 35; ++attempt) {
-        // If candidates are known, keep punching them periodically while waiting for printer reply
+    auto start_time = std::chrono::steady_clock::now();
+    auto deadline = start_time + std::chrono::seconds(15);
+    auto last_probe_broadcast = start_time;
+    auto last_challenge_broadcast = start_time - std::chrono::seconds(1);
+    auto last_session_broadcast = start_time - std::chrono::seconds(1);
+    auto last_cand_punch = start_time - std::chrono::seconds(1);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto now = std::chrono::steady_clock::now();
+
+        // If candidates are known, keep punching them periodically (~250ms)
         if (num_candidates > 0) {
-            for (int c = 0; c < num_candidates; ++c) {
-                send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_cand_punch).count() >= 250) {
+                last_cand_punch = now;
+                for (int c = 0; c < num_candidates; ++c) {
+                    send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
+                }
+                for (int s = 0; s < ns; ++s) {
+                    send_rdv_punch2(sock, &servers[s], uid_upper, session_token);
+                    send_rdv_authkey(sock, &servers[s], uid_upper, authkey);
+                }
             }
-            if (attempt % 3 == 0) {
-                send_rdv_punch2(sock, srv, uid_upper, session_token);
-                send_rdv_authkey(sock, srv, uid_upper, authkey);
+        } else {
+            // Periodic retry of initial probe/authkey broadcast if no response yet (~2s)
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_probe_broadcast).count() >= 2000) {
+                last_probe_broadcast = now;
+                OBN_DEBUG("[rdv] re-broadcasting initial probes and authkey to %d servers", ns);
+                for (int s = 0; s < ns; ++s) {
+                    send_stun_probe(sock, &servers[s], txn);
+                    send_rdv_authkey(sock, &servers[s], uid_upper, authkey);
+                }
             }
         }
 
         uint8_t resp[1024];
         struct sockaddr_in src{}; socklen_t sl = sizeof(src);
-        ssize_t n = recvfrom(sock, resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
+        ssize_t n = recvfrom(sock, (char*)resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
         if (n < 16) continue;
         reverse_trans_code_partial(resp, (size_t)n);
         if (resp[0] != 0x04 || resp[1] != 0x02) continue;
@@ -2916,10 +2975,8 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
         if (resp[8] == 0x04 && resp[9] == 0x80) {
             struct sockaddr_in mine{};
             if (read_addr_rec(resp + 16, &mine) && ntohs(mine.sin_port) != 3478) {
-                *reflexive = mine;
-                char ipb[INET_ADDRSTRLEN] = {};
-                inet_ntop(AF_INET, &mine.sin_addr, ipb, sizeof(ipb));
-                OBN_DEBUG("[rdv] reflexive learned %s:%u", ipb, ntohs(mine.sin_port));
+                reflexive = mine;
+                OBN_DEBUG("[rdv] reflexive learned %s:%u", inet_ntoa(mine.sin_addr), ntohs(mine.sin_port));
             }
             continue;
         }
@@ -2943,20 +3000,30 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
             return true;
         }
 
-        // Server challenge (27 02 42): triggers candidate registration 04 08 24
+        // Server challenge (27 02 42): triggers candidate registration 04 08 24 broadcast
         if (resp[8] == 0x27 && resp[9] == 0x02 && resp[10] == 0x42) {
-            OBN_DEBUG("[rdv] server challenge 27 02 42 -> sending candidate registration 04 08 24");
-            send_rdv_punch(sock, srv, uid_upper, session_token, &local_ep, reflexive);
-            send_stun_probe(sock, srv, txn);
-            send_rdv_authkey(sock, srv, uid_upper, authkey);
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_challenge_broadcast).count() >= 150) {
+                last_challenge_broadcast = now;
+                OBN_DEBUG("[rdv] server challenge 27 02 42 -> broadcasting 04 08 24 to %d servers", ns);
+                for (int s = 0; s < ns; ++s) {
+                    send_rdv_punch(sock, &servers[s], uid_upper, session_token, &local_ep, &reflexive);
+                    send_stun_probe(sock, &servers[s], txn);
+                    send_rdv_authkey(sock, &servers[s], uid_upper, authkey);
+                }
+            }
             continue;
         }
 
-        // Prepared session response (15 02 42): triggers 03 02 34 and 0a 02 24
+        // Prepared session response (15 02 42): triggers 03 02 34 and 0a 02 24 broadcast
         if (resp[8] == 0x15 && resp[9] == 0x02 && resp[10] == 0x42) {
-            OBN_DEBUG("[rdv] prepared session 15 02 42 -> sending 03 02 34 and 0a 02 24");
-            send_rdv_random(sock, srv, uid_upper, &local_ep, session_token, authkey);
-            send_rdv_token(sock, srv, uid_upper, session_token, authkey);
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_session_broadcast).count() >= 150) {
+                last_session_broadcast = now;
+                OBN_DEBUG("[rdv] prepared session 15 02 42 -> broadcasting 03 02 34 and 0a 02 24 to %d servers", ns);
+                for (int s = 0; s < ns; ++s) {
+                    send_rdv_random(sock, &servers[s], uid_upper, &local_ep, session_token, authkey);
+                    send_rdv_token(sock, &servers[s], uid_upper, session_token, authkey);
+                }
+            }
             continue;
         }
 
@@ -2969,8 +3036,10 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
                     send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
                 }
             }
-            send_rdv_punch2(sock, srv, uid_upper, session_token);
-            send_rdv_authkey(sock, srv, uid_upper, authkey);
+            for (int s = 0; s < ns; ++s) {
+                send_rdv_punch2(sock, &servers[s], uid_upper, session_token);
+                send_rdv_authkey(sock, &servers[s], uid_upper, authkey);
+            }
             continue;
         }
 
@@ -2979,46 +3048,18 @@ static bool offlan_rendezvous_server(obn::net::socket_t sock, const struct socka
             uint32_t tag = 0;
             if (n >= 40) memcpy(&tag, resp + 36, 4);
             uint32_t tag_h = le32toh(tag);
-            OBN_INFO("[rdv] pairing confirmed 03 03 43 with tag=%u", tag_h);
-            send_rdv_ack(sock, srv, uid_upper, session_token, tag_h);
+            OBN_INFO("[rdv] pairing confirmed 03 03 43 from %s:%u with tag=%u",
+                     inet_ntoa(src.sin_addr), ntohs(src.sin_port), tag_h);
+            send_rdv_ack(sock, &src, uid_upper, session_token, tag_h);
+            send_rdv_ack(sock, &src, uid_upper, session_token, tag_h);
 
-            *peer_out = *srv;
+            *peer_out = src;
             if (tag_out) *tag_out = tag_h;
             return true;
         }
     }
-    return false;
-}
 
-// Returns true if a printer rendezvous or server relay pairing succeeds.
-static bool offlan_rendezvous(obn::net::socket_t sock,
-                              const uint8_t* master_reply, size_t reply_len,
-                              const char* uid_upper, const char* authkey,
-                              const uint8_t session_token[8],
-                              struct sockaddr_in* peer_out,
-                              uint32_t* tag_out)
-{
-    if (!authkey || !authkey[0]) return false;
-
-    struct sockaddr_in servers[4];
-    int ns = parse_rdv_servers(master_reply, reply_len, servers, 4);
-    if (ns == 0) return false;
-
-    struct sockaddr_in reflexive{};
-    bool have_reflexive = parse_reflexive(master_reply, reply_len, &reflexive);
-    if (!have_reflexive) {
-        OBN_DEBUG("[rdv] master reply has no reflexive record; seeding from server1");
-        if (ns > 0) reflexive = servers[0];
-    }
-
-    for (int s = 0; s < ns; ++s) {
-        if (offlan_rendezvous_server(sock, &servers[s], uid_upper, authkey,
-                                     session_token,
-                                     &reflexive,
-                                     peer_out,
-                                     tag_out))
-            return true;
-    }
+    OBN_WARN("[rdv] rendezvous timed out after 15s");
     return false;
 }
 
