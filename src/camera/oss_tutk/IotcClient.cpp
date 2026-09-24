@@ -3302,14 +3302,20 @@ int iotc_relay_send_app_data(RelayConn* rc,
 
     std::vector<uint8_t> dtls_rec;
     if (!dtls_encrypt_record(&ds, 0x17 /*ApplicationData*/, data, len, dtls_rec)) {
-        OBN_ERROR("[relay-send] encrypt ApplicationData failed");
+        OBN_ERROR("[relay-send] encrypt ApplicationData failed (len=%zu)", len);
         return -1;
     }
 
-    return send_dtls_packet(rc->sock, &rc->relay_addr,
-                             ds.epoch, rc->session_token,
-                             dtls_rec.data(), dtls_rec.size(),
-                             rc->relay_tag);
+    int rc_send = send_dtls_packet(rc->sock, &rc->relay_addr,
+                                   ds.epoch, rc->session_token,
+                                   dtls_rec.data(), dtls_rec.size(),
+                                   rc->relay_tag);
+    if (rc_send != 0) {
+        OBN_ERROR("[relay-send] send_dtls_packet failed (len=%zu, dtls_len=%zu)", len, dtls_rec.size());
+    } else {
+        OBN_DEBUG("[relay-send] sent %zu B app data (dtls_len=%zu, epoch=%u)", len, dtls_rec.size(), ds.epoch);
+    }
+    return rc_send;
 }
 
 int iotc_relay_recv_app_data(RelayConn* rc,
