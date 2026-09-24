@@ -618,7 +618,8 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
 
 // Retries on non-DTLS IOTC packets (e.g., stray type 0x33 echoes before ServerHello).
 // Returns DTLS payload length on success, -1 on timeout/error.
-static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t buf_size,
+static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* peer,
+                             uint8_t* dtls_out, size_t buf_size,
                              uint32_t* epoch_out,
                              uint8_t session_token_out[8],
                              int timeout_ms)
@@ -633,6 +634,12 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
         ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
                               (struct sockaddr*)&src, &src_len);
         if (n < 28) continue;
+
+        // Ignore stray packets from other rendezvous servers or unknown peers
+        if (peer && (src.sin_addr.s_addr != peer->sin_addr.s_addr ||
+                     src.sin_port != peer->sin_port)) {
+            continue;
+        }
 
         reverse_trans_code_partial(raw, (size_t)n);
 
@@ -1279,6 +1286,9 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
         OBN_ERROR("[dtls] ClientHello send failed");
         return -1;
     }
+    // Redundantly send ClientHello to protect against initial UDP loss on WAN/cellular
+    send_dtls_packet(sock, dst, initial_epoch, session_token,
+                     ch_dtls.data(), ch_dtls.size(), relay_tag);
     OBN_DEBUG("[dtls] ClientHello sent (%zu bytes DTLS, epoch=0x%x)", ch_dtls.size(), initial_epoch);
 
     // =======================================================================
@@ -1310,8 +1320,8 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
             send_dtls_packet(sock, dst, initial_epoch, session_token,
                              ch_dtls.data(), ch_dtls.size(), relay_tag);
         }
-        srv_len = recv_dtls_packet(sock, srv_raw, sizeof(srv_raw),
-                                   &srv_epoch, srv_token, 1500);
+        srv_len = recv_dtls_packet(sock, dst, srv_raw, sizeof(srv_raw),
+                                   &srv_epoch, srv_token, 1000);
     }
     if (srv_len < 13) {
         OBN_ERROR("[dtls] no ServerHello (got %d bytes)", srv_len);
@@ -1679,8 +1689,8 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     // =======================================================================
 
     uint8_t srv2_raw[1024];
-    int srv2_len = recv_dtls_packet(sock, srv2_raw, sizeof(srv2_raw),
-                                     nullptr, nullptr, 5000);
+    int srv2_len = recv_dtls_packet(sock, dst, srv2_raw, sizeof(srv2_raw),
+                                     nullptr, nullptr, 4000);
     if (srv2_len < 14) {
         OBN_ERROR("[dtls] no server CCS/Finished (got %d bytes)", srv2_len);
         return -1;
@@ -1698,8 +1708,8 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
             fin_rec_ptr = srv2_raw + ccs_rec_len;
             fin_rec_len = (size_t)srv2_len - ccs_rec_len;
         } else {
-            srv2_len = recv_dtls_packet(sock, srv2_raw, sizeof(srv2_raw),
-                                        nullptr, nullptr, 5000);
+            srv2_len = recv_dtls_packet(sock, dst, srv2_raw, sizeof(srv2_raw),
+                                        nullptr, nullptr, 3000);
             if (srv2_len >= 13 && srv2_raw[0] == 0x16) {
                 fin_rec_ptr = srv2_raw;
                 fin_rec_len = (size_t)srv2_len;
