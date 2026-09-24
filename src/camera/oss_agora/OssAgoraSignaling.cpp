@@ -236,8 +236,13 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
         if (n == 0) {
             OBN_WARN("[oss-relay] LOGIN ACK timed out (n=0) — proceeding to IPCAM_START anyway");
         } else {
-            OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %02x %02x %02x %02x",
-                     n, ack_buf[0], n > 1 ? ack_buf[1] : 0, n > 2 ? ack_buf[2] : 0, n > 3 ? ack_buf[3] : 0);
+            char ack_hex[256];
+            int ack_dump_len = std::min(n, 64);
+            int ack_pos = 0;
+            for (int i = 0; i < ack_dump_len; ++i) {
+                ack_pos += snprintf(ack_hex + ack_pos, sizeof(ack_hex) - ack_pos, "%02x ", ack_buf[i]);
+            }
+            OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %s", n, ack_hex);
         }
     }
 
@@ -312,18 +317,46 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
     bool first_frame = true;
     auto last_keepalive = std::chrono::steady_clock::now();
 
-    while (joined.load()) {
-        auto now = std::chrono::steady_clock::now();
-        // Send periodic TUTK AV keepalive ping every 2 seconds
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_keepalive).count() >= 2) {
-            last_keepalive = now;
-            std::vector<uint8_t> ping(24, 0);
-            ping[0] = 0x10;
-            uint16_t ver = htole16(0x000b);
-            memcpy(ping.data() + 2, &ver, 2);
-            iotc_relay_send_app_data(&relay, ping.data(), ping.size());
+    struct TutkFrameAssembly {
+        uint32_t frm_no = 0xFFFFFFFF;
+        uint32_t timestamp = 0;
+        uint16_t total_pkts = 0;
+        uint16_t received_pkts = 0;
+        std::vector<std::vector<uint8_t>> chunks;
+
+        bool add(uint32_t fno, uint32_t ts, uint16_t idx, uint16_t cnt, const uint8_t* data, size_t len) {
+            if (cnt == 0 || idx >= cnt) return false;
+            if (fno != frm_no) {
+                frm_no = fno;
+                timestamp = ts;
+                total_pkts = cnt;
+                received_pkts = 0;
+                chunks.clear();
+                chunks.resize(cnt);
+            }
+            if (chunks[idx].empty()) {
+                chunks[idx].assign(data, data + len);
+                received_pkts++;
+            }
+            return (received_pkts == total_pkts);
         }
 
+        std::vector<uint8_t> get_frame() {
+            size_t total_len = 0;
+            for (const auto& c : chunks) total_len += c.size();
+            std::vector<uint8_t> out;
+            out.reserve(total_len);
+            for (const auto& c : chunks) {
+                out.insert(out.end(), c.begin(), c.end());
+            }
+            chunks.clear();
+            received_pkts = 0;
+            total_pkts = 0;
+            return out;
+        }
+    } reassembler;
+
+    while (joined.load()) {
         uint8_t plaintext[65536];
         int n = iotc_relay_recv_app_data(&relay, plaintext, sizeof(plaintext), 100);
 
@@ -334,10 +367,10 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         if (n == 0) continue;  // timeout, poll again
 
         static int s_pkt_log_cnt = 0;
-        if (s_pkt_log_cnt < 20) {
+        if (s_pkt_log_cnt < 40) {
             s_pkt_log_cnt++;
-            char hex_buf[128];
-            int dump_len = std::min(n, 32);
+            char hex_buf[256];
+            int dump_len = std::min(n, 48);
             int pos = 0;
             for (int i = 0; i < dump_len; ++i) {
                 pos += snprintf(hex_buf + pos, sizeof(hex_buf) - pos, "%02x ", plaintext[i]);
@@ -345,12 +378,161 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
             OBN_INFO("[oss-relay] PKT_DUMP #%d: n=%d hex: %s", s_pkt_log_cnt, n, hex_buf);
         }
 
+        // Handle TUTK Control packets (opcode 0x10, 0x12, etc.)
+        if (n >= 24 && plaintext[0] == 0x00) {
+            uint16_t ver;
+            memcpy(&ver, plaintext + 2, 2);
+            ver = le16toh(ver);
+            if (ver == 0x000b) {
+                uint8_t opcode = plaintext[1];
+
+                // 1. TUTK IOCtrl (0x10): Reply with 0x71 ACK immediately
+                if (opcode == 0x10) {
+                    uint32_t ioCtrlNo = 0;
+                    memcpy(&ioCtrlNo, plaintext + 12, 4);
+                    ioCtrlNo = le32toh(ioCtrlNo);
+                    uint16_t channel = 0;
+                    memcpy(&channel, plaintext + 8, 2);
+                    channel = le16toh(channel);
+                    OBN_INFO("[oss-relay] received TUTK IOCtrl 0x10 (ch=%u, ioCtrlNo=%u) -> sending 0x71 ACK", channel, ioCtrlNo);
+
+                    uint8_t ack[24];
+                    memcpy(ack, plaintext, 24);
+                    ack[1] = 0x71; // OPCODE_AV_IOCTRL_INNER_ACK
+                    ack[16] = 0;   // payload length = 0
+                    ack[17] = 0;
+                    iotc_relay_send_app_data(&relay, ack, 24);
+                    continue;
+                }
+
+                // 2. TUTK Reset Buffer (0x12): Reply with 0x13 ACK
+                if (opcode == 0x12) {
+                    OBN_INFO("[oss-relay] received TUTK RESET_BUFFER 0x12 -> sending 0x13 ACK");
+                    uint8_t ack[44] = {0};
+                    memcpy(ack, plaintext, 24);
+                    ack[1] = 0x13; // OPCODE_AV_RESET_BUFFER_ACK
+                    ack[16] = 20;  // payload length = 20
+                    ack[17] = 0;
+                    if (n >= 44) {
+                        memcpy(ack + 24, plaintext + 24, 20);
+                    }
+                    iotc_relay_send_app_data(&relay, ack, 44);
+                    continue;
+                }
+
+                // Skip non-video management/ack packets (0x70, 0x71, 0x72, 0x21, etc.)
+                if (opcode == 0x70 || opcode == 0x71 || opcode == 0x72 || opcode == 0x21 || opcode == 0x20) {
+                    OBN_DEBUG("[oss-relay] skipping TUTK control packet opcode=0x%02x", opcode);
+                    continue;
+                }
+            }
+        }
+
         const uint8_t* h264 = nullptr;
         size_t payload_len = 0;
         uint32_t seq = 0;
+        std::vector<uint8_t> frame_buf;
+
+        // Check TUTK Transport / Video packets
+        if (n >= 24) {
+            uint16_t ver;
+            memcpy(&ver, plaintext + 2, 2);
+            ver = le16toh(ver);
+            if (ver == 0x000b) {
+                uint8_t ptype = plaintext[0];
+                uint8_t opcode = plaintext[1];
+
+                // Audio packets (opcode 4 or 5)
+                if (ptype == 0x01 && (opcode == 4 || opcode == 5)) {
+                    uint8_t a_ok[32] = {0};
+                    a_ok[0] = 0x00;
+                    a_ok[1] = 0x17; // OPCODE_AUDIO_DATA_OK
+                    uint16_t v = htole16(0x000b);
+                    memcpy(a_ok + 2, &v, 2);
+                    memcpy(a_ok + 18, plaintext + 18, 2);
+                    memcpy(a_ok + 20, plaintext + 4, 4);
+                    memcpy(a_ok + 24, plaintext + 4, 4);
+                    memcpy(a_ok + 28, plaintext + 8, 4);
+                    iotc_relay_send_app_data(&relay, a_ok, 32);
+                    continue;
+                }
+
+                // Video packet
+                bool is_video = (ptype == 0x01) ||
+                                (ptype == 0x00 && (opcode == 3 || opcode == 6 || opcode == 9 || opcode == 0x15 || opcode == 0x16));
+
+                if (is_video) {
+                    uint32_t frm_no;
+                    memcpy(&frm_no, plaintext + 4, 4);
+                    frm_no = le32toh(frm_no);
+
+                    uint32_t ts_ms;
+                    memcpy(&ts_ms, plaintext + 8, 4);
+                    ts_ms = le32toh(ts_ms);
+
+                    uint16_t pkt_idx;
+                    memcpy(&pkt_idx, plaintext + 12, 2);
+                    pkt_idx = le16toh(pkt_idx);
+
+                    uint16_t pkt_cnt;
+                    memcpy(&pkt_cnt, plaintext + 14, 2);
+                    pkt_cnt = le16toh(pkt_cnt);
+
+                    uint16_t pl_len;
+                    memcpy(&pl_len, plaintext + 16, 2);
+                    pl_len = le16toh(pl_len);
+
+                    if (pkt_cnt == 0) pkt_cnt = 1;
+
+                    size_t chunk_len = (pl_len > 0 && n >= (int)(24 + pl_len)) ? pl_len : (size_t)(n - 24);
+                    const uint8_t* chunk_data = plaintext + 24;
+
+                    bool complete = reassembler.add(frm_no, ts_ms, pkt_idx, pkt_cnt, chunk_data, chunk_len);
+                    if (complete) {
+                        frame_buf = reassembler.get_frame();
+                        seq = ts_ms;
+
+                        // Send OPCODE_VIDEO_DATA_OK (32 bytes)
+                        uint8_t ok_pkt[32] = {0};
+                        ok_pkt[0] = 0x00;
+                        ok_pkt[1] = 0x08; // OPCODE_VIDEO_DATA_OK
+                        uint16_t v = htole16(0x000b);
+                        memcpy(ok_pkt + 2, &v, 2);
+                        memcpy(ok_pkt + 18, plaintext + 18, 2); // echo tag
+                        memcpy(ok_pkt + 20, plaintext + 4, 4);  // frm_no
+                        memcpy(ok_pkt + 24, plaintext + 4, 4);  // frm_no
+                        memcpy(ok_pkt + 28, plaintext + 8, 4);  // timestamp
+                        iotc_relay_send_app_data(&relay, ok_pkt, 32);
+
+                        // Strip 16-byte FRAMEINFO_t if present
+                        if (frame_buf.size() > 16) {
+                            uint16_t codec_id;
+                            memcpy(&codec_id, frame_buf.data(), 2);
+                            codec_id = le16toh(codec_id);
+                            if (codec_id == 0x004c || codec_id == 0x004b) {
+                                const uint8_t* p = frame_buf.data() + 16;
+                                if ((p[0] == 0 && p[1] == 0 && p[2] == 1) ||
+                                    (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) ||
+                                    (p[0] == 0xff && p[1] == 0xd8)) {
+                                    h264 = p;
+                                    payload_len = frame_buf.size() - 16;
+                                }
+                            }
+                        }
+                        if (!h264 && !frame_buf.empty()) {
+                            h264 = frame_buf.data();
+                            payload_len = frame_buf.size();
+                        }
+                    } else {
+                        // Incomplete frame, continue reading chunks
+                        continue;
+                    }
+                }
+            }
+        }
 
         // Check Case 1: 16-byte AvFrameHeader
-        if (n >= 16) {
+        if (!h264 && n >= 16) {
             uint32_t magic;
             memcpy(&magic, plaintext + 4, 4);
             magic = le32toh(magic);
@@ -377,63 +559,6 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                     payload_len = pl;
                     memcpy(&seq, plaintext + 8, 4);
                     seq = le32toh(seq);
-                }
-            }
-        }
-
-        // Check Case 2: 24-byte TUTK packet header (ver=0x000b)
-        if (!h264 && n >= 24) {
-            uint16_t ver;
-            memcpy(&ver, plaintext + 2, 2);
-            ver = le16toh(ver);
-            if (ver == 0x000b) {
-                uint8_t pkt_type = plaintext[0];
-                uint16_t pl_len;
-                memcpy(&pl_len, plaintext + 16, 2);
-                pl_len = le16toh(pl_len);
-
-                // TUTK IOCtrl responses (0x08, 0x09, 0x10) are NOT video
-                if (pkt_type == 0x08 || pkt_type == 0x09 || pkt_type == 0x10) {
-                    OBN_DEBUG("[oss-relay] skipping TUTK IOCtrl response (pkt_type=0x%02x, pl_len=%u)", pkt_type, pl_len);
-                    continue;
-                }
-
-                // Video frames are never <= 8 bytes
-                if (pl_len <= 8) {
-                    OBN_INFO("[oss-relay] skipping short TUTK packet (n=%d, pkt_type=0x%02x, pl_len=%u)", n, pkt_type, pl_len);
-                    continue;
-                }
-
-                if (n >= (int)(24 + pl_len) && pl_len > 0) {
-                    const uint8_t* inner = plaintext + 24;
-                    // Check if inner payload has 16-byte AvFrameHeader
-                    if (pl_len >= 16) {
-                        uint32_t inner_magic;
-                        memcpy(&inner_magic, inner + 4, 4);
-                        inner_magic = le32toh(inner_magic);
-                        if ((inner_magic & 0xffff) == kFrameMagicMarker) {
-                            uint8_t inner_sub = (inner_magic >> 16) & 0xff;
-                            if (inner_sub == kFrameSubtypeCtrl) {
-                                OBN_DEBUG("[oss-relay] skipping inner AvFrame IOCtrl");
-                                continue;
-                            }
-                            uint32_t inner_pl;
-                            memcpy(&inner_pl, inner, 4);
-                            inner_pl = le32toh(inner_pl);
-                            if (pl_len >= 16 + inner_pl && inner_pl > 0) {
-                                h264 = inner + 16;
-                                payload_len = inner_pl;
-                                memcpy(&seq, inner + 8, 4);
-                                seq = le32toh(seq);
-                            }
-                        }
-                    }
-                    if (!h264) {
-                        h264 = inner;
-                        payload_len = pl_len;
-                        memcpy(&seq, plaintext + 20, 4);
-                        seq = le32toh(seq);
-                    }
                 }
             }
         }
@@ -481,7 +606,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         }
 
         if (cb && payload_len > 0) {
-            int64_t pts_us = (seq > 0) ? ((int64_t)seq * 1000000LL / 90000LL) : 0;
+            int64_t pts_us = (seq > 0) ? ((int64_t)seq * 1000LL) : 0;
             cb(h264, (int)payload_len, pts_us, is_keyframe);
         }
     }
