@@ -333,6 +333,18 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         }
         if (n == 0) continue;  // timeout, poll again
 
+        static int s_pkt_log_cnt = 0;
+        if (s_pkt_log_cnt < 20) {
+            s_pkt_log_cnt++;
+            char hex_buf[128];
+            int dump_len = std::min(n, 32);
+            int pos = 0;
+            for (int i = 0; i < dump_len; ++i) {
+                pos += snprintf(hex_buf + pos, sizeof(hex_buf) - pos, "%02x ", plaintext[i]);
+            }
+            OBN_INFO("[oss-relay] PKT_DUMP #%d: n=%d hex: %s", s_pkt_log_cnt, n, hex_buf);
+        }
+
         const uint8_t* h264 = nullptr;
         size_t payload_len = 0;
         uint32_t seq = 0;
@@ -388,7 +400,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
 
                 // Video frames are never <= 8 bytes
                 if (pl_len <= 8) {
-                    OBN_DEBUG("[oss-relay] skipping short TUTK packet (pl_len=%u)", pl_len);
+                    OBN_INFO("[oss-relay] skipping short TUTK packet (n=%d, pkt_type=0x%02x, pl_len=%u)", n, pkt_type, pl_len);
                     continue;
                 }
 
