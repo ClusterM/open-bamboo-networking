@@ -135,7 +135,65 @@ struct OssAgoraSignaling::Impl {
     void run_test_mode(AgoraJoinParams params);
     int  do_join(const AgoraJoinParams& params);
     void recv_loop(const AgoraJoinParams& params);
+    void send_ipcam_start(uint16_t ch, uint16_t& out_seq);
 };
+
+void OssAgoraSignaling::Impl::send_ipcam_start(uint16_t ch, uint16_t& out_seq)
+{
+    using namespace bambu_net::oss_tutk;
+    OBN_INFO("[oss-relay] sending TUTK IPCAM_START (ch=%u seq=%u)...", ch, out_seq);
+
+    uint32_t iotype = htole32(IOTYPE_USER_IPCAM_START);
+    uint32_t ch_le = htole32(ch);
+
+    // 1. Classic TUTK AV IOCtrl (flag = 0x70, 36 bytes)
+    {
+        uint8_t pkt70[36] = {0};
+        pkt70[0] = 0x00;
+        pkt70[1] = 0x70;
+        uint16_t v = htole16(0x000b);
+        memcpy(pkt70 + 2, &v, 2);
+        uint16_t dlen = htole16(12); // ioType(4) + payload(8)
+        memcpy(pkt70 + 16, &dlen, 2);
+        uint32_t sq = htole32(out_seq++);
+        memcpy(pkt70 + 20, &sq, 4);
+        memcpy(pkt70 + 24, &iotype, 4);
+        memcpy(pkt70 + 28, &ch_le, 4);
+        iotc_relay_send_app_data(&relay, pkt70, sizeof(pkt70));
+    }
+
+    // 2. TUTK inner IOCtrl with flag = 0x10 (40 bytes, matching printer's framing)
+    uint8_t pkt10[40] = {0};
+    pkt10[0] = 0x00;
+    pkt10[1] = 0x10;
+    uint16_t v10 = htole16(0x000b);
+    memcpy(pkt10 + 2, &v10, 2);
+    uint16_t c_seq = htole16(out_seq++);
+    memcpy(pkt10 + 4, &c_seq, 2);
+    // inner header at [8..27]
+    pkt10[8] = 0x00;
+    pkt10[9] = 0x10;
+    uint16_t p_seq = htole16(1);
+    memcpy(pkt10 + 10, &p_seq, 2);
+    pkt10[12] = 1; // s_count = 1
+    uint16_t inner_len = htole16(12);
+    memcpy(pkt10 + 16, &inner_len, 2);
+    memcpy(pkt10 + 20, &ch_le, 4);
+    // ioType at [28..31]
+    memcpy(pkt10 + 28, &iotype, 4);
+    // payload at [32..39] (channel=ch, res=0)
+    memcpy(pkt10 + 32, &ch_le, 4);
+    iotc_relay_send_app_data(&relay, pkt10, sizeof(pkt10));
+
+    // 3. TUTK inner IOCtrl with flag = 0x72 (40 bytes, BBR framing)
+    {
+        uint8_t pkt72[40] = {0};
+        memcpy(pkt72, pkt10, 40);
+        pkt72[1] = 0x72;
+        pkt72[9] = 0x72;
+        iotc_relay_send_app_data(&relay, pkt72, sizeof(pkt72));
+    }
+}
 
 void OssAgoraSignaling::Impl::run_test_mode(AgoraJoinParams /*params*/)
 {
@@ -247,63 +305,8 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     }
 
     // Send IPCAM_START IOCtrl
-    // In TUTK AV API, IOTYPE_USER_IPCAM_START requires SMsgAVIoctrlAVStream (channel=0, reserved=0, data_len=8).
-    // 1. TUTK AV IOCtrl frame (40 bytes): 24-byte header + 16 bytes payload
-    {
-        std::vector<uint8_t> tutk_ioctrl(40, 0);
-        tutk_ioctrl[0] = 0x08; // TUTK AV IOCtrl
-        tutk_ioctrl[1] = 0x00;
-        uint16_t ver = htole16(0x000b);
-        memcpy(tutk_ioctrl.data() + 2, &ver, 2);
-        uint16_t plen = htole16(16);
-        memcpy(tutk_ioctrl.data() + 16, &plen, 2);
-        uint32_t sq = htole32(3);
-        memcpy(tutk_ioctrl.data() + 20, &sq, 4);
-        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
-        memcpy(tutk_ioctrl.data() + 24, &iotype, 4);
-        uint32_t dlen = htole32(8);
-        memcpy(tutk_ioctrl.data() + 28, &dlen, 4);
-        // channel = 0 at [32..35], reserved = 0 at [36..39]
-
-        OBN_INFO("[oss-relay] sending TUTK IPCAM_START IOCtrl (40 bytes, iotype=0x01ff, dlen=8, ch=0)...");
-        if (iotc_relay_send_app_data(&relay, tutk_ioctrl.data(), tutk_ioctrl.size()) != 0) {
-            OBN_WARN("[oss-relay] TUTK IPCAM_START send failed");
-        }
-    }
-
-    // 2. Also send AvFrameHeader IOCtrl frame (32 bytes):
-    // 16-byte AvFrameHeader + 16 bytes payload (iotype=0x01ff, dlen=8, ch=0, res=0)
-    {
-        std::vector<uint8_t> ioctrl(16 + 16, 0);
-        write_av_frame_hdr(ioctrl.data(), /*payload_len=*/16,
-                           kFrameSubtypeCtrl, kFrameDirClientToP,
-                           /*seq=*/4, /*reserved=*/0);
-        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
-        memcpy(ioctrl.data() + 16, &iotype, 4);
-        uint32_t dlen = htole32(8);
-        memcpy(ioctrl.data() + 20, &dlen, 4);
-        // channel = 0 at [24..27], reserved = 0 at [28..31]
-
-        OBN_INFO("[oss-relay] sending AvFrame IPCAM_START IOCtrl (32 bytes, iotype=0x01ff, dlen=8, ch=0)...");
-        if (iotc_relay_send_app_data(&relay, ioctrl.data(), ioctrl.size()) != 0) {
-            OBN_WARN("[oss-relay] AvFrame IPCAM_START send failed");
-        }
-    }
-
-    // 3. Fallback: also send 32-byte TUTK IOCtrl (dlen=0) and 24-byte AvFrame IOCtrl (dlen=0)
-    {
-        std::vector<uint8_t> tutk_ioctrl0(32, 0);
-        tutk_ioctrl0[0] = 0x08;
-        uint16_t ver = htole16(0x000b);
-        memcpy(tutk_ioctrl0.data() + 2, &ver, 2);
-        uint16_t plen = htole16(8);
-        memcpy(tutk_ioctrl0.data() + 16, &plen, 2);
-        uint32_t sq = htole32(5);
-        memcpy(tutk_ioctrl0.data() + 20, &sq, 4);
-        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
-        memcpy(tutk_ioctrl0.data() + 24, &iotype, 4);
-        iotc_relay_send_app_data(&relay, tutk_ioctrl0.data(), tutk_ioctrl0.size());
-    }
+    uint16_t init_seq = 1;
+    send_ipcam_start(0, init_seq);
 
     OBN_INFO("[oss-relay] do_join complete — waiting for video frames");
     return 0;
@@ -450,6 +453,26 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                         }
                         OBN_INFO("[oss-relay] TUTK inner IOCtrl 0x10: seq=%u ch=%u opCode=0x%x (ACKed)",
                                  pkt_seq, channel, opCode);
+
+                        // Send IOCtrl ACK 0x11 (echo 24-byte header with flag=0x11, len=0)
+                        uint8_t ack11[24] = {0};
+                        memcpy(ack11, plaintext, 24);
+                        ack11[1] = 0x11;
+                        if (n >= 10) ack11[9] = 0x11;
+                        ack11[16] = 0; ack11[17] = 0;
+                        iotc_relay_send_app_data(&relay, ack11, 24);
+
+                        // Printer sent buffer setup (opCode 0x40) or channel control -> reply with IPCAM_START!
+                        send_ipcam_start(channel, s_client_out_seq);
+                        continue;
+                    }
+                    if (flag == 0x70) {
+                        OBN_INFO("[oss-relay] TUTK IOC_REQ 0x70 -> sending 0x71 ACK");
+                        uint8_t ack71[24] = {0};
+                        memcpy(ack71, plaintext, 24);
+                        ack71[1] = 0x71;
+                        ack71[16] = 0; ack71[17] = 0;
+                        iotc_relay_send_app_data(&relay, ack71, 24);
                         continue;
                     }
                     if (flag == 0x12) {
