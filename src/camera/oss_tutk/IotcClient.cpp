@@ -2963,7 +2963,7 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
 
         uint8_t resp[1024];
         struct sockaddr_in src{}; socklen_t sl = sizeof(src);
-        ssize_t n = recvfrom(sock, (char*)resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
+        ssize_t n = recvfrom(sock, resp, sizeof(resp), 0, (struct sockaddr*)&src, &sl);
         if (n < 16) continue;
         reverse_trans_code_partial(resp, (size_t)n);
         if (resp[0] != 0x04 || resp[1] != 0x02) continue;
