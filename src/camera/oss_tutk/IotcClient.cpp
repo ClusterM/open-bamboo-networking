@@ -633,7 +633,7 @@ static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* p
         socklen_t src_len = sizeof(src);
         ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
                               (struct sockaddr*)&src, &src_len);
-        if (n < 28) continue;
+        if (n < 24) continue;
 
         // Ignore stray packets from other rendezvous servers or unknown peers
         if (peer && (src.sin_addr.s_addr != peer->sin_addr.s_addr ||
@@ -644,6 +644,21 @@ static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* p
         reverse_trans_code_partial(raw, (size_t)n);
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
+
+        // Relay keepalive ping: 0x23 0x05 0x42 (24 bytes)
+        if (n == 24 && raw[8] == 0x23 && raw[9] == 0x05 && raw[10] == 0x42) {
+            uint8_t pong[24];
+            memcpy(pong, raw, 24);
+            pong[2] = 0x1c;
+            pong[8] = 0x24; pong[9] = 0x05; pong[10] = 0x24;
+            trans_code_partial(pong, sizeof(pong));
+            bambu_net::oss_tutk::sendto(sock, pong, sizeof(pong), 0,
+                                        (const struct sockaddr*)&src, (int)sizeof(src));
+            OBN_DEBUG("[dtls] answered relay ping 23 05 42 with pong 24 05 24 during handshake");
+            continue;
+        }
+
+        if (n < 28) continue;
 
         // Skip non-DTLS IOTC packets (type 0x33 echoes, stray rendezvous packets):
         // DTLS content starts with 0x16 (Handshake), 0x14 (CCS), or 0x15 (Alert).
@@ -3285,6 +3300,8 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     }
     memset(&out->dtls, 0, sizeof(out->dtls));
     out->dtls.relay_tag = relay_tag;
+    memset(out->relay_cookie, 0, sizeof(out->relay_cookie));
+    out->have_relay_cookie = false;
 
     return 0;
 }
@@ -3399,6 +3416,22 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             return -2;
         }
 
+        // Relay keepalive ping: 0x23 0x05 0x42 (24 bytes)
+        if (rc->is_relay && n == 24 && raw[8] == 0x23 && raw[9] == 0x05 && raw[10] == 0x42) {
+            memcpy(rc->relay_cookie, raw + 16, 8);
+            rc->have_relay_cookie = true;
+
+            uint8_t pong[24];
+            memcpy(pong, raw, 24);
+            pong[2] = 0x1c;
+            pong[8] = 0x24; pong[9] = 0x05; pong[10] = 0x24;
+            trans_code_partial(pong, sizeof(pong));
+            bambu_net::oss_tutk::sendto(rc->sock, pong, sizeof(pong), 0,
+                                        (const struct sockaddr*)&rc->relay_addr, (int)sizeof(rc->relay_addr));
+            OBN_DEBUG("[relay-recv] answered relay ping 23 05 42 with pong 24 05 24 (tag=%u)", rc->relay_tag);
+            continue;
+        }
+
         // Verify DTLS packet encapsulation:
         // Relay: raw[8..10] == {0x03, 0x05, 0x42}
         // Direct P2P: raw[8..10] == {0x07, 0x04, 0x21}
@@ -3438,6 +3471,36 @@ void iotc_relay_close(RelayConn* rc)
 {
     if (!rc) return;
     if (rc->sock >= 0) {
+        if (rc->is_relay && rc->relay_tag != 0) {
+            // Burst 5x 0x14 0x05 0x24 relay close packets to ThroughTek relay server
+            // so the server tears down the relay tag immediately and sends 0x13 0x05 0x42
+            // to the printer to release its liveview worker.
+            uint8_t pkt[24] = {0};
+            pkt[0] = 0x04; pkt[1] = 0x02;
+            pkt[2] = 0x1c; pkt[3] = 0x0a;
+            pkt[4] = 0x08; pkt[5] = 0x00; pkt[6] = 0x00; pkt[7] = 0x00;
+            pkt[8] = 0x14; pkt[9] = 0x05; pkt[10] = 0x24; pkt[11] = 0x00;
+            uint32_t tag_le = htole32(rc->relay_tag);
+            memcpy(pkt + 12, &tag_le, 4);
+            if (rc->have_relay_cookie) {
+                memcpy(pkt + 16, rc->relay_cookie, 8);
+            } else {
+                memcpy(pkt + 16, rc->session_token, 8);
+            }
+            trans_code_partial(pkt, sizeof(pkt));
+            for (int i = 0; i < 5; ++i) {
+                bambu_net::oss_tutk::sendto(rc->sock, pkt, sizeof(pkt), 0,
+                                            (const struct sockaddr*)&rc->relay_addr, (int)sizeof(rc->relay_addr));
+            }
+            OBN_INFO("[relay-close] sent 5x relay close packets (type=0x14 0x05 0x24, tag=%u)", rc->relay_tag);
+        } else if (!rc->is_relay) {
+            // Direct P2P: MSG_P2P_CLOSE_C2D (0x18 0x02 0x24)
+            uint8_t pkt[16] = {0};
+            write_rdv_hdr(pkt, 0, 0x18, 0x02, 0x24);
+            trans_code_partial(pkt, sizeof(pkt));
+            bambu_net::oss_tutk::sendto(rc->sock, pkt, sizeof(pkt), 0,
+                                        (const struct sockaddr*)&rc->relay_addr, (int)sizeof(rc->relay_addr));
+        }
         obn::net::close_socket(rc->sock);
         rc->sock = -1;
     }

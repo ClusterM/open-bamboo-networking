@@ -501,6 +501,8 @@ struct RelayConn {
     uint32_t         relay_tag;
     bool             is_relay;
     char             uid_upper[32];
+    uint8_t          relay_cookie[8];  // 8-byte session cookie from relay ping (0x23 0x05 0x42)
+    bool             have_relay_cookie;
 };
 
 // --------------------------------------------------------------------------
