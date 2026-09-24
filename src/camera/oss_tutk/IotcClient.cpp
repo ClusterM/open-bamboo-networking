@@ -3343,15 +3343,44 @@ int iotc_relay_recv_app_data(RelayConn* rc,
             return -1;
         }
 
-        if (n < 28 + 13) continue;  // too short for IOTC header + DTLS record header
+        if (n < 16) continue;
+
+        // Ignore stray packets from other rendezvous servers or unknown peers
+        if (src.sin_addr.s_addr != rc->relay_addr.sin_addr.s_addr ||
+            src.sin_port != rc->relay_addr.sin_port) {
+            continue;
+        }
 
         reverse_trans_code_partial(raw, (size_t)n);
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;
 
+        // If server re-sends 03 03 43 pairing confirmed, ACK it so server stops retrying
+        if (raw[8] == 0x03 && raw[9] == 0x03 && raw[10] == 0x43) {
+            uint32_t tag = 0;
+            if (n >= 40) memcpy(&tag, raw + 36, 4);
+            uint32_t tag_h = le32toh(tag);
+            send_rdv_ack(rc->sock, &src, rc->uid_upper, rc->session_token, tag_h);
+            OBN_DEBUG("[relay-recv] re-ACKed 03 03 43 from relay (tag=%u)", tag_h);
+            continue;
+        }
+
+        // Verify DTLS packet encapsulation:
+        // Relay: raw[8..10] == {0x03, 0x05, 0x42}
+        // Direct P2P: raw[8..10] == {0x07, 0x04, 0x21}
+        bool is_dtls = rc->is_relay ? (raw[8] == 0x03 && raw[9] == 0x05 && raw[10] == 0x42)
+                                    : (raw[8] == 0x07 && raw[9] == 0x04 && raw[10] == 0x21);
+        if (!is_dtls) {
+            OBN_DEBUG("[relay-recv] skipping non-DTLS packet: len=%zd type=%02x %02x %02x",
+                      n, raw[8], raw[9], raw[10]);
+            continue;
+        }
+
+        if (n < 28 + 13) continue;  // too short for IOTC header + DTLS record header
+
         uint8_t content_type = raw[28];
 
-        // Skip non-ApplicationData records (keepalives, etc.)
+        // Skip non-ApplicationData records (handshake/alerts)
         if (content_type != 0x17) {
             OBN_DEBUG("[relay-recv] skipping DTLS record type 0x%02x", content_type);
             continue;

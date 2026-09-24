@@ -242,40 +242,62 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     }
 
     // Send IPCAM_START IOCtrl
-    // 1. TUTK AV IOCtrl frame (32 bytes): 24-byte header + 8 bytes payload
+    // In TUTK AV API, IOTYPE_USER_IPCAM_START requires SMsgAVIoctrlAVStream (channel=0, reserved=0, data_len=8).
+    // 1. TUTK AV IOCtrl frame (40 bytes): 24-byte header + 16 bytes payload
     {
-        std::vector<uint8_t> tutk_ioctrl(32, 0);
+        std::vector<uint8_t> tutk_ioctrl(40, 0);
         tutk_ioctrl[0] = 0x08; // TUTK AV IOCtrl
         tutk_ioctrl[1] = 0x00;
         uint16_t ver = htole16(0x000b);
         memcpy(tutk_ioctrl.data() + 2, &ver, 2);
-        uint16_t plen = htole16(8);
+        uint16_t plen = htole16(16);
         memcpy(tutk_ioctrl.data() + 16, &plen, 2);
         uint32_t sq = htole32(3);
         memcpy(tutk_ioctrl.data() + 20, &sq, 4);
         uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
         memcpy(tutk_ioctrl.data() + 24, &iotype, 4);
-        // data_len is 0 at [28..31]
+        uint32_t dlen = htole32(8);
+        memcpy(tutk_ioctrl.data() + 28, &dlen, 4);
+        // channel = 0 at [32..35], reserved = 0 at [36..39]
 
-        OBN_INFO("[oss-relay] sending TUTK IPCAM_START IOCtrl (32 bytes, iotype=0x01ff)...");
+        OBN_INFO("[oss-relay] sending TUTK IPCAM_START IOCtrl (40 bytes, iotype=0x01ff, dlen=8, ch=0)...");
         if (iotc_relay_send_app_data(&relay, tutk_ioctrl.data(), tutk_ioctrl.size()) != 0) {
             OBN_WARN("[oss-relay] TUTK IPCAM_START send failed");
         }
     }
 
-    // 2. Also send AvFrameHeader IOCtrl frame (24 bytes) for compatibility
+    // 2. Also send AvFrameHeader IOCtrl frame (32 bytes):
+    // 16-byte AvFrameHeader + 16 bytes payload (iotype=0x01ff, dlen=8, ch=0, res=0)
     {
-        std::vector<uint8_t> ioctrl(16 + 8, 0);
-        write_av_frame_hdr(ioctrl.data(), /*payload_len=*/8,
+        std::vector<uint8_t> ioctrl(16 + 16, 0);
+        write_av_frame_hdr(ioctrl.data(), /*payload_len=*/16,
                            kFrameSubtypeCtrl, kFrameDirClientToP,
                            /*seq=*/4, /*reserved=*/0);
         uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
         memcpy(ioctrl.data() + 16, &iotype, 4);
+        uint32_t dlen = htole32(8);
+        memcpy(ioctrl.data() + 20, &dlen, 4);
+        // channel = 0 at [24..27], reserved = 0 at [28..31]
 
-        OBN_INFO("[oss-relay] sending AvFrame IPCAM_START IOCtrl (24 bytes, iotype=0x01ff)...");
+        OBN_INFO("[oss-relay] sending AvFrame IPCAM_START IOCtrl (32 bytes, iotype=0x01ff, dlen=8, ch=0)...");
         if (iotc_relay_send_app_data(&relay, ioctrl.data(), ioctrl.size()) != 0) {
             OBN_WARN("[oss-relay] AvFrame IPCAM_START send failed");
         }
+    }
+
+    // 3. Fallback: also send 32-byte TUTK IOCtrl (dlen=0) and 24-byte AvFrame IOCtrl (dlen=0)
+    {
+        std::vector<uint8_t> tutk_ioctrl0(32, 0);
+        tutk_ioctrl0[0] = 0x08;
+        uint16_t ver = htole16(0x000b);
+        memcpy(tutk_ioctrl0.data() + 2, &ver, 2);
+        uint16_t plen = htole16(8);
+        memcpy(tutk_ioctrl0.data() + 16, &plen, 2);
+        uint32_t sq = htole32(5);
+        memcpy(tutk_ioctrl0.data() + 20, &sq, 4);
+        uint32_t iotype = htole32(bambu_net::oss_tutk::IOTYPE_USER_IPCAM_START);
+        memcpy(tutk_ioctrl0.data() + 24, &iotype, 4);
+        iotc_relay_send_app_data(&relay, tutk_ioctrl0.data(), tutk_ioctrl0.size());
     }
 
     OBN_INFO("[oss-relay] do_join complete — waiting for video frames");
@@ -288,8 +310,20 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
 
     OBN_INFO("[oss-relay] recv_loop started");
     bool first_frame = true;
+    auto last_keepalive = std::chrono::steady_clock::now();
 
     while (joined.load()) {
+        auto now = std::chrono::steady_clock::now();
+        // Send periodic TUTK AV keepalive ping every 2 seconds
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_keepalive).count() >= 2) {
+            last_keepalive = now;
+            std::vector<uint8_t> ping(24, 0);
+            ping[0] = 0x10;
+            uint16_t ver = htole16(0x000b);
+            memcpy(ping.data() + 2, &ver, 2);
+            iotc_relay_send_app_data(&relay, ping.data(), ping.size());
+        }
+
         uint8_t plaintext[65536];
         int n = iotc_relay_recv_app_data(&relay, plaintext, sizeof(plaintext), 100);
 
@@ -316,15 +350,17 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                 if (sub_type == kFrameSubtypeLogin && direction == kFrameDirPrinterToC)
                     continue;
 
+                // All control payloads are IOCtrl responses, NOT video
+                if (sub_type == kFrameSubtypeCtrl) {
+                    OBN_DEBUG("[oss-relay] skipping AvFrame IOCtrl packet (n=%d)", n);
+                    continue;
+                }
+
                 uint32_t pl;
                 memcpy(&pl, plaintext, 4);
                 pl = le32toh(pl);
 
-                // Small control payloads are IOCtrl responses
-                if (sub_type == kFrameSubtypeCtrl && pl <= 8)
-                    continue;
-
-                if (n >= (int)(16 + pl)) {
+                if (n >= (int)(16 + pl) && pl > 0) {
                     h264 = plaintext + 16;
                     payload_len = pl;
                     memcpy(&seq, plaintext + 8, 4);
@@ -339,9 +375,22 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
             memcpy(&ver, plaintext + 2, 2);
             ver = le16toh(ver);
             if (ver == 0x000b) {
+                uint8_t pkt_type = plaintext[0];
                 uint16_t pl_len;
                 memcpy(&pl_len, plaintext + 16, 2);
                 pl_len = le16toh(pl_len);
+
+                // TUTK IOCtrl responses (0x08, 0x09, 0x10) are NOT video
+                if (pkt_type == 0x08 || pkt_type == 0x09 || pkt_type == 0x10) {
+                    OBN_DEBUG("[oss-relay] skipping TUTK IOCtrl response (pkt_type=0x%02x, pl_len=%u)", pkt_type, pl_len);
+                    continue;
+                }
+
+                // Video frames are never <= 8 bytes
+                if (pl_len <= 8) {
+                    OBN_DEBUG("[oss-relay] skipping short TUTK packet (pl_len=%u)", pl_len);
+                    continue;
+                }
 
                 if (n >= (int)(24 + pl_len) && pl_len > 0) {
                     const uint8_t* inner = plaintext + 24;
@@ -351,10 +400,15 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                         memcpy(&inner_magic, inner + 4, 4);
                         inner_magic = le32toh(inner_magic);
                         if ((inner_magic & 0xffff) == kFrameMagicMarker) {
+                            uint8_t inner_sub = (inner_magic >> 16) & 0xff;
+                            if (inner_sub == kFrameSubtypeCtrl) {
+                                OBN_DEBUG("[oss-relay] skipping inner AvFrame IOCtrl");
+                                continue;
+                            }
                             uint32_t inner_pl;
                             memcpy(&inner_pl, inner, 4);
                             inner_pl = le32toh(inner_pl);
-                            if (pl_len >= 16 + inner_pl) {
+                            if (pl_len >= 16 + inner_pl && inner_pl > 0) {
                                 h264 = inner + 16;
                                 payload_len = inner_pl;
                                 memcpy(&seq, inner + 8, 4);
@@ -393,9 +447,12 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
             nal_offset = 4;
         } else if (payload_len >= 3 && h264[0] == 0 && h264[1] == 0 && h264[2] == 1) {
             nal_offset = 3;
+        } else if (payload_len >= 2 && h264[0] == 0xff && h264[1] == 0xd8) {
+            // MJPEG frame (every JPEG is an intra frame)
+            is_keyframe = true;
         }
 
-        if (payload_len > nal_offset) {
+        if (!is_keyframe && payload_len > nal_offset) {
             uint8_t nal_type = h264[nal_offset] & 0x1f;
             if (nal_type == 5 || nal_type == 7) {
                 is_keyframe = true;

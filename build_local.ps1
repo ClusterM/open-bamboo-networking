@@ -33,3 +33,35 @@ elseif ($Action -eq "build") {
 elseif ($Action -eq "install") {
     cmake --install $buildDir --config Release
 }
+elseif ($Action -eq "deploy") {
+    cmake --build $buildDir --config Release --parallel
+    $srcDir = "$buildDir\Release"
+    $bambuSrc = "$srcDir\BambuSource.dll"
+    $bambuNet = "$srcDir\bambu_networking.dll"
+
+    if (-not (Test-Path $bambuSrc) -or -not (Test-Path $bambuNet)) {
+        throw "Built DLLs not found in $srcDir"
+    }
+
+    $targets = @(
+        "D:\Documentos\Programming projects\orcaslicer-bbl-cloud-patches\orcaslicer-patched\resources\plugins",
+        "D:\Documentos\Programming projects\orcaslicer-bbl-cloud-patches\oss\OrcaSlicer_Windows_V2.5.0-dev_x64_portable(2)\resources\plugins",
+        "D:\Documentos\Programming projects\orcaslicer-bbl-cloud-patches\oss\OrcaSlicer_Windows_V2.5.0-dev_x64_portable(2)",
+        (Join-Path $env:APPDATA "OrcaSlicer\plugins")
+    )
+
+    foreach ($t in $targets) {
+        if (-not (Test-Path $t)) {
+            New-Item -ItemType Directory -Path $t -Force | Out-Null
+        }
+        Copy-Item -Path $bambuSrc -Destination $t -Force
+        Copy-Item -Path $bambuNet -Destination $t -Force
+        Write-Host "Deployed to $t"
+    }
+
+    # Register BambuSource.dll from portable plugins directory
+    $mainDll = "D:\Documentos\Programming projects\orcaslicer-bbl-cloud-patches\oss\OrcaSlicer_Windows_V2.5.0-dev_x64_portable(2)\resources\plugins\BambuSource.dll"
+    $proc = Start-Process "regsvr32.exe" -ArgumentList "/s `"$mainDll`"" -PassThru -Wait
+    Write-Host "regsvr32 exit code: $($proc.ExitCode)"
+}
+
