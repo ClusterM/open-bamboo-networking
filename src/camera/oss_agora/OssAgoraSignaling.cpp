@@ -400,6 +400,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
     int retry_start_count = 0;
     int ioc_trigger_cnt = 0;
     int frame_log_cnt = 0;
+    int s_pkt_log_cnt = 0;
     auto last_retry_time = std::chrono::steady_clock::now();
 
     auto send_tutk_transport_ack = [&](uint16_t pkt_seq) {
@@ -447,8 +448,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
         }
         if (n == 0) continue;  // timeout, poll again
 
-        static int s_pkt_log_cnt = 0;
-        if (s_pkt_log_cnt < 40) {
+        if (s_pkt_log_cnt < 60) {
             s_pkt_log_cnt++;
             char hex_buf[256];
             int dump_len = std::min(n, 48);
@@ -769,16 +769,19 @@ int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 
 int OssAgoraSignaling::leave()
 {
+    OBN_INFO("[oss-relay] leave() called (joined=%d)", m_impl->joined.load() ? 1 : 0);
     if (m_impl->joined.exchange(false)) {
         // Send IPCAM_STOP before closing relay connection so printer frees stream worker
         m_impl->send_ipcam_stop(0, m_impl->client_out_seq);
         m_impl->send_ipcam_stop(1, m_impl->client_out_seq);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        OBN_INFO("[oss-relay] IPCAM_STOP sent on both channels, closing relay...");
     }
     // Close the relay socket to unblock recvfrom in recv_loop
     bambu_net::oss_tutk::iotc_relay_close(&m_impl->relay);
     if (m_impl->worker_thread.joinable()) {
         m_impl->worker_thread.join();
+        OBN_INFO("[oss-relay] worker thread joined — leave() complete");
     }
     return 0;
 }
