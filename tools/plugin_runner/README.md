@@ -153,6 +153,12 @@ per ABI). Plugin downloads are cached in
 --soft-match-target-spool-id N targetSpoolId (only link_other uses it)
 --soft-match-only              skip the catalogue read and the slot-mapping
                                sync, leaving just the soft-match calls
+--device-region                alias for --action device_region
+--device-region-device-id ID   DeviceId (stock does not put this on the wire)
+--device-region-client-type T  ClientType; omitted means "slicer"
+--device-region-country CC     country field (stock does not put this on the wire)
+--device-region-x-client-country CC
+                               XClientCountry (same)
 ```
 
 `http_probe` calls `get_studio_info_url`, `get_my_message`, `check_user_task_report`,
@@ -174,6 +180,14 @@ write, so point `--soft-match-spool-id` at a row that does not exist to
 capture the request shape without touching the account; the server answers
 404 and the plugin returns −35
 ([research §8.15.10](../../research/08.15-filament.md#81510-bambu_network_get_soft_match_pending)).
+
+`device_region` (ABI `02.08.04` or newer) calls `post_device_region` once and
+prints the return code plus the raw body. `--user-info` is optional.
+`--device-region` is an alias for the action. `ClientType` defaults to
+`slicer`; pass an empty string to send the field blank. The other three
+fields default to empty. `--country` still selects the API host via
+`set_country_code` (`CN` → `api.bambulab.cn`)
+([research §8.10.12](../../research/08.10-http.md#81012-bambu_network_post_device_region)).
 
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch

@@ -9,6 +9,7 @@
 #include "obn/auth.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
+#include "obn/device_region.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -617,3 +618,47 @@ OBN_ABI int bambu_network_get_slice_info(void* /*agent*/,
     if (slice_json) slice_json->clear();
     return BAMBU_NETWORK_SUCCESS;
 }
+
+#if ABI_VERSION >= 0x020804
+
+namespace obn::detail {
+
+std::string build_device_region_body(const BBL::DeviceRegionParams& params)
+{
+    // Stock substitutes this literal when the struct field is empty. It is
+    // not read back out of the X-BBL-Client-Type header.
+    const std::string client = params.ClientType.empty() ? std::string("slicer")
+                                                         : params.ClientType;
+    return std::string("{\"ClientType\":") + obn::json::escape(client) + "}";
+}
+
+} // namespace obn::detail
+
+// Startup query Studio fires once from GUI_App::check_cert. The response is
+// only logged. See research/08.10-http.md.
+OBN_ABI int bambu_network_post_device_region(void* agent,
+                                            BBL::DeviceRegionParams params,
+                                            std::string* http_body)
+{
+    if (obn::config::current().block_cloud) {
+        if (http_body) http_body->clear();
+        OBN_DEBUG("bambu_network_post_device_region: blocked by block_cloud");
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+
+    const std::string body = obn::detail::build_device_region_body(params);
+    const std::string url  = obn::cloud::api_host(a->cloud_region())
+                           + "/v1/user-service/device/region";
+    auto resp = obn::http::post_json(url, body, a->cloud_api_http_headers());
+    OBN_INFO("post_device_region http=%ld bytes=%zu client_len=%zu",
+             resp.status_code, resp.body.size(), params.ClientType.size());
+    if (http_body) *http_body = std::move(resp.body);
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300)
+        return BAMBU_NETWORK_ERR_POST_DEVICE_REGION_FAILED;
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+#endif

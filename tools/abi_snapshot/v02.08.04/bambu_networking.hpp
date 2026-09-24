@@ -1,20 +1,12 @@
 #ifndef __BAMBU_NETWORKING_HPP__
 #define __BAMBU_NETWORKING_HPP__
 
-#include <cstdint>
 #include <string>
 #include <functional>
 #include <map>
 #include <vector>
+#include <cstdint>
 
-#ifndef ABI_VERSION
-#error ABI_VERSION must be defined by the build system (see CMakeLists.txt).
-#endif
-
-// Studio's copy of this header also carries a BAMBU_NETWORK_AGENT_VERSION
-// literal that Bambu bumps per release. Nothing in Studio reads it, and our
-// version string comes from OBN_VERSION at configure time, so mirroring the
-// literal here would only hardcode a wrong version.
 extern std::string g_log_folder;
 extern std::string g_log_start_time;
 
@@ -54,15 +46,8 @@ namespace BBL {
 #define BAMBU_NETWORK_ERR_GET_FILAMENT_CONFIG_FAILED    -31
 #define BAMBU_NETWORK_ERR_AMS_SYNC_FAILED               -32
 #define BAMBU_NETWORK_ERR_SLOT_MAPPINGS_SYNC_FAILED     -33
-// -34 / -35 were the gap left by 02.08.02; 02.08.03 fills it with the AMS
-// soft-match endpoints.
 #define BAMBU_NETWORK_ERR_GET_SOFT_MATCH_PENDING_FAILED -34
 #define BAMBU_NETWORK_ERR_POST_SOFT_MATCH_PENDING_FAILED -35
-
-// -36 … -59 belong to the Print Queue feature Studio 02.08.02 declares but
-// does not call yet, though the stock plugin already implements it.
-// Mirrored for fidelity; nothing returns them yet.
-// See research/08.16-errors.md §8.16.9.
 #define BAMBU_NETWORK_ERR_CREATE_PRINT_QUEUE_PROJECT_FAILED       -36
 #define BAMBU_NETWORK_ERR_GET_PRINT_QUEUE_PROJECTS_FAILED         -37
 #define BAMBU_NETWORK_ERR_UPDATE_PRINT_QUEUE_PROJECT_FAILED       -38
@@ -88,6 +73,7 @@ namespace BBL {
 #define BAMBU_NETWORK_ERR_DOWNLOAD_PRINT_QUEUE_CONFIG_FAILED      -58
 #define BAMBU_NETWORK_ERR_START_PRINT_QUEUE_TASK_FAILED           -59
 #define BAMBU_NETWORK_ERR_POST_DEVICE_REGION_FAILED               -60
+
 
 //bind error
 #define BAMBU_NETWORK_ERR_BIND_CREATE_SOCKET_FAILED          -1010 //failed to create socket
@@ -148,6 +134,8 @@ namespace BBL {
 #define BAMBU_NETWORK_LIBRARY               "bambu_networking"
 #define BAMBU_NETWORK_AGENT_NAME            "bambu_network_agent"
 
+#define BAMBU_NETWORK_AGENT_VERSION         "02.08.04.xx"
+
 //iot preset type strings
 #define IOT_PRINTER_TYPE_STRING     "printer"
 #define IOT_FILAMENT_STRING         "filament"
@@ -162,7 +150,6 @@ namespace BBL {
 #define IOT_JSON_KEY_SETTING_ID         "setting_id"
 #define IOT_JSON_KEY_FILAMENT_ID        "filament_id"
 #define IOT_JSON_KEY_USER_ID            "user_id"
-#define IOT_JSON_KEY_INHERITS           "inherits"
 
 // user callbacks
 typedef std::function<void(int online_login, bool login)> OnUserLoginFn;
@@ -278,29 +265,19 @@ struct PrintParams {
     bool            task_vibration_cali;    /* vibration calibration of task */
     bool            task_layer_inspect;     /* first layer inspection of task */
     bool            task_record_timelapse;  /* record timelapse of task */
-#if ABI_VERSION >= 0x020503
     bool            task_timelapse_use_internal;
-#endif
     bool            task_use_ams;
     std::string     task_bed_type;
     std::string     extra_options;
     int             auto_bed_leveling{ 0 };
     int             auto_flow_cali{ 0 };
     int             auto_offset_cali{ 0 };
-#if ABI_VERSION >= 0x020400
     int             extruder_cali_manual_mode{ -1 };
-#endif
     bool            task_ext_change_assist;
     bool            try_emmc_print;
-#if ABI_VERSION >= 0x020701
     std::string     svc_context;
-#endif
-#if ABI_VERSION >= 0x020801
     std::string     slicer_uid;
-#endif
-#if ABI_VERSION >= 0x020802
     std::string     queue_plate_id;
-#endif
 };
 
 struct TaskQueryParams
@@ -311,14 +288,6 @@ struct TaskQueryParams
     int limit = 20;
 };
 
-#if ABI_VERSION >= 0x020802
-// Print Queue: declared by Studio 02.08.02 but not wired up anywhere in it —
-// no NetworkAgent method, no dlsym, no UI. The stock plugin, however, already
-// exports all 14 bambu_network_*_print_queue_* entry points, so this is a
-// feature the plugin ships ahead of Studio rather than a dead declaration.
-// Mirrored verbatim so our header stays a faithful copy of the ABI surface;
-// see research/08.16-errors.md §8.16.9.
-//
 // Queue record IDs are int64 so request payloads retain the service's numeric
 // project, plate, and profile ID types across the dynamic-library ABI.
 struct PrintQueuePlateCreateParams
@@ -414,7 +383,6 @@ struct PrintQueueTaskParams
     std::string profile_id;
     PrintParams params;
 };
-#endif
 
 struct FilamentQueryParams
 {
@@ -432,7 +400,6 @@ struct FilamentDeleteParams
     std::vector<std::string> rfids;
 };
 
-#if ABI_VERSION >= 0x020801
 struct AmsSyncItem {
     std::string RFID;
     std::string filamentVendor;
@@ -458,12 +425,7 @@ struct AmsSyncParams {
     std::string              devId;
     std::vector<AmsSyncItem> items;
 };
-#endif
 
-#if ABI_VERSION >= 0x020802
-// Slot binding for one AMS tray. Studio sends this in two flavours through
-// the same endpoint: a bind (spoolId/rfid set) and an unbind (both zeroed,
-// mount fields carrying the pre-eject values).
 struct SlotMappingItem {
     std::string amsSn;
     std::string slotId;
@@ -477,40 +439,24 @@ struct SlotMappingsSyncParams {
     std::string                  devId;
     std::vector<SlotMappingItem> mappings;
 };
-#endif
 
-#if ABI_VERSION >= 0x020803
-// AMS soft match: the cloud queues a newly-read official RFID spool that it
-// could not attach to an existing catalogue row on its own, and Studio asks
-// the user to arbitrate. The GET names the printer and the AMS unit whose
-// queue to read; the POST carries the verdict for one queued spool.
 struct SoftMatchPendingParams {
     std::string devId;
     std::string amsSn;
 };
 
-// `action` is one of "accept" (keep the queued spool), "link_other" (merge
-// into `targetSpoolId`, a candidate the cloud proposed) or "create_new"
-// (record a fresh catalogue row). `targetSpoolId` is only meaningful for
-// "link_other"; Studio leaves it at 0 otherwise.
 struct SoftMatchPendingActionParams {
     std::string action;
     int         spoolId       = 0;
     int         targetSpoolId = 0;
 };
-#endif
 
-#if ABI_VERSION >= 0x020804
-// One-shot startup query. Studio fills only ClientType ("slicer") and logs
-// the body; the other fields exist on the ABI and the stock plugin forwards
-// them. Field order matches upstream bambu_networking.hpp.
 struct DeviceRegionParams {
     std::string DeviceId;
     std::string ClientType;
     std::string country;
     std::string XClientCountry;
 };
-#endif
 
 struct PublishParams {
     std::string     project_name;

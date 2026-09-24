@@ -940,6 +940,25 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME filament_body COMMAND filament_body_test)
 
+    # Pins the 02.08.04 device-region body and the block_cloud short-circuit.
+    add_executable(device_region_test tests/device_region_test.cpp
+        src/abi_http.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(device_region_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(device_region_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(device_region_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME device_region COMMAND device_region_test)
+
     # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
     # the AWS SigV4 signing-key derivation against the vendors' published
     # test vectors, plus config parsing and header construction.

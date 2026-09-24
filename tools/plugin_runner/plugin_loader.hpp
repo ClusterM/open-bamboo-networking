@@ -146,6 +146,11 @@ using func_post_soft_match_pending = int (*)(void* agent,
                                              BBL::SoftMatchPendingActionParams params,
                                              std::string* http_body);
 #endif
+#if ABI_VERSION >= 0x020804
+using func_post_device_region = int (*)(void* agent,
+                                        BBL::DeviceRegionParams params,
+                                        std::string* http_body);
+#endif
 
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
@@ -269,6 +274,9 @@ struct PluginExports {
 #if ABI_VERSION >= 0x020803
     func_get_soft_match_pending      get_soft_match_pending      = nullptr;
     func_post_soft_match_pending     post_soft_match_pending     = nullptr;
+#endif
+#if ABI_VERSION >= 0x020804
+    func_post_device_region          post_device_region          = nullptr;
 #endif
 };
 

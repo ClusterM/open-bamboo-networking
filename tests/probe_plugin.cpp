@@ -196,6 +196,9 @@ const char* kBambuNetworkSymbols[] = {
     "bambu_network_get_soft_match_pending",
     "bambu_network_post_soft_match_pending",
 #endif
+#if ABI_VERSION >= 0x020804
+    "bambu_network_post_device_region",
+#endif
     "bambu_network_get_printer_firmware",
     "bambu_network_get_task_plate_index",
     "bambu_network_get_subtask_info",

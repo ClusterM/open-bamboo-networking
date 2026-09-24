@@ -206,6 +206,10 @@ PluginExports load(const std::string& so_path)
     out.post_soft_match_pending = resolve<func_post_soft_match_pending>(
         out.dl_handle, "bambu_network_post_soft_match_pending");
 #endif
+#if ABI_VERSION >= 0x020804
+    out.post_device_region = resolve<func_post_device_region>(
+        out.dl_handle, "bambu_network_post_device_region");
+#endif
 
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }

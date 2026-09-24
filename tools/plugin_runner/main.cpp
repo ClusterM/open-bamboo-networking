@@ -194,6 +194,15 @@ struct CliArgs {
     int         soft_match_target_spool_id = 0;
     bool        soft_match_only = false;
 
+    // --action device_region (ABI >= 02.08.04): one post_device_region
+    // call. ClientType defaults to Studio's "slicer" when the flag is
+    // omitted; pass an empty value to send the field blank. user-info is
+    // optional so a logged-out agent can be captured too.
+    std::optional<std::string> device_region_device_id;
+    std::optional<std::string> device_region_client_type;
+    std::optional<std::string> device_region_country;
+    std::optional<std::string> device_region_x_client_country;
+
     // --action account_bind extras (Studio BindJob defaults).
     std::string dev_model = "N7";
     std::string timezone  = "UTC+02:00";
@@ -293,6 +302,14 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--soft-match-spool-id N] [--soft-match-target-spool-id N]
                      [--soft-match-only] [--country US]
 
+       plugin_runner --action device_region --plugin-path PATH
+                     [--user-info @session.json] [--data-dir DIR]
+                     [--device-region-device-id ID]
+                     [--device-region-client-type TYPE]
+                     [--device-region-country CC]
+                     [--device-region-x-client-country CC]
+                     [--country US]
+
        plugin_runner --action update_cert --plugin-path PATH
                      [--user-info @session.json] [--data-dir DIR]
                      [--country US]
@@ -322,9 +339,9 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
 
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
                 | local_print_with_record | cloud_print | send_raw | none
-                | http_probe | mw_probe | filament_probe | update_cert
-                | query_bind | bind_detect | account_bind | gap_probe
-                | cert_probe
+                | http_probe | mw_probe | filament_probe | device_region
+                | update_cert | query_bind | bind_detect | account_bind
+                | gap_probe | cert_probe
 
   cloud_print: bambu_network_start_print — the pure-cloud path. Uploads
   the 3mf to S3 and dispatches through POST /my/task with
@@ -367,6 +384,13 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   post_soft_match_pending call — that one writes to the cloud catalogue,
   so pass spool ids that do not exist to capture the shape safely.
   --soft-match-only skips the catalogue read and the slot-mapping sync.
+
+  device_region: no printer. Optional change_user, then one
+  post_device_region (ABI >= 02.08.04). --device-region is an alias for
+  this action. ClientType defaults to "slicer" (what Studio sends); the
+  other three fields default to empty. Pass an empty string to force
+  ClientType blank. --country still selects the cloud region via
+  set_country_code. Run under MITM to capture the request.
 
   update_cert: no printer. Mirrors Studio GUI_App::check_cert →
   bambu_network_update_cert. Under MITM this should be the shared app
@@ -474,6 +498,15 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--soft-match-target-spool-id")
             c.soft_match_target_spool_id = std::stoi(require(a, ++i, f));
         else if (f == "--soft-match-only")   c.soft_match_only = true;
+        else if (f == "--device-region")     c.action = "device_region";
+        else if (f == "--device-region-device-id")
+            c.device_region_device_id = require(a, ++i, f);
+        else if (f == "--device-region-client-type")
+            c.device_region_client_type = require(a, ++i, f);
+        else if (f == "--device-region-country")
+            c.device_region_country = require(a, ++i, f);
+        else if (f == "--device-region-x-client-country")
+            c.device_region_x_client_country = require(a, ++i, f);
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--dev-model")         c.dev_model = require(a, ++i, f);
         else if (f == "--timezone")          c.timezone  = require(a, ++i, f);
@@ -502,7 +535,8 @@ CliArgs parse_cli(int argc, char** argv)
     const bool cloud_probe =
         (c.action == "http_probe" || c.action == "mw_probe" ||
          c.action == "update_cert" || c.action == "query_bind" ||
-         c.action == "gap_probe" || c.action == "filament_probe");
+         c.action == "gap_probe" || c.action == "filament_probe" ||
+         c.action == "device_region");
     const bool bind_detect_only = (c.action == "bind_detect");
     const bool account_bind     = (c.action == "account_bind");
     const bool cert_probe       = (c.action == "cert_probe");
@@ -1063,9 +1097,10 @@ try {
     const bool bind_detect_only  = (args.action == "bind_detect");
     const bool account_bind_probe = (args.action == "account_bind");
     const bool filament_probe     = (args.action == "filament_probe");
+    const bool device_region_probe = (args.action == "device_region");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
-        gap_probe_action || filament_probe;
+        gap_probe_action || filament_probe || device_region_probe;
     // account_bind / bind_detect call bind_detect themselves then exit
     // (or call bind()); they must not open a competing LAN MQTT session.
     const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
@@ -1858,6 +1893,47 @@ try {
         pr::unload(exports);
         emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
         return 0;
+    } else if (args.action == "device_region") {
+#if ABI_VERSION < 0x020804
+        emit_event("post_device_region", { {"unsupported_abi", true} });
+        emit_text("fatal",
+                  "post_device_region requires a runner built for ABI >= 02.08.04");
+        return 70;
+#else
+        if (!exports.post_device_region) {
+            emit_event("post_device_region", { {"missing", true} });
+            emit_text("fatal", "plugin missing bambu_network_post_device_region");
+            return 70;
+        }
+        BBL::DeviceRegionParams p;
+        p.DeviceId       = args.device_region_device_id.value_or("");
+        p.ClientType     = args.device_region_client_type.value_or("slicer");
+        p.country        = args.device_region_country.value_or("");
+        p.XClientCountry = args.device_region_x_client_country.value_or("");
+        emit_event("post_device_region_request", {
+            {"DeviceId", p.DeviceId},
+            {"ClientType", p.ClientType},
+            {"country", p.country},
+            {"XClientCountry", p.XClientCountry},
+        });
+        std::string body;
+        int rc = exports.post_device_region(agent, p, &body);
+        emit_event("post_device_region", {
+            {"rc", rc},
+            {"body", body},
+        });
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            fast_exit(rc == 0 ? 0 : 1);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return rc == 0 ? 0 : 1;
+#endif
     } else if (args.action == "filament_probe") {
         auto trunc = [](const std::string& s, size_t n = 2000) {
             if (s.size() <= n) return s;
