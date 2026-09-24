@@ -139,32 +139,28 @@ bool OssTutkCameraSource::open()
 
     open_.store(true);
 
-    // Wait briefly for first frame to detect stream codec and dimensions
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
-    while (std::chrono::steady_clock::now() < deadline && open_.load()) {
-        bambu_net::camera::oss_agora::OssVideoFrame f;
-        if (queue_.pop(f)) {
-            if (f.data.size() >= 2 && f.data[0] == 0xff && f.data[1] == 0xd8) {
-                detected_codec_ = Codec::MotionJpeg;
-                int w = 0, h = 0;
-                if (parse_jpeg_dimensions(f.data.data(), f.data.size(), w, h)) {
-                    detected_width_  = w;
-                    detected_height_ = h;
-                }
-                OBN_INFO("camera: TUTK first frame detected as MotionJpeg (%zu B, %dx%d)",
-                         f.data.size(), detected_width_, detected_height_);
-            } else {
-                detected_codec_ = Codec::H264_AnnexB;
-                OBN_INFO("camera: TUTK first frame detected as H264_AnnexB (%zu B)", f.data.size());
+    // Non-blocking check in case first frame already arrived in queue
+    bambu_net::camera::oss_agora::OssVideoFrame f;
+    if (queue_.pop(f)) {
+        detected_first_ = true;
+        if (f.data.size() >= 2 && f.data[0] == 0xff && f.data[1] == 0xd8) {
+            detected_codec_ = Codec::MotionJpeg;
+            int w = 0, h = 0;
+            if (parse_jpeg_dimensions(f.data.data(), f.data.size(), w, h)) {
+                detected_width_  = w;
+                detected_height_ = h;
             }
-            bambu_net::camera::VideoFrame vf;
-            vf.nal_data = std::move(f.data);
-            vf.pts_us = f.pts_us;
-            vf.is_keyframe = f.is_keyframe;
-            first_frame_ = std::move(vf);
-            break;
+            OBN_INFO("camera: TUTK first frame detected as MotionJpeg (%zu B, %dx%d)",
+                     f.data.size(), detected_width_, detected_height_);
+        } else {
+            detected_codec_ = Codec::H264_AnnexB;
+            OBN_INFO("camera: TUTK first frame detected as H264_AnnexB (%zu B)", f.data.size());
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        bambu_net::camera::VideoFrame vf;
+        vf.nal_data = std::move(f.data);
+        vf.pts_us = f.pts_us;
+        vf.is_keyframe = f.is_keyframe;
+        first_frame_ = std::move(vf);
     }
 
     OBN_INFO("camera: TUTK source open uid=%.20s codec=%s (%dx%d)",
@@ -177,6 +173,7 @@ bool OssTutkCameraSource::open()
 void OssTutkCameraSource::close()
 {
     if (!open_.exchange(false)) return;
+    detected_first_ = false;
     first_frame_.reset();
     signaling_.leave();
     OBN_INFO("camera: TUTK source closed uid=%.20s", tutk_uid_.c_str());
@@ -203,6 +200,22 @@ OssTutkCameraSource::next_frame(int timeout_ms)
     while (open_.load()) {
         bambu_net::camera::oss_agora::OssVideoFrame f;
         if (queue_.pop(f)) {
+            if (!detected_first_) {
+                detected_first_ = true;
+                if (f.data.size() >= 2 && f.data[0] == 0xff && f.data[1] == 0xd8) {
+                    detected_codec_ = Codec::MotionJpeg;
+                    int w = 0, h = 0;
+                    if (parse_jpeg_dimensions(f.data.data(), f.data.size(), w, h)) {
+                        detected_width_  = w;
+                        detected_height_ = h;
+                    }
+                    OBN_INFO("camera: TUTK confirmed MotionJpeg (%zu B, %dx%d)",
+                             f.data.size(), detected_width_, detected_height_);
+                } else {
+                    detected_codec_ = Codec::H264_AnnexB;
+                    OBN_INFO("camera: TUTK confirmed H264_AnnexB (%zu B)", f.data.size());
+                }
+            }
             bambu_net::camera::VideoFrame out;
             out.nal_data    = std::move(f.data);
             out.pts_us      = f.pts_us;

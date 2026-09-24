@@ -56,6 +56,7 @@ private:
     int                                              detected_width_  = 1280;
     int                                              detected_height_ = 720;
     std::optional<bambu_net::camera::VideoFrame>     first_frame_;
+    bool                                             detected_first_  = false;
 };
 
 }  // namespace camera

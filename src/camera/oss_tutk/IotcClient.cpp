@@ -3325,25 +3325,37 @@ int iotc_relay_recv_app_data(RelayConn* rc,
     if (!rc || rc->sock < 0) return -1;
     DtlsSession& ds = rc->dtls;
 
-    static constexpr int kMaxRetries = 16;
-    set_recv_timeout(rc->sock, timeout_ms);
+    auto start_time = std::chrono::steady_clock::now();
+    auto deadline = start_time + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
 
-    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+    do {
+        int remain_ms = (timeout_ms <= 0) ? 0 :
+            (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (remain_ms < 0) break;
+
+        int step_timeout = (timeout_ms <= 0) ? 0 : std::max(1, std::min(remain_ms, 200));
+        set_recv_timeout(rc->sock, step_timeout);
+
         uint8_t raw[65536 + 64];
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         ssize_t n = recvfrom(rc->sock, raw, sizeof(raw), 0,
                               (struct sockaddr*)&src, &src_len);
         if (n < 0) {
-            // EAGAIN / timeout → return 0
 #if defined(_WIN32)
             int err = ::WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)
-                return 0;
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return 0;
+                continue;
+            }
             OBN_ERROR("[relay-recv] recvfrom error: WSA %d", err);
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)
-                return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT) {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return 0;
+                continue;
+            }
             OBN_ERROR("[relay-recv] recvfrom error: %s", strerror(errno));
 #endif
             return -1;
@@ -3401,9 +3413,9 @@ int iotc_relay_recv_app_data(RelayConn* rc,
         } else {
             OBN_WARN("[relay-recv] dtls_decrypt_record failed (err=%d, dtls_len=%zu)", plain_len, dtls_len);
         }
-    }
+    } while (std::chrono::steady_clock::now() < deadline);
 
-    return 0;  // exhausted retries without an AppData packet
+    return 0;  // timed out without an AppData packet
 }
 
 void iotc_relay_close(RelayConn* rc)

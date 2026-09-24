@@ -794,6 +794,15 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
         return Bambu_would_block;
     }
 
+    if (t->frame_count == 0) {
+        auto si = t->tutk_source->info();
+        t->width = si.width;
+        t->height = si.height;
+        t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+        log_fmt(t->logger, t->log_ctx, "read_tutk: first frame received (%dx%d, subtype=%d)",
+                t->width, t->height, t->sub_type);
+    }
+
     auto now = std::chrono::steady_clock::now();
     auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t->t0).count();
 

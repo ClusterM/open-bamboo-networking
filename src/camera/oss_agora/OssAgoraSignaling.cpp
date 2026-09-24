@@ -132,6 +132,7 @@ struct OssAgoraSignaling::Impl {
     FrameCallback      cb;
 
     bambu_net::oss_tutk::RelayConn relay{};
+    uint16_t           client_out_seq{1};
 
     void run_test_mode(AgoraJoinParams params);
     int  do_join(const AgoraJoinParams& params);
@@ -253,36 +254,31 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     OBN_INFO("[oss-relay] building 570-byte TUTK AV LOGIN packets (acc='%s', uid='%s')...",
              account.c_str(), uid_upper.c_str());
 
-    auto pkt1 = build_tutk_av_login_pkt(0x00, /*seq=*/1, account, login_pwd, uid_upper);
-    auto pkt2 = build_tutk_av_login_pkt(0x20, /*seq=*/2, account, login_pwd, uid_upper);
+    bool login_acked = false;
+    for (int login_attempt = 1; login_attempt <= 6; ++login_attempt) {
+        OBN_INFO("[oss-relay] sending LOGIN packets (attempt %d/6, seq=%u)...", login_attempt, client_out_seq);
+        uint16_t seq1 = client_out_seq++;
+        uint16_t seq2 = client_out_seq++;
+        auto pkt1 = build_tutk_av_login_pkt(0x00, seq1, account, login_pwd, uid_upper);
+        auto pkt2 = build_tutk_av_login_pkt(0x20, seq2, account, login_pwd, uid_upper);
 
-    OBN_INFO("[oss-relay] sending LOGIN packet 1 (type=0x00, 570B)...");
-    if (iotc_relay_send_app_data(&relay, pkt1.data(), pkt1.size()) != 0) {
-        OBN_ERROR("[oss-relay] LOGIN packet 1 send failed");
-        iotc_relay_close(&relay);
-        return -1;
-    }
+        if (iotc_relay_send_app_data(&relay, pkt1.data(), pkt1.size()) != 0 ||
+            iotc_relay_send_app_data(&relay, pkt2.data(), pkt2.size()) != 0) {
+            OBN_WARN("[oss-relay] LOGIN packet send failed (attempt %d/6)", login_attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
 
-    OBN_INFO("[oss-relay] sending LOGIN packet 2 (type=0x20, 570B)...");
-    if (iotc_relay_send_app_data(&relay, pkt2.data(), pkt2.size()) != 0) {
-        OBN_ERROR("[oss-relay] LOGIN packet 2 send failed");
-        iotc_relay_close(&relay);
-        return -1;
-    }
-
-    // Wait for LOGIN ACK from printer
-    {
+        // Wait for LOGIN ACK from printer
         uint8_t ack_buf[512];
-        OBN_INFO("[oss-relay] waiting for LOGIN ACK from printer (timeout=5000ms)...");
-        int n = iotc_relay_recv_app_data(&relay, ack_buf, sizeof(ack_buf), 5000);
+        OBN_INFO("[oss-relay] waiting for LOGIN ACK (attempt %d/6, timeout=1000ms)...", login_attempt);
+        int n = iotc_relay_recv_app_data(&relay, ack_buf, sizeof(ack_buf), 1000);
         if (n < 0) {
             OBN_ERROR("[oss-relay] LOGIN ACK error (n=%d)", n);
             iotc_relay_close(&relay);
             return -1;
         }
-        if (n == 0) {
-            OBN_WARN("[oss-relay] LOGIN ACK timed out (n=0) — proceeding to IPCAM_START anyway");
-        } else {
+        if (n > 0) {
             char ack_hex[256];
             int ack_dump_len = std::min(n, 64);
             int ack_pos = 0;
@@ -290,24 +286,35 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
                 ack_pos += snprintf(ack_hex + ack_pos, sizeof(ack_hex) - ack_pos, "%02x ", ack_buf[i]);
             }
             OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %s", n, ack_hex);
+            login_acked = true;
+            break;
+        } else {
+            OBN_DEBUG("[oss-relay] LOGIN ACK timed out on attempt %d/6, retrying...", login_attempt);
         }
     }
 
+    if (!login_acked) {
+        OBN_WARN("[oss-relay] LOGIN ACK not received after 6 retries — proceeding to IPCAM_START anyway");
+    }
+
     // Send IPCAM_START IOCtrl on channel 0 and channel 1
-    uint16_t init_seq = 3;
-    send_ipcam_start(0, init_seq);
-    send_ipcam_start(1, init_seq);
+    send_ipcam_start(0, client_out_seq);
+    send_ipcam_start(1, client_out_seq);
 
     OBN_INFO("[oss-relay] do_join complete — waiting for video frames");
     return 0;
 }
 
-void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
+void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
 {
     using namespace bambu_net::oss_tutk;
 
     OBN_INFO("[oss-relay] recv_loop started");
     bool first_frame = true;
+
+    std::string login_pwd = params.av_passwd.empty() ? params.dtls_passwd : params.av_passwd;
+    std::string account = "admin";
+    std::string uid_upper = to_upper(params.tutk_uid);
 
     struct TutkFrameAssembly {
         uint32_t frm_no = 0xFFFFFFFF;
@@ -343,7 +350,6 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         }
     } reassembler;
 
-    uint16_t s_client_out_seq = 4;
     uint16_t s_ack_counter = 1;
 
     int received_video_frames = 0;
@@ -358,7 +364,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
         ack_pkt[1] = 0x00; // flag = 0
         uint16_t v = htole16(0x000b);
         memcpy(ack_pkt + 2, &v, 2);
-        uint16_t c_seq = htole16(s_client_out_seq++);
+        uint16_t c_seq = htole16(client_out_seq++);
         memcpy(ack_pkt + 4, &c_seq, 2);
         // bytes 6..7: 0
         uint16_t p_seq = htole16(pkt_seq);
@@ -372,15 +378,19 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
     };
 
     while (joined.load()) {
-        // Periodic IPCAM_START retry if no video frames have arrived yet
-        if (received_video_frames == 0 && retry_start_count < 6) {
+        // Periodic LOGIN + IPCAM_START retry if no video frames have arrived yet
+        if (received_video_frames == 0 && retry_start_count < 8) {
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_retry_time).count() >= 1500) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_retry_time).count() >= 1200) {
                 last_retry_time = now;
                 retry_start_count++;
-                OBN_INFO("[oss-relay] no video yet, resending IPCAM_START (attempt %d/6)...", retry_start_count);
-                send_ipcam_start(0, s_client_out_seq);
-                send_ipcam_start(1, s_client_out_seq);
+                OBN_INFO("[oss-relay] no video yet, resending LOGIN + IPCAM_START (attempt %d/8)...", retry_start_count);
+                auto p1 = build_tutk_av_login_pkt(0x00, client_out_seq++, account, login_pwd, uid_upper);
+                auto p2 = build_tutk_av_login_pkt(0x20, client_out_seq++, account, login_pwd, uid_upper);
+                iotc_relay_send_app_data(&relay, p1.data(), p1.size());
+                iotc_relay_send_app_data(&relay, p2.data(), p2.size());
+                send_ipcam_start(0, client_out_seq);
+                send_ipcam_start(1, client_out_seq);
             }
         }
 
@@ -425,6 +435,12 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
 
                 // 1. Control packets (dataType 0x00)
                 if (dataType == 0x00) {
+                    if (flag == 0x21) {
+                        OBN_INFO("[oss-relay] TUTK LOGIN ACK 0x21 received in recv_loop -> sending IPCAM_START");
+                        send_ipcam_start(0, client_out_seq);
+                        send_ipcam_start(1, client_out_seq);
+                        continue;
+                    }
                     if (flag == 0x10) {
                         uint16_t channel = 0;
                         if (n >= 12) {
@@ -447,9 +463,9 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                         // OpCode 0x40 is SET_CLIENT_MAX_BUFFER_SIZE. Official binary does NOT reply with 0x11 ACK!
                         // Reply with IPCAM_START for both channels to trigger transmission
                         if (ioc_trigger_cnt++ < 3) {
-                            send_ipcam_start(channel, s_client_out_seq);
-                            if (channel != 0) send_ipcam_start(0, s_client_out_seq);
-                            if (channel != 1) send_ipcam_start(1, s_client_out_seq);
+                            send_ipcam_start(channel, client_out_seq);
+                            if (channel != 0) send_ipcam_start(0, client_out_seq);
+                            if (channel != 1) send_ipcam_start(1, client_out_seq);
                         }
                         continue;
                     }
