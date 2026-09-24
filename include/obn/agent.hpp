@@ -469,6 +469,12 @@ private:
     void harvest_developer_mode(const std::string& dev_id,
                                 const std::string& json);
 
+    // Records the printer's ipcam.tutk_server status ("enable" / "disable")
+    // into tutk_server_ready_by_dev_ to prevent unnecessary liveview.prepare
+    // commands that restart a running server.
+    void harvest_tutk_server_status(const std::string& dev_id,
+                                    const std::string& json);
+
     // Whether outbound signed print fields should be treated as Developer
     // Mode (keep cleartext url/param) vs secured (drop cleartext, *_enc only).
     // Uses the harvested print.fun bit 29 when seen; before the first fun
@@ -571,6 +577,7 @@ private:
     // developer_mode_effective(), which falls back to a key-material default
     // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
+    std::map<std::string, bool>                 tutk_server_ready_by_dev_;
 
     // First cloud report per dev_id flips this set, which is what
     // triggers the one-shot on_printer_connected("tunnel/<id>")

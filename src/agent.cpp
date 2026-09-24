@@ -1172,6 +1172,30 @@ bool Agent::developer_mode_effective(const std::string& dev_id) const
     return !have_material;
 }
 
+void Agent::harvest_tutk_server_status(const std::string& dev_id,
+                                       const std::string& json)
+{
+    if (json.find("\"ipcam\"") == std::string::npos) return;
+    bool ready = false;
+    bool found = false;
+    if (json.find("\"tutk_server\":\"enable\"") != std::string::npos) {
+        ready = true;
+        found = true;
+    } else if (json.find("\"tutk_server\":\"disable\"") != std::string::npos) {
+        ready = false;
+        found = true;
+    }
+    if (!found) return;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = tutk_server_ready_by_dev_.find(dev_id);
+    const bool changed = (it == tutk_server_ready_by_dev_.end() || it->second != ready);
+    tutk_server_ready_by_dev_[dev_id] = ready;
+    if (changed) {
+        OBN_INFO("dev=%s tutk_server status: %s", dev_id.c_str(), ready ? "enable" : "disable");
+    }
+}
+
 void Agent::maybe_install_app_cert(const std::string& dev_id)
 {
     if (dev_id.empty()) return;
@@ -1608,6 +1632,15 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     // printer's TUTK server before it finishes registering with the
     // rendezvous servers, so the viewer never receives a candidate list
     // (observed live:4 prepares in36s, zero01 03 43 replies).
+    bool tutk_already_ready = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = tutk_server_ready_by_dev_.find(serial);
+        if (it != tutk_server_ready_by_dev_.end() && it->second) {
+            tutk_already_ready = true;
+        }
+    }
+
     bool prepare_recently = false;
     {
         static std::mutex                prep_mu;
@@ -1615,13 +1648,16 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(prep_mu);
         auto it = last_prepare.find(uid);
-        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(3)) {
+        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(10)) {
             prepare_recently = true;
         } else {
             last_prepare[uid] = now;
         }
     }
-    if (prepare_recently) {
+    if (tutk_already_ready) {
+        OBN_INFO("camera_url(remote): dev=%s tutk_server already running — skipping prepare to prevent server restart",
+                 serial.c_str());
+    } else if (prepare_recently) {
         OBN_INFO("camera_url(remote): prepare cooldown active for dev=%s uid=%.20s - not re-dispatching",
                  serial.c_str(), uid.c_str());
     } else {
@@ -1690,6 +1726,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_security_flags(dev_id, json);
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
+    harvest_tutk_server_status(dev_id, json);
     rescue_cloud_liveview(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
@@ -2852,6 +2889,7 @@ int Agent::connect_cloud()
         harvest_security_flags(dev_id, json);
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
+        harvest_tutk_server_status(dev_id, json);
         rescue_cloud_liveview(dev_id, json);
 
         // Drop rejected unsigned cloud liveview frames from notifying Studio UI

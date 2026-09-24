@@ -264,89 +264,107 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
     }
 
     OBN_INFO("[oss-relay] do_join: region=%s relay_id=%s uid=%s",
-        rstr, channel.c_str(), uid_upper.c_str());
-    // PSK = SHA256(dtls_passwd); identity = "AUTHPWD_admin" — same derivation as LAN DTLS.
-    OBN_INFO("[oss-relay] starting relay connect...");
-    if (iotc_relay_connect(uid_upper.c_str(), channel.c_str(), rstr,
-                           params.authkey.c_str(), &relay) != 0) {
-        OBN_ERROR("[oss-relay] iotc_relay_connect failed");
-        return -1;
-    }
+             rstr, channel.c_str(), uid_upper.c_str());
 
-    OBN_INFO("[oss-relay] starting DTLS handshake...");
-    if (iotc_relay_dtls(&relay, params.dtls_passwd.c_str(), "admin") != 0) {
-        OBN_ERROR("[oss-relay] DTLS handshake failed");
-        iotc_relay_close(&relay);
-        return -1;
-    }
-    OBN_INFO("[oss-relay] DTLS handshake complete");
-
-    // AV LOGIN: send TUTK 570-byte packets (type 0x00 and type 0x20)
     std::string login_pwd = params.av_passwd.empty() ? params.dtls_passwd : params.av_passwd;
     if (login_pwd.empty()) {
         OBN_ERROR("[oss-agora] av_passwd and dtls_passwd are both empty");
-        iotc_relay_close(&relay);
         return -1;
     }
-
     std::string account = "admin";
-    OBN_INFO("[oss-relay] building 570-byte TUTK AV LOGIN packets (acc='%s', uid='%s')...",
-             account.c_str(), uid_upper.c_str());
 
-    bool login_acked = false;
-    for (int login_attempt = 1; login_attempt <= 6; ++login_attempt) {
+    // Outer connection loop: retry up to 3 times with fresh relay rendezvous.
+    // This handles the race where liveview.prepare restarts the printer's tutk_server,
+    // which orphans any relay session connected before the restart completes.
+    for (int conn_try = 1; conn_try <= 3; ++conn_try) {
         if (!joined.load()) {
             OBN_INFO("[oss-relay] do_join aborted (leave requested)");
-            iotc_relay_close(&relay);
             return -1;
         }
-        OBN_INFO("[oss-relay] sending LOGIN packets (attempt %d/6, seq=%u)...", login_attempt, client_out_seq);
-        uint16_t seq1 = client_out_seq++;
-        uint16_t seq2 = client_out_seq++;
-        auto pkt1 = build_tutk_av_login_pkt(0x00, seq1, account, login_pwd, uid_upper);
-        auto pkt2 = build_tutk_av_login_pkt(0x20, seq2, account, login_pwd, uid_upper);
 
-        if (iotc_relay_send_app_data(&relay, pkt1.data(), pkt1.size()) != 0 ||
-            iotc_relay_send_app_data(&relay, pkt2.data(), pkt2.size()) != 0) {
-            OBN_WARN("[oss-relay] LOGIN packet send failed (attempt %d/6)", login_attempt);
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        OBN_INFO("[oss-relay] do_join attempt %d/3: region=%s relay_id=%s uid=%s",
+                 conn_try, rstr, channel.c_str(), uid_upper.c_str());
+
+        if (iotc_relay_connect(uid_upper.c_str(), channel.c_str(), rstr,
+                               params.authkey.c_str(), &relay) != 0) {
+            OBN_WARN("[oss-relay] iotc_relay_connect failed (try %d/3)", conn_try);
+            iotc_relay_close(&relay);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
 
-        // Wait for LOGIN ACK from printer
-        uint8_t ack_buf[512];
-        OBN_INFO("[oss-relay] waiting for LOGIN ACK (attempt %d/6, timeout=1000ms)...", login_attempt);
-        int n = iotc_relay_recv_app_data(&relay, ack_buf, sizeof(ack_buf), 1000);
-        if (n < 0) {
-            OBN_ERROR("[oss-relay] LOGIN ACK error (n=%d)", n);
+        OBN_INFO("[oss-relay] starting DTLS handshake (try %d/3)...", conn_try);
+        if (iotc_relay_dtls(&relay, params.dtls_passwd.c_str(), "admin") != 0) {
+            OBN_WARN("[oss-relay] DTLS handshake failed (try %d/3)", conn_try);
             iotc_relay_close(&relay);
-            return -1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
         }
-        if (n > 0) {
-            char ack_hex[256];
-            int ack_dump_len = std::min(n, 64);
-            int ack_pos = 0;
-            for (int i = 0; i < ack_dump_len; ++i) {
-                ack_pos += snprintf(ack_hex + ack_pos, sizeof(ack_hex) - ack_pos, "%02x ", ack_buf[i]);
+        OBN_INFO("[oss-relay] DTLS handshake complete (try %d/3)", conn_try);
+
+        OBN_INFO("[oss-relay] building 570-byte TUTK AV LOGIN packets (acc='%s', uid='%s')...",
+                 account.c_str(), uid_upper.c_str());
+
+        bool login_acked = false;
+        // On this relay connection, try LOGIN up to 2 times (each with 1000ms timeout)
+        for (int login_attempt = 1; login_attempt <= 2; ++login_attempt) {
+            if (!joined.load()) {
+                OBN_INFO("[oss-relay] do_join aborted (leave requested)");
+                iotc_relay_close(&relay);
+                return -1;
             }
-            OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %s", n, ack_hex);
-            login_acked = true;
-            break;
-        } else {
-            OBN_DEBUG("[oss-relay] LOGIN ACK timed out on attempt %d/6, retrying...", login_attempt);
+            OBN_INFO("[oss-relay] sending LOGIN packets (conn %d/3, login %d/2, seq=%u)...",
+                     conn_try, login_attempt, client_out_seq);
+            uint16_t seq1 = client_out_seq++;
+            uint16_t seq2 = client_out_seq++;
+            auto pkt1 = build_tutk_av_login_pkt(0x00, seq1, account, login_pwd, uid_upper);
+            auto pkt2 = build_tutk_av_login_pkt(0x20, seq2, account, login_pwd, uid_upper);
+
+            if (iotc_relay_send_app_data(&relay, pkt1.data(), pkt1.size()) != 0 ||
+                iotc_relay_send_app_data(&relay, pkt2.data(), pkt2.size()) != 0) {
+                OBN_WARN("[oss-relay] LOGIN packet send failed (conn %d, attempt %d)", conn_try, login_attempt);
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+
+            uint8_t ack_buf[512];
+            int n = iotc_relay_recv_app_data(&relay, ack_buf, sizeof(ack_buf), 1000);
+            if (n < 0) {
+                OBN_ERROR("[oss-relay] LOGIN ACK recv error (n=%d)", n);
+                break;
+            }
+            if (n > 0) {
+                char ack_hex[256];
+                int ack_dump_len = std::min(n, 64);
+                int ack_pos = 0;
+                for (int i = 0; i < ack_dump_len; ++i) {
+                    ack_pos += snprintf(ack_hex + ack_pos, sizeof(ack_hex) - ack_pos, "%02x ", ack_buf[i]);
+                }
+                OBN_INFO("[oss-relay] LOGIN ACK received: n=%d bytes, hex: %s", n, ack_hex);
+                login_acked = true;
+                break;
+            } else {
+                OBN_DEBUG("[oss-relay] LOGIN ACK timed out (conn %d/3, login %d/2)", conn_try, login_attempt);
+            }
         }
+
+        if (login_acked) {
+            // Successfully paired, DTLS handshake done, LOGIN ACKed!
+            send_ipcam_start(0, client_out_seq);
+            send_ipcam_start(1, client_out_seq);
+            OBN_INFO("[oss-relay] do_join complete — waiting for video frames");
+            return 0;
+        }
+
+        // If LOGIN ACK wasn't received, printer likely restarted its TUTK server.
+        // Close relay and reconnect to get fresh rendezvous with the new device session!
+        OBN_WARN("[oss-relay] no LOGIN ACK on connection %d/3 — closing relay to refresh rendezvous", conn_try);
+        iotc_relay_close(&relay);
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    if (!login_acked) {
-        OBN_WARN("[oss-relay] LOGIN ACK not received after 6 retries — proceeding to IPCAM_START anyway");
-    }
-
-    // Send IPCAM_START IOCtrl on channel 0 and channel 1
-    send_ipcam_start(0, client_out_seq);
-    send_ipcam_start(1, client_out_seq);
-
-    OBN_INFO("[oss-relay] do_join complete — waiting for video frames");
-    return 0;
+    OBN_ERROR("[oss-relay] do_join failed after 3 connection attempts");
+    return -1;
 }
 
 void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
