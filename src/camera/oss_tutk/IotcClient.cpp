@@ -184,6 +184,11 @@ inline int setsockopt(obn::net::socket_t s, int level, int optname,
                         static_cast<const char*>(optval), optlen);
 }
 
+#else
+using ::sendto;
+using ::recvfrom;
+using ::recv;
+using ::send;
 #endif // _WIN32
 
 // getaddrinfo error string: on Windows `gai_strerror` is a UNICODE-aware
