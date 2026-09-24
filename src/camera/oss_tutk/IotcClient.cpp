@@ -2999,14 +2999,14 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
             return true;
         }
 
-        // Direct printer punch / ack (01 04 33 or 02 04 33) from printer P2P candidate
+        // Direct printer punch probe (01 04 33 or 02 04 33) from printer P2P candidate:
+        // Respond with ctrl0x33 to assist punch exchange, but do NOT abort rendezvous loop.
+        // Wait for authoritative relay confirmation (03 03 43) or direct rendezvous (02 06 12).
         if ((resp[8] == 0x01 || resp[8] == 0x02) && resp[9] == 0x04 && resp[10] == 0x33) {
             send_ctrl0x33(sock, &src, uid_upper, session_token);
-            *peer_out = src;
-            if (tag_out) *tag_out = 0;
-            OBN_INFO("[rdv] direct printer punch %02x 04 33 received from %s:%u - P2P established!",
-                     resp[8], inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-            return true;
+            OBN_DEBUG("[rdv] candidate punch probe %02x 04 33 from %s:%u (probe exchanged, awaiting relay/rendezvous)",
+                      resp[8], inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+            continue;
         }
 
         // Server challenge (27 02 42): triggers candidate registration 04 08 24 broadcast
