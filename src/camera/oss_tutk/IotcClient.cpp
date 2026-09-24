@@ -623,21 +623,22 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
                              uint8_t session_token_out[8],
                              int timeout_ms)
 {
-    set_recv_timeout(sock, timeout_ms);
+    set_recv_timeout(sock, 100);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
-    for (int attempt = 0; attempt < 8; ++attempt) {
+    while (std::chrono::steady_clock::now() < deadline) {
         uint8_t raw[2048];
         struct sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         ssize_t n = recvfrom(sock, raw, sizeof(raw), 0,
                               (struct sockaddr*)&src, &src_len);
-        if (n < 28) return -1;
+        if (n < 28) continue;
 
         reverse_trans_code_partial(raw, (size_t)n);
 
         if (raw[0] != 0x04 || raw[1] != 0x02) continue;  // discard non-IOTC
 
-        // Skip non-DTLS IOTC packets (type 0x33 echoes etc.):
+        // Skip non-DTLS IOTC packets (type 0x33 echoes, stray rendezvous packets):
         // DTLS content starts with 0x16 (Handshake), 0x14 (CCS), or 0x15 (Alert).
         size_t dtls_len = (size_t)(n - 28);
         if (dtls_len < 1 || (raw[28] != 0x16 && raw[28] != 0x14 && raw[28] != 0x15)) {
@@ -660,7 +661,7 @@ static int recv_dtls_packet(obn::net::socket_t sock, uint8_t* dtls_out, size_t b
         if (dtls_len > buf_size) dtls_len = buf_size;
         memcpy(dtls_out, raw + 28, dtls_len);
         return (int)dtls_len;
-    }  // end for (attempt)
+    }
     return -1;
 }
 
@@ -1302,8 +1303,16 @@ static int dtls_psk_handshake(obn::net::socket_t sock, const struct sockaddr_in*
     uint8_t srv_raw[1024];
     uint32_t srv_epoch = 0;
     uint8_t srv_token[8] = {};
-    int srv_len = recv_dtls_packet(sock, srv_raw, sizeof(srv_raw),
-                                    &srv_epoch, srv_token, 5000);
+    int srv_len = -1;
+    for (int ch_attempt = 0; ch_attempt < 3 && srv_len < 13; ++ch_attempt) {
+        if (ch_attempt > 0) {
+            OBN_DEBUG("[dtls] re-sending ClientHello (attempt %d)", ch_attempt + 1);
+            send_dtls_packet(sock, dst, initial_epoch, session_token,
+                             ch_dtls.data(), ch_dtls.size(), relay_tag);
+        }
+        srv_len = recv_dtls_packet(sock, srv_raw, sizeof(srv_raw),
+                                   &srv_epoch, srv_token, 1500);
+    }
     if (srv_len < 13) {
         OBN_ERROR("[dtls] no ServerHello (got %d bytes)", srv_len);
         return -1;
@@ -3055,6 +3064,14 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
 
             *peer_out = src;
             if (tag_out) *tag_out = tag_h;
+
+            // Drain any stray packets remaining in socket queue from other servers
+            set_recv_timeout(sock, 10);
+            uint8_t drain_buf[1024];
+            struct sockaddr_in drain_src{};
+            socklen_t drain_len = sizeof(drain_src);
+            while (recvfrom(sock, drain_buf, sizeof(drain_buf), 0, (struct sockaddr*)&drain_src, &drain_len) > 0) {}
+
             return true;
         }
     }
