@@ -802,8 +802,7 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
     sample->size        = static_cast<int>(t->tutk_current_frame.size());
     sample->flags       = frame_opt->is_keyframe ? 1 : 0;
     sample->buffer      = t->tutk_current_frame.data();
-    sample->decode_time = static_cast<unsigned long long>(
-        frame_opt->pts_us > 0 ? frame_opt->pts_us * 10ULL : (ns / 100));
+    sample->decode_time = static_cast<unsigned long long>(ns / 100);
 
     ++t->frame_count;
     if (t->frame_count <= 10 || (t->frame_count & 0x3F) == 1) {

@@ -338,6 +338,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
             }
             chunks.clear();
             total_pkts = 0;
+            frm_no = 0xFFFFFFFF;
             return out;
         }
     } reassembler;
@@ -347,6 +348,8 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
 
     int received_video_frames = 0;
     int retry_start_count = 0;
+    int ioc_trigger_cnt = 0;
+    int frame_log_cnt = 0;
     auto last_retry_time = std::chrono::steady_clock::now();
 
     auto send_tutk_transport_ack = [&](uint16_t pkt_seq) {
@@ -443,8 +446,7 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
 
                         // OpCode 0x40 is SET_CLIENT_MAX_BUFFER_SIZE. Official binary does NOT reply with 0x11 ACK!
                         // Reply with IPCAM_START for both channels to trigger transmission
-                        static int s_ioc_trigger_cnt = 0;
-                        if (s_ioc_trigger_cnt++ < 3) {
+                        if (ioc_trigger_cnt++ < 3) {
                             send_ipcam_start(channel, s_client_out_seq);
                             if (channel != 0) send_ipcam_start(0, s_client_out_seq);
                             if (channel != 1) send_ipcam_start(1, s_client_out_seq);
@@ -484,46 +486,52 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                     if (n < 28) continue;
 
                     uint8_t stream_type = (dataType == 0x01) ? flag : dataType;
-                    // Audio packet (stream_type 4 or 5) -> skip
-                    if (stream_type == 0x04 || stream_type == 0x05) {
+                    // Audio packet (stream_type 4) -> skip
+                    if (stream_type == 0x04) {
                         continue;
                     }
 
-                    // Video packet: offsets reversed from BambuSource.dll @ 0x1800525de
-                    // Inner header at offset 8:
-                    //   [10..11] = slice_idx (pkt)
-                    //   [12..13] = slice_cnt (s_count)
-                    //   [16..17] = slice_len (payload_len)
-                    //   [20..23] = frm_no
-                    //   [24..27] = avfrm_no
-                    // Slice data at offset 28
+                    // Video packet: offsets reversed from BambuSource.dll @ 0x1800525de & 0x180052402
+                    // When (flag & 8) != 0, an 8-byte transport header exists at bytes 8..15 (extra = 8)
+                    // Inner header at offset 8 + extra:
+                    //   [+2..3]   = slice_idx (pkt)
+                    //   [+4..5]   = slice_cnt (s_count)
+                    //   [+8..9]   = slice_len (payload_len)
+                    //   [+12..15] = frm_no
+                    //   [+16..19] = avfrm_no
+                    // Slice data at offset 28 + extra
+                    int extra = (flag & 0x08) ? 8 : 0;
+                    if (n < 28 + extra) continue;
+
+                    size_t hdr_off = 8 + extra;
                     uint16_t slice_idx = 0;
-                    memcpy(&slice_idx, plaintext + 10, 2);
+                    memcpy(&slice_idx, plaintext + hdr_off + 2, 2);
                     slice_idx = le16toh(slice_idx);
 
                     uint16_t slice_cnt = 0;
-                    memcpy(&slice_cnt, plaintext + 12, 2);
+                    memcpy(&slice_cnt, plaintext + hdr_off + 4, 2);
                     slice_cnt = le16toh(slice_cnt);
 
                     uint16_t slice_len = 0;
-                    memcpy(&slice_len, plaintext + 16, 2);
+                    memcpy(&slice_len, plaintext + hdr_off + 8, 2);
                     slice_len = le16toh(slice_len);
 
                     uint32_t frm_no = 0;
-                    memcpy(&frm_no, plaintext + 20, 4);
+                    memcpy(&frm_no, plaintext + hdr_off + 12, 4);
                     frm_no = le32toh(frm_no);
 
                     uint32_t avfrm_no = 0;
-                    memcpy(&avfrm_no, plaintext + 24, 4);
+                    memcpy(&avfrm_no, plaintext + hdr_off + 16, 4);
                     avfrm_no = le32toh(avfrm_no);
 
+                    size_t payload_off = 28 + extra;
                     if (slice_cnt == 0) slice_cnt = 1;
-                    if (slice_len == 0 || n < (int)(28 + slice_len)) {
-                        slice_len = (n > 28) ? (uint16_t)(n - 28) : 0;
+                    if (slice_len == 0 || n < (int)(payload_off + slice_len)) {
+                        slice_len = (n > (int)payload_off) ? (uint16_t)(n - payload_off) : 0;
                     }
                     if (slice_len == 0) continue;
 
-                    const uint8_t* slice_data = plaintext + 28;
+                    const uint8_t* slice_data = plaintext + payload_off;
 
                     bool complete = reassembler.add(frm_no, avfrm_no, slice_idx, slice_cnt, slice_data, slice_len);
                     if (complete) {
@@ -531,23 +539,28 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
                         seq = avfrm_no;
                         received_video_frames++;
 
-                        // In New AV API, do NOT send OPCODE_VIDEO_DATA_OK
-
-                        // Strip 16-byte FRAMEINFO_t if present
-                        if (frame_buf.size() > 16) {
-                            const uint8_t* p = frame_buf.data() + 16;
-                            if ((p[0] == 0 && p[1] == 0 && p[2] == 1) ||
-                                (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) ||
-                                (p[0] == 0xff && p[1] == 0xd8)) {
-                                h264 = p;
-                                payload_len = frame_buf.size() - 16;
-                                uint8_t frame_flag = frame_buf.data()[2];
-                                if (frame_flag == 1) is_keyframe = true;
-                            }
-                        }
-                        if (!h264 && !frame_buf.empty()) {
+                        // Detect MJPEG directly (SOI FF D8)
+                        if (frame_buf.size() >= 2 && frame_buf[0] == 0xff && frame_buf[1] == 0xd8) {
                             h264 = frame_buf.data();
                             payload_len = frame_buf.size();
+                            is_keyframe = true;
+                        } else {
+                            // Strip 16-byte FRAMEINFO_t if present
+                            if (frame_buf.size() > 16) {
+                                const uint8_t* p = frame_buf.data() + 16;
+                                if ((p[0] == 0 && p[1] == 0 && p[2] == 1) ||
+                                    (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) ||
+                                    (p[0] == 0xff && p[1] == 0xd8)) {
+                                    h264 = p;
+                                    payload_len = frame_buf.size() - 16;
+                                    uint8_t frame_flag = frame_buf.data()[2];
+                                    if (frame_flag == 1) is_keyframe = true;
+                                }
+                            }
+                            if (!h264 && !frame_buf.empty()) {
+                                h264 = frame_buf.data();
+                                payload_len = frame_buf.size();
+                            }
                         }
                     } else {
                         // Incomplete frame, wait for next slice
@@ -624,11 +637,10 @@ void OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& /*params*/)
             }
         }
 
-        static int s_frame_log_cnt = 0;
-        if (s_frame_log_cnt < 30) {
-            s_frame_log_cnt++;
+        if (frame_log_cnt < 30) {
+            frame_log_cnt++;
             OBN_INFO("[oss-relay] VIDEO FRAME #%d: %zu bytes (key=%d, seq=%u)",
-                     s_frame_log_cnt, payload_len, is_keyframe ? 1 : 0, seq);
+                     frame_log_cnt, payload_len, is_keyframe ? 1 : 0, seq);
         }
 
         if (cb && payload_len > 0) {

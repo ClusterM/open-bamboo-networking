@@ -70,6 +70,36 @@ OssTutkCameraSource::~OssTutkCameraSource()
     close();
 }
 
+static bool parse_jpeg_dimensions(const uint8_t* data, size_t size, int& width, int& height)
+{
+    if (size < 4 || data[0] != 0xff || data[1] != 0xd8) return false;
+    size_t i = 2;
+    while (i + 4 <= size) {
+        if (data[i] != 0xff) {
+            ++i;
+            continue;
+        }
+        uint8_t marker = data[i + 1];
+        if (marker == 0xd9 || marker == 0xda) break; // EOI or SOS
+        if (marker == 0x00 || marker == 0xff) {
+            i += 2;
+            continue;
+        }
+        if (i + 4 > size) break;
+        uint16_t len = (static_cast<uint16_t>(data[i + 2]) << 8) | data[i + 3];
+        if (marker == 0xc0 || marker == 0xc1 || marker == 0xc2) { // SOF0, SOF1, SOF2
+            if (i + 9 <= size) {
+                height = (static_cast<int>(data[i + 5]) << 8) | data[i + 6];
+                width  = (static_cast<int>(data[i + 7]) << 8) | data[i + 8];
+                return true;
+            }
+        }
+        if (len < 2) break;
+        i += 2 + len;
+    }
+    return false;
+}
+
 bool OssTutkCameraSource::open()
 {
     if (open_.load()) return true;
@@ -108,13 +138,46 @@ bool OssTutkCameraSource::open()
     }
 
     open_.store(true);
-    OBN_INFO("camera: TUTK source open uid=%.20s", tutk_uid_.c_str());
+
+    // Wait briefly for first frame to detect stream codec and dimensions
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
+    while (std::chrono::steady_clock::now() < deadline && open_.load()) {
+        bambu_net::camera::oss_agora::OssVideoFrame f;
+        if (queue_.pop(f)) {
+            if (f.data.size() >= 2 && f.data[0] == 0xff && f.data[1] == 0xd8) {
+                detected_codec_ = Codec::MotionJpeg;
+                int w = 0, h = 0;
+                if (parse_jpeg_dimensions(f.data.data(), f.data.size(), w, h)) {
+                    detected_width_  = w;
+                    detected_height_ = h;
+                }
+                OBN_INFO("camera: TUTK first frame detected as MotionJpeg (%zu B, %dx%d)",
+                         f.data.size(), detected_width_, detected_height_);
+            } else {
+                detected_codec_ = Codec::H264_AnnexB;
+                OBN_INFO("camera: TUTK first frame detected as H264_AnnexB (%zu B)", f.data.size());
+            }
+            bambu_net::camera::VideoFrame vf;
+            vf.nal_data = std::move(f.data);
+            vf.pts_us = f.pts_us;
+            vf.is_keyframe = f.is_keyframe;
+            first_frame_ = std::move(vf);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    OBN_INFO("camera: TUTK source open uid=%.20s codec=%s (%dx%d)",
+             tutk_uid_.c_str(),
+             detected_codec_ == Codec::MotionJpeg ? "MotionJpeg" : "H264_AnnexB",
+             detected_width_, detected_height_);
     return true;
 }
 
 void OssTutkCameraSource::close()
 {
     if (!open_.exchange(false)) return;
+    first_frame_.reset();
     signaling_.leave();
     OBN_INFO("camera: TUTK source closed uid=%.20s", tutk_uid_.c_str());
 }
@@ -128,6 +191,12 @@ std::optional<bambu_net::camera::VideoFrame>
 OssTutkCameraSource::next_frame(int timeout_ms)
 {
     if (!open_.load()) return std::nullopt;
+
+    if (first_frame_.has_value()) {
+        auto f = std::move(*first_frame_);
+        first_frame_.reset();
+        return f;
+    }
 
     const auto deadline = std::chrono::steady_clock::now()
                         + std::chrono::milliseconds(timeout_ms);
@@ -149,10 +218,10 @@ OssTutkCameraSource::next_frame(int timeout_ms)
 bambu_net::camera::ICameraSource::StreamInfo OssTutkCameraSource::info() const
 {
     StreamInfo si;
-    si.width  = 1920;
-    si.height = 1080;
+    si.width  = detected_width_;
+    si.height = detected_height_;
     si.fps    = 30;
-    si.codec  = Codec::H264_AnnexB;
+    si.codec  = detected_codec_;
     return si;
 }
 

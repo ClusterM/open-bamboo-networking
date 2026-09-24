@@ -541,13 +541,13 @@ bool make_mjpeg_media_type(AM_MEDIA_TYPE* mt)
 
 bool make_media_type_for_scheme(AM_MEDIA_TYPE* mt, UrlScheme scheme)
 {
-    if (scheme == UrlScheme::Local) return make_mjpeg_media_type(mt);
+    if (scheme == UrlScheme::Local || scheme == UrlScheme::Tutk) return make_mjpeg_media_type(mt);
     return make_h264_media_type(mt);
 }
 
 GUID subtype_for_scheme(UrlScheme scheme)
 {
-    return (scheme == UrlScheme::Local) ? MEDIASUBTYPE_MJPG : kMediaSubtypeH264;
+    return (scheme == UrlScheme::Local || scheme == UrlScheme::Tutk) ? MEDIASUBTYPE_MJPG : kMediaSubtypeH264;
 }
 
 // ----------------------------------------------------------------------------

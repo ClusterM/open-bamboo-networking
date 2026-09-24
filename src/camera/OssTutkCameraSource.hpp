@@ -52,6 +52,10 @@ private:
     bambu_net::camera::oss_agora::OssAgoraSignaling signaling_;
     bambu_net::camera::oss_agora::OssFrameQueue     queue_;
     std::atomic<bool>                                open_{false};
+    bambu_net::camera::ICameraSource::Codec          detected_codec_  = bambu_net::camera::ICameraSource::Codec::MotionJpeg;
+    int                                              detected_width_  = 1280;
+    int                                              detected_height_ = 720;
+    std::optional<bambu_net::camera::VideoFrame>     first_frame_;
 };
 
 }  // namespace camera
