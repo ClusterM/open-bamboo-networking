@@ -77,7 +77,7 @@ int main()
     EVP_PKEY* key_A = gen_key();
     EVP_PKEY* key_B = gen_key();
     CHECK(key_A && key_B);
-    CHECK(EVP_PKEY_cmp(key_A, key_B) == 0); // keys differ
+    CHECK(EVP_PKEY_eq(key_A, key_B) == 0); // keys differ
 
     std::string pem_A = make_self_signed_cert_pem(key_A, "DeviceA");
     std::string pem_B = make_self_signed_cert_pem(key_B, "DeviceB");
@@ -93,7 +93,7 @@ int main()
 
         EVP_PKEY* loaded = obn::cert_store::get_printer_pub_key(dev1);
         CHECK(loaded != nullptr);
-        CHECK(EVP_PKEY_cmp(loaded, key_A) == 1);
+        CHECK(EVP_PKEY_eq(loaded, key_A) == 1);
         EVP_PKEY_free(loaded);
 
         obn::cert_store::forget_printer(dev1);
@@ -116,15 +116,16 @@ int main()
         // In-memory A must win; disk B must NOT clobber A
         EVP_PKEY* k = obn::cert_store::get_printer_pub_key(dev2);
         CHECK(k != nullptr);
-        CHECK(EVP_PKEY_cmp(k, key_A) == 1);
-        CHECK(EVP_PKEY_cmp(k, key_B) == 0);
+        CHECK(EVP_PKEY_eq(k, key_A) == 1);
+        CHECK(EVP_PKEY_eq(k, key_B) == 0);
         EVP_PKEY_free(k);
 
         obn::cert_store::forget_printer(dev2);
     }
 
     // -----------------------------------------------------------------------
-    // Test 3: Unparseable/corrupt disk file does not destroy good in-memory key
+    // Test 3: Unparseable/corrupt disk file does not destroy good in-memory
+    // key (the cached key short-circuits before the file is even opened)
     // -----------------------------------------------------------------------
     {
         const std::string dev3 = "DEV_CORRUPT_DISK";
@@ -135,7 +136,7 @@ int main()
 
         EVP_PKEY* k = obn::cert_store::get_printer_pub_key(dev3);
         CHECK(k != nullptr);
-        CHECK(EVP_PKEY_cmp(k, key_A) == 1);
+        CHECK(EVP_PKEY_eq(k, key_A) == 1);
         EVP_PKEY_free(k);
 
         obn::cert_store::forget_printer(dev3);
@@ -159,10 +160,57 @@ int main()
         CHECK(obn::cert_store::set_printer_pub_key_from_cert_pem(dev4, pem_A));
         EVP_PKEY* k = obn::cert_store::get_printer_pub_key(dev4);
         CHECK(k != nullptr);
-        CHECK(EVP_PKEY_cmp(k, key_A) == 1);
+        CHECK(EVP_PKEY_eq(k, key_A) == 1);
         EVP_PKEY_free(k);
 
         obn::cert_store::forget_printer(dev4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: Cold start with an unparseable cert on disk yields no key, and
+    // the failed parse is remembered just like a missing file
+    // -----------------------------------------------------------------------
+    {
+        const std::string dev5 = "DEV_CORRUPT_COLD";
+        fs::path p5 = obn::cert_store::device_cert_path(obn::config::dir(), dev5);
+        write_file(p5, "-----BEGIN CERTIFICATE-----\nnot_base64_at_all\n");
+
+        CHECK(obn::cert_store::get_printer_pub_key(dev5) == nullptr);
+
+        // A cert appearing on disk inside the TTL is not picked up; the writers
+        // that matter (capture_peer_cert_pem, app_cert_install) drop the
+        // remembered miss themselves, and so does forget_printer.
+        write_file(p5, pem_A);
+        CHECK(obn::cert_store::get_printer_pub_key(dev5) == nullptr);
+
+        obn::cert_store::forget_printer(dev5);
+        EVP_PKEY* k = obn::cert_store::get_printer_pub_key(dev5);
+        CHECK(k != nullptr);
+        CHECK(EVP_PKEY_eq(k, key_A) == 1);
+        EVP_PKEY_free(k);
+
+        obn::cert_store::forget_printer(dev5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: Without a config dir there is nowhere to look, so the miss must
+    // not be remembered — the next lookup once the dir is known has to succeed
+    // -----------------------------------------------------------------------
+    {
+        const std::string dev6  = "DEV_NO_CONFIG_DIR";
+        const std::string saved = obn::config::dir();
+        write_file(obn::cert_store::device_cert_path(saved, dev6), pem_A);
+
+        obn::config::test_dir().clear();
+        CHECK(obn::cert_store::get_printer_pub_key(dev6) == nullptr);
+        obn::config::test_dir() = saved;
+
+        EVP_PKEY* k = obn::cert_store::get_printer_pub_key(dev6);
+        CHECK(k != nullptr);
+        CHECK(EVP_PKEY_eq(k, key_A) == 1);
+        EVP_PKEY_free(k);
+
+        obn::cert_store::forget_printer(dev6);
     }
 
     EVP_PKEY_free(key_A);

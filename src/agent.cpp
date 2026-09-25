@@ -1019,35 +1019,55 @@ void Agent::harvest_security_report(const std::string& dev_id,
         }
         // Persist full PEM chain like Studio's certs/<serial>.pem.
         const std::string cfg_dir = config_dir();
+        std::string       out_path;
+        bool              cert_on_disk = false;
         if (!cfg_dir.empty()) {
-            const std::string out_path =
-                cert_store::device_cert_path(cfg_dir, dev_id);
-            if (cert_store::ensure_parent_dir(out_path)) {
+            out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+            std::string reason;
+            if (!cert_store::ensure_parent_dir(out_path)) {
+                reason = "cannot create the certs directory";
+            } else {
                 const std::string tmp_path = out_path + ".tmp";
                 std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
                 if (ofs) {
                     ofs << printer_cert;
                     ofs.close();
+                }
+                // Swap into place only after a complete write: renaming a
+                // truncated PEM over the previous cert would leave an
+                // unparseable file there for good, and the rename itself can
+                // fail (on Windows a reader holding the destination open is
+                // enough).
+                if (!ofs) {
+                    reason = "write failed";
+                } else {
                     std::error_code ec;
                     std::filesystem::rename(tmp_path, out_path, ec);
-                    if (ec) {
-                        std::filesystem::remove(tmp_path, ec);
-                    }
-                    std::string ip;
-                    {
-                        std::lock_guard<std::mutex> lk(mu_);
-                        if (lan_session_ && lan_session_->dev_id() == dev_id)
-                            ip = lan_session_->dev_ip();
-                        certified_devs_.insert(dev_id);
-                    }
-                    if (!ip.empty())
-                        obn::lan_tls::registry_set_peer_cert(ip, out_path);
+                    cert_on_disk = !ec;
+                    if (ec) reason = ec.message();
+                }
+                if (!cert_on_disk) {
+                    std::error_code rm_ec;
+                    std::filesystem::remove(tmp_path, rm_ec);
                 }
             }
-        } else {
+            if (!cert_on_disk) {
+                OBN_WARN("app_cert_install dev=%s: could not persist device cert "
+                         "to %s (%s); continuing with the in-memory pubkey only",
+                         dev_id.c_str(), out_path.c_str(), reason.c_str());
+            }
+        }
+        // The install itself succeeded and the pubkey is cached, so the device
+        // counts as certified either way; only the on-disk pin needs the file.
+        std::string ip;
+        {
             std::lock_guard<std::mutex> lk(mu_);
             certified_devs_.insert(dev_id);
+            if (cert_on_disk && lan_session_ && lan_session_->dev_id() == dev_id)
+                ip = lan_session_->dev_ip();
         }
+        if (!ip.empty())
+            obn::lan_tls::registry_set_peer_cert(ip, out_path);
         // Latch only after a successful printer reply (not at publish time),
         // so a lost/failed install can be retried on the next Studio tick.
         {

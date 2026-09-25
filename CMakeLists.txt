@@ -859,9 +859,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(cert_store_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    if(WIN32)
-        target_link_libraries(cert_store_test PRIVATE ws2_32 crypt32 secur32 bcrypt iphlpapi)
-    endif()
     add_test(NAME cert_store COMMAND cert_store_test)
 
     # Agent and its transitive deps: the tests below exercise pure helpers,
