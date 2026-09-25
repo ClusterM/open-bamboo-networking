@@ -1314,6 +1314,19 @@ void Agent::harvest_media_caps(const std::string& dev_id,
             OBN_INFO("dev=%s LAN liveview protocol: %s", dev_id.c_str(),
                      proto.c_str());
         }
+        lan_rtsp_disabled_by_dev_.erase(dev_id);
+    } else if (url == "disable") {
+        // Printer supports RTSP liveview but it's toggled off - not the
+        // same as "we haven't learned a protocol yet". X2D/H2D/H2S need
+        // Settings -> General -> "LAN Only Liveview" enabled for this to
+        // ever report a real rtsps://... URL; P1S/P2S don't have this
+        // extra toggle. camera_url_for() uses this to give
+        // libBambuSource an actionable error instead of a generic one.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (lan_rtsp_disabled_by_dev_.insert(dev_id).second) {
+            OBN_INFO("dev=%s LAN liveview: RTSP capable but disabled "
+                     "(printer setting)", dev_id.c_str());
+        }
     }
 
     // SSDP is the usual LAN IP source but is often firewalled or not routed
@@ -1376,6 +1389,7 @@ std::string Agent::camera_url_for(const std::string& dev_id)
     std::string ip;
     std::string code;
     std::string lv;
+    bool        rtsp_disabled = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (auto it = lan_ip_by_dev_.find(dev_id); it != lan_ip_by_dev_.end())
@@ -1390,6 +1404,8 @@ std::string Agent::camera_url_for(const std::string& dev_id)
         if (auto it = lan_lv_proto_by_dev_.find(dev_id);
             it != lan_lv_proto_by_dev_.end())
             lv = it->second;
+        rtsp_disabled = lv.empty() &&
+                        lan_rtsp_disabled_by_dev_.count(dev_id) != 0;
     }
     if (ip.empty() || code.empty()) {
         OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
@@ -1406,6 +1422,7 @@ std::string Agent::camera_url_for(const std::string& dev_id)
     std::string url = "bambu:///local/" + ip + "?port=6000&user=bblp&passwd="
                     + code;
     if (!lv.empty()) url += "&lv=" + lv;
+    else if (rtsp_disabled) url += "&rtsp_off=1";
     return url;
 }
 
