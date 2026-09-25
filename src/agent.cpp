@@ -2571,7 +2571,7 @@ int Agent::connect_cloud()
     // registered. The message callback is intentionally NOT queued:
     // DeviceManager::on_push_message() is thread-aware and has its own
     // fast-path handling.
-    auto on_connected_cb = [this, on_server, queue, on_printer_connected]
+    auto on_connected_cb = [this, on_server, queue]
         (int status, int reason, std::string /*msg*/)
     {
         OBN_INFO("cloud: server_connected status=%d reason=%d", status, reason);
@@ -2581,24 +2581,19 @@ int Agent::connect_cloud()
             };
             if (queue) queue(invoke); else invoke();
         }
-        // On successful CONNACK, if we already know the user's device
-        // list (passed via add_subscribe earlier), fire
-        // on_printer_connected with a "tunnel/" prefix for each of
-        // them so Studio marks them cloud-online and requests pushall.
-        if (status == 0 && on_printer_connected) {
-            std::vector<std::string> devs;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (cloud_session_) {
-                    // CloudSession exposes is_connected() only; mirror
-                    // its subscribed set via our own copy -> we don't
-                    // duplicate the state here. Instead: we rely on
-                    // Studio calling add_subscribe right after
-                    // connect_server, which will then call this path
-                    // via the sub-success logic below.
-                }
-            }
-            (void)devs;
+        // CONNACK re-applies the whole subscription set, so this is where the
+        // devices Studio handed us before the connection came up become
+        // reachable. Ask them for a snapshot; on_printer_connected stays
+        // report-driven, so we never claim a powered-off printer is online.
+        if (status == 0) {
+            kickstart_cloud_status();
+        } else {
+            // A transport drop invalidates the broker-side subscriptions
+            // (CloudSession clears active_ too), and the status we hold may be
+            // minutes stale by the time we are back, so bootstrap again on the
+            // next CONNACK.
+            std::lock_guard<std::mutex> lk(mu_);
+            cloud_kickstarted_devs_.clear();
         }
     };
 
@@ -2676,6 +2671,7 @@ int Agent::disconnect_cloud()
         sess = std::move(cloud_session_);
         devs.swap(cloud_connected_devs_);
         cloud_notified_devs_.clear();
+        cloud_kickstarted_devs_.clear();
         if (lan_session_) lan_dev = lan_session_->dev_id();
         // Drop install latches for everything except an active LAN session
         // (that session still owns its once-per-session install).
@@ -2747,7 +2743,13 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
     if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    return sess->add_subscribe(filtered);
+    int rc = sess->add_subscribe(filtered);
+    // Covers the other ordering: Studio subscribes on an already-connected
+    // session (device list refresh, LAN failback, multi-device page). When it
+    // subscribes before CONNACK instead, add_subscribe only records the set and
+    // the CONNACK path does the kickstart.
+    if (rc == BAMBU_NETWORK_SUCCESS) kickstart_cloud_status();
+    return rc;
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
@@ -2759,11 +2761,56 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
         for (const auto& d : dev_ids) {
             cloud_connected_devs_.erase(d);
             cloud_notified_devs_.erase(d);
+            cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
         }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;
     return sess->del_subscribe(dev_ids);
+}
+
+// Stock kickstart shape (research/06.02 + research/12.01): constant
+// sequence_id "0" — the 20000-29999 window is Studio's, not the plugin's —
+// plus version and push_target, both 1.
+static constexpr char kPushallRequest[] =
+    R"({"pushing":{"sequence_id":"0","command":"pushall","version":1,"push_target":1}})";
+
+void Agent::kickstart_cloud_status()
+{
+    if (!obn::config::current().cloud_pushall_on_connect) return;
+
+    CloudSession* sess = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = cloud_session_.get();
+    }
+    // Only bootstrap devices whose report subscription is already live: a
+    // reply to a topic nobody listens on is lost, which is exactly the trap
+    // of publishing straight after add_subscribe (that runs before CONNACK).
+    if (!sess || !sess->is_connected()) return;
+
+    // Queried before taking mu_ so the two mutexes are never nested.
+    const std::vector<std::string> active = sess->active_devices();
+    std::vector<std::string>       pending;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& d : active) {
+            if (cloud_kickstarted_devs_.insert(d).second) pending.push_back(d);
+        }
+    }
+    for (const auto& d : pending) {
+        int rc = cloud_send_message(d, kPushallRequest, /*qos=*/0);
+        if (rc == BAMBU_NETWORK_SUCCESS) {
+            OBN_INFO("cloud: pushall kickstart sent to %s", d.c_str());
+        } else {
+            // Most likely a disconnect racing us. Un-latch so the next
+            // CONNACK or subscribe retries instead of leaving the device
+            // waiting for telemetry that may never come.
+            OBN_WARN("cloud: pushall kickstart to %s failed rc=%d", d.c_str(), rc);
+            std::lock_guard<std::mutex> lk(mu_);
+            cloud_kickstarted_devs_.erase(d);
+        }
+    }
 }
 
 int Agent::cloud_send_message(const std::string& dev_id,

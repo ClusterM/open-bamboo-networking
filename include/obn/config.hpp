@@ -47,6 +47,11 @@ struct Settings {
     // When true, get_user_tasks returns an empty history envelope.
     bool cloud_hide_history       = false;
 
+    // Ask each freshly subscribed cloud device for a full status snapshot
+    // (pushing.pushall) once per session instead of waiting for the printer
+    // to volunteer telemetry.
+    bool cloud_pushall_on_connect = true;
+
     // Print behavior overrides
     bool force_timelapse_external = false;
 

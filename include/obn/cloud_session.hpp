@@ -80,6 +80,12 @@ public:
 
     bool is_connected() const { return connected_.load(std::memory_order_acquire); }
 
+    // dev_ids whose report subscription is currently applied on the broker.
+    // Filled as SUBSCRIBEs succeed and cleared on CONNACK / disconnect, so it
+    // is the set a caller can safely bootstrap (a printer we are not
+    // subscribed to yet would answer into a topic nobody listens on).
+    std::vector<std::string> active_devices() const;
+
     // True once start() has handed the client to mosquitto_loop_start.
     // Distinct from is_connected(): after a transport drop the loop keeps
     // running and reconnects in the background while this stays true.

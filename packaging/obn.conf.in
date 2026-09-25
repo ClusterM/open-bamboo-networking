@@ -61,6 +61,19 @@ force_ftps = 0
 disable_camera_preview = 0
 
 
+# --- Cloud status bootstrap ------------------------------------------
+#
+# Ask every printer for a full status snapshot (pushall) once per cloud
+# session, right after its report subscription goes live.  Without it the
+# device panel stays empty (no AMS trays, no temperatures) until the
+# printer volunteers telemetry on its own, because the slicer only asks
+# for a snapshot after it has already seen one report.  Stock plugins send
+# the same request.  Set to 0 if you would rather keep the cloud session
+# completely silent.
+
+cloud_pushall_on_connect = 1
+
+
 # --- MQTT connection persistence -------------------------------------
 #
 # Keep the MQTT connection alive across the slicer's internal

@@ -83,6 +83,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     }
     else if (key == "block_cloud")              out.block_cloud = truthy(val);
     else if (key == "cloud_hide_history")       out.cloud_hide_history = truthy(val);
+    else if (key == "cloud_pushall_on_connect") out.cloud_pushall_on_connect = truthy(val);
     else if (key == "cloud_print") {
         const std::string v = to_lower(val);
         if (v == "cloud_only")

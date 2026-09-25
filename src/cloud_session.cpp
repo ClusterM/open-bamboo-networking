@@ -292,6 +292,12 @@ void CloudSession::apply_subscriptions_locked_()
     }
 }
 
+std::vector<std::string> CloudSession::active_devices() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return {active_.begin(), active_.end()};
+}
+
 int CloudSession::publish(const std::string& dev_id,
                           const std::string& json_str,
                           int qos)
