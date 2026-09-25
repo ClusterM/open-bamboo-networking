@@ -36,6 +36,24 @@ function IsValidVersion {
     return $v -match '^\d+(\.\d+){2,3}$'
 }
 
+# Windows PowerShell 5.1 ConvertFrom-Json cannot build a PSCustomObject
+# property with an empty name. OrcaSlicer.conf contains valid JSON keys
+# like "access_code": {"": "..."}. Swap those keys for a sentinel around
+# the parse/serialize round-trip, then put "" back.
+$script:ObnEmptyJsonKey = "__OBN_EMPTY_JSON_KEY__"
+
+function Protect-EmptyJsonKeys {
+    param([string]$Json)
+    $name = '"' + $script:ObnEmptyJsonKey + '"'
+    return [regex]::Replace($Json, '""(\s*:)', ($name + '$1'))
+}
+
+function Restore-EmptyJsonKeys {
+    param([string]$Json)
+    $name = '"' + $script:ObnEmptyJsonKey + '"'
+    return $Json.Replace($name, '""')
+}
+
 # -- Client selection ------------------------------------------------------
 
 Write-Host ""
@@ -316,7 +334,7 @@ if (Test-Path $ConfPath) {
     try {
         $raw = Get-Content -Path $ConfPath -Raw
         $jsonBody = $raw -replace '[\r\n]+# MD5 checksum[^\r\n]*[\r\n]*$', ''
-        $conf = $jsonBody | ConvertFrom-Json
+        $conf = Protect-EmptyJsonKeys $jsonBody | ConvertFrom-Json
         $changed = $false
 
         if ($null -ne $conf.app) {
@@ -357,7 +375,7 @@ if (Test-Path $ConfPath) {
 
             if ($changed) {
                 Copy-Item -Path $ConfPath -Destination "$ConfPath.obn-bak" -Force
-                $newJson = $conf | ConvertTo-Json -Depth 20
+                $newJson = Restore-EmptyJsonKeys ($conf | ConvertTo-Json -Depth 20)
                 $newJson + "`n# MD5 checksum 00000000000000000000000000000000`n" |
                     Set-Content -Path $ConfPath -NoNewline
                 Write-Info "Patched $ConfName (backup: $ConfName.obn-bak)"
