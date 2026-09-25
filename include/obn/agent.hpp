@@ -638,6 +638,15 @@ private:
     // Latched LAN liveview protocol per dev_id ("rtsps"/"rtsp"), parsed
     // from push_status ipcam.rtsp_url by harvest_media_caps().
     std::unordered_map<std::string, std::string> lan_lv_proto_by_dev_;
+    // dev_ids where push_status.ipcam.rtsp_url == "disable" was observed
+    // (the printer supports LAN RTSP liveview but it's administratively
+    // off - X2D/H2D/H2S have a separate "LAN Only Liveview" printer
+    // setting for this, unlike P1S/P2S). Distinct from "unknown" (dev_id
+    // absent from both this and lan_lv_proto_by_dev_): lets
+    // camera_url_for() tell libBambuSource to report an actionable error
+    // instead of a generic "not a JPEG frame" failure when the MJPEG path
+    // (wrongly) gets tried on one of these printers.
+    std::set<std::string> lan_rtsp_disabled_by_dev_;
 
     // dev_ids for which an asynchronous LAN-autostart worker is currently
     // running, so the ~5s SSDP / access-code hooks don't stack duplicate

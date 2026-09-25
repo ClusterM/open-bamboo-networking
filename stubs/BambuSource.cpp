@@ -248,6 +248,14 @@ struct TunnelUrl {
     // channel (file browser) keeps using TLS :6000. Empty for URLs minted
     // by Studio itself.
     std::string lv;
+    // Set by the plugin when push_status.ipcam.rtsp_url == "disable" was
+    // observed for this device and no lv hint is available: the printer
+    // supports RTSP liveview but it's administratively off (X2D/H2D/H2S
+    // need a separate "LAN Only Liveview" printer setting; P1S/P2S
+    // don't). Lets Bambu_ReadSample() give an actionable error instead of
+    // a generic "not a JPEG frame" one when the MJPEG path is (wrongly)
+    // attempted on one of these printers.
+    bool rtsp_off = false;
 };
 
 std::string url_decode(const std::string& s)
@@ -384,6 +392,7 @@ bool parse_url(const std::string& url, TunnelUrl* out)
         else if (key == "cli_ver") { out->cli_ver = val; }
         else if (key == "net_ver") { out->net_ver = val; }
         else if (key == "lv")     { out->lv = val; }
+        else if (key == "rtsp_off") { out->rtsp_off = (val == "1"); }
         i = amp + 1;
     }
 
@@ -1877,6 +1886,20 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
         t->frame_buf[0] != 0xFF || t->frame_buf[1] != 0xD8 ||
         t->frame_buf[payload_size - 2] != 0xFF ||
         t->frame_buf[payload_size - 1] != 0xD9) {
+        if (t->url.rtsp_off) {
+            // Confirmed cause, not a guess: the plugin already saw this
+            // printer report ipcam.rtsp_url=="disable" in push_status, so
+            // MJPEG was never going to work here regardless of what came
+            // back on the wire.
+            log_fmt(t->logger, t->log_ctx,
+                    "Bambu_ReadSample: printer has LAN RTSP liveview "
+                    "disabled (not a stream error) size=%u", payload_size);
+            set_last_error(
+                "Camera liveview is turned off on this printer. On X2D / "
+                "H2D / H2S, enable it on the printer screen: Settings -> "
+                "General -> LAN Only Liveview.");
+            return -1;
+        }
         log_fmt(t->logger, t->log_ctx,
                 "Bambu_ReadSample: JPEG magic mismatch size=%u", payload_size);
         set_last_error("JPEG magic mismatch");
