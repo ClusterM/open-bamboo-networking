@@ -93,6 +93,15 @@ configure_file(
     "${OBN_GENERATED_DIR}/obn_conf_default.h"
     @ONLY)
 
+# Compile in a standard root CA bundle (see include/obn/cloud_ca_bundle.hpp
+# for why: Windows has no usable default trust store for mosquitto/OpenSSL
+# to validate the cloud MQTT broker against).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/resources/cacert.pem" OBN_CA_BUNDLE_PEM)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cloud_ca_bundle_data.cpp.in"
+    "${OBN_GENERATED_DIR}/cloud_ca_bundle_data.cpp"
+    @ONLY)
+
 option(OBN_RELEASE "Build a release (show project version instead of commit hash)" OFF)
 
 # Extract OBN_PROJECT_VERSION from the single source of truth: include/obn/version.hpp
@@ -329,6 +338,8 @@ add_library(bambu_networking SHARED
     src/cloud_presets.cpp
     src/cloud_print.cpp
     src/cloud_session.cpp
+    src/cloud_ca_bundle.cpp
+    "${OBN_GENERATED_DIR}/cloud_ca_bundle_data.cpp"
     src/cover_cache.cpp
     src/cover_server.cpp
     src/ftps.cpp
