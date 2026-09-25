@@ -564,11 +564,17 @@ private:
     // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
 
-    // First cloud report per dev_id flips this set, which is what
-    // triggers the one-shot on_printer_connected("tunnel/<id>")
-    // notification. Cleared on disconnect/resubscribe so reconnects
-    // re-fire the notification.
+    // Devices seen on the current cloud session (first report flips them in).
+    // disconnect_cloud drains this set to release the RSA pubkeys learned
+    // while it lasted. Cleared on disconnect/resubscribe.
     std::set<std::string> cloud_connected_devs_;
+
+    // Devices for which the one-shot on_printer_connected("tunnel/<id>")
+    // notification was actually delivered. Kept apart from
+    // cloud_connected_devs_ so a report arriving before Studio registers the
+    // callback does not consume the notification for the whole session.
+    // Cleared alongside it.
+    std::set<std::string> cloud_notified_devs_;
 
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.

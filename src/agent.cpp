@@ -2602,7 +2602,7 @@ int Agent::connect_cloud()
         }
     };
 
-    auto on_msg_cb = [this, on_msg, on_printer_connected]
+    auto on_msg_cb = [this, on_msg]
         (std::string dev_id, std::string json)
     {
         harvest_security_report(dev_id, json);
@@ -2615,20 +2615,38 @@ int Agent::connect_cloud()
         // notification so Studio moves the device from "subscribing"
         // to "online" in its UI. App-cert provisioning is Studio-driven
         // via bambu_network_install_device_cert (not eager on report).
-        bool first = false;
+        //
+        // Both slicers answer that notification with pushall
+        // (GUI_App::init_networking_callbacks -> command_request_push_all),
+        // which is what fills the device panel — AMS trays, temperatures,
+        // job state. Losing it leaves that panel empty until something else
+        // asks, so read the callback *fresh* here instead of using the
+        // snapshot taken when connect_cloud() ran: Studio may register it
+        // after connect_server, and a stale null capture would stay null for
+        // the whole session. For the same reason the notification latch is
+        // separate from the seen-this-session set — a report that arrives
+        // before the callback exists must not swallow the notification.
+        bool                      first_report = false;
+        bool                      notify       = false;
+        BBL::OnPrinterConnectedFn printer_connected_cb;
+        BBL::QueueOnMainFn        q;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            first = cloud_connected_devs_.insert(dev_id).second;
+            first_report         = cloud_connected_devs_.insert(dev_id).second;
+            printer_connected_cb = on_printer_connected_;
+            q                    = queue_on_main_;
+            if (printer_connected_cb)
+                notify = cloud_notified_devs_.insert(dev_id).second;
         }
-        if (first && on_printer_connected) {
-            BBL::OnPrinterConnectedFn cb = on_printer_connected;
-            BBL::QueueOnMainFn        q;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                q = queue_on_main_;
-            }
-            auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
+        if (notify) {
+            auto invoke = [printer_connected_cb, dev_id]() {
+                printer_connected_cb("tunnel/" + dev_id);
+            };
             if (q) q(invoke); else invoke();
+        } else if (first_report && !printer_connected_cb) {
+            OBN_DEBUG("cloud: first report for dev=%s arrived before Studio "
+                      "registered on_printer_connected; will notify on a "
+                      "later report", dev_id.c_str());
         }
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
@@ -2657,6 +2675,7 @@ int Agent::disconnect_cloud()
         std::lock_guard<std::mutex> lk(mu_);
         sess = std::move(cloud_session_);
         devs.swap(cloud_connected_devs_);
+        cloud_notified_devs_.clear();
         if (lan_session_) lan_dev = lan_session_->dev_id();
         // Drop install latches for everything except an active LAN session
         // (that session still owns its once-per-session install).
@@ -2739,6 +2758,7 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
         sess = cloud_session_.get();
         for (const auto& d : dev_ids) {
             cloud_connected_devs_.erase(d);
+            cloud_notified_devs_.erase(d);
             app_cert_install_sent_.erase(d);
         }
     }
