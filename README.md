@@ -191,6 +191,7 @@ plugin can drive it over the LAN with no signing keys at all.
 1. On the printer screen, enable LAN-only mode and Developer mode. Bambu places these toggles in different submenus depending on the model and firmware — look for options named along the lines of "LAN Only", "LAN Only liveview", and "Developer mode". Examples:
    - **P2S**: Nut icon -> Settings -> **LAN Only Mode**
    - **P1S**: Nut icon -> **WLAN**
+   - **X2D / H2D / H2S**: also enable Settings -> General -> **LAN Only Liveview**, in addition to the toggles above — without it the printer reports LAN RTSP liveview as disabled and the camera never connects. P1S/P2S don't have this extra toggle; camera works there as soon as LAN mode is on.
 2. In Bambu Studio: Device -> Connect via LAN with access code.
 
 In this mode the printer skips MQTT verification and accepts plain LAN
