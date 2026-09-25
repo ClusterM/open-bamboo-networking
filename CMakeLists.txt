@@ -86,6 +86,11 @@ message(STATUS "obn: ABI_VERSION=${OBN_ABI_VERSION_HEX} (from OBN_VERSION=${OBN_
 
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/packaging/obn.conf.in"
      OBN_CONF_DEFAULT_TEMPLATE)
+# The template is embedded into obn_conf_default.h at configure time, so CMake
+# has to know it is an input: without this an edit to obn.conf.in keeps
+# shipping the previously generated default config.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/packaging/obn.conf.in")
 set(OBN_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${OBN_GENERATED_DIR}")
 configure_file(
