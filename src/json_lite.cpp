@@ -9,10 +9,16 @@ namespace obn::json {
 
 namespace {
 
+// Nested {}/[] recurse one C++ stack frame per level with no other bound;
+// wire data (MQTT push_status, HTTP/cloud responses) can be arbitrarily
+// deeply nested, so cap it well short of a real stack overflow.
+constexpr int kMaxNestingDepth = 512;
+
 struct Parser {
     const char* p;
     const char* end;
     std::string err;
+    int depth = 0;
 
     bool at_end() const { return p >= end; }
 
@@ -152,31 +158,42 @@ struct Parser {
             out = Value(std::move(s));
             return true;
         }
-        if (c == '{') {
-            ++p;
-            Object obj;
-            skip_ws();
-            if (p < end && *p == '}') { ++p; out = Value(std::move(obj)); return true; }
-            while (true) {
-                skip_ws();
-                std::string key;
-                if (!parse_string(key)) return false;
-                skip_ws();
-                if (p >= end || *p != ':') { err = "expected ':'"; return false; }
-                ++p;
-                Value v;
-                if (!parse_value(v)) return false;
-                obj.emplace(std::move(key), std::move(v));
-                skip_ws();
-                if (p < end && *p == ',') { ++p; continue; }
-                if (p < end && *p == '}') { ++p; break; }
-                err = "expected ',' or '}'";
+        if (c == '{' || c == '[') {
+            if (depth >= kMaxNestingDepth) {
+                err = "max nesting depth exceeded";
                 return false;
             }
-            out = Value(std::move(obj));
-            return true;
-        }
-        if (c == '[') {
+            ++depth;
+            struct DepthGuard {
+                int& d;
+                ~DepthGuard() { --d; }
+            } depth_guard{depth};
+
+            if (c == '{') {
+                ++p;
+                Object obj;
+                skip_ws();
+                if (p < end && *p == '}') { ++p; out = Value(std::move(obj)); return true; }
+                while (true) {
+                    skip_ws();
+                    std::string key;
+                    if (!parse_string(key)) return false;
+                    skip_ws();
+                    if (p >= end || *p != ':') { err = "expected ':'"; return false; }
+                    ++p;
+                    Value v;
+                    if (!parse_value(v)) return false;
+                    obj.emplace(std::move(key), std::move(v));
+                    skip_ws();
+                    if (p < end && *p == ',') { ++p; continue; }
+                    if (p < end && *p == '}') { ++p; break; }
+                    err = "expected ',' or '}'";
+                    return false;
+                }
+                out = Value(std::move(obj));
+                return true;
+            }
+            // c == '['
             ++p;
             Array arr;
             skip_ws();
