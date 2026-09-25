@@ -14,6 +14,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
+#include "obn/cloud_ca_bundle.hpp"
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
@@ -2541,27 +2542,23 @@ int Agent::connect_cloud()
     //   - Linux/macOS: empty here -> mqtt_client falls back to the distro
     //     trust store (/etc/ssl/certs/...), which validates *.bambulab.com
     //     properly.
-    //   - Windows: vcpkg's static OpenSSL ships no default trust store,
-    //     and mosquitto_tls_set() rejects (cafile=null, capath=null) with
-    //     MOSQ_ERR_INVAL. We hand it Studio's BBL bundle (the same file
-    //     Studio passed via set_cert_file, e.g.
-    //     resources/cert/slicer_base64.cer) just so the call validates;
-    //     CloudSession then sets tls_skip_chain_verify=true so the
-    //     handshake doesn't actually require *.bambulab.com to chain
-    //     up to that BBL CA. Documented MVP limitation -- cloud auth
-    //     still rides on top of TLS via u_<userid>+token, so MITM gets
-    //     opaque traffic but no usable credentials.
+    //   - Windows: vcpkg's static OpenSSL ships no default trust store, and
+    //     mosquitto_tls_set() rejects (cafile=null, capath=null) with
+    //     MOSQ_ERR_INVAL. *.bambulab.com serves an ordinary, publicly
+    //     trusted DigiCert-issued certificate (verified independently:
+    //     `openssl s_client -connect us.mqtt.bambulab.com:8883` chains to
+    //     DigiCert Global Root G2) -- it needs a normal CA bundle, not
+    //     anything Bambu-specific. Write out the vendored bundle (see
+    //     cloud_ca_bundle.hpp) and use that, with full chain + hostname
+    //     verification (CloudSession::configure() no longer skips either
+    //     check now that this hands it a trust anchor that actually
+    //     validates the real chain).
     std::string cloud_ca;
 #if defined(_WIN32)
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!cert_folder_.empty() && !cert_filename_.empty()) {
-            cloud_ca = cert_folder_;
-            if (cloud_ca.back() != '/' && cloud_ca.back() != '\\') {
-                cloud_ca += '\\';
-            }
-            cloud_ca += cert_filename_;
-        }
+    cloud_ca = obn::tls::ensure_cloud_ca_bundle_file(config_dir());
+    if (cloud_ca.empty()) {
+        OBN_WARN("connect_cloud: failed to write vendored CA bundle; "
+                  "cloud MQTT connect will likely fail on Windows");
     }
 #endif
     cloud_session_->configure(cloud_region(), s.user_id, s.access_token,
