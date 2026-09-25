@@ -95,8 +95,30 @@ configure_file(
 
 # Compile in a standard root CA bundle (see include/obn/cloud_ca_bundle.hpp
 # for why: Windows has no usable default trust store for mosquitto/OpenSSL
-# to validate the cloud MQTT broker against).
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/resources/cacert.pem" OBN_CA_BUNDLE_PEM)
+# to validate the cloud MQTT broker against). MSVC caps a single string
+# literal at 65535 bytes (C2026 "string too big"), well under the ~189 KB
+# bundle, so split it into chunks and emit them as adjacent raw-string
+# literals -- the compiler concatenates those into one string constant at
+# compile time with no limit on the total length.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/resources/cacert.pem" _obn_cacert_full)
+string(LENGTH "${_obn_cacert_full}" _obn_cacert_len)
+set(_obn_chunk_size 8000)
+set(OBN_CA_BUNDLE_CHUNKS "")
+set(_obn_chunk_index 0)
+set(_obn_pos 0)
+while(_obn_pos LESS _obn_cacert_len)
+    math(EXPR _obn_remaining "${_obn_cacert_len} - ${_obn_pos}")
+    if(_obn_remaining GREATER _obn_chunk_size)
+        set(_obn_len ${_obn_chunk_size})
+    else()
+        set(_obn_len ${_obn_remaining})
+    endif()
+    string(SUBSTRING "${_obn_cacert_full}" ${_obn_pos} ${_obn_len} _obn_chunk)
+    string(APPEND OBN_CA_BUNDLE_CHUNKS
+        "    R\"OBN_PEM_${_obn_chunk_index}(${_obn_chunk})OBN_PEM_${_obn_chunk_index}\"\n")
+    math(EXPR _obn_pos "${_obn_pos} + ${_obn_len}")
+    math(EXPR _obn_chunk_index "${_obn_chunk_index} + 1")
+endwhile()
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/cloud_ca_bundle_data.cpp.in"
     "${OBN_GENERATED_DIR}/cloud_ca_bundle_data.cpp"

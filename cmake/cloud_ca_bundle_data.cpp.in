@@ -4,8 +4,7 @@
 
 namespace obn::tls {
 
-const char* const kCloudCaBundlePem = R"OBN_CACERT_PEM(
-@OBN_CA_BUNDLE_PEM@
-)OBN_CACERT_PEM";
+const char* const kCloudCaBundlePem =
+@OBN_CA_BUNDLE_CHUNKS@    ;
 
 } // namespace obn::tls
