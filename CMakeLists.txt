@@ -319,6 +319,7 @@ add_library(bambu_networking SHARED
     src/abi_track.cpp
     src/abi_ft.cpp
     src/agent.cpp
+    src/hms_filter.cpp
     src/auth.cpp
     src/cert_store.cpp
     src/config.cpp
@@ -796,6 +797,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     add_executable(lan_live_test tests/lan_live_test.cpp
         src/agent.cpp
+        src/hms_filter.cpp
         src/auth.cpp
         src/cert_store.cpp
         src/config.cpp
@@ -849,11 +851,18 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME signing COMMAND signing_test)
 
+    add_executable(hms_filter_test tests/hms_filter_test.cpp
+        src/hms_filter.cpp
+        src/json_lite.cpp)
+    target_include_directories(hms_filter_test PRIVATE include ${OBN_GENERATED_DIR})
+    add_test(NAME hms_filter COMMAND hms_filter_test)
+
     # Agent and its transitive deps: the tests below exercise pure helpers,
     # but those live in translation units that reference the agent, so the
     # whole core has to be linked in.
     set(OBN_TEST_CORE_SOURCES
         src/agent.cpp
+        src/hms_filter.cpp
         src/auth.cpp
         src/cert_store.cpp
         src/config.cpp
