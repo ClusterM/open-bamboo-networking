@@ -123,6 +123,14 @@ using func_get_mw_user_preference = int (*)(void* agent,
 using func_get_mw_user_4ulist = int (*)(void* agent, int seed, int limit,
                                         std::function<void(std::string)> cb);
 
+// Remote camera URL mint (--action camera_url). `dev_id` is Studio's packed
+// "serial|dev_ver|protocols" key; the URL arrives through `cb`.
+using func_get_camera_url = int (*)(void* agent, std::string dev_id,
+                                    std::function<void(std::string)> cb);
+using func_add_subscribe  = int (*)(void* agent, std::vector<std::string> dev_list);
+using func_send_message   = int (*)(void* agent, std::string dev_id, std::string json_str,
+                                    int qos, int flag);
+
 // Filament Manager cloud probes (--action filament_probe). sync_ams_filaments
 // landed in ABI 02.08.01, sync_slot_mappings in 02.08.02; both take their
 // params by value, so BBL::AmsSyncParams / BBL::SlotMappingsSyncParams must
@@ -261,6 +269,12 @@ struct PluginExports {
     func_put_model_mall_rating       put_model_mall_rating       = nullptr;
     func_get_mw_user_preference      get_mw_user_preference      = nullptr;
     func_get_mw_user_4ulist          get_mw_user_4ulist          = nullptr;
+
+    // Optional camera probe (--action camera_url).
+    func_get_camera_url              get_camera_url              = nullptr;
+    func_add_subscribe               add_subscribe               = nullptr;
+    // Cloud-routed publish onto device/<dev_id>/request.
+    func_send_message                send_message                = nullptr;
 
     // Optional Filament Manager probes (--action filament_probe).
     func_get_filament_spools         get_filament_spools         = nullptr;

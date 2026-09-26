@@ -187,6 +187,12 @@ PluginExports load(const std::string& so_path)
         out.dl_handle, "bambu_network_get_mw_user_preference");
     out.get_mw_user_4ulist = resolve<func_get_mw_user_4ulist>(
         out.dl_handle, "bambu_network_get_mw_user_4ulist");
+    out.get_camera_url = resolve<func_get_camera_url>(
+        out.dl_handle, "bambu_network_get_camera_url");
+    out.add_subscribe = resolve<func_add_subscribe>(
+        out.dl_handle, "bambu_network_add_subscribe");
+    out.send_message = resolve<func_send_message>(
+        out.dl_handle, "bambu_network_send_message");
 
     out.get_filament_spools = resolve<func_get_filament_spools>(
         out.dl_handle, "bambu_network_get_filament_spools");

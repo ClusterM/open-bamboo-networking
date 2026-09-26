@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -99,6 +100,68 @@ void emit_text(const std::string& kind, const std::string& msg)
     json j;
     j["msg"] = msg;
     emit_event(kind, std::move(j));
+}
+
+// --action camera_url: cloud push_status arrives every second, so only its
+// ipcam.tutk_server transitions are logged; every other frame (command
+// replies, liveview, security, ...) is logged verbatim.
+std::atomic<bool> g_camera_msg_filter{false};
+std::atomic<int>  g_wait_info_count{0};
+std::mutex        g_tutk_mu;
+std::string       g_last_tutk_server;
+
+void emit_cloud_message(const std::string& dev_id, const std::string& msg)
+{
+    // Stock posts dev_id="" + "wait_info" when it lacks this session's
+    // printer cert (Studio GUI_App::process_network_msg).
+    if (dev_id.empty() && msg == "wait_info") ++g_wait_info_count;
+    if (!g_camera_msg_filter) {
+        emit_event("message", { {"dev_id", dev_id}, {"msg", msg} });
+        return;
+    }
+    json j = json::parse(msg, nullptr, /*allow_exceptions=*/false);
+    const bool push_status = j.is_object() && j.contains("print") &&
+                             j["print"].is_object() &&
+                             j["print"].value("command", "") == "push_status";
+    if (!push_status) {
+        emit_event("message", { {"dev_id", dev_id}, {"msg", msg} });
+        return;
+    }
+    static std::atomic<bool> first_seen{false};
+    if (!first_seen.exchange(true)) emit_event("push_status_first", { {"dev_id", dev_id} });
+    const json& print = j["print"];
+    if (!print.contains("ipcam") || !print["ipcam"].is_object()) return;
+    const std::string tutk = print["ipcam"].value("tutk_server", "");
+    if (tutk.empty()) return;
+    std::lock_guard<std::mutex> lk(g_tutk_mu);
+    if (tutk == g_last_tutk_server) return;
+    emit_event("tutk_server", {
+        {"dev_id", dev_id}, {"from", g_last_tutk_server}, {"to", tutk},
+    });
+    g_last_tutk_server = tutk;
+}
+
+// Masks every query value of a camera URL (TUTK uid / authkey / passwd)
+// down to a 3-char prefix plus its length.
+std::string mask_camera_url(const std::string& url)
+{
+    const auto q = url.find('?');
+    if (q == std::string::npos) return url;
+    std::string out = url.substr(0, q + 1);
+    std::stringstream ss(url.substr(q + 1));
+    std::string kv;
+    bool first = true;
+    while (std::getline(ss, kv, '&')) {
+        if (!first) out += '&';
+        first = false;
+        const auto eq = kv.find('=');
+        if (eq == std::string::npos) { out += kv; continue; }
+        const std::string v = kv.substr(eq + 1);
+        out += kv.substr(0, eq + 1);
+        if (v.size() <= 3) out += v;
+        else out += v.substr(0, 3) + "***(" + std::to_string(v.size()) + ")";
+    }
+    return out;
 }
 
 } // namespace
@@ -202,6 +265,16 @@ struct CliArgs {
     std::optional<std::string> device_region_client_type;
     std::optional<std::string> device_region_country;
     std::optional<std::string> device_region_x_client_country;
+
+    // --action camera_url: one get_camera_url call with Studio's packed
+    // "serial|dev_ver|protocols" key (MediaPlayCtrl::Play). The minted URL
+    // carries TUTK credentials, so events only show a masked copy; the raw
+    // URL goes to --camera-url-out (mode 0600) for tools/tutk_probe.
+    std::string camera_dev_ver;
+    std::string camera_protocols = "\"tutk\",\"agora\"";
+    std::string camera_url_out;
+    bool        camera_cloud     = true;
+    int         camera_settle_s  = 5;
 
     // --action account_bind extras (Studio BindJob defaults).
     std::string dev_model = "N7";
@@ -309,6 +382,12 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--device-region-country CC]
                      [--device-region-x-client-country CC]
                      [--country US]
+
+       plugin_runner --action camera_url --plugin-path PATH
+                     --user-info @session.json --dev-id ID
+                     [--camera-dev-ver VER] [--camera-protocols LIST]
+                     [--camera-url-out PATH] [--camera-cloud 0|1]
+                     [--camera-settle-s N] [--data-dir DIR] [--country US]
 
        plugin_runner --action update_cert --plugin-path PATH
                      [--user-info @session.json] [--data-dir DIR]
@@ -507,6 +586,12 @@ CliArgs parse_cli(int argc, char** argv)
             c.device_region_country = require(a, ++i, f);
         else if (f == "--device-region-x-client-country")
             c.device_region_x_client_country = require(a, ++i, f);
+        else if (f == "--camera-dev-ver")    c.camera_dev_ver   = require(a, ++i, f);
+        else if (f == "--camera-protocols")  c.camera_protocols = require(a, ++i, f);
+        else if (f == "--camera-url-out")    c.camera_url_out   = require(a, ++i, f);
+        else if (f == "--camera-cloud")      c.camera_cloud = (require(a, ++i, f) != "0");
+        else if (f == "--camera-settle-s")
+            c.camera_settle_s = std::stoi(require(a, ++i, f));
         else if (f == "--auto-stop")         c.auto_stop = true;
         else if (f == "--dev-model")         c.dev_model = require(a, ++i, f);
         else if (f == "--timezone")          c.timezone  = require(a, ++i, f);
@@ -536,7 +621,7 @@ CliArgs parse_cli(int argc, char** argv)
         (c.action == "http_probe" || c.action == "mw_probe" ||
          c.action == "update_cert" || c.action == "query_bind" ||
          c.action == "gap_probe" || c.action == "filament_probe" ||
-         c.action == "device_region");
+         c.action == "device_region" || c.action == "camera_url");
     const bool bind_detect_only = (c.action == "bind_detect");
     const bool account_bind     = (c.action == "account_bind");
     const bool cert_probe       = (c.action == "cert_probe");
@@ -592,6 +677,11 @@ CliArgs parse_cli(int argc, char** argv)
     }
     if (c.action == "query_bind" && c.dev_id.empty()) {
         std::fprintf(stderr, "plugin_runner: --action query_bind requires --dev-id\n");
+        usage(64);
+    }
+    if (c.action == "camera_url" && (c.dev_id.empty() || c.user_info.empty())) {
+        std::fprintf(stderr, "plugin_runner: --action camera_url requires "
+                             "--dev-id and --user-info\n");
         usage(64);
     }
     return c;
@@ -820,6 +910,7 @@ const char* stage_name(int s)
 int main(int argc, char** argv)
 try {
     CliArgs args = parse_cli(argc, argv);
+    g_camera_msg_filter = (args.action == "camera_url");
 
     if (args.download_only) {
         std::string cache = args.cache_dir.empty() ? default_cache_dir() : args.cache_dir;
@@ -932,7 +1023,7 @@ try {
         });
     exports.set_on_message_fn(agent,
         [](std::string dev_id, std::string msg) {
-            emit_event("message", { {"dev_id", dev_id}, {"msg", msg} });
+            emit_cloud_message(dev_id, msg);
         });
     exports.set_on_user_message_fn(agent,
         [](std::string dev_id, std::string msg) {
@@ -1098,9 +1189,11 @@ try {
     const bool account_bind_probe = (args.action == "account_bind");
     const bool filament_probe     = (args.action == "filament_probe");
     const bool device_region_probe = (args.action == "device_region");
+    const bool camera_url_probe    = (args.action == "camera_url");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
-        gap_probe_action || filament_probe || device_region_probe;
+        gap_probe_action || filament_probe || device_region_probe ||
+        camera_url_probe;
     // account_bind / bind_detect call bind_detect themselves then exit
     // (or call bind()); they must not open a competing LAN MQTT session.
     const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
@@ -1934,6 +2027,170 @@ try {
         emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
         return rc == 0 ? 0 : 1;
 #endif
+    } else if (args.action == "camera_url") {
+        if (!exports.get_camera_url) {
+            emit_event("get_camera_url", { {"missing", true} });
+            emit_text("fatal", "plugin missing bambu_network_get_camera_url");
+            return 70;
+        }
+        // Studio only asks for a remote URL once the printer is online over
+        // the cloud: connect_server, then add_subscribe for the device.
+        if (args.camera_cloud) {
+            if (exports.enable_multi_machine) exports.enable_multi_machine(agent, true);
+            if (exports.connect_server) {
+                server_ready.reset();
+                int rc = exports.connect_server(agent);
+                bool got = server_ready.wait_for(std::chrono::seconds(15));
+                emit_event("connect_server", { {"rc", rc}, {"server_ready", got} });
+            }
+            if (exports.add_subscribe) {
+                int rc = exports.add_subscribe(agent, {args.dev_id});
+                emit_event("add_subscribe", { {"dev_id", args.dev_id}, {"rc", rc} });
+            }
+            // Studio's bring-up once the device is subscribed. Stock only
+            // publishes app_cert_install after it has seen a full status.
+            if (exports.send_message) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                const char* kickstart[] = {
+                    R"({"pushing":{"sequence_id":"20000","command":"pushall","version":1,"push_target":1}})",
+                    R"({"info":{"sequence_id":"20001","command":"get_version"}})",
+                    R"({"system":{"sequence_id":"20002","command":"get_access_code"}})",
+                };
+                for (const char* m : kickstart) {
+                    int rc = exports.send_message(agent, args.dev_id, m, /*qos=*/0, /*flag=*/0);
+                    emit_event("send_message", { {"json", m}, {"rc", rc} });
+                }
+            }
+        }
+
+        // Studio calls refresh_connection + install_device_cert (lan_only =
+        // is_lan_mode_printer) once a second for the selected machine. Stock
+        // get_camera_url answers "wait_info" (no callback) until
+        // app_cert_install has succeeded this session, so mirror that loop.
+        std::atomic<bool> keepalive_stop{false};
+        std::thread keepalive;
+        if (args.camera_cloud) {
+            keepalive = std::thread([&] {
+                while (!keepalive_stop) {
+                    if (exports.refresh_connection) exports.refresh_connection(agent);
+                    if (exports.install_device_cert)
+                        exports.install_device_cert(agent, args.dev_id, /*lan_only=*/false);
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            });
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+
+        const std::string key =
+            args.dev_id + "|" + args.camera_dev_ver + "|" + args.camera_protocols;
+
+        // Shared so a callback arriving after the timeout cannot touch a
+        // dead stack frame.
+        struct CamState {
+            std::mutex              m;
+            std::condition_variable cv;
+            bool                    done = false;
+            bool                    returned = false;
+            bool                    before_return = false;
+            long long               cb_ms = -1;
+            std::string             url;
+        };
+
+        int rc = -1;
+        long long ret_ms = -1;
+        bool got = false;
+        std::string url;
+        long long cb_ms = -1;
+        bool before_return = false;
+        int attempt = 0;
+        for (attempt = 1; attempt <= 4 && !got; ++attempt) {
+            const int wait_info_before = g_wait_info_count.load();
+            emit_event("get_camera_url_call", {
+                {"attempt", attempt},
+                {"dev_id", args.dev_id},
+                {"dev_ver", args.camera_dev_ver},
+                {"protocols", args.camera_protocols},
+            });
+            auto st = std::make_shared<CamState>();
+            const auto t0 = std::chrono::steady_clock::now();
+            auto ms_since = [t0] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+            };
+            rc = exports.get_camera_url(agent, key, [st, ms_since](std::string u) {
+                std::lock_guard<std::mutex> lk(st->m);
+                st->url           = std::move(u);
+                st->cb_ms         = ms_since();
+                st->before_return = !st->returned;
+                st->done          = true;
+                st->cv.notify_all();
+            });
+            ret_ms = ms_since();
+            {
+                std::lock_guard<std::mutex> lk(st->m);
+                st->returned = true;
+            }
+            {
+                std::unique_lock<std::mutex> lk(st->m);
+                got = st->cv.wait_for(lk, std::chrono::seconds(15), [&] { return st->done; });
+                url           = st->url;
+                cb_ms         = st->cb_ms;
+                before_return = st->before_return;
+            }
+            if (!got) {
+                emit_event("get_camera_url_no_callback", {
+                    {"attempt", attempt},
+                    {"rc", rc},
+                    {"wait_info", g_wait_info_count.load() > wait_info_before},
+                });
+            }
+        }
+        std::vector<std::string> query_keys;
+        if (auto q = url.find('?'); q != std::string::npos) {
+            std::stringstream ss(url.substr(q + 1));
+            std::string kv;
+            while (std::getline(ss, kv, '&')) query_keys.push_back(kv.substr(0, kv.find('=')));
+        }
+        emit_event("get_camera_url", {
+            {"attempts", attempt - 1},
+            {"rc", rc},
+            {"return_ms", ret_ms},
+            {"callback", got},
+            {"callback_ms", cb_ms},
+            {"callback_before_return", before_return},
+            {"url_bytes", url.size()},
+            {"url_masked", mask_camera_url(url)},
+            {"query_keys", query_keys},
+        });
+
+        if (!args.camera_url_out.empty() && !url.empty()) {
+            const mode_t old = ::umask(077);
+            std::ofstream f(args.camera_url_out, std::ios::trunc);
+            ::umask(old);
+            f << url << '\n';
+            emit_event("camera_url_out", {
+                {"path", args.camera_url_out}, {"ok", static_cast<bool>(f)},
+            });
+        }
+
+        // Keep the agent alive so any follow-up publish the plugin makes on
+        // its own (and the printer's reply) still lands in the log.
+        std::this_thread::sleep_for(std::chrono::seconds(std::max(args.camera_settle_s, 0)));
+        keepalive_stop = true;
+        if (keepalive.joinable()) keepalive.join();
+
+        const bool ok = rc == 0 && got && !url.empty();
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            fast_exit(ok ? 0 : 1);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return ok ? 0 : 1;
     } else if (args.action == "filament_probe") {
         auto trunc = [](const std::string& s, size_t n = 2000) {
             if (s.size() <= n) return s;

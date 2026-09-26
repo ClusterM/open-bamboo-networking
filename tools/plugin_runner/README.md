@@ -189,6 +189,36 @@ fields default to empty. `--country` still selects the API host via
 `set_country_code` (`CN` → `api.bambulab.cn`)
 ([research §8.10.12](../../research/08.10-http.md#81012-bambu_network_post_device_region)).
 
+`camera_url` makes one `get_camera_url` call with Studio's packed key
+`<dev-id>|<--camera-dev-ver>|<--camera-protocols>` (default protocols
+`"tutk","agora"`, as `MediaPlayCtrl::Play` sends them). With
+`--camera-cloud 1` (default) it first runs `connect_server` +
+`add_subscribe(dev-id)`, so the call happens with the printer online over
+the cloud, the way Studio makes it. The event log shows the return and
+callback latency, whether the callback fired before the call returned, the
+query keys, and a masked URL. Cloud `push_status` frames are reduced to
+`tutk_server` transitions; every other cloud frame is logged verbatim, so a
+follow-up command the plugin publishes on its own shows up through its
+reply. `--camera-url-out FILE` writes the raw URL (mode 0600) for
+[`tools/tutk_probe`](../tutk_probe/main.cpp), which opens it through a
+`libBambuSource.so` and counts the video samples:
+
+```bash
+./tools/plugin_runner.sh --abi 02.08.01 \
+  --plugin-path ~/.config/BambuStudio/plugins/libbambu_networking.so \
+  --action camera_url --client-name BambuStudio \
+  --user-info @$HOME/.config/BambuStudio/obn.auth.json \
+  --data-dir $HOME/.config/BambuStudio \
+  --dev-id <serial> --camera-dev-ver <fw> --camera-url-out /tmp/cam.url
+cmake -S tools/tutk_probe -B tools/tutk_probe/build && cmake --build tools/tutk_probe/build
+tools/tutk_probe/build/tutk_probe --url-file /tmp/cam.url --device <serial> --seconds 10
+```
+
+The credentials in the URL are stable, but the printer only accepts TUTK
+connections for ~9.5 minutes after a mint: each `/user/ttcode` POST makes the
+cloud push `liveview.prepare` to the printer, which starts its `tutk_server`.
+Re-run `camera_url` if `tutk_probe` fails with `-90` (device offline).
+
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch
 `GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256=…&ver=1`
