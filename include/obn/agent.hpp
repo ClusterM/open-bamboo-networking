@@ -89,6 +89,8 @@ private:
 // itself.
 class Agent {
 public:
+    static Agent* active_instance() noexcept;
+
     explicit Agent(std::string log_dir);
     ~Agent();
 
@@ -414,6 +416,12 @@ public:
     // the printer is cloud-paired. Returns "" when either piece is missing;
     // Studio then shows its normal "connection failed" state.
     std::string camera_url_for(const std::string& dev_id);
+    // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
+    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode,
+    // proactively dispatches signed/encrypted prepare command to the printer,
+    // and returns "bambu:///tutk?uid=...".
+    std::string remote_camera_url(const std::string& dev_id);
+    void rescue_cloud_liveview(const std::string& dev_id, const std::string& json);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
@@ -460,6 +468,12 @@ private:
     // full JSON parse only on candidate frames. See research/10.03.
     void harvest_developer_mode(const std::string& dev_id,
                                 const std::string& json);
+
+    // Records the printer's ipcam.tutk_server status ("enable" / "disable")
+    // into tutk_server_ready_by_dev_ to prevent unnecessary liveview.prepare
+    // commands that restart a running server.
+    void harvest_tutk_server_status(const std::string& dev_id,
+                                    const std::string& json);
 
     // Whether outbound signed print fields should be treated as Developer
     // Mode (keep cleartext url/param) vs secured (drop cleartext, *_enc only).
@@ -573,6 +587,7 @@ private:
     // developer_mode_effective(), which falls back to a key-material default
     // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
+    std::map<std::string, bool>                 tutk_server_ready_by_dev_;
 
     // Devices seen on the current cloud session (first report flips them in).
     // disconnect_cloud drains this set to release the RSA pubkeys learned

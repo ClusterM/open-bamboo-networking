@@ -18,6 +18,7 @@
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
+#include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
@@ -83,9 +84,22 @@ std::string ipv4_from_le_int(std::int64_t v)
 
 } // namespace
 
-Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir)) {}
+static std::atomic<Agent*> s_active_agent{nullptr};
+
+Agent* Agent::active_instance() noexcept
+{
+    return s_active_agent.load(std::memory_order_acquire);
+}
+
+Agent::Agent(std::string log_dir) : log_dir_(std::move(log_dir))
+{
+    s_active_agent.store(this, std::memory_order_release);
+}
+
 Agent::~Agent()
 {
+    Agent* expected = this;
+    s_active_agent.compare_exchange_strong(expected, nullptr);
     shutdown_lan_session();
     {
         std::lock_guard<std::mutex> lk(lan_watchdog_mu_);
@@ -1184,6 +1198,30 @@ bool Agent::developer_mode_effective(const std::string& dev_id) const
     return !have_material;
 }
 
+void Agent::harvest_tutk_server_status(const std::string& dev_id,
+                                       const std::string& json)
+{
+    if (json.find("\"ipcam\"") == std::string::npos) return;
+    bool ready = false;
+    bool found = false;
+    if (json.find("\"tutk_server\":\"enable\"") != std::string::npos) {
+        ready = true;
+        found = true;
+    } else if (json.find("\"tutk_server\":\"disable\"") != std::string::npos) {
+        ready = false;
+        found = true;
+    }
+    if (!found) return;
+
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = tutk_server_ready_by_dev_.find(dev_id);
+    const bool changed = (it == tutk_server_ready_by_dev_.end() || it->second != ready);
+    tutk_server_ready_by_dev_[dev_id] = ready;
+    if (changed) {
+        OBN_INFO("dev=%s tutk_server status: %s", dev_id.c_str(), ready ? "enable" : "disable");
+    }
+}
+
 void Agent::maybe_install_app_cert(const std::string& dev_id)
 {
     if (dev_id.empty()) return;
@@ -1201,6 +1239,81 @@ void Agent::maybe_install_app_cert(const std::string& dev_id)
     (void)request_app_cert_install(dev_id);
 }
 
+void Agent::rescue_cloud_liveview(const std::string& dev_id,
+                                  const std::string& json)
+{
+    if (json.find("\"liveview\"") == std::string::npos) return;
+    if (json.find("\"prepare\"") == std::string::npos) return;
+    if (json.find("84033543") == std::string::npos) return;
+
+    auto root = obn::json::parse(json);
+    if (!root) return;
+    const obn::json::Value& lv_val = root->find("liveview");
+    if (lv_val.kind() != obn::json::Value::Kind::Object) return;
+
+    obn::json::Object lv_obj = lv_val.as_object();
+
+    auto cmd_it = lv_obj.find("command");
+    if (cmd_it == lv_obj.end() || !cmd_it->second.is_string()) return;
+    if (cmd_it->second.as_string() != "prepare") return;
+
+    auto err_it = lv_obj.find("err_code");
+    if (err_it == lv_obj.end()) return;
+    {
+        bool is_rejection = false;
+        if (err_it->second.is_number()) {
+            is_rejection = (err_it->second.as_int() == 84033543LL);
+        }
+        if (!is_rejection) return;
+    }
+
+    std::string ttcode;
+    auto tt_it = lv_obj.find("ttcode");
+    if (tt_it != lv_obj.end() && tt_it->second.is_string())
+        ttcode = tt_it->second.as_string();
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it_ready = tutk_server_ready_by_dev_.find(dev_id);
+        if (it_ready != tutk_server_ready_by_dev_.end() && it_ready->second) {
+            OBN_INFO("rescue_cloud_liveview dev=%s: tutk_server already running (enable) - skipping prepare to prevent server restart",
+                     dev_id.c_str());
+            return;
+        }
+
+        static std::map<std::string, std::chrono::steady_clock::time_point> last_rescue;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = last_rescue.find(dev_id);
+        if (it != last_rescue.end() && now - it->second < std::chrono::seconds(2)) {
+            OBN_DEBUG("rescue_cloud_liveview dev=%s: rescue cooldown active (2s), skip duplicate",
+                      dev_id.c_str());
+            return;
+        }
+        last_rescue[dev_id] = now;
+    }
+
+    OBN_INFO("rescue_cloud_liveview dev=%s ttcode=%s: intercepting unsigned rejection, signing and republishing",
+             dev_id.c_str(), ttcode.c_str());
+
+    lv_obj.erase("err_code");
+    lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+
+    obn::json::Object new_root;
+    new_root["liveview"] = obn::json::Value(std::move(lv_obj));
+    const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+    std::string dev_id_copy = dev_id;
+    std::thread([this, dev_id_copy, req_json]() mutable {
+        int rc = send_message(dev_id_copy, req_json, /*qos=*/0);
+        if (rc == BAMBU_NETWORK_SUCCESS) {
+            OBN_INFO("rescue_cloud_liveview dev=%s: signed liveview prepare dispatched OK",
+                     dev_id_copy.c_str());
+        } else {
+            OBN_WARN("rescue_cloud_liveview dev=%s: send_message failed rc=%d",
+                     dev_id_copy.c_str(), rc);
+        }
+    }).detach();
+}
 int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
@@ -1392,10 +1505,10 @@ std::string Agent::camera_url_for(const std::string& dev_id)
             lv = it->second;
     }
     if (ip.empty() || code.empty()) {
-        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
+        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s) — trying remote TUTK",
                  dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
                  code.empty() ? "unknown" : "known");
-        return {};
+        return remote_camera_url(dev_id);
     }
 
     // The :6000 tunnel (and a possible RTSPS liveview redirect) verify the
@@ -1407,6 +1520,204 @@ std::string Agent::camera_url_for(const std::string& dev_id)
                     + code;
     if (!lv.empty()) url += "&lv=" + lv;
     return url;
+}
+
+// Remote (cloud/off-LAN) camera URL: mint bambu:///tutk?... from the
+// iot-service ttcode endpoint, which returns the per-device TUTK credentials
+// (uid + authkey/passwd/region). Studio then hands this to BambuSource, which
+// runs the TUTK rendezvous (OssTutkCameraSource / IotcClient).
+std::string Agent::remote_camera_url(const std::string& dev_id)
+{
+    auto hdrs = cloud_api_http_headers();
+    if (!hdrs.count("Authorization")) {
+        OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
+        return {};
+    }
+
+    if (!hdrs.count("X-BBL-Client-Name")) {
+        const std::string client_name = obn::config::current().client_name.empty()
+                                       ? std::string("BambuStudio")
+                                       : obn::config::current().client_name;
+        hdrs["X-BBL-Client-Name"] = client_name;
+        hdrs["X-BBL-Client-Type"] = "slicer";
+    }
+    if (!hdrs.count("User-Agent")) {
+        hdrs["User-Agent"] = "BambuStudio/01.09.05.51 (Windows; 10.0.26100)";
+    }
+    std::string uid_user = cloud_user_id();
+    if (!uid_user.empty() && !hdrs.count("X-BBL-Client-ID")) {
+        hdrs["X-BBL-Client-ID"] = "slicer:" + uid_user + ":obn0";
+    }
+
+    const std::string url = obn::cloud::api_host(cloud_region())
+                          + "/v1/iot-service/api/user/ttcode";
+
+    std::string serial = dev_id;
+    std::string dev_version;
+    std::string protocols_spec;
+
+    const auto b1 = serial.find('|');
+    if (b1 != std::string::npos) {
+        const auto b2 = serial.find('|', b1 + 1);
+        dev_version = serial.substr(b1 + 1, b2 == std::string::npos ? std::string::npos : b2 - (b1 + 1));
+        if (b2 != std::string::npos) {
+            const auto b3 = serial.find('|', b2 + 1);
+            protocols_spec = serial.substr(b2 + 1, b3 == std::string::npos ? std::string::npos : b3 - (b2 + 1));
+        }
+        serial = serial.substr(0, b1);
+    }
+
+    if (dev_version.empty()) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = device_fw_.find(serial);
+        if (it != device_fw_.end()) {
+            auto ota = it->second.modules.find("ota");
+            if (ota != it->second.modules.end()) {
+                dev_version = ota->second.cur_ver;
+            }
+        }
+    }
+
+    std::vector<std::string> protos;
+    if (protocols_spec.find("tutk") != std::string::npos)  protos.push_back("\"tutk\"");
+    if (protocols_spec.find("agora") != std::string::npos) protos.push_back("\"agora\"");
+    if (protos.empty()) {
+        protos.push_back("\"tutk\"");
+        protos.push_back("\"agora\"");
+    }
+
+    std::string protos_json = "[";
+    for (size_t i = 0; i < protos.size(); ++i) {
+        if (i > 0) protos_json += ",";
+        protos_json += protos[i];
+    }
+    protos_json += "]";
+
+    std::string req_body = "{\"dev_id\":" + obn::json::escape(serial);
+    if (!dev_version.empty()) {
+        req_body += ",\"dev_version\":" + obn::json::escape(dev_version);
+    }
+    req_body += ",\"protocols\":" + protos_json + "}";
+
+    OBN_INFO("camera_url(remote): request dev=%s ver=%s protos=%s",
+             serial.c_str(), dev_version.c_str(), protos_json.c_str());
+
+    obn::http::Response resp = obn::http::post_json(url, req_body, hdrs);
+    OBN_INFO("camera_url(remote): ttcode POST http=%ld body=%.700s",
+             resp.status_code, resp.body.c_str());
+    if (resp.status_code != 200 || resp.body.empty()) return {};
+
+    std::string perr;
+    auto root = obn::json::parse(resp.body, &perr);
+    if (!root) {
+        OBN_WARN("camera_url(remote): ttcode JSON parse failed: %s", perr.c_str());
+        return {};
+    }
+
+    auto get = [](const obn::json::Value& v, const char* k) -> std::string {
+        auto f = v.find(k);
+        return f.is_null() ? std::string{} : f.as_string();
+    };
+
+    std::string uid     = get(*root, "ttcode");
+    if (uid.empty()) uid = get(*root, "uid");
+    std::string authkey = get(*root, "authkey");
+    std::string passwd  = get(*root, "passwd");
+    std::string region  = get(*root, "region");
+
+    if (uid.empty()) {
+        for (const char* arr_key : {"devices", "ttcodes", "list", "data"}) {
+            auto arr = root->find(arr_key);
+            if (!arr.is_array()) continue;
+            for (const auto& d : arr.as_array()) {
+                std::string did = get(d, "dev_id");
+                if (did.empty()) did = get(d, "device");
+                if (!serial.empty() && !did.empty() && did != serial) continue;
+                std::string u = get(d, "ttcode");
+                if (u.empty()) u = get(d, "uid");
+                if (u.empty()) continue;
+                uid     = u;
+                authkey = get(d, "authkey");
+                passwd  = get(d, "passwd");
+                region  = get(d, "region");
+                break;
+            }
+            if (!uid.empty()) break;
+        }
+    }
+
+    if (uid.empty()) {
+        OBN_WARN("camera_url(remote): no ttcode/uid for dev=%s in response", serial.c_str());
+        return {};
+    }
+
+    const std::string type = get(*root, "type");
+    if (!type.empty() && type != "tutk") {
+        OBN_WARN("camera_url(remote): dev=%s uses non-tutk transport '%s'; unsupported",
+                 serial.c_str(), type.c_str());
+        return {};
+    }
+    if (region.empty()) region = "us";
+
+    // Proactively send signed prepare command so printer starts tutk_server —
+    // but at most once per uid per12s. The video player retries
+    // get_camera_url while buffering fails, and every re-prepare restarts the
+    // printer's TUTK server before it finishes registering with the
+    // rendezvous servers, so the viewer never receives a candidate list
+    // (observed live:4 prepares in36s, zero01 03 43 replies).
+    bool tutk_already_ready = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = tutk_server_ready_by_dev_.find(serial);
+        if (it != tutk_server_ready_by_dev_.end() && it->second) {
+            tutk_already_ready = true;
+        }
+    }
+
+    bool prepare_recently = false;
+    {
+        static std::mutex                prep_mu;
+        static std::map<std::string, std::chrono::steady_clock::time_point> last_prepare;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(prep_mu);
+        auto it = last_prepare.find(uid);
+        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(10)) {
+            prepare_recently = true;
+        } else {
+            last_prepare[uid] = now;
+        }
+    }
+    if (tutk_already_ready) {
+        OBN_INFO("camera_url(remote): dev=%s tutk_server already running — skipping prepare to prevent server restart",
+                 serial.c_str());
+    } else if (prepare_recently) {
+        OBN_INFO("camera_url(remote): prepare cooldown active for dev=%s uid=%.20s - not re-dispatching",
+                 serial.c_str(), uid.c_str());
+    } else {
+        obn::json::Object lv_obj;
+        lv_obj["command"]     = obn::json::Value(std::string("prepare"));
+        lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+        lv_obj["ttcode"]      = obn::json::Value(uid);
+        lv_obj["authkey"]     = obn::json::Value(authkey);
+        lv_obj["passwd"]      = obn::json::Value(passwd);
+        lv_obj["region"]      = obn::json::Value(region);
+
+        obn::json::Object new_root;
+        new_root["liveview"] = obn::json::Value(std::move(lv_obj));
+        const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+        OBN_INFO("camera_url(remote): proactively dispatching signed liveview prepare for dev=%s uid=%s",
+                 serial.c_str(), uid.c_str());
+        int rc = send_message(serial, req_json, /*qos=*/0);
+        OBN_INFO("camera_url(remote): liveview prepare dev=%s rc=%d",
+                 serial.c_str(), rc);
+    }
+
+    std::string turl = "bambu:///tutk?uid=" + uid + "&authkey=" + authkey
+                     + "&passwd=" + passwd + "&region=" + region;
+    OBN_INFO("camera_url(remote): built tutk url for dev=%s uid=%.20s region=%s",
+             serial.c_str(), uid.c_str(), region.c_str());
+    return turl;
 }
 
 void Agent::notify_message(const std::string& dev_id, const std::string& msg)
@@ -1448,6 +1759,8 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_security_flags(dev_id, json);
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
+    harvest_tutk_server_status(dev_id, json);
+    rescue_cloud_liveview(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
     // defer-close the cloud report subscription for this device.
@@ -2604,6 +2917,14 @@ int Agent::connect_cloud()
         harvest_security_flags(dev_id, json);
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
+        harvest_tutk_server_status(dev_id, json);
+        rescue_cloud_liveview(dev_id, json);
+
+        // Drop rejected unsigned cloud liveview frames from notifying Studio UI
+        if (json.find("\"liveview\"") != std::string::npos &&
+            json.find("84033543") != std::string::npos) {
+            return;
+        }
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
