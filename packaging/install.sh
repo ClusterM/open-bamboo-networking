@@ -114,7 +114,10 @@ build_candidates() {
                     add_candidate "Orca Slicer (Snap)" \
                         "OrcaSlicer.conf" "network_plugin_version" \
                         "${HOME}/snap/orcaslicer/10/.config/OrcaSlicer"
-                    ;;
+		 add_candidate "Orca Slicer (Snap)" \
+                        "OrcaSlicer.conf" "network_plugin_version" \
+                        "${HOME}/snap/orcaslicer/9/.config/OrcaSlicer"
+		    ;;
                 Darwin)
                     add_candidate "Orca Slicer" \
                         "OrcaSlicer.conf" "network_plugin_version" \
