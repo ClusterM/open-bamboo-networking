@@ -493,6 +493,33 @@ static int test_blockwise_multiblock_roundtrip()
     return 0;
 }
 
+static int test_liveview_prepare_ttcode_encrypted()
+{
+    const std::string ttcode = "VGC47JEVNKCHC9RZ111A";
+    const std::string payload =
+        R"({"liveview":{"authkey":"c0c597fc","command":"prepare","passwd":"a71c21","region":"us","sequence_id":"21143","ttcode":")" +
+        ttcode + R"("}})";
+
+    // Secured printer (developer_mode = false): ttcode_enc added, cleartext ttcode dropped.
+    const std::string env_sec = obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/false);
+    auto val_sec = obn::json::parse(env_sec);
+    CHECK(val_sec);
+    CHECK(val_sec->find("header.sign_string").kind() == obn::json::Value::Kind::String);
+    CHECK(val_sec->find("liveview.ttcode").kind()    == obn::json::Value::Kind::Null);
+    CHECK(val_sec->find("liveview.ttcode_enc").kind() == obn::json::Value::Kind::String);
+    CHECK(rsa_decrypt_blocks_b64(val_sec->find("liveview.ttcode_enc").as_string()) == ttcode);
+    CHECK(val_sec->find("liveview.authkey").as_string() == "c0c597fc");
+    CHECK(val_sec->find("liveview.passwd").as_string()  == "a71c21");
+
+    // Developer Mode printer (developer_mode = true): ttcode_enc added, cleartext ttcode kept.
+    const std::string env_dev = obn::signing::maybe_sign(payload, g_test_key, /*developer_mode=*/true);
+    auto val_dev = obn::json::parse(env_dev);
+    CHECK(val_dev);
+    CHECK(val_dev->find("liveview.ttcode").as_string()  == ttcode);
+    CHECK(val_dev->find("liveview.ttcode_enc").kind()  == obn::json::Value::Kind::String);
+    return 0;
+}
+
 namespace obn::config {
     Settings& test_settings();
     std::string& test_dir();
@@ -549,6 +576,7 @@ int main()
     if (test_no_device_key_leaves_cleartext() != 0) rc = 1;
     if (test_param_enc_idempotent()        != 0) rc = 1;
     if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
+    if (test_liveview_prepare_ttcode_encrypted() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 

@@ -12,12 +12,14 @@
 #include <utility>
 
 #include "obn/bambu_networking.hpp"
+#include "obn/camera_url.hpp"
 #include "obn/cert_store.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
+#include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
@@ -1407,6 +1409,98 @@ std::string Agent::camera_url_for(const std::string& dev_id)
                     + code;
     if (!lv.empty()) url += "&lv=" + lv;
     return url;
+}
+
+std::string Agent::remote_camera_url(const std::string& dev_id)
+{
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("camera_url(remote): blocked by block_cloud config");
+        return {};
+    }
+
+    auto hdrs = cloud_api_http_headers();
+    if (!hdrs.count("Authorization")) {
+        OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
+        return {};
+    }
+
+    const auto parsed = obn::camera::parse_packed_dev_key(dev_id);
+    const std::string& serial = parsed.serial;
+    if (serial.empty()) return {};
+
+    std::string dev_version = parsed.dev_version;
+    if (dev_version.empty()) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = device_fw_.find(serial);
+        if (it != device_fw_.end()) {
+            auto ota = it->second.modules.find("ota");
+            if (ota != it->second.modules.end()) {
+                dev_version = ota->second.cur_ver;
+            }
+        }
+    }
+
+    const std::string req_body = obn::camera::build_ttcode_request_body(
+        serial, dev_version, parsed.protocols);
+
+    const std::string url = obn::cloud::api_host(cloud_region())
+                          + "/v1/iot-service/api/user/ttcode";
+
+    OBN_INFO("camera_url(remote): request dev=%s ver=%s",
+             serial.c_str(), dev_version.c_str());
+
+    obn::http::Response resp = obn::http::post_json(url, req_body, hdrs);
+    OBN_INFO("camera_url(remote): ttcode POST http=%ld body=%.700s",
+             resp.status_code, resp.body.c_str());
+    if (resp.status_code != 200 || resp.body.empty()) return {};
+
+    obn::camera::TtcodeResponse tt_resp;
+    std::string perr;
+    if (!obn::camera::parse_ttcode_response(resp.body, tt_resp, &perr)) {
+        OBN_WARN("camera_url(remote): ttcode JSON parse failed: %s", perr.c_str());
+        return {};
+    }
+
+    if (!tt_resp.type.empty() && tt_resp.type != "tutk") {
+        OBN_WARN("camera_url(remote): dev=%s uses non-tutk transport '%s'; "
+                 "third-party Agora liveview mint is out of scope for this ABI",
+                 serial.c_str(), tt_resp.type.c_str());
+        return {};
+    }
+
+    if (tt_resp.uid.empty()) {
+        OBN_WARN("camera_url(remote): no ttcode/uid for dev=%s in response", serial.c_str());
+        return {};
+    }
+
+    if (tt_resp.region.empty()) tt_resp.region = "us";
+
+    // Proactively send signed and encrypted prepare command so printer starts tutk_server
+    {
+        obn::json::Object lv_obj;
+        lv_obj["command"]     = obn::json::Value(std::string("prepare"));
+        lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+        lv_obj["ttcode"]      = obn::json::Value(tt_resp.uid);
+        lv_obj["authkey"]     = obn::json::Value(tt_resp.authkey);
+        lv_obj["passwd"]      = obn::json::Value(tt_resp.passwd);
+        lv_obj["region"]      = obn::json::Value(tt_resp.region);
+
+        obn::json::Object new_root;
+        new_root["liveview"] = obn::json::Value(std::move(lv_obj));
+        const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+        OBN_INFO("camera_url(remote): dispatching liveview prepare for dev=%s uid=%s",
+                 serial.c_str(), tt_resp.uid.c_str());
+        int rc = send_message(serial, req_json, /*qos=*/0);
+        OBN_INFO("camera_url(remote): liveview prepare dev=%s rc=%d",
+                 serial.c_str(), rc);
+    }
+
+    std::string turl = obn::camera::build_tutk_url(
+        tt_resp.uid, tt_resp.authkey, tt_resp.passwd, tt_resp.region);
+    OBN_INFO("camera_url(remote): built tutk url for dev=%s uid=%.20s region=%s",
+             serial.c_str(), tt_resp.uid.c_str(), tt_resp.region.c_str());
+    return turl;
 }
 
 void Agent::notify_message(const std::string& dev_id, const std::string& msg)
