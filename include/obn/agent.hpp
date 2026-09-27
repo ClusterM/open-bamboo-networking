@@ -468,10 +468,22 @@ private:
     void harvest_developer_mode(const std::string& dev_id,
                                 const std::string& json);
 
-    // Records the printer's ipcam.tutk_server status ("enable" / "disable")
-    // into tutk_server_ready_by_dev_.
+    // Records the printer's print.ipcam.tutk_server status ("enable" /
+    // "disable") into tutk_server_ready_by_dev_ and the time of the last
+    // liveview.prepare "succeed" into liveview_prepared_at_; wakes
+    // wait_tutk_ready(). Cheap substring prefilter; full JSON parse only on
+    // candidate frames.
     void harvest_tutk_server_status(const std::string& dev_id,
                                     const std::string& json);
+
+    // Blocks until the printer reports it can take a TUTK session: either a
+    // liveview.prepare "succeed" newer than `since` (the reply to the
+    // cloud's prepare that follows a /user/ttcode mint) or tutk_server
+    // "enable". Returns false on timeout; the URL is still usable then, the
+    // first IOTC connect may just fail with -90 while the server starts.
+    bool wait_tutk_ready(const std::string& dev_id,
+                         std::chrono::steady_clock::time_point since,
+                         std::chrono::milliseconds timeout);
 
     // Whether outbound signed print fields should be treated as Developer
     // Mode (keep cleartext url/param) vs secured (drop cleartext, *_enc only).
@@ -585,7 +597,12 @@ private:
     // developer_mode_effective(), which falls back to a key-material default
     // until the first fun frame arrives. See research/10.03-mqtt-field-encryption.md.
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
+    // TUTK readiness per dev_id, see harvest_tutk_server_status(). Guarded
+    // by mu_; tutk_ready_cv_ is notified on every update.
     std::map<std::string, bool>                 tutk_server_ready_by_dev_;
+    std::map<std::string, std::chrono::steady_clock::time_point>
+                                                liveview_prepared_at_;
+    std::condition_variable                     tutk_ready_cv_;
 
     // Devices seen on the current cloud session (first report flips them in).
     // disconnect_cloud drains this set to release the RSA pubkeys learned

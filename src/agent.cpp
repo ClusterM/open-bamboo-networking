@@ -1202,25 +1202,51 @@ bool Agent::developer_mode_effective(const std::string& dev_id) const
 void Agent::harvest_tutk_server_status(const std::string& dev_id,
                                        const std::string& json)
 {
-    if (json.find("\"ipcam\"") == std::string::npos) return;
-    bool ready = false;
-    bool found = false;
-    if (json.find("\"tutk_server\":\"enable\"") != std::string::npos) {
-        ready = true;
-        found = true;
-    } else if (json.find("\"tutk_server\":\"disable\"") != std::string::npos) {
-        ready = false;
-        found = true;
-    }
-    if (!found) return;
+    if (json.find("\"tutk_server\"") == std::string::npos &&
+        json.find("\"liveview\"") == std::string::npos)
+        return;
 
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = tutk_server_ready_by_dev_.find(dev_id);
-    const bool changed = (it == tutk_server_ready_by_dev_.end() || it->second != ready);
-    tutk_server_ready_by_dev_[dev_id] = ready;
-    if (changed) {
-        OBN_INFO("dev=%s tutk_server status: %s", dev_id.c_str(), ready ? "enable" : "disable");
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+
+    const auto& server = root->find("print.ipcam.tutk_server");
+    const bool has_server = server.is_string() &&
+        (server.as_string() == "enable" || server.as_string() == "disable");
+    const bool prepared = root->find("liveview.command").as_string() == "prepare" &&
+                          root->find("liveview.result").as_string() == "succeed";
+    if (!has_server && !prepared) return;
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (has_server) {
+            const bool ready = server.as_string() == "enable";
+            auto it = tutk_server_ready_by_dev_.find(dev_id);
+            const bool changed = it == tutk_server_ready_by_dev_.end() || it->second != ready;
+            tutk_server_ready_by_dev_[dev_id] = ready;
+            if (changed)
+                OBN_INFO("dev=%s tutk_server status: %s", dev_id.c_str(),
+                         ready ? "enable" : "disable");
+        }
+        if (prepared) {
+            liveview_prepared_at_[dev_id] = std::chrono::steady_clock::now();
+            OBN_INFO("dev=%s liveview.prepare succeed", dev_id.c_str());
+        }
     }
+    tutk_ready_cv_.notify_all();
+}
+
+bool Agent::wait_tutk_ready(const std::string& dev_id,
+                            std::chrono::steady_clock::time_point since,
+                            std::chrono::milliseconds timeout)
+{
+    std::unique_lock<std::mutex> lk(mu_);
+    return tutk_ready_cv_.wait_for(lk, timeout, [&] {
+        auto p = liveview_prepared_at_.find(dev_id);
+        if (p != liveview_prepared_at_.end() && p->second >= since) return true;
+        auto r = tutk_server_ready_by_dev_.find(dev_id);
+        return r != tutk_server_ready_by_dev_.end() && r->second;
+    });
 }
 
 void Agent::maybe_install_app_cert(const std::string& dev_id)
@@ -1494,6 +1520,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     OBN_INFO("camera_url(remote): request dev=%s ver=%s",
              serial.c_str(), dev_version.c_str());
 
+    const auto minted_at = std::chrono::steady_clock::now();
     obn::http::Response resp = obn::http::post_json(url, req_body, hdrs);
     OBN_INFO("camera_url(remote): ttcode POST http=%ld body=%.700s",
              resp.status_code, resp.body.c_str());
@@ -1524,6 +1551,15 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         tt_resp.uid, tt_resp.authkey, tt_resp.passwd, tt_resp.region);
     OBN_INFO("camera_url(remote): built tutk url for dev=%s uid=%.20s region=%s",
              serial.c_str(), tt_resp.uid.c_str(), tt_resp.region.c_str());
+
+    // The cloud answers the mint by pushing liveview.prepare to the printer;
+    // its tutk_server only accepts sessions once that went through. Stock
+    // hands the URL to Studio right after the prepare reply, so do the same.
+    if (wait_tutk_ready(serial, minted_at, std::chrono::seconds(5)))
+        OBN_INFO("camera_url(remote): dev=%s ready for TUTK", serial.c_str());
+    else
+        OBN_WARN("camera_url(remote): dev=%s no liveview.prepare / tutk_server enable "
+                 "within 5s; returning the URL anyway", serial.c_str());
     return turl;
 }
 
