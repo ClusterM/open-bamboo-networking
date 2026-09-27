@@ -2,7 +2,8 @@
 
 // A standard, Mozilla-derived root CA bundle (the same one curl.se
 // publishes at https://curl.se/ca/cacert.pem, vendored at
-// resources/cacert.pem and compiled in by cmake/EmbedCloudCaBundle.cmake).
+// resources/cacert.pem and compiled in by the top-level CMakeLists.txt via
+// cmake/cloud_ca_bundle_data.cpp.in).
 //
 // Why this exists: on Windows, vcpkg's static OpenSSL build ships no
 // default trust store, so mosquitto has nothing to validate the cloud

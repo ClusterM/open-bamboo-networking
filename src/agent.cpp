@@ -2735,7 +2735,7 @@ int Agent::connect_cloud()
     //     DigiCert Global Root G2) -- it needs a normal CA bundle, not
     //     anything Bambu-specific. Write out the vendored bundle (see
     //     cloud_ca_bundle.hpp) and use that, with full chain + hostname
-    //     verification (CloudSession::configure() no longer skips either
+    //     verification (CloudSession::start() no longer skips either
     //     check now that this hands it a trust anchor that actually
     //     validates the real chain).
     std::string cloud_ca;
