@@ -538,8 +538,15 @@ OBN_ABI ft_err ft_tunnel_start_connect(FT_TunnelHandle* h, ft_tunnel_connect_cb 
     t->conn_user = user;
 
     if (t->is_lan) {
-        std::lock_guard<std::mutex> lk(t->lan_mu);
-        if (std::string err = connect_lan_tunnel(t); !err.empty()) {
+        std::string err;
+        {
+            std::lock_guard<std::mutex> lk(t->lan_mu);
+            err = connect_lan_tunnel(t);
+        }
+        // Never call Studio's callbacks under lan_mu: a failed connect makes
+        // FileTransferObject fail its pending requests, which can reach
+        // reset_locked() -> ft_tunnel_shutdown() and re-lock lan_mu.
+        if (!err.empty()) {
             OBN_WARN("ft: start_connect: %s", err.c_str());
             if (cb) cb(user, /*ok=*/1, /*err=*/FT_EIO, err.c_str());
             if (t->status_cb) {
