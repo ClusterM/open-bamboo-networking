@@ -39,3 +39,7 @@ debug_*.log.*
 *.pem
 *.key
 *cert_id.txt
+# ...except the vendored public root CA bundle we compile in (see
+# include/obn/cloud_ca_bundle.hpp) - it's curl.se's public cacert.pem,
+# not a secret.
+!resources/cacert.pem
