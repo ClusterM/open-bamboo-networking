@@ -417,11 +417,10 @@ public:
     // Studio then shows its normal "connection failed" state.
     std::string camera_url_for(const std::string& dev_id);
     // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
-    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode,
-    // proactively dispatches signed/encrypted prepare command to the printer,
-    // and returns "bambu:///tutk?uid=...".
+    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode
+    // and returns "bambu:///tutk?uid=...". The cloud itself pushes
+    // liveview.prepare to the printer in response to that POST.
     std::string remote_camera_url(const std::string& dev_id);
-    void rescue_cloud_liveview(const std::string& dev_id, const std::string& json);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
     // Bearer + optional Studio certification headers for api.bambulab.com.
@@ -470,8 +469,7 @@ private:
                                 const std::string& json);
 
     // Records the printer's ipcam.tutk_server status ("enable" / "disable")
-    // into tutk_server_ready_by_dev_ to prevent unnecessary liveview.prepare
-    // commands that restart a running server.
+    // into tutk_server_ready_by_dev_.
     void harvest_tutk_server_status(const std::string& dev_id,
                                     const std::string& json);
 
