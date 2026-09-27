@@ -1386,11 +1386,13 @@ void Agent::harvest_media_caps(const std::string& dev_id,
     if (!root) return;
     const std::string url = root->find("print.ipcam.rtsp_url").as_string();
     // Firmware reports "disable" when LAN liveview is off and an
-    // rtsps://... URL when it is on (DeviceManager.cpp keys LVL_Rtsps
-    // off the same prefix test).
+    // rtsps://... URL when it is on (DeviceManager.cpp keys LVL_Disable /
+    // LVL_Rtsps off the same values). "off" replaces a stale rtsps latch
+    // when the user flips the printer's LAN Only Liveview toggle.
     std::string proto;
     if (url.rfind("rtsps", 0) == 0)     proto = "rtsps";
     else if (url.rfind("rtsp", 0) == 0) proto = "rtsp";
+    else if (url == "disable")          proto = "off";
     if (!proto.empty()) {
         std::lock_guard<std::mutex> lk(mu_);
         std::string& latched = lan_lv_proto_by_dev_[dev_id];
@@ -1492,6 +1494,13 @@ std::string Agent::camera_url_for(const std::string& dev_id)
                     + code;
     if (!lv.empty()) url += "&lv=" + lv;
     return url;
+}
+
+bool Agent::lan_liveview_off(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = lan_lv_proto_by_dev_.find(dev_id);
+    return it != lan_lv_proto_by_dev_.end() && it->second == "off";
 }
 
 std::string Agent::remote_camera_url(const std::string& dev_id)

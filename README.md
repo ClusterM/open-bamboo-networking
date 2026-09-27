@@ -466,7 +466,7 @@ Spaces around `=` are optional.
 | --- | --- | --- |
 | `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
 | `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot shown in the device panel when live view is off. |
-| `prefer_rtsp` | `0` | For a cloud-bound printer (with `block_cloud = 0`), use the local RTSP(S) / :6000 camera stream instead of TUTK when the printer answers on LAN. If LAN is down and the slicer key is present, fall back to TUTK. Default matches the stock plugin (TUTK). Without the slicer key TUTK is unavailable. |
+| `prefer_rtsp` | `0` | For a cloud-bound printer (with `block_cloud = 0`), use the local RTSP(S) / :6000 camera stream instead of TUTK when the printer answers on LAN. If LAN is down or the printer reports "LAN Only Liveview" off, and the slicer key is present, fall back to TUTK. Default matches the stock plugin (TUTK). Without the slicer key TUTK is unavailable. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
 
 **MQTT push_status patches** (all off by default; enable only if your model needs it):

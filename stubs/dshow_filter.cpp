@@ -1372,6 +1372,11 @@ HRESULT STDMETHODCALLTYPE BambuSourceFilter::Load(LPCOLESTR lpwszFileName,
         "dshow: parsed scheme=%d host=%s port=%d user=%s path=%s",
         static_cast<int>(pu.scheme), pu.host.c_str(), pu.port,
         pu.user.c_str(), pu.path.c_str());
+    if (pu.scheme == UrlScheme::Local && pu.lv == "off") {
+        log_at(LL_ERROR, kNoLogger, nullptr,
+            "dshow: LAN Only Liveview is off on the printer; no LAN video");
+        return E_FAIL;
+    }
     pu.mjpeg = pu.scheme == UrlScheme::Local;
     std::unique_ptr<obn::camera::TutkCameraSource> tutk;
     if (pu.scheme == UrlScheme::Tutk) {

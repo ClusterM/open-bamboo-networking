@@ -2117,6 +2117,16 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
         return rc;
     }
 
+    // lv=off: the printer reported LAN Only Liveview off. :6000 only
+    // serves CTRL then; an MJPEG auth there reads a short non-JPEG reply.
+    if (t->url.scheme == Scheme::Local && !t->ctrl_mode && t->url.lv == "off") {
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_StartStream: LAN Only Liveview is off on the printer");
+        if (!t->url.device.empty() && fallback_to_tutk(t)) return open_tutk(t);
+        set_last_error("LAN Only Liveview is off on the printer");
+        return -1;
+    }
+
     if (t->url.scheme == Scheme::Tutk)
         return t->tutk_source ? Bambu_success : open_tutk(t);
     if (t->url.scheme == Scheme::Local && !t->ssl) return -1;

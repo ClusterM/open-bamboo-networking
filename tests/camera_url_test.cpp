@@ -151,6 +151,13 @@ static int test_parse_local_camera_url()
     }
     {
         obn::camera::LocalCameraUrl u;
+        CHECK(obn::camera::parse_local_camera_url(
+            "bambu:///local/1.2.3.4?port=6000&user=bblp&lv=off", u));
+        CHECK(u.video_port == 0);
+        CHECK(u.lv == "off");
+    }
+    {
+        obn::camera::LocalCameraUrl u;
         CHECK(!obn::camera::parse_local_camera_url("bambu:///tutk?uid=x", u));
     }
     return 0;
