@@ -110,15 +110,16 @@ int CloudSession::start(ConnectedCb on_connected,
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
 
+    std::shared_ptr<mqtt::Client> client;
     try {
-        client_ = std::make_unique<mqtt::Client>(make_client_id(user_id));
+        client = std::make_shared<mqtt::Client>(make_client_id(user_id));
     } catch (const std::exception& e) {
         OBN_ERROR("cloud mqtt::Client ctor failed: %s", e.what());
         started_.store(false, std::memory_order_release);
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
     }
 
-    client_->set_on_connect([this](int rc) {
+    client->set_on_connect([this](int rc) {
         int reason = 0;
         int status = map_connack_to_status(rc, reason);
         if (rc == 0) {
@@ -146,7 +147,7 @@ int CloudSession::start(ConnectedCb on_connected,
         }
     });
 
-    client_->set_on_disconnect([this](int rc) {
+    client->set_on_disconnect([this](int rc) {
         connected_.store(false, std::memory_order_release);
         OBN_WARN("cloud mqtt disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
         ConnectedCb cb;
@@ -164,7 +165,7 @@ int CloudSession::start(ConnectedCb on_connected,
         }
     });
 
-    client_->set_on_message([this](const mqtt::Message& msg) {
+    client->set_on_message([this](const mqtt::Message& msg) {
         // Topic is device/<dev_id>/report. Pull the dev_id out; any
         // other topic shape we ignore (shouldn't happen - we only ever
         // subscribe to report topics).
@@ -214,10 +215,19 @@ int CloudSession::start(ConnectedCb on_connected,
              cfg.host.c_str(), cfg.port, user_id.c_str(), token.size(),
              verify ? 1 : 0);
 
-    int rc = client_->connect(cfg);
+    // Published before connect(): the CONNACK callback subscribes via client_.
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client_ = client;
+    }
+    int rc = client->connect(cfg);
     if (rc != MOSQ_ERR_SUCCESS) {
         OBN_ERROR("cloud mqtt connect_async rc=%d (%s)",
                   rc, mqtt::Client::err_str(rc));
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            client_.reset();
+        }
         started_.store(false, std::memory_order_release);
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
     }
@@ -227,10 +237,15 @@ int CloudSession::start(ConnectedCb on_connected,
 void CloudSession::stop()
 {
     if (!started_.exchange(false, std::memory_order_acq_rel)) return;
-    if (client_) {
-        client_->disconnect();
-        client_.reset();
+    std::shared_ptr<mqtt::Client> client;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client = std::move(client_);
     }
+    // Joins the loop thread, so mu_ must not be held: its callbacks take it.
+    // A publisher still holding a snapshot keeps the object alive; its final
+    // release is then a plain mosquitto_destroy.
+    if (client) client->disconnect();
     connected_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lk(mu_);
     active_.clear();
@@ -300,11 +315,16 @@ int CloudSession::publish(const std::string& dev_id,
                           const std::string& json_str,
                           int qos)
 {
-    if (!client_ || !connected_.load(std::memory_order_acquire)) {
+    std::shared_ptr<mqtt::Client> client;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        client = client_;
+    }
+    if (!client || !connected_.load(std::memory_order_acquire)) {
         OBN_WARN("cloud mqtt: publish to %s while disconnected", dev_id.c_str());
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
-    int rc = client_->publish(request_topic_(dev_id), json_str, qos, /*retain=*/false);
+    int rc = client->publish(request_topic_(dev_id), json_str, qos, /*retain=*/false);
     if (rc != MOSQ_ERR_SUCCESS) {
         OBN_WARN("cloud mqtt: publish to %s rc=%d (%s)",
                  dev_id.c_str(), rc, mqtt::Client::err_str(rc));

@@ -64,6 +64,7 @@ public:
 private:
     std::string report_topic_() const;
     std::string request_topic_() const;
+    std::shared_ptr<mqtt::Client> client_snapshot_() const;
 
     std::string dev_id_;
     std::string dev_ip_;
@@ -72,7 +73,10 @@ private:
     bool        use_ssl_;
     std::string ca_file_;
 
-    std::unique_ptr<mqtt::Client> client_;
+    // Shared so publish_json()/is_connected() on another thread keep the
+    // client alive while disconnect() drops it.
+    mutable std::mutex            client_mu_;
+    std::shared_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
     // Set on the first successful CONNACK. Disconnects before that are
@@ -545,7 +549,13 @@ private:
     std::string        remembered_machine_;
     std::map<std::string, std::string> extra_http_headers_;
 
-    std::unique_ptr<LanSession> lan_session_;
+    // lan_session_, discovery_ and cloud_session_ are shared so a caller can
+    // copy one under mu_ and keep using it after unlocking, while another
+    // thread swaps it out. Whoever takes one out of the member must call
+    // disconnect()/stop() itself: that joins the object's network thread, so
+    // the last release - possibly on some other thread - is then trivial and
+    // never lands on the object's own thread.
+    std::shared_ptr<LanSession> lan_session_;
 
     // Deferred disconnect for mqtt_keep_connection: instead of tearing down
     // the session immediately, we wait a few seconds for a reconnect with
@@ -561,8 +571,8 @@ private:
     // session right away, so the printer gets a clean MQTT DISCONNECT while we
     // are still alive to send it.
     void shutdown_lan_session();
-    std::unique_ptr<ssdp::Discovery> discovery_;
-    std::unique_ptr<CloudSession>   cloud_session_;
+    std::shared_ptr<ssdp::Discovery> discovery_;
+    std::shared_ptr<CloudSession>   cloud_session_;
     // Lazy localhost HTTP server that hands cover PNGs to Studio's
     // wxWebRequest. Only spun up when we first mint a synthetic
     // subtask id; destructor joins its accept loop.

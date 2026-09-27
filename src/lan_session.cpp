@@ -85,8 +85,9 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     OBN_INFO("LanSession start dev=%s ip=%s user=%s ssl=%d",
              dev_id_.c_str(), dev_ip_.c_str(), username_.c_str(), use_ssl_);
 
+    std::shared_ptr<mqtt::Client> client;
     try {
-        client_ = std::make_unique<mqtt::Client>(make_client_id());
+        client = std::make_shared<mqtt::Client>(make_client_id());
     } catch (const std::exception& e) {
         OBN_ERROR("LanSession mqtt::Client ctor failed: %s", e.what());
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
@@ -95,14 +96,17 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
         return BAMBU_NETWORK_ERR_CONNECT_FAILED;
     }
 
-    client_->set_on_connect([this](int rc) {
+    // The client owns its callbacks, so it is alive whenever one runs; use the
+    // raw pointer rather than client_, which disconnect() may be clearing.
+    mqtt::Client* const raw_client = client.get();
+    client->set_on_connect([this, raw_client](int rc) {
         if (rc == 0) {
             // Subscribe to the printer's report topic as soon as we are
             // connected; the printer answers LAN command requests by pushing
             // status updates to this topic.
             ever_connected_.store(true, std::memory_order_release);
             OBN_INFO("LanSession connected, subscribing to %s", report_topic_().c_str());
-            client_->subscribe(report_topic_(), 0);
+            raw_client->subscribe(report_topic_(), 0);
             if (on_connected_) on_connected_(BBL::ConnectStatusOk, {});
         } else {
             OBN_WARN("LanSession mqtt connect failed rc=%d (%s)",
@@ -114,7 +118,7 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
         }
     });
 
-    client_->set_on_disconnect([this](int rc) {
+    client->set_on_disconnect([this](int rc) {
         OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
         // libmosquitto uses keepalive as a connect timeout. On a P1 that is
         // still holding a ghost session the first TLS handshake sits there
@@ -133,7 +137,7 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
         }
     });
 
-    client_->set_on_message([this](const mqtt::Message& msg) {
+    client->set_on_message([this](const mqtt::Message& msg) {
         OBN_DEBUG("LanSession msg dev=%s bytes=%zu",
                   dev_id_.c_str(), msg.payload.size());
         if (on_message_) on_message_(dev_id_, msg.payload);
@@ -171,7 +175,11 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
              dev_id_.c_str(),
              cfg.tls_insecure ? 1 : 0);
 
-    int rc = client_->connect(cfg);
+    {
+        std::lock_guard<std::mutex> lk(client_mu_);
+        client_ = client;
+    }
+    int rc = client->connect(cfg);
     if (rc != 0) {
         OBN_ERROR("mqtt connect to %s:%d failed rc=%d (%s)",
                   cfg.host.c_str(), cfg.port, rc, mqtt::Client::err_str(rc));
@@ -179,24 +187,36 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
     return map_mqtt_err(rc);
 }
 
+std::shared_ptr<mqtt::Client> LanSession::client_snapshot_() const
+{
+    std::lock_guard<std::mutex> lk(client_mu_);
+    return client_;
+}
+
 int LanSession::publish_json(const std::string& json_str, int qos)
 {
-    if (!client_) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    int rc = client_->publish(request_topic_(), json_str, qos, /*retain=*/false);
+    auto client = client_snapshot_();
+    if (!client) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    int rc = client->publish(request_topic_(), json_str, qos, /*retain=*/false);
     return rc == MOSQ_ERR_SUCCESS ? BAMBU_NETWORK_SUCCESS : BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
 }
 
 bool LanSession::is_connected() const
 {
-    return client_ && client_->is_connected();
+    auto client = client_snapshot_();
+    return client && client->is_connected();
 }
 
 int LanSession::disconnect()
 {
-    if (client_) {
-        client_->disconnect();
-        client_.reset();
+    std::shared_ptr<mqtt::Client> client;
+    {
+        std::lock_guard<std::mutex> lk(client_mu_);
+        client = std::move(client_);
     }
+    // Joins the loop thread. A publisher still holding a snapshot keeps the
+    // object alive; its final release is then a plain mosquitto_destroy.
+    if (client) client->disconnect();
     return BAMBU_NETWORK_SUCCESS;
 }
 

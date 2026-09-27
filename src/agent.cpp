@@ -132,7 +132,7 @@ void Agent::schedule_deferred_disconnect()
 
             OBN_INFO("mqtt_keep_connection: no reconnect within %ds, disconnecting",
                      static_cast<int>(kMqttKeepReconnectGracePeriod.count()));
-            std::unique_ptr<LanSession> session;
+            std::shared_ptr<LanSession> session;
             {
                 std::lock_guard<std::mutex> mlk(mu_);
                 session = std::move(lan_session_);
@@ -149,7 +149,7 @@ void Agent::schedule_deferred_disconnect()
             std::lock_guard<std::mutex> lk(deferred_dc_mu_);
             deferred_dc_active_ = false;
         }
-        std::unique_ptr<LanSession> session;
+        std::shared_ptr<LanSession> session;
         {
             std::lock_guard<std::mutex> mlk(mu_);
             session = std::move(lan_session_);
@@ -184,7 +184,7 @@ void Agent::shutdown_lan_session()
     // frees the session slot while we can still write to the socket (#38).
     cancel_deferred_disconnect();
 
-    std::unique_ptr<LanSession> session;
+    std::shared_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
         session = std::move(lan_session_);
@@ -231,7 +231,7 @@ int Agent::connect_printer(std::string dev_id,
     // session cleanly so we don't leak MQTT threads.
     bool switching_printer = false;
     {
-        std::unique_ptr<LanSession> prev;
+        std::shared_ptr<LanSession> prev;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (lan_session_ && lan_session_->dev_id() != dev_id) {
@@ -239,9 +239,9 @@ int Agent::connect_printer(std::string dev_id,
             }
             prev = std::move(lan_session_);
         }
-        // prev.reset() happens outside the lock; destructor joins the MQTT
-        // loop thread which may call back into notify_local_connected under
-        // mu_.
+        // Outside the lock: disconnect() joins the MQTT loop thread, which
+        // may call back into notify_local_connected under mu_.
+        if (prev) prev->disconnect();
     }
 
     if (switching_printer) {
@@ -285,7 +285,7 @@ int Agent::connect_printer(std::string dev_id,
         }
     }
 
-    auto session = std::make_unique<LanSession>(std::move(dev_id),
+    auto session = std::make_shared<LanSession>(std::move(dev_id),
                                                 std::move(dev_ip),
                                                 std::move(username),
                                                 std::move(password),
@@ -305,12 +305,17 @@ int Agent::connect_printer(std::string dev_id,
     if (rc == BAMBU_NETWORK_SUCCESS) {
         std::string password_snap = session->password();
         std::string ip_snap       = session->dev_ip();
+        // Normally empty (prev was taken above); non-empty only if another
+        // connect_printer() raced us in between.
+        std::shared_ptr<LanSession> displaced;
         {
             std::lock_guard<std::mutex> lk(mu_);
             lan_access_code_by_dev_[sess_dev_id] = password_snap;
             lan_ip_by_dev_[sess_dev_id]          = ip_snap;
-            lan_session_                         = std::move(session);
+            displaced    = std::move(lan_session_);
+            lan_session_ = std::move(session);
         }
+        if (displaced) displaced->disconnect();
     }
     return rc;
 }
@@ -333,7 +338,7 @@ int Agent::disconnect_printer()
         }
     }
 
-    std::unique_ptr<LanSession> session;
+    std::shared_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
         session = std::move(lan_session_);
@@ -1302,11 +1307,11 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     if (sign)
         wait_for_app_cert(dev_id, std::chrono::seconds(8));
 
-    LanSession* session = nullptr;
+    std::shared_ptr<LanSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (lan_session_ && lan_session_->dev_id() == dev_id)
-            session = lan_session_.get();
+            session = lan_session_;
     }
     if (!session) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
 
@@ -2207,7 +2212,7 @@ bool Agent::start_discovery(bool enable, bool sending)
     OBN_INFO("start_discovery enable=%d sending=%d", enable, sending);
 
     if (!enable) {
-        std::unique_ptr<ssdp::Discovery> d;
+        std::shared_ptr<ssdp::Discovery> d;
         {
             std::lock_guard<std::mutex> lk(mu_);
             d = std::move(discovery_);
@@ -2244,11 +2249,11 @@ void Agent::dispatch_ssdp_json(std::string json)
 
 bool Agent::ensure_ssdp_discovery_running()
 {
-    ssdp::Discovery* d_ptr = nullptr;
+    std::shared_ptr<ssdp::Discovery> d_ptr;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!discovery_) discovery_ = std::make_unique<ssdp::Discovery>();
-        d_ptr = discovery_.get();
+        if (!discovery_) discovery_ = std::make_shared<ssdp::Discovery>();
+        d_ptr = discovery_;
     }
 
     auto on_msg = [this](std::string json) {
@@ -2703,9 +2708,11 @@ int Agent::connect_cloud()
     BBL::GetSubscribeFailureFn on_sub_fail;
     BBL::QueueOnMainFn       queue;
     BBL::OnPrinterConnectedFn on_printer_connected;
+    std::shared_ptr<CloudSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!cloud_session_) cloud_session_ = std::make_unique<CloudSession>();
+        if (!cloud_session_) cloud_session_ = std::make_shared<CloudSession>();
+        session              = cloud_session_;
         on_server            = on_server_connected_;
         on_msg               = on_message_;
         on_sub_fail          = on_subscribe_failure_;
@@ -2749,8 +2756,8 @@ int Agent::connect_cloud()
                   "lan_tls_skip_verify = 1");
     }
 #endif
-    cloud_session_->configure(cloud_region(), s.user_id, s.access_token,
-                              std::move(cloud_ca));
+    session->configure(cloud_region(), s.user_id, s.access_token,
+                       std::move(cloud_ca));
 
     // Trampoline callbacks onto Studio's UI thread where one is
     // registered. The message callback is intentionally NOT queued:
@@ -2845,12 +2852,12 @@ int Agent::connect_cloud()
         }
     };
 
-    return cloud_session_->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
+    return session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
 }
 
 int Agent::disconnect_cloud()
 {
-    std::unique_ptr<CloudSession> sess;
+    std::shared_ptr<CloudSession> sess;
     std::set<std::string>         devs;
     std::string                   lan_dev;
     {
@@ -2907,11 +2914,11 @@ int Agent::cloud_refresh()
 
 int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
 {
-    CloudSession* sess = nullptr;
+    std::shared_ptr<CloudSession> sess;
     std::vector<std::string> filtered;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_.get();
+        sess = cloud_session_;
         // Skip devices currently covered by LAN telemetry (LAN-priority): the
         // cloud report subscription for them is intentionally deferred. The
         // failback path clears the device from lan_report_priority_ before
@@ -2941,10 +2948,10 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
 {
-    CloudSession* sess = nullptr;
+    std::shared_ptr<CloudSession> sess;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_.get();
+        sess = cloud_session_;
         for (const auto& d : dev_ids) {
             cloud_connected_devs_.erase(d);
             cloud_notified_devs_.erase(d);
@@ -2966,10 +2973,10 @@ void Agent::kickstart_cloud_status()
 {
     if (!obn::config::current().cloud_pushall_on_connect) return;
 
-    CloudSession* sess = nullptr;
+    std::shared_ptr<CloudSession> sess;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_.get();
+        sess = cloud_session_;
     }
     // Only bootstrap devices whose report subscription is already live: a
     // reply to a topic nobody listens on is lost, which is exactly the trap
@@ -3004,10 +3011,10 @@ int Agent::cloud_send_message(const std::string& dev_id,
                               const std::string& json_str,
                               int qos)
 {
-    CloudSession* sess = nullptr;
+    std::shared_ptr<CloudSession> sess;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        sess = cloud_session_.get();
+        sess = cloud_session_;
     }
     if (!sess) {
         OBN_WARN("cloud_send_message: no active cloud session for %s",

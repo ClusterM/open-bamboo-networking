@@ -109,7 +109,9 @@ private:
     std::set<std::string> subscribed_; // the desired set; re-applied on connect.
     std::set<std::string> active_;     // what we've actually issued SUBSCRIBEs for.
 
-    std::unique_ptr<mqtt::Client> client_;
+    // Guarded by mu_. Shared so publish() on another thread keeps the client
+    // alive while stop() drops it.
+    std::shared_ptr<mqtt::Client> client_;
     ConnectedCb                   on_connected_;
     MessageCb                     on_message_;
     SubscribeFailedCb             on_subscribe_failed_;
