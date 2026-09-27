@@ -11,7 +11,9 @@
 #include <fstream>
 
 #if !defined(_WIN32)
+#  include <fcntl.h>
 #  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 
 namespace obn::auth {
@@ -58,6 +60,28 @@ void restrict_user_readwrite(const std::string& path)
         OBN_WARN("auth: chmod(0600) failed on %s: %s",
                  path.c_str(), std::strerror(errno));
     }
+}
+
+// Creates (or truncates) `path` as 0600 before any token is written to it.
+// Opening it with std::ofstream alone would create it with the umask's
+// permissions - typically world-readable - until a later chmod.
+bool precreate_private_file(const std::string& path)
+{
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        OBN_ERROR("auth: open(%s) failed: %s", path.c_str(), std::strerror(errno));
+        return false;
+    }
+    // A stale file from an older build keeps its old mode; O_CREAT's mode
+    // only applies to new files.
+    const bool ok = ::fchmod(fd, S_IRUSR | S_IWUSR) == 0;
+    if (!ok) {
+        OBN_ERROR("auth: fchmod(0600) failed on %s: %s", path.c_str(),
+                  std::strerror(errno));
+    }
+    ::close(fd);
+    return ok;
 }
 #endif
 
@@ -122,6 +146,9 @@ void Store::persist_locked() const
         // semantics on Linux but on Windows it forwards to MoveFileEx
         // without MOVEFILE_REPLACE_EXISTING -- we work around that with an
         // explicit remove on the target).
+#if !defined(_WIN32)
+        if (!precreate_private_file(tmp)) return;
+#endif
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out.good()) {
             OBN_ERROR("auth: open(%s) failed: %s", tmp.c_str(), std::strerror(errno));
@@ -160,9 +187,6 @@ void Store::persist_locked() const
         }
         out.close();
     }
-#if !defined(_WIN32)
-    restrict_user_readwrite(tmp);
-#endif
 #if defined(_WIN32)
     // Windows MoveFileEx semantics through std::filesystem::rename do not
     // overwrite by default. Remove the destination first so the rename
@@ -179,9 +203,8 @@ void Store::persist_locked() const
         fs::remove(tmp, rmec);
         return;
     }
-#if !defined(_WIN32)
-    restrict_user_readwrite(path_);
-#endif
+    // No chmod needed: rename() keeps the 0600 mode the temp file was
+    // created with.
 }
 
 void Store::set(Session s)

@@ -11,6 +11,10 @@
 #include <fstream>
 #include <string>
 
+#if !defined(_WIN32)
+#  include <sys/stat.h>
+#endif
+
 namespace fs = std::filesystem;
 
 #define EXPECT(r, cond)                                              \
@@ -160,9 +164,43 @@ void test_clear_resets_beta(Result& r)
     EXPECT(r, store.snapshot().access_token.empty());
 }
 
+#if !defined(_WIN32)
+// The token file must be 0600 without relying on a chmod after the tokens are
+// already on disk - including when a stale, world-readable .tmp is lying
+// around from an older build.
+void test_persist_is_private(Result& r)
+{
+    std::string path = tmp_path("perms");
+    std::string tmp  = path + ".tmp";
+    fs::remove(path);
+    { std::ofstream(tmp) << "stale"; }
+    fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write |
+                         fs::perms::group_read | fs::perms::others_read);
+
+    const mode_t old_umask = ::umask(022);
+    {
+        obn::auth::Store store(path);
+        obn::auth::Session s;
+        s.access_token = "secret";
+        s.user_id      = "1";
+        store.set(s);
+    }
+    ::umask(old_umask);
+
+    struct stat st{};
+    EXPECT(r, ::stat(path.c_str(), &st) == 0);
+    EXPECT(r, (st.st_mode & 0777) == 0600);
+    EXPECT(r, !fs::exists(tmp));
+    fs::remove(path);
+}
+#endif
+
 int main()
 {
     Result r;
+#if !defined(_WIN32)
+    test_persist_is_private(r);
+#endif
     test_firmware_beta_default(r);
     test_firmware_beta_persist_true(r);
     test_firmware_beta_persist_false(r);
