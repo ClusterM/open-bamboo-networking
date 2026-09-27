@@ -406,14 +406,14 @@ public:
     void note_device_lan_ip(const std::string& dev_id,
                             const std::string& ip);
     // LAN route for bambu_network_get_camera_url (used instead of TUTK
-    // when prefer_rtsp is set or cloud credentials are unavailable). When the printer's LAN IP (SSDP / connect_printer) and
-    // access code (connect_printer / cloud dev_access_code) are both known
-    // we return "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>"
-    // instead, so Studio's PrinterFileSystem (file browser), the device
-    // image flow (mem:/N snapshot) and — with the lv=rtsps hint handled in
-    // libBambuSource — liveview all run over the local network even while
-    // the printer is cloud-paired. Returns "" when either piece is missing;
-    // Studio then shows its normal "connection failed" state.
+    // when prefer_rtsp is set and the printer answers a TCP probe, or when
+    // cloud credentials are unavailable). When the printer's LAN IP (SSDP /
+    // connect_printer) and access code (connect_printer / cloud
+    // dev_access_code) are both known we return
+    // "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>" so Studio's
+    // PrinterFileSystem, the device image flow and — with the lv=rtsps
+    // hint — liveview can run over the local network. Returns "" when
+    // either piece is missing.
     std::string camera_url_for(const std::string& dev_id);
     // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
     // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode

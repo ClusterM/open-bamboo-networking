@@ -1,6 +1,7 @@
 #include "obn/camera_url.hpp"
 #include "obn/json_lite.hpp"
 
+#include <cstdlib>
 #include <sstream>
 
 namespace obn::camera {
@@ -120,6 +121,43 @@ std::string build_tutk_url(const std::string& uid,
          + "&authkey=" + url_encode(authkey)
          + "&passwd=" + url_encode(passwd)
          + "&region=" + url_encode(region);
+}
+
+bool parse_local_camera_url(const std::string& url, LocalCameraUrl& out)
+{
+    out = LocalCameraUrl{};
+    static const char kPfx[] = "bambu:///local/";
+    constexpr size_t kPfxLen = sizeof(kPfx) - 1;
+    if (url.size() <= kPfxLen || url.compare(0, kPfxLen, kPfx) != 0) return false;
+
+    const size_t q = url.find('?', kPfxLen);
+    out.ip = url.substr(kPfxLen, q == std::string::npos ? std::string::npos : q - kPfxLen);
+    if (!out.ip.empty() && out.ip.back() == '.') out.ip.pop_back();
+    if (out.ip.empty()) return false;
+
+    auto query_val = [&](const char* key) -> std::string {
+        if (q == std::string::npos) return {};
+        const std::string needle = std::string(key) + "=";
+        size_t pos = q + 1;
+        for (;;) {
+            pos = url.find(needle, pos);
+            if (pos == std::string::npos) return {};
+            if (pos == q + 1 || url[pos - 1] == '&') break;
+            pos += needle.size();
+        }
+        const size_t start = pos + needle.size();
+        const size_t end   = url.find('&', start);
+        return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    };
+
+    if (const std::string port = query_val("port"); !port.empty()) {
+        const int n = std::atoi(port.c_str());
+        if (n > 0 && n < 65536) out.ctrl_port = n;
+    }
+    out.lv = query_val("lv");
+    if (out.lv == "rtsps") out.video_port = 322;
+    else if (out.lv == "rtsp") out.video_port = 554;
+    return true;
 }
 
 } // namespace obn::camera

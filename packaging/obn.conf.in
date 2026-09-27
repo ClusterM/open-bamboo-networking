@@ -72,6 +72,9 @@ disable_camera_preview = 0
 # needs "LAN Only Liveview" enabled on the printer for RTSP(S) models.
 # TUTK credentials are only handed out to a signed slicer request, so
 # without the slicer key/certificate the local stream is used regardless.
+# If the printer does not answer on LAN (blocked, off-net, liveview off)
+# the plugin falls back to TUTK when the slicer key is present; otherwise
+# Studio gets a generic "Connection Failed" instead of the LAN IP dialog.
 # With this project's BambuSource the file browser keeps using the local
 # network either way (it does not speak TUTK).
 

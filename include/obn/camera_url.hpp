@@ -38,6 +38,16 @@ std::string build_tutk_url(const std::string& uid,
                            const std::string& passwd,
                            const std::string& region);
 
+// LAN URL minted by camera_url_for: bambu:///local/<ip>?port=6000&…[&lv=rtsps]
+struct LocalCameraUrl {
+    std::string ip;
+    int         ctrl_port  = 6000; // TLS :6000 (CTRL / MJPEG)
+    int         video_port = 0;    // 322 (rtsps) or 554 (rtsp); 0 = MJPEG only
+    std::string lv;
+};
+
+bool parse_local_camera_url(const std::string& url, LocalCameraUrl& out);
+
 // URL-encodes a string according to RFC 3986 unreserved character rules.
 std::string url_encode(const std::string& in);
 

@@ -7,12 +7,64 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/camera_url.hpp"
 #include "obn/config.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
+#include "obn/os_compat.hpp"
 #include "obn/signing.hpp"
+#include "obn/tls_dial.hpp"
 
 using obn::as_agent;
+
+namespace {
+
+// Studio's MediaPlayCtrl treats a non-bambu:/// callback as failed_code=3
+// ("Connection Failed. Please check the network and try again") and does
+// not open the LAN IP/access-code dialog reserved for a local URL that
+// then fails to play.
+constexpr const char* kNoCamera =
+    "liveview unavailable: printer not reachable on LAN and TUTK is not available[3]";
+
+bool cloud_camera_usable(const obn::Agent* a)
+{
+    return !obn::config::current().block_cloud &&
+           !a->user_session_snapshot().access_token.empty() &&
+           obn::signing::slicer_signing_key_present() &&
+           !obn::signing::app_certification_id().empty();
+}
+
+bool tcp_open(const std::string& host, int port, int timeout_ms)
+{
+    const obn::os::socket_t fd = obn::tls::dial(host, port, timeout_ms);
+    if (!obn::os::socket_valid(fd)) return false;
+    obn::os::close_socket(fd);
+    return true;
+}
+
+// Short TCP probe of the :6000 CTRL port and, when lv= says so, the
+// RTSP(S) video port. iptables DROP needs the timeout; REJECT is instant.
+bool lan_camera_reachable(const std::string& lan_url)
+{
+    obn::camera::LocalCameraUrl u;
+    if (!obn::camera::parse_local_camera_url(lan_url, u)) return false;
+    constexpr int kTimeoutMs = 400;
+    if (tcp_open(u.ip, u.ctrl_port, kTimeoutMs)) return true;
+    if (u.video_port > 0 && tcp_open(u.ip, u.video_port, kTimeoutMs)) return true;
+    return false;
+}
+
+void deliver_camera_url(const std::function<void(std::string)>& callback,
+                        const std::string& serial, std::string url,
+                        const char* kind)
+{
+    const bool ok = url.size() >= 10 && url.compare(0, 10, "bambu:///") == 0;
+    OBN_INFO("get_camera_url dev=%s -> %s", serial.c_str(),
+             ok ? kind : (url.empty() ? "(none)" : kind));
+    if (callback) callback(std::move(url));
+}
+
+} // namespace
 
 // Studio only calls this for a cloud-bound printer (MediaPlayCtrl::Play,
 // RequestFileSystemUrl, MediaFilePanel::fetchUrl); in LAN-only mode it builds
@@ -24,12 +76,16 @@ using obn::as_agent;
 // Like the stock plugin we mint TUTK by default: POST /user/ttcode returns
 // the printer's TUTK credentials and makes the cloud push liveview.prepare,
 // which starts the printer's tutk_server. The LAN URL is used instead when
-// prefer_rtsp is set, when the cloud is unusable (block_cloud, no session)
-// or when the mint fails, provided the printer's IP + access code are known.
-// Studio only checks that the reply starts with "bambu:///", so the file
-// browser (CTRL over :6000), the device-panel snapshot and liveview all work
-// over LAN that way; the lv= hint makes libBambuSource fetch video over
-// RTSP(S) :322 instead of MJPEG :6000 on X1/P1S/P2S printers.
+// prefer_rtsp is set (and the printer answers a short TCP probe), when the
+// cloud is unusable (block_cloud, no session) or when the mint fails,
+// provided the printer's IP + access code are known. If prefer_rtsp is set
+// but LAN is down and TUTK credentials exist, the callback is the TUTK URL.
+// If neither path works the callback is a non-bambu:/// string so Studio
+// shows its generic "Connection Failed" status instead of the LAN IP dialog.
+// Studio only checks that a success reply starts with "bambu:///", so the
+// file browser (CTRL over :6000), the device-panel snapshot and liveview
+// all work over LAN that way; the lv= hint makes libBambuSource fetch video
+// over RTSP(S) :322 instead of MJPEG :6000 on X1/P1S/P2S printers.
 OBN_ABI int bambu_network_get_camera_url(void* agent,
                                          std::string dev_id,
                                          std::function<void(std::string)> callback)
@@ -45,36 +101,62 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     }
 
     std::string lan_url = a->camera_url_for(serial);
-    // /user/ttcode answers 403 without both PoP headers, so without the slicer
-    // key + cert TUTK is out of reach and there is no point trying the mint.
-    const bool cloud_usable = !obn::config::current().block_cloud &&
-                              !a->user_session_snapshot().access_token.empty() &&
-                              obn::signing::slicer_signing_key_present() &&
-                              !obn::signing::app_certification_id().empty();
-    if (!lan_url.empty() && (obn::config::current().prefer_rtsp || !cloud_usable)) {
-        OBN_INFO("get_camera_url dev=%s -> LAN URL (%s)", serial.c_str(),
-                 cloud_usable ? "prefer_rtsp" : "cloud unavailable");
-        if (callback) callback(std::move(lan_url));
-        return BAMBU_NETWORK_SUCCESS;
-    }
+    const bool cloud_usable = cloud_camera_usable(a);
+    const bool prefer_rtsp  = obn::config::current().prefer_rtsp;
 
-    // Cloud URL minting is an HTTP POST. Offload to a worker thread so
-    // Studio's UI / MediaPlayCtrl thread returns immediately (research/08.11.1).
-    // The full packed key goes to the mint: dev_ver and protocols are part of
-    // the /user/ttcode request body.
-    auto mint = [a, dev_id, serial, lan_url, callback]() {
+    // Cloud URL minting is an HTTP POST (and prefer_rtsp may probe LAN).
+    // Offload so Studio's UI / MediaPlayCtrl thread returns immediately.
+    auto work = [a, dev_id, serial, lan_url, callback, cloud_usable, prefer_rtsp]() {
+        if (!lan_url.empty() && prefer_rtsp) {
+            if (lan_camera_reachable(lan_url)) {
+                deliver_camera_url(callback, serial, lan_url, "LAN URL (prefer_rtsp)");
+                return;
+            }
+            OBN_INFO("get_camera_url dev=%s: LAN unreachable, trying TUTK",
+                     serial.c_str());
+            if (cloud_usable) {
+                std::string url = a->remote_camera_url(dev_id);
+                if (!url.empty()) {
+                    deliver_camera_url(callback, serial, std::move(url),
+                                       "TUTK cloud URL (prefer_rtsp fallback)");
+                    return;
+                }
+            }
+            deliver_camera_url(callback, serial, kNoCamera,
+                               "neither LAN nor TUTK");
+            return;
+        }
+
+        if (!lan_url.empty() && !cloud_usable) {
+            if (lan_camera_reachable(lan_url)) {
+                deliver_camera_url(callback, serial, lan_url, "LAN URL (cloud unavailable)");
+                return;
+            }
+            deliver_camera_url(callback, serial, kNoCamera,
+                               "LAN unreachable, TUTK unavailable");
+            return;
+        }
+
         std::string url = a->remote_camera_url(dev_id);
         const char* kind = "TUTK cloud URL";
         if (url.empty() && !lan_url.empty()) {
-            url  = lan_url;
-            kind = "LAN URL (mint failed)";
+            if (lan_camera_reachable(lan_url)) {
+                url  = lan_url;
+                kind = "LAN URL (mint failed)";
+            } else {
+                deliver_camera_url(callback, serial, kNoCamera,
+                                   "mint failed and LAN unreachable");
+                return;
+            }
         }
-        OBN_INFO("get_camera_url dev=%s -> %s", serial.c_str(),
-                 url.empty() ? "(none)" : kind);
-        if (callback) callback(std::move(url));
+        if (url.empty()) {
+            deliver_camera_url(callback, serial, kNoCamera, "no camera URL");
+            return;
+        }
+        deliver_camera_url(callback, serial, std::move(url), kind);
     };
     try {
-        std::thread(std::move(mint)).detach();
+        std::thread(std::move(work)).detach();
     } catch (const std::system_error& e) {
         OBN_WARN("get_camera_url: thread spawn failed (%s)", e.what());
         if (callback) callback(std::string{});

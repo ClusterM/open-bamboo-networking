@@ -312,7 +312,7 @@ This `bambu_networking.so` group only covers the camera URL accessors (cloud TUT
 
 | Function | Status | Notes |
 | --- | :--: | --- |
-| `bambu_network_get_camera_url` | ✅ | Like stock, mints `bambu:///tutk?uid=…&authkey=…&passwd=…&region=…` via `POST /v1/iot-service/api/user/ttcode` on a worker thread (needs the slicer key: the endpoint requires the PoP headers), then waits up to 5 s for the cloud-pushed `liveview.prepare` reply / `tutk_server` enable. Returns the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) instead when `prefer_rtsp` is set, the cloud is unusable (`block_cloud`, no session, no slicer key) or the mint fails, provided IP and access code are known. [research §8.11](research/08.11-camera.md) |
+| `bambu_network_get_camera_url` | ✅ | Like stock, mints `bambu:///tutk?uid=…&authkey=…&passwd=…&region=…` via `POST /v1/iot-service/api/user/ttcode` on a worker thread (needs the slicer key: the endpoint requires the PoP headers), then waits up to 5 s for the cloud-pushed `liveview.prepare` reply / `tutk_server` enable. Returns the printer's **LAN URL** (`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]`) when `prefer_rtsp` is set or the cloud is unusable **and** the printer answers a short TCP probe. If LAN is down and TUTK can be minted, the TUTK URL is returned instead; if neither path works the callback is a non-`bambu:///` string so Studio shows "Connection Failed" rather than the LAN IP dialog. [research §8.11](research/08.11-camera.md) |
 | `bambu_network_get_camera_url_for_golive` | 🔒 | Same as above, for the Go-Live flow. |
 | `bambu_network_get_hms_snapshot` | 🔒 | HMS photo snapshot is cloud-only and requires the same SDK. Callback is invoked with `("", -1)`. |
 

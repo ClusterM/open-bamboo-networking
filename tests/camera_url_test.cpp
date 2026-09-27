@@ -124,12 +124,45 @@ static int test_build_tutk_url()
     return 0;
 }
 
+static int test_parse_local_camera_url()
+{
+    {
+        obn::camera::LocalCameraUrl u;
+        CHECK(obn::camera::parse_local_camera_url(
+            "bambu:///local/10.13.1.30?port=6000&user=bblp&passwd=abc&lv=rtsps", u));
+        CHECK(u.ip == "10.13.1.30");
+        CHECK(u.ctrl_port == 6000);
+        CHECK(u.video_port == 322);
+        CHECK(u.lv == "rtsps");
+    }
+    {
+        obn::camera::LocalCameraUrl u;
+        CHECK(obn::camera::parse_local_camera_url("bambu:///local/192.168.1.5.?port=6000", u));
+        CHECK(u.ip == "192.168.1.5");
+        CHECK(u.ctrl_port == 6000);
+        CHECK(u.video_port == 0);
+    }
+    {
+        obn::camera::LocalCameraUrl u;
+        CHECK(obn::camera::parse_local_camera_url(
+            "bambu:///local/1.2.3.4?user=bblp&lv=rtsp&port=6000", u));
+        CHECK(u.video_port == 554);
+        CHECK(u.lv == "rtsp");
+    }
+    {
+        obn::camera::LocalCameraUrl u;
+        CHECK(!obn::camera::parse_local_camera_url("bambu:///tutk?uid=x", u));
+    }
+    return 0;
+}
+
 int main()
 {
     if (test_parse_packed_dev_key() != 0) return 1;
     if (test_build_ttcode_request_body() != 0) return 1;
     if (test_parse_ttcode_response() != 0) return 1;
     if (test_build_tutk_url() != 0) return 1;
+    if (test_parse_local_camera_url() != 0) return 1;
 
     std::cout << "camera_url_test: ok\n";
     return 0;

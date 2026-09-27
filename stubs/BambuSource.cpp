@@ -117,6 +117,12 @@
 #include <filesystem>
 #if !defined(_WIN32)
 #  include <dlfcn.h>
+#  if defined(__linux__)
+#    include <link.h>
+#  endif
+#  if defined(__APPLE__)
+#    include <mach-o/dyld.h>
+#  endif
 #endif
 
 #include "obn/config.hpp"
@@ -831,6 +837,33 @@ int read_tutk(Tunnel* t, Bambu_Sample* sample)
 // loads it, so a stock plugin (no such symbols) simply disables the fallbacks.
 using GetUrlFn = const char* (*)(const char*);
 
+#if !defined(_WIN32)
+static GetUrlFn lookup_in_handle(void* handle, const char* name)
+{
+    if (!handle) return nullptr;
+    return reinterpret_cast<GetUrlFn>(dlsym(handle, name));
+}
+
+#if defined(__linux__)
+struct PluginLookup {
+    const char* name;
+    GetUrlFn    fn;
+};
+
+static int visit_loaded_plugin(struct dl_phdr_info* info, size_t, void* data)
+{
+    auto* want = static_cast<PluginLookup*>(data);
+    if (!info->dlpi_name || !std::strstr(info->dlpi_name, "bambu_networking"))
+        return 0;
+    void* h = dlopen(info->dlpi_name, RTLD_NOLOAD | RTLD_LAZY);
+    if (!h) return 0;
+    want->fn = lookup_in_handle(h, want->name);
+    dlclose(h);
+    return want->fn ? 1 : 0;
+}
+#endif
+#endif
+
 static GetUrlFn resolve_plugin_url_fn(const char* name)
 {
 #if defined(_WIN32)
@@ -868,7 +901,43 @@ static GetUrlFn resolve_plugin_url_fn(const char* name)
     }
     return nullptr;
 #else
-    return reinterpret_cast<GetUrlFn>(dlsym(RTLD_DEFAULT, name));
+    // Studio dlopens the plugin without RTLD_GLOBAL, so RTLD_DEFAULT often
+    // cannot see obn_get_* — look up the already-loaded module next.
+    if (auto fn = lookup_in_handle(RTLD_DEFAULT, name)) return fn;
+
+    static const char* const kNames[] = {
+        "libbambu_networking.so",
+        "bambu_networking.so",
+        "libbambu_networking.dylib",
+        nullptr
+    };
+    for (int i = 0; kNames[i]; ++i) {
+        if (void* h = dlopen(kNames[i], RTLD_NOLOAD | RTLD_LAZY)) {
+            auto fn = lookup_in_handle(h, name);
+            dlclose(h);
+            if (fn) return fn;
+        }
+    }
+
+#if defined(__linux__)
+    PluginLookup look{name, nullptr};
+    dl_iterate_phdr(visit_loaded_plugin, &look);
+    if (look.fn) return look.fn;
+#endif
+
+#if defined(__APPLE__)
+    const uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* img = _dyld_get_image_name(i);
+        if (!img || !std::strstr(img, "bambu_networking")) continue;
+        if (void* h = dlopen(img, RTLD_NOLOAD | RTLD_LAZY)) {
+            auto fn = lookup_in_handle(h, name);
+            dlclose(h);
+            if (fn) return fn;
+        }
+    }
+#endif
+    return nullptr;
 #endif
 }
 
@@ -876,7 +945,12 @@ static std::string query_plugin(const char* export_name, const std::string& arg)
 {
     if (arg.empty()) return {};
     GetUrlFn fn = resolve_plugin_url_fn(export_name);
-    if (!fn) return {};
+    if (!fn) {
+        log_fmt(nullptr, nullptr,
+                "query_plugin: %s is not exported by the loaded networking plugin",
+                export_name);
+        return {};
+    }
     const char* u = fn(arg.c_str());
     return u ? std::string(u) : std::string{};
 }
@@ -920,6 +994,7 @@ static bool fallback_to_tutk(Tunnel* t)
         log_fmt(t->logger, t->log_ctx,
                 "fallback_to_tutk: failed to resolve TUTK URL for dev=%s",
                 dev_id.c_str());
+        set_last_error("LAN camera is unreachable and TUTK fallback failed");
         return false;
     }
 
@@ -1929,6 +2004,17 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
 
+    // lv=rtsps/rtsp: video starts in Bambu_StartStream, not here. Skip the
+    // :6000 TLS dial so a blocked CTRL port does not fail an RTSP liveview
+    // (or the TUTK fallback that StartStream runs after RTSP fails).
+    if (t->url.scheme == Scheme::Local &&
+        (t->url.lv == "rtsps" || t->url.lv == "rtsp")) {
+        log_fmt(t->logger, t->log_ctx,
+                "Bambu_Open: lv=%s, deferring video to StartStream",
+                t->url.lv.c_str());
+        return Bambu_success;
+    }
+
     // RTSP(S) is so different from MJPG that it gets its own code path
     // (passthrough worker + RTSP handshake); MJPG stays as manual
     // TLS + auth packet below. Both the stock plugin and our passthrough
@@ -2086,7 +2172,11 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     if (t->url.scheme == Scheme::Tutk) {
         return (t->tutk_source && t->tutk_source->is_open()) ? 1 : 0;
     }
-    if (t->url.scheme == Scheme::Local && !t->ssl)      return 0;
+    if (t->url.scheme == Scheme::Local && !t->ssl) {
+        // Open deferred the :6000 dial for lv= RTSP(S) video.
+        if (t->url.lv == "rtsps" || t->url.lv == "rtsp") return 1;
+        return 0;
+    }
     if ((t->url.scheme == Scheme::Rtsps ||
          t->url.scheme == Scheme::Rtsp) && !t->rtsp_pass) return 0;
     return 1; // one video track (MJPEG for local-scheme, AVC1 for RTSP).
