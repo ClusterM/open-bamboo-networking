@@ -377,10 +377,13 @@ bool parse_upload_init_reply(const std::string& wire_json,
     if (raw_kb <= 0 || raw_kb > kMaxChunkSizeKb) return false;
     const std::uint32_t kb = static_cast<std::uint32_t>(raw_kb);
 
+    // Resume offset. A negative value would wrap to ~2^64 and send the
+    // resume-prefix hashing loop reading to EOF before it fails.
+    const std::int64_t raw_offset = reply.find("offset").as_int(0);
+    if (raw_offset < 0) return false;
+
     if (chunk_size_kb) *chunk_size_kb = kb;
-    if (offset) {
-        *offset = static_cast<std::uint64_t>(reply.find("offset").as_int(0));
-    }
+    if (offset) *offset = static_cast<std::uint64_t>(raw_offset);
     return true;
 }
 
