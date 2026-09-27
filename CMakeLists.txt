@@ -465,6 +465,7 @@ set(_obn_bambusource_sources
     src/camera/TutkCameraSource.cpp
     src/camera/tutk/TutkSession.cpp
     src/camera/tutk/IotcClient.cpp
+    src/camera/tutk/Fec.cpp
 )
 if(WIN32)
     list(APPEND _obn_bambusource_sources
@@ -792,6 +793,12 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         stubs/h264_avcc.cpp)
     target_include_directories(h264_avcc_test PRIVATE stubs)
     add_test(NAME h264_avcc COMMAND h264_avcc_test)
+
+    # Reed-Solomon recovery of the TUTK AV transport FEC groups.
+    add_executable(tutk_fec_test tests/tutk_fec_test.cpp
+        src/camera/tutk/Fec.cpp)
+    target_include_directories(tutk_fec_test PRIVATE src/camera/tutk)
+    add_test(NAME tutk_fec COMMAND tutk_fec_test)
 
     # Hermetic unit test for obn::auth::Store persistence, specifically
     # the firmware_beta_open field (profile setting.isFirmwareBetaOpen)

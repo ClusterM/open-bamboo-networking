@@ -1,4 +1,5 @@
 #include "TutkCameraSource.hpp"
+#include "h264_avcc.hpp"
 #include "obn/log.hpp"
 
 #include <chrono>
@@ -92,6 +93,14 @@ void TutkCameraSource::push_frame(const uint8_t* data, int len, int64_t pts_us, 
             if (len >= 2 && data[0] == 0xff && data[1] == 0xd8) {
                 codec_ = Codec::MotionJpeg;
                 jpeg_dimensions(data, (size_t)len, width_, height_);
+            } else {
+                h264::ParameterSets ps;
+                h264::SpsGeometry   geo;
+                h264::extract_parameter_sets(data, (size_t)len, &ps);
+                if (!ps.sps.empty() && h264::parse_sps_geometry(ps.sps.data(), ps.sps.size(), &geo)) {
+                    width_  = geo.width;
+                    height_ = geo.height;
+                }
             }
         }
         if (frames_.size() >= kMaxQueuedFrames) frames_.pop_front();

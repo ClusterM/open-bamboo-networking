@@ -168,6 +168,13 @@ static void set_recv_timeout(obn::net::socket_t fd, int ms)
     set_socket_recv_timeout(fd, ms);
 }
 
+// A 1080p keyframe arrives as a burst of ~150 datagrams.
+static void enlarge_recv_buffer(obn::net::socket_t fd)
+{
+    int size = 2 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+}
+
 // ==========================================================================
 // TransCodePartial — TUTK datagram obfuscation
 // ==========================================================================
@@ -1900,6 +1907,7 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
         OBN_ERROR("iotc relay: socket() failed: %s", strerror(errno));
         return -1;
     }
+    enlarge_recv_buffer(sock);
 
     uint8_t session_token[8];
     {
@@ -2122,6 +2130,7 @@ int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
     }
     int on = 1;
     setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+    enlarge_recv_buffer(sock);
 
     uint8_t session_token[8];
     RAND_bytes(session_token, sizeof(session_token));
