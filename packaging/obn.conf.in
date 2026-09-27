@@ -26,6 +26,10 @@ bambusource_log_file =
 # --- LAN TLS --------------------------------------------------------
 #
 # Skip TLS certificate verification for LAN MQTT/FTPS connections.
+# Despite the name, this also disables certificate and hostname checks on
+# the cloud MQTT connection. Use it as a last resort when cloud MQTT fails
+# TLS verification, e.g. behind a TLS-inspecting corporate proxy or when
+# the CA bundle built into the plugin (Windows) has gone stale.
 
 lan_tls_skip_verify = 0
 

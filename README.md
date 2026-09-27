@@ -456,7 +456,7 @@ Spaces around `=` are optional.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. |
+| `lan_tls_skip_verify` | `0` | Skip TLS certificate verification for LAN MQTT/FTPS connections. Despite the name, also disables certificate and hostname checks for cloud MQTT — a last resort for TLS-inspecting proxies or a stale built-in CA bundle (Windows). |
 | `override_lan_ip` | `0` | Replace the printer's self-reported LAN IP in push_status with the IP used in connect_printer. Enable for NAT / port-forwarding setups where the printer advertises its internal address. |
 | `mqtt_keep_connection` | `1` | Keep the MQTT connection alive across the slicer's internal disconnect/reconnect cycles (e.g. after sending a print job). Avoids 5-30s reconnection delays on printers with limited MQTT session slots. Useful for Orca Slicer. |
 

@@ -2738,12 +2738,15 @@ int Agent::connect_cloud()
     //     verification (CloudSession::start() no longer skips either
     //     check now that this hands it a trust anchor that actually
     //     validates the real chain).
+    //   - lan_tls_skip_verify = 1 disables both checks on every platform,
+    //     for TLS-inspecting proxies or a stale bundle.
     std::string cloud_ca;
 #if defined(_WIN32)
     cloud_ca = obn::tls::ensure_cloud_ca_bundle_file(config_dir());
     if (cloud_ca.empty()) {
         OBN_WARN("connect_cloud: failed to write vendored CA bundle; "
-                  "cloud MQTT connect will likely fail on Windows");
+                  "cloud MQTT connect will likely fail on Windows unless "
+                  "lan_tls_skip_verify = 1");
     }
 #endif
     cloud_session_->configure(cloud_region(), s.user_id, s.access_token,

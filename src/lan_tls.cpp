@@ -274,7 +274,8 @@ void sync_registry_locked()
 void warn_skip_once()
 {
     if (g_skip_warn_logged.exchange(true)) return;
-    OBN_WARN("OBN_SKIP_TLS_VERIFY set — printer TLS verification disabled");
+    OBN_WARN("lan_tls_skip_verify / OBN_SKIP_TLS_VERIFY set — TLS verification "
+             "disabled for printer (LAN) and cloud MQTT connections");
 }
 
 } // namespace

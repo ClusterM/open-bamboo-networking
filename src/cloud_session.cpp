@@ -2,6 +2,7 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
 
@@ -194,16 +195,24 @@ int CloudSession::start(ConnectedCb on_connected,
     cfg.password     = token;
     cfg.use_tls      = true;
     // Cloud broker runs a real, publicly-trusted (DigiCert) cert, so we
-    // always verify both the chain and the hostname. On Windows, ca_file
-    // (below) is Agent::connect_cloud's vendored standard CA bundle
+    // verify both the chain and the hostname. On Windows, ca_file (below)
+    // is Agent::connect_cloud's vendored standard CA bundle
     // (obn::tls::kCloudCaBundlePem) rather than a Bambu-specific one, so
-    // it actually chains -- no need to skip either check here.
-    cfg.tls_insecure = false;
-    cfg.ca_file      = ca_file; // optional override; empty -> system store
-    cfg.keepalive_s  = 60;
+    // it actually chains.
+    //
+    // lan_tls_skip_verify / OBN_SKIP_TLS_VERIFY turns both checks off here
+    // too: it is the escape hatch for a TLS-inspecting proxy whose root is
+    // not in the vendored bundle, or for a bundle that has gone stale.
+    const bool verify         = obn::lan_tls::verify_enabled();
+    cfg.tls_insecure          = !verify;
+    cfg.tls_skip_chain_verify = !verify;
+    cfg.ca_file               = ca_file; // optional override; empty -> system store
+    cfg.keepalive_s           = 60;
 
-    OBN_INFO("cloud mqtt: connecting to %s:%d as u_%s (token=%zu bytes)",
-             cfg.host.c_str(), cfg.port, user_id.c_str(), token.size());
+    OBN_INFO("cloud mqtt: connecting to %s:%d as u_%s (token=%zu bytes, "
+             "tls_verify=%d)",
+             cfg.host.c_str(), cfg.port, user_id.c_str(), token.size(),
+             verify ? 1 : 0);
 
     int rc = client_->connect(cfg);
     if (rc != MOSQ_ERR_SUCCESS) {
