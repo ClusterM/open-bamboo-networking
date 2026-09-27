@@ -521,13 +521,15 @@ static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* p
     return -1;
 }
 
-// 02 04 33 control packet (52 bytes), sent between ClientHello and
-// ServerHello on the off-LAN direct path; the printer echoes it back.
+// xx 04 33 punch control packet (52 bytes): 01 probes a candidate, 02
+// answers a probe, 04 confirms an answer. 02 is also sent between
+// ClientHello and ServerHello on the off-LAN direct path.
 //   [16..35] UID, [36..43] session token, rest zero.
 
 static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
                           const char* uid_upper,
-                          const uint8_t session_token[8])
+                          const uint8_t session_token[8],
+                          uint8_t step = 0x02)
 {
     uint8_t pkt[52];
     memset(pkt, 0, sizeof(pkt));
@@ -536,7 +538,7 @@ static int send_ctrl0x33(obn::net::socket_t sock, const struct sockaddr_in* dst,
     pkt[2] = 0x1c;
     pkt[3] = 0x02;  // flags=0x02 for control packets
     pkt[4] = 0x24;  // payload_len=36 LE
-    pkt[8]  = 0x02; pkt[9]  = 0x04; pkt[10] = 0x33;
+    pkt[8]  = step; pkt[9]  = 0x04; pkt[10] = 0x33;
 
     memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, session_token, 8);
@@ -1658,9 +1660,11 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
                               const char* uid_upper, const char* authkey,
                               const uint8_t session_token[8],
                               struct sockaddr_in* peer_out,
-                              uint32_t* tag_out)
+                              uint32_t* tag_out,
+                              bool* direct_out)
 {
     if (!authkey || !authkey[0]) return false;
+    *direct_out = false;
 
     struct sockaddr_in servers[4];
     int ns = parse_rdv_servers(master_reply, reply_len, servers, 4);
@@ -1762,14 +1766,29 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
             return true;
         }
 
-        // Direct printer punch probe (01 04 33 or 02 04 33) from printer P2P candidate:
-        // Respond with ctrl0x33 to assist punch exchange, but do NOT abort rendezvous loop.
-        // Wait for authoritative relay confirmation (03 03 43) or direct rendezvous (02 06 12).
-        if ((resp[8] == 0x01 || resp[8] == 0x02) && resp[9] == 0x04 && resp[10] == 0x33) {
-            send_ctrl0x33(sock, &src, uid_upper, session_token);
-            OBN_DEBUG("iotc rdv: candidate punch probe %02x 04 33 from %s:%u (probe exchanged, awaiting relay/rendezvous)",
-                      resp[8], inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-            continue;
+        // Punch exchange with a printer candidate: its 01 04 33 probe gets a
+        // 02 answer; its 02 answer to our probe (or its 04 confirmation of
+        // ours) means the path works both ways. Stock then confirms with 04
+        // and runs the session directly against that address, even when
+        // the servers also offer a relay.
+        if (resp[9] == 0x04 && resp[10] == 0x33 && n >= 44 &&
+            memcmp(resp + 16, uid_upper, kUidLen) == 0 &&
+            memcmp(resp + 36, session_token, 8) == 0) {
+            if (resp[8] == 0x01) {
+                send_ctrl0x33(sock, &src, uid_upper, session_token, 0x02);
+                continue;
+            }
+            if (resp[8] != 0x02 && resp[8] != 0x04) continue;
+            if (resp[8] == 0x02) {
+                send_ctrl0x33(sock, &src, uid_upper, session_token, 0x04);
+                send_ctrl0x33(sock, &src, uid_upper, session_token, 0x04);
+            }
+            OBN_INFO("iotc rdv: direct path to the printer at %s:%u",
+                     inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+            *peer_out = src;
+            if (tag_out) *tag_out = 0;
+            *direct_out = true;
+            return true;
         }
 
         // Server challenge (27 02 42): triggers candidate registration 04 08 24 broadcast
@@ -1999,10 +2018,12 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     // reflexive/candidate exchange with the servers the master listed. On success
     // peer_addr is the printer's P2P media address or the rendezvous relay server.
     uint32_t relay_tag = 0;
+    bool     punched   = false;
     if (!got_assignment && master_reply_len > 0) {
         OBN_DEBUG("iotc relay: no direct rendezvous; trying off-LAN candidate exchange");
         if (offlan_rendezvous(sock, master_reply, master_reply_len,
-                              uid_upper, authkey, session_token, &peer_addr, &relay_tag)) {
+                              uid_upper, authkey, session_token, &peer_addr, &relay_tag,
+                              &punched)) {
             got_assignment = true;
             char pip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &peer_addr.sin_addr, pip, sizeof(pip));
@@ -2018,8 +2039,9 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     }
 
     // Punch and run the session against the peer's own address (from the
-    // rendezvous), not the master server. Only send knock if direct P2P.
-    if (ntohs(peer_addr.sin_port) != 3478) {
+    // rendezvous), not the master server. A candidate that completed the
+    // punch exchange needs no further knock.
+    if (!punched && ntohs(peer_addr.sin_port) != 3478) {
         if (send_relay_knock(sock, &peer_addr, uid_upper, session_token, true) != 0) {
             OBN_ERROR("iotc relay: post-assignment KNOCK failed: %s", strerror(errno));
             obn::net::close_socket(sock);
@@ -2215,9 +2237,10 @@ int iotc_send_app_data(IotcConn* rc,
         return -1;
     }
 
-    // Stock keeps the sub-header epoch at 0 on the LAN path.
+    // Stock keeps the sub-header epoch at 0 on direct paths (LAN and
+    // off-LAN P2P).
     int rc_send = send_dtls_packet(rc->sock, &rc->peer,
-                                   rc->is_lan ? 0 : ds.epoch, rc->session_token,
+                                   rc->is_relay ? ds.epoch : 0, rc->session_token,
                                    dtls_rec.data(), dtls_rec.size(),
                                    ds.pkt_seq++, rc->relay_tag);
     if (rc_send != 0) {
