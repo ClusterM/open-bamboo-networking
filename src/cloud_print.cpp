@@ -298,43 +298,7 @@ long long parse_int64_or_zero(const std::string& s)
 // HTTP plumbing
 // ---------------------------------------------------------------
 
-// Compile-time OS identity for X-BBL-OS-Type. The MakerWorld POST /my/task
-// endpoint validates this against the OS the content was uploaded from and
-// rejects a mismatch with HTTP 403, so it must reflect the real platform
-// (an earlier hard-coded "linux" broke Windows/macOS cloud prints).
-constexpr const char* kOsType =
-#if defined(_WIN32)
-    "windows";
-#elif defined(__APPLE__)
-    "macos";
-#else
-    "linux";
-#endif
-
-// Shared X-BBL headers captured from the stock plugin. Cloudflare
-// in front of api.bambulab.com is lenient about missing X-BBL
-// fields, but POST /my/task enforces two by VALUE: X-BBL-Client-Name
-// (must be "BambuStudio" to access the uploaded content) and
-// X-BBL-OS-Type (must match the uploader's OS). See config::client_name.
-std::map<std::string, std::string> bbl_headers(const std::string& access_token,
-                                               const std::string& user_id)
-{
-    const auto& cfg_client_name = obn::config::current().client_name;
-    std::map<std::string, std::string> h;
-    h["Authorization"]        = "Bearer " + access_token;
-    h["Content-Type"]         = "application/json";
-    h["Accept"]               = "application/json";
-    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
-                                                        : cfg_client_name;
-    h["X-BBL-Client-Type"]    = "slicer";
-    h["X-BBL-OS-Type"]        = kOsType;
-    h["X-BBL-Agent-OS-Type"]  = kOsType;
-    h["X-BBL-Language"]       = "en-US";
-    h["X-BBL-Executable-info"]= "{}";
-    if (!user_id.empty())
-        h["X-BBL-Client-ID"] = "slicer:" + user_id + ":obn0";
-    return h;
-}
+using obn::cloud::bbl_headers;
 
 bool status_ok(long code) { return code >= 200 && code < 300; }
 
@@ -729,21 +693,8 @@ int create_task(const std::string& api, const std::string& token,
               "(config client_name=%s) uid=%s",
               hdrs["X-BBL-Client-Name"].c_str(), hdrs["X-BBL-OS-Type"].c_str(),
               obn::config::current().client_name.c_str(), user_id.c_str());
-    // Signing headers are best-effort: when no slicer key/cert is configured
-    // these come back empty, and we omit them rather than send blanks. The
-    // cloud verifies x-bbl-device-security-sign by recovering a recent
-    // timestamp from the signature (current time in ms, raw PKCS#1 v1.5, not
-    // the body); it is only enforced on signed writes.
-    // The HTTP header uses `issuer:serial.lower()`, a DIFFERENT serialization
-    // from the MQTT envelope cert_id (`serial+issuer`). Sending the MQTT form
-    // here gets the write rejected with 403.
-    const std::string cert_id  = obn::signing::app_certification_id();
-    const std::string sec_sign = obn::signing::device_security_sign();
-    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) "
-              "sec_sign_len=%zu",
-              cert_id.c_str(), cert_id.size(), sec_sign.size());
-    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
-    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
+    OBN_DEBUG("cloud_print: create_task PoP hdrs %s",
+              obn::signing::add_pop_headers(hdrs) ? "attached" : "unavailable");
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;

@@ -421,6 +421,16 @@ std::string device_security_sign()
         reinterpret_cast<const unsigned char*>(ts.data()), ts.size());
 }
 
+bool add_pop_headers(std::map<std::string, std::string>& headers)
+{
+    const std::string& cert_id  = app_certification_id();
+    const std::string  sec_sign = device_security_sign();
+    if (cert_id.empty() || sec_sign.empty()) return false;
+    headers["x-bbl-app-certification-id"] = cert_id;
+    headers["x-bbl-device-security-sign"] = sec_sign;
+    return true;
+}
+
 // Blockwise RSA-PKCS#1 v1.5 encryption -> base64. Splits `plaintext` into
 // <=kMaxChunk-byte pieces so the total ciphertext is a concatenation of
 // key-sized blocks (matching the stock plugin's url_enc / param_enc form).

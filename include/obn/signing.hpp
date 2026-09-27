@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <string>
 
 // Forward-declaration matching <openssl/evp.h>; avoids pulling OpenSSL headers
@@ -55,6 +56,13 @@ std::string sign_bytes(const std::string& data);
 // Returns "" when no slicer key is configured (the caller should omit the
 // header rather than fail — it is only enforced on signed writes).
 std::string device_security_sign();
+
+// Adds the proof-of-possession pair to `headers`: x-bbl-app-certification-id
+// (app_certification_id(), `issuer:serial.lower()` — NOT the MQTT cert_id
+// form, which the cloud rejects with 403) and x-bbl-device-security-sign.
+// Leaves `headers` untouched and returns false when the slicer key or cert is
+// missing, so callers never send blank values.
+bool add_pop_headers(std::map<std::string, std::string>& headers);
 
 // Standard base64 encoding (RFC 4648, with padding).
 std::string base64_encode(const unsigned char* data, std::size_t len);

@@ -1455,11 +1455,17 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         return {};
     }
 
-    auto hdrs = cloud_api_http_headers();
-    if (!hdrs.count("Authorization")) {
+    const auto session = user_session_snapshot();
+    if (session.access_token.empty()) {
         OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
         return {};
     }
+    // /user/ttcode answers 403 (code 8) unless X-BBL-Client-Name is
+    // "BambuStudio", X-BBL-OS-Type is present and the PoP pair is attached
+    // (research/06.06).
+    auto hdrs = obn::cloud::bbl_headers(session.access_token, session.user_id);
+    if (!obn::signing::add_pop_headers(hdrs))
+        OBN_WARN("camera_url(remote): no slicer cert/key; /user/ttcode will likely 403");
 
     const auto parsed = obn::camera::parse_packed_dev_key(dev_id);
     const std::string& serial = parsed.serial;

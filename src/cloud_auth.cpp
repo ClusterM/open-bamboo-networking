@@ -64,6 +64,39 @@ std::string web_host(const std::string& region)
     return obn::config::cloud_web_host_for(obn::config::current(), region);
 }
 
+const char* os_type()
+{
+    // POST /my/task rejects an OS mismatch with the uploader with HTTP 403,
+    // so this must reflect the real platform.
+#if defined(_WIN32)
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+std::map<std::string, std::string> bbl_headers(const std::string& access_token,
+                                               const std::string& user_id)
+{
+    const auto& cfg_client_name = obn::config::current().client_name;
+    std::map<std::string, std::string> h;
+    h["Authorization"]        = "Bearer " + access_token;
+    h["Content-Type"]         = "application/json";
+    h["Accept"]               = "application/json";
+    h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"OpenBambooNetworking"}
+                                                        : cfg_client_name;
+    h["X-BBL-Client-Type"]    = "slicer";
+    h["X-BBL-OS-Type"]        = os_type();
+    h["X-BBL-Agent-OS-Type"]  = os_type();
+    h["X-BBL-Language"]       = "en-US";
+    h["X-BBL-Executable-info"]= "{}";
+    if (!user_id.empty())
+        h["X-BBL-Client-ID"] = "slicer:" + user_id + ":obn0";
+    return h;
+}
+
 AuthResult login_with_ticket(const std::string& region,
                              const std::string& ticket)
 {

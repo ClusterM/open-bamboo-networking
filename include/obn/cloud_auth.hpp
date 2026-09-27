@@ -14,6 +14,7 @@
 // `api.bambulab.cn`.
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,18 @@ struct ProfileResult {
 //                "bambulab.comapi/..." and DNS fails.
 std::string api_host(const std::string& region);
 std::string web_host(const std::string& region);
+
+// Compile-time OS identity for X-BBL-OS-Type ("windows" / "macos" / "linux").
+const char* os_type();
+
+// Shared X-BBL headers captured from the stock plugin. Cloudflare in front of
+// api.bambulab.com is lenient about most X-BBL fields, but POST /my/task and
+// POST /iot-service/api/user/ttcode enforce two by VALUE: X-BBL-Client-Name
+// (must be "BambuStudio"; see config::client_name) and X-BBL-OS-Type (for
+// /my/task it must match the OS the content was uploaded from). Both endpoints
+// also need the PoP headers from obn::signing::add_pop_headers().
+std::map<std::string, std::string> bbl_headers(const std::string& access_token,
+                                               const std::string& user_id);
 
 // Ticket-exchange: the "system browser" / wxWebView login lands on the
 // local HTTP server Studio stands up and hands us a short-lived
