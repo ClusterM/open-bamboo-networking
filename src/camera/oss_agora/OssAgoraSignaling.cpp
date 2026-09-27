@@ -1,5 +1,4 @@
 #include "OssAgoraSignaling.hpp"
-#include "OssAgoraEngine.hpp"
 #include "../oss_tutk/IotcProtocol.hpp"
 
 #include <atomic>
@@ -23,13 +22,6 @@ namespace bambu_net {
 namespace camera {
 namespace oss_agora {
 
-std::vector<AgoraEdgeServer>
-agora_discover_edge_servers(const std::string& /*app_id*/,
-                             uint32_t /*area_code*/)
-{
-    return {};
-}
-
 // Map area_code to a TUTK region string for the relay DNS hostname.
 //   1=CN→"cn", 4=EU→"eu", 2/0x800=NA/US→"us", default→"us"
 static const char* region_str_from_area_code(uint32_t area_code)
@@ -43,42 +35,12 @@ static const char* region_str_from_area_code(uint32_t area_code)
     }
 }
 
-#ifdef OBN_TESTING
-const char* region_str_from_area_code_test(uint32_t area_code)
-{
-    return region_str_from_area_code(area_code);
-}
-#endif
-
 static std::string to_upper(const std::string& s)
 {
     std::string out = s;
     for (char& c : out)
         if (c >= 'a' && c <= 'z') c -= 0x20;
     return out;
-}
-
-// Write a 16-byte AV frame header into buf (which must be pre-zeroed for seq/reserved).
-// payload_len: byte count of the payload following the header.
-// sub_type: kFrameSubtypeLogin, kFrameSubtypeCtrl, etc.
-// dir:      kFrameDirClientToP, kFrameDirPrinterToC.
-// seq:      monotonic sequence number for this frame.
-// reserved: header word at [12..15] (0x0b for LOGIN, 0 otherwise).
-static void write_av_frame_hdr(uint8_t* buf, uint32_t payload_len,
-                                uint8_t sub_type, uint8_t dir,
-                                uint32_t seq, uint32_t reserved)
-{
-    using namespace bambu_net::oss_tutk;
-    uint32_t pl    = htole32(payload_len);
-    uint32_t magic = htole32((uint32_t)kFrameMagicMarker
-                              | ((uint32_t)sub_type << 16)
-                              | ((uint32_t)dir      << 24));
-    uint32_t sq    = htole32(seq);
-    uint32_t res   = htole32(reserved);
-    memcpy(buf,      &pl,    4);
-    memcpy(buf + 4,  &magic, 4);
-    memcpy(buf + 8,  &sq,    4);
-    memcpy(buf + 12, &res,   4);
 }
 
 // Builds a 570-byte TUTK AV connect / login packet:
@@ -126,7 +88,6 @@ static std::vector<uint8_t> build_tutk_av_login_pkt(uint8_t type, uint32_t seq,
 
 struct OssAgoraSignaling::Impl {
     std::atomic<bool>  joined{false};
-    std::atomic<bool>  test_mode{false};
     std::thread        worker_thread;
 
     FrameCallback      cb;
@@ -134,7 +95,6 @@ struct OssAgoraSignaling::Impl {
     bambu_net::oss_tutk::RelayConn relay{};
     uint16_t           client_out_seq{1};
 
-    void run_test_mode(AgoraJoinParams params);
     int  do_join(const AgoraJoinParams& params);
     int  recv_loop(const AgoraJoinParams& params);
     void send_ipcam_start(uint16_t ch, uint16_t& out_seq);
@@ -222,28 +182,6 @@ void OssAgoraSignaling::Impl::send_ipcam_stop(uint16_t ch, uint16_t& out_seq)
     memcpy(pkt + 32, &ch_le, 4);
 
     (void)iotc_relay_send_app_data(&relay, pkt, sizeof(pkt));
-}
-
-void OssAgoraSignaling::Impl::run_test_mode(AgoraJoinParams /*params*/)
-{
-    static const uint8_t kSyntheticIDR[] = {
-        // SPS NAL
-        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x1E,
-        0xD9, 0x00, 0xA0, 0x47, 0xFE, 0xC8, 0x00,
-        // PPS NAL
-        0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80,
-        // IDR slice
-        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00,
-        0x33, 0xFF
-    };
-
-    while (joined.load()) {
-        if (cb) {
-            cb(kSyntheticIDR, sizeof(kSyntheticIDR),
-               0 /*pts*/, true /*keyframe*/);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-    }
 }
 
 int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
@@ -744,26 +682,12 @@ OssAgoraSignaling::~OssAgoraSignaling()
     delete m_impl;
 }
 
-void OssAgoraSignaling::set_test_mode(bool enabled)
-{
-    m_impl->test_mode.store(enabled);
-}
-
 int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 {
     if (m_impl->joined.load()) leave();
 
     m_impl->cb = std::move(cb);
     m_impl->joined.store(true);
-
-    if (m_impl->test_mode.load()) {
-        OBN_INFO("[oss-relay] TEST MODE: delivering synthetic frames");
-        AgoraJoinParams p = params;
-        m_impl->worker_thread = std::thread([this, p]() {
-            m_impl->run_test_mode(p);
-        });
-        return 0;
-    }
 
     OBN_INFO("[oss-relay] join: channel=%.20s uid=%s area=0x%08X",
         params.channel.c_str(), params.tutk_uid.c_str(), params.area_code);

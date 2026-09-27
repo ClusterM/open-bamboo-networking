@@ -120,7 +120,6 @@ bool OssTutkCameraSource::open()
     p.av_passwd   = passwd_;
     p.authkey     = authkey_;
     p.area_code   = area_code_;
-    // app_id, token, uid are unused in the direct TUTK relay path
 
     int rc = signaling_.join(p, [this](const uint8_t* data, int len,
                                         int64_t pts_us, bool key) {

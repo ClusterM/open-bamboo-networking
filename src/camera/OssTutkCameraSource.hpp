@@ -14,8 +14,7 @@
 #pragma once
 
 #include "ICameraSource.hpp"
-#include "oss_agora/OssAgoraEngine.hpp"     // OssFrameQueue, OssVideoFrame
-#include "oss_agora/OssAgoraSignaling.hpp"  // OssAgoraSignaling, AgoraJoinParams
+#include "oss_agora/OssAgoraSignaling.hpp"
 
 #include <atomic>
 #include <chrono>

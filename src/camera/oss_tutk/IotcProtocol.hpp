@@ -112,16 +112,6 @@ namespace bambu_net {
 namespace oss_tutk {
 
 // --------------------------------------------------------------------------
-// IOTC session limits
-// --------------------------------------------------------------------------
-
-// Size of each gSessionInfo[] slot (imul $0x16c0 in IOTC_Connect_UDP_Inner)
-static constexpr size_t kSessionInfoStride = 0x16c0; // 5824 bytes
-
-// Default connect timeout used by IOTC_Connect_ByUIDEx config (0x14 = 20s)
-static constexpr uint32_t kConnectTimeoutSec = 20;
-
-// --------------------------------------------------------------------------
 // UID format
 // --------------------------------------------------------------------------
 //
@@ -243,75 +233,6 @@ struct LanSearchR3Pkt {
     uint32_t   nat_info;             // [0xc4] NAT type / extra info
     // ... remainder zero-padded to 516 bytes
 };
-
-// IOTC Connect configuration passed to IOTC_Connect_ByUIDEx (3rd argument).
-// IotcConnectCfg fields:
-//   - First field: struct size = 0x14 = 20 (checked at 1a8e22: cmpl $0x14,(%rdx))
-//   - authkey: first 8 bytes from the authkey string (null-padded uint64)
-//   - timeout1, timeout2: both 0x14 = 20 seconds
-struct IotcConnectCfg {
-    uint32_t struct_size;    // [0] must be 0x14 = 20
-    uint32_t authkey_lo;     // [4] lower 4 bytes of authkey (little-endian)
-    uint32_t authkey_hi;     // [8] upper 4 bytes of authkey
-    uint32_t timeout1_sec;   // [12] = 20
-    uint32_t timeout2_sec;   // [16] = 20
-};
-static_assert(sizeof(IotcConnectCfg) == 0x14, "IotcConnectCfg must be 20 bytes");
-
-// avClientStartEx input struct (AvStartIn).
-// Key fields accessed at known offsets in avClientStartEx:
-//   [0x00] struct_size check: cmpl $0x37, (%rdi) → must be > 0x37 = 55
-//   [0x04] sid: uint32  — IOTC session ID
-//   [0x08] channel: uint8 — AV channel number; checked: cmpb $0x1f,0x8(%rdi)
-//            → must be <= 0x1f = 31 (only lower 5 bits used)
-//            Bambu uses channel 0x00 (not 0x38 as commented — see note below)
-//   [0x0c] param_u32: uint32 — passed to avClientStart_inner as arg
-//   [0x10] account: char* — "admin"
-//   [0x18] passwd:  char* — printer password
-//   [0x20] timeout_sec: uint32 = 30
-//   [0x24] flags: uint32 (r9d = avClientStart_inner arg6)
-//   [0x28] flags2: uint32 → pushed as stack arg
-//   [0x2c] flags3: uint32 (another avClientStart_inner arg)
-//   [0x30] flags4: uint64 or uint32 → pushed as stack arg
-//   struct_size field = 0x38 = 56 (meaning the struct is 56 bytes including the size field)
-//
-// NOTE on channel: The avClientStartEx validator (0x1607f6) does cmpb $0x1f, 0x8(%rdi) and takes
-// the error path if channel > 0x1f.  The value 0x38 = 56 in the old code was
-// actually stored at struct_size, not channel.  The actual channel for the
-// Bambu printer video stream is 0x00 or 0x01.  Future capture needed to confirm.
-struct AvStartIn {
-    uint32_t struct_size;    // [0x00] = 0x38 (56 bytes, size of this struct)
-    uint32_t sid;            // [0x04] IOTC session ID
-    uint8_t  channel;        // [0x08] AV channel (0..31); Bambu video = 0?
-    uint8_t  _pad1[3];
-    uint32_t param;          // [0x0c]
-    const char* account;     // [0x10] "admin"
-    const char* passwd;      // [0x18] printer password (default "888888")
-    uint32_t timeout_sec;    // [0x20] = 30
-    uint32_t flags;          // [0x24]
-    uint32_t flags2;         // [0x28]
-    uint32_t flags3;         // [0x2c]
-    uint64_t flags4;         // [0x30]
-};
-static_assert(sizeof(AvStartIn) == 0x38, "AvStartIn must be 56 bytes");
-
-// avClientStartEx output struct (AvStartOut).
-// avClientStartEx writes back these output fields:
-//   [0x00] struct_size: must be pre-set to 0x18 = 24
-//   [0x04] resend:      bool/uint32 — resend enabled flag
-//   [0x08] two_way:     uint32 — two-way streaming flag
-//   [0x0c] unknown1:    uint32
-//   [0x10] unknown2:    uint32
-//   [0x14] av_index:    int32 — returned AV channel index (may be separate retval)
-struct AvStartOut {
-    uint32_t struct_size;    // [0x00] = 0x18 (pre-fill before call)
-    uint32_t resend;         // [0x04] out: resend enabled
-    uint32_t two_way;        // [0x08] out: two-way streaming
-    uint32_t unknown1;       // [0x0c] out
-    uint32_t unknown2;       // [0x10] out
-    int32_t  av_index;       // [0x14] out (avClientStartEx return value also gives this)
-};
-static_assert(sizeof(AvStartOut) == 0x18, "AvStartOut must be 24 bytes");
 
 #pragma pack(pop)
 
