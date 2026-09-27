@@ -1,4 +1,4 @@
-// Frame source interface for libBambuSource's TUTK path (OssTutkCameraSource),
+// Frame source interface for libBambuSource.s TUTK path (TutkCameraSource),
 // shared by the Bambu_* stub and the Windows DirectShow filter.
 //
 // Frame encoding (documented once here):
@@ -13,14 +13,14 @@
 // `StreamInfo::sps` / `pps` MUST be raw NAL bodies (no start code, no length
 // prefix) for the SDP `sprop-parameter-sets` advertising.
 
-#ifndef BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
-#define BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
+#ifndef OBN_CAMERA_I_CAMERA_SOURCE_HPP
+#define OBN_CAMERA_I_CAMERA_SOURCE_HPP
 
 #include <cstdint>
 #include <optional>
 #include <vector>
 
-namespace bambu_net {
+namespace obn {
 namespace camera {
 
 struct VideoFrame {
@@ -67,6 +67,6 @@ public:
 };
 
 }  // namespace camera
-}  // namespace bambu_net
+}  // namespace obn
 
-#endif  // BAMBU_NET_CAMERA_I_CAMERA_SOURCE_HPP
+#endif  // OBN_CAMERA_I_CAMERA_SOURCE_HPP

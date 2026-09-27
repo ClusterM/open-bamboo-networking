@@ -65,7 +65,7 @@
 #include "source_log.hpp"
 #include "tls_socket.hpp"
 #include "obn/os_compat.hpp"
-#include "camera/OssTutkCameraSource.hpp"
+#include "camera/TutkCameraSource.hpp"
 #include "camera/ICameraSource.hpp"
 
 #include <openssl/err.h>
@@ -292,6 +292,9 @@ struct ParsedUrl {
     std::string tutk_uid;
     std::string path = "/streaming/live/1";
     std::string lv;
+    // Stream codec: MJPEG for Local, H.264 for RTSP, and for TUTK whatever
+    // the first frame turned out to be (see BambuSourceFilter::Load).
+    bool        mjpeg = false;
 };
 
 std::string url_decode(const std::string& s)
@@ -539,15 +542,14 @@ bool make_mjpeg_media_type(AM_MEDIA_TYPE* mt)
     return true;
 }
 
-bool make_media_type_for_scheme(AM_MEDIA_TYPE* mt, UrlScheme scheme)
+bool make_media_type_for_url(AM_MEDIA_TYPE* mt, const ParsedUrl& url)
 {
-    if (scheme == UrlScheme::Local || scheme == UrlScheme::Tutk) return make_mjpeg_media_type(mt);
-    return make_h264_media_type(mt);
+    return url.mjpeg ? make_mjpeg_media_type(mt) : make_h264_media_type(mt);
 }
 
-GUID subtype_for_scheme(UrlScheme scheme)
+GUID subtype_for_url(const ParsedUrl& url)
 {
-    return (scheme == UrlScheme::Local || scheme == UrlScheme::Tutk) ? MEDIASUBTYPE_MJPG : kMediaSubtypeH264;
+    return url.mjpeg ? MEDIASUBTYPE_MJPG : kMediaSubtypeH264;
 }
 
 // ----------------------------------------------------------------------------
@@ -556,7 +558,7 @@ GUID subtype_for_scheme(UrlScheme scheme)
 
 class MediaTypeEnumerator : public IEnumMediaTypes {
 public:
-    MediaTypeEnumerator(UrlScheme scheme) : scheme_(scheme), ref_(1)
+    MediaTypeEnumerator(const ParsedUrl& url) : url_(url), ref_(1)
     {
         module_lock();
     }
@@ -592,7 +594,7 @@ public:
             if (cursor_ >= 1) break;
             auto* mt = static_cast<AM_MEDIA_TYPE*>(::CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE)));
             if (!mt) return E_OUTOFMEMORY;
-            if (!make_media_type_for_scheme(mt, scheme_)) {
+            if (!make_media_type_for_url(mt, url_)) {
                 ::CoTaskMemFree(mt);
                 return E_OUTOFMEMORY;
             }
@@ -612,14 +614,14 @@ public:
     HRESULT STDMETHODCALLTYPE Clone(IEnumMediaTypes** ppEnum) override
     {
         if (!ppEnum) return E_POINTER;
-        auto* clone = new MediaTypeEnumerator(scheme_);
+        auto* clone = new MediaTypeEnumerator(url_);
         clone->cursor_ = cursor_;
         *ppEnum = clone;
         return S_OK;
     }
 
 private:
-    UrlScheme         scheme_;
+    ParsedUrl         url_;
     std::atomic<long> ref_;
     ULONG             cursor_ = 0;
 };
@@ -823,6 +825,12 @@ public:
     FILTER_STATE        state() const noexcept   { return state_.load(std::memory_order_acquire); }
     IReferenceClock*    clock() noexcept         { return clock_; }
     IFilterGraph*       graph() noexcept         { return graph_; }
+    // The TUTK source Load() opened to learn the codec, handed to the worker.
+    std::unique_ptr<obn::camera::TutkCameraSource> take_tutk_source()
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return std::move(tutk_);
+    }
 
 private:
     std::atomic<long>    ref_;
@@ -835,6 +843,7 @@ private:
     std::wstring         url_w_;
     ParsedUrl            url_;
     bool                 url_loaded_ = false;
+    std::unique_ptr<obn::camera::TutkCameraSource> tutk_;
 };
 
 // ============================================================================
@@ -919,11 +928,10 @@ HRESULT STDMETHODCALLTYPE BambuSourceOutPin::Connect(IPin* pReceivePin,
     }
 
     AM_MEDIA_TYPE candidate{};
-    UrlScheme scheme = parent_->url().scheme;
     if (pmt && pmt->majortype != GUID_NULL) {
         if (!am_copy_media_type(&candidate, pmt)) return E_OUTOFMEMORY;
     } else {
-        if (!make_media_type_for_scheme(&candidate, scheme)) return E_OUTOFMEMORY;
+        if (!make_media_type_for_url(&candidate, parent_->url())) return E_OUTOFMEMORY;
     }
 
     HRESULT hr = pReceivePin->ReceiveConnection(static_cast<IPin*>(this), &candidate);
@@ -1098,7 +1106,7 @@ HRESULT STDMETHODCALLTYPE BambuSourceOutPin::QueryAccept(const AM_MEDIA_TYPE* pm
 {
     if (!pmt) return E_POINTER;
     bool major_ok = IsEqualGUID(pmt->majortype, MEDIATYPE_Video);
-    bool sub_ok   = IsEqualGUID(pmt->subtype, subtype_for_scheme(parent_->url().scheme));
+    bool sub_ok   = IsEqualGUID(pmt->subtype, subtype_for_url(parent_->url()));
     log_at(LL_DEBUG, kNoLogger, nullptr,
         "dshow: Pin::QueryAccept major=%s sub=%s -> %s",
         mediatype_to_string(pmt->majortype),
@@ -1113,7 +1121,7 @@ HRESULT STDMETHODCALLTYPE BambuSourceOutPin::EnumMediaTypes(IEnumMediaTypes** pp
         "dshow: Pin::EnumMediaTypes scheme=%d",
         static_cast<int>(parent_->url().scheme));
     if (!ppEnum) return E_POINTER;
-    *ppEnum = new MediaTypeEnumerator(parent_->url().scheme);
+    *ppEnum = new MediaTypeEnumerator(parent_->url());
     return S_OK;
 }
 
@@ -1364,10 +1372,24 @@ HRESULT STDMETHODCALLTYPE BambuSourceFilter::Load(LPCOLESTR lpwszFileName,
         "dshow: parsed scheme=%d host=%s port=%d user=%s path=%s",
         static_cast<int>(pu.scheme), pu.host.c_str(), pu.port,
         pu.user.c_str(), pu.path.c_str());
+    pu.mjpeg = pu.scheme == UrlScheme::Local;
+    std::unique_ptr<obn::camera::TutkCameraSource> tutk;
+    if (pu.scheme == UrlScheme::Tutk) {
+        // Pin types are negotiated before the worker runs, and a TUTK stream
+        // can be either codec, so start it now and look at the first frame.
+        tutk = std::make_unique<obn::camera::TutkCameraSource>(pu.raw_url);
+        if (tutk->open()) {
+            pu.mjpeg = tutk->info().codec == obn::camera::ICameraSource::Codec::MotionJpeg;
+        } else {
+            log_at(LL_WARN, kNoLogger, nullptr, "dshow: TUTK stream did not start in Load");
+            tutk.reset();
+        }
+    }
     std::lock_guard<std::mutex> lk(mu_);
     url_w_      = lpwszFileName;
     url_        = std::move(pu);
     url_loaded_ = true;
+    tutk_       = std::move(tutk);
     return S_OK;
 }
 
@@ -1388,7 +1410,7 @@ HRESULT STDMETHODCALLTYPE BambuSourceFilter::GetCurFile(LPOLESTR* ppszFileName,
         // contract; do not assume any pre-existing pbFormat/pUnk we
         // would need to release first.
         std::memset(pmt, 0, sizeof(*pmt));
-        if (url_loaded_) make_media_type_for_scheme(pmt, url_.scheme);
+        if (url_loaded_) make_media_type_for_url(pmt, url_);
     }
     return S_OK;
 }
@@ -1552,7 +1574,9 @@ void BambuSourceOutPin::worker_main()
         pass.stop();
     } else if (url.scheme == UrlScheme::Tutk) {
         // ---- TUTK off-LAN / relay branch ----
-        obn::camera::OssTutkCameraSource tutk_src(url.raw_url);
+        auto tutk = parent_->take_tutk_source();
+        if (!tutk) tutk = std::make_unique<obn::camera::TutkCameraSource>(url.raw_url);
+        obn::camera::TutkCameraSource& tutk_src = *tutk;
         if (!tutk_src.open()) {
             log_at(LL_ERROR, kNoLogger, nullptr, "dshow: TUTK open failed");
             return;

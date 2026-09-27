@@ -128,7 +128,7 @@
 #include "source_log.hpp"
 #include "rtsp_passthrough.hpp"
 #include "tls_socket.hpp"
-#include "camera/OssTutkCameraSource.hpp"
+#include "camera/TutkCameraSource.hpp"
 #include "camera/ICameraSource.hpp"
 
 #if defined(_WIN32)
@@ -589,7 +589,7 @@ struct Tunnel {
     std::string                ctrl_current_reply;
 
     // ---- TUTK off-LAN / relay camera state (Scheme::Tutk) ----
-    std::unique_ptr<obn::camera::OssTutkCameraSource> tutk_source;
+    std::unique_ptr<obn::camera::TutkCameraSource> tutk_source;
     std::vector<uint8_t>       tutk_current_frame;
 };
 
@@ -762,14 +762,14 @@ int read_rtsp(Tunnel* t, Bambu_Sample* sample)
 
 // -----------------------------------------------------------------------
 // TUTK off-LAN / relay video source.
-// Uses obn::camera::OssTutkCameraSource to connect to ThroughTek
+// Uses obn::camera::TutkCameraSource to connect to ThroughTek
 // master/relay server and stream H.264 / MJPEG frames.
 // -----------------------------------------------------------------------
 
 int open_tutk(Tunnel* t)
 {
     log_fmt(t->logger, t->log_ctx, "open_tutk: starting TUTK session url=%.160s", t->url.raw_url.c_str());
-    t->tutk_source = std::make_unique<obn::camera::OssTutkCameraSource>(t->url.raw_url);
+    t->tutk_source = std::make_unique<obn::camera::TutkCameraSource>(t->url.raw_url);
     if (!t->tutk_source->open()) {
         log_fmt(t->logger, t->log_ctx, "open_tutk: failed to open TUTK stream");
         set_last_error("TUTK stream open failed");
@@ -780,7 +780,7 @@ int open_tutk(Tunnel* t)
     t->width = si.width;
     t->height = si.height;
     t->frame_rate = si.fps;
-    t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+    t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
     t->t0 = std::chrono::steady_clock::now();
     t->started = true;
     log_fmt(t->logger, t->log_ctx, "open_tutk: stream ready (%dx%d @ %d fps, subtype=%d)",
@@ -801,7 +801,7 @@ int read_tutk(Tunnel* t, Bambu_Sample* sample)
         auto si = t->tutk_source->info();
         t->width = si.width;
         t->height = si.height;
-        t->sub_type = (si.codec == bambu_net::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
+        t->sub_type = (si.codec == obn::camera::ICameraSource::Codec::MotionJpeg) ? MJPG : AVC1;
         log_fmt(t->logger, t->log_ctx, "read_tutk: first frame received (%dx%d, subtype=%d)",
                 t->width, t->height, t->sub_type);
     }
@@ -2160,7 +2160,7 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
         return read_rtsp(t, sample);
     }
 
-    // TUTK: pull from OssTutkCameraSource.
+    // TUTK: pull from TutkCameraSource.
     if (t->url.scheme == Scheme::Tutk) {
         return read_tutk(t, sample);
     }

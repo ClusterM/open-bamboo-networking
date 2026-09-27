@@ -405,9 +405,8 @@ public:
     // the selected printer once the access code is known too.
     void note_device_lan_ip(const std::string& dev_id,
                             const std::string& ip);
-    // LAN fallback for bambu_network_get_camera_url: stock plugin mints a
-    // bambu:///tutk?... URL via the proprietary TUTK/Agora SDK, which we
-    // don't ship. When the printer's LAN IP (SSDP / connect_printer) and
+    // LAN route for bambu_network_get_camera_url (used instead of TUTK
+    // when prefer_rtsp is set or cloud credentials are unavailable). When the printer's LAN IP (SSDP / connect_printer) and
     // access code (connect_printer / cloud dev_access_code) are both known
     // we return "bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>"
     // instead, so Studio's PrinterFileSystem (file browser), the device

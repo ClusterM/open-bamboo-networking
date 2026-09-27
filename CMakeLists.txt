@@ -462,9 +462,9 @@ set(_obn_bambusource_sources
     src/lan_tls.cpp
     src/log.cpp
     src/os_compat.cpp
-    src/camera/OssTutkCameraSource.cpp
-    src/camera/oss_agora/OssAgoraSignaling.cpp
-    src/camera/oss_tutk/IotcClient.cpp
+    src/camera/TutkCameraSource.cpp
+    src/camera/tutk/TutkSession.cpp
+    src/camera/tutk/IotcClient.cpp
 )
 if(WIN32)
     list(APPEND _obn_bambusource_sources
