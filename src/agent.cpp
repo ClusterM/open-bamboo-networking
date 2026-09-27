@@ -1464,8 +1464,10 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     // "BambuStudio", X-BBL-OS-Type is present and the PoP pair is attached
     // (research/06.06).
     auto hdrs = obn::cloud::bbl_headers(session.access_token, session.user_id);
-    if (!obn::signing::add_pop_headers(hdrs))
-        OBN_WARN("camera_url(remote): no slicer cert/key; /user/ttcode will likely 403");
+    if (!obn::signing::add_pop_headers(hdrs)) {
+        OBN_WARN("camera_url(remote): no slicer cert/key; /user/ttcode needs PoP, not minting");
+        return {};
+    }
 
     const auto parsed = obn::camera::parse_packed_dev_key(dev_id);
     const std::string& serial = parsed.serial;

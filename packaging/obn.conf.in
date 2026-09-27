@@ -61,6 +61,23 @@ force_ftps = 0
 disable_camera_preview = 0
 
 
+# --- Camera transport ------------------------------------------------
+#
+# Only matters for a printer that is bound to the cloud (the slicer builds
+# the local URL itself in LAN-only mode) and only while block_cloud = 0.
+# By default live view uses TUTK like the stock plugin: the plugin asks
+# Bambu's cloud for TUTK credentials, and the cloud wakes the printer's
+# TUTK server. Set to 1 to use the local RTSP(S) / port 6000 stream
+# instead whenever the printer's IP and access code are known; this
+# needs "LAN Only Liveview" enabled on the printer for RTSP(S) models.
+# TUTK credentials are only handed out to a signed slicer request, so
+# without the slicer key/certificate the local stream is used regardless.
+# With this project's BambuSource the file browser keeps using the local
+# network either way (it does not speak TUTK).
+
+prefer_rtsp = 0
+
+
 # --- Cloud status bootstrap ------------------------------------------
 #
 # Ask every printer for a full status snapshot (pushall) once per cloud

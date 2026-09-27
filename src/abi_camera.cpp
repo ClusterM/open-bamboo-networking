@@ -7,33 +7,34 @@
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
+#include "obn/config.hpp"
 #include "obn/log.hpp"
+#include "obn/signing.hpp"
 
 using obn::as_agent;
 
-// When Studio asks for a remote URL (MediaFilePanel::fetchUrl,
-// MediaPlayCtrl::Play/RequestFileSystemUrl), we first prefer the printer's
-// LAN URL if its IP + access code are known:
+// Studio only calls this for a cloud-bound printer (MediaPlayCtrl::Play,
+// RequestFileSystemUrl, MediaFilePanel::fetchUrl); in LAN-only mode it builds
+// the local URL itself (research/08.11). Two answers are possible:
 //
+//   bambu:///tutk?uid=<ttcode>&authkey=..&passwd=..&region=..   (cloud mint)
 //   bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>[&lv=rtsps]
 //
-// Studio only checks that the reply starts with "bambu:///", so the
-// file browser (PrinterFileSystem CTRL over :6000), the device-panel
-// snapshot (mem:/N via FileTransferObject) and liveview take the local route
-// even while the printer is cloud-paired. The lv= hint tells libBambuSource to
-// fetch video over RTSP(S) :322 instead of MJPEG :6000 on X1/P1S/P2S printers.
-//
-// When no LAN route is known (e.g. printer remote or off-LAN), we query the
-// Bambu cloud iot-service ttcode endpoint to mint a bambu:///tutk?... URL.
-// The cloud answers that POST by pushing liveview.prepare to the printer,
-// which starts its tutk_server.
+// Like the stock plugin we mint TUTK by default: POST /user/ttcode returns
+// the printer's TUTK credentials and makes the cloud push liveview.prepare,
+// which starts the printer's tutk_server. The LAN URL is used instead when
+// prefer_rtsp is set, when the cloud is unusable (block_cloud, no session)
+// or when the mint fails, provided the printer's IP + access code are known.
+// Studio only checks that the reply starts with "bambu:///", so the file
+// browser (CTRL over :6000), the device-panel snapshot and liveview all work
+// over LAN that way; the lv= hint makes libBambuSource fetch video over
+// RTSP(S) :322 instead of MJPEG :6000 on X1/P1S/P2S printers.
 OBN_ABI int bambu_network_get_camera_url(void* agent,
                                          std::string dev_id,
                                          std::function<void(std::string)> callback)
 {
     // Studio packs "dev_id|dev_ver|protocols[|channel]" into the first
-    // argument (MediaPlayCtrl.cpp / MediaFilePanel.cpp); only the leading
-    // serial matters to us for the synchronous LAN route lookup.
+    // argument (MediaPlayCtrl.cpp / MediaFilePanel.cpp).
     const std::string serial = dev_id.substr(0, dev_id.find('|'));
 
     auto* a = as_agent(agent);
@@ -42,10 +43,17 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
         return BAMBU_NETWORK_SUCCESS;
     }
 
-    std::string url = a->camera_url_for(serial);
-    if (!url.empty()) {
-        OBN_INFO("get_camera_url dev=%s -> LAN URL", serial.c_str());
-        if (callback) callback(std::move(url));
+    std::string lan_url = a->camera_url_for(serial);
+    // /user/ttcode answers 403 without both PoP headers, so without the slicer
+    // key + cert TUTK is out of reach and there is no point trying the mint.
+    const bool cloud_usable = !obn::config::current().block_cloud &&
+                              !a->user_session_snapshot().access_token.empty() &&
+                              obn::signing::slicer_signing_key_present() &&
+                              !obn::signing::app_certification_id().empty();
+    if (!lan_url.empty() && (obn::config::current().prefer_rtsp || !cloud_usable)) {
+        OBN_INFO("get_camera_url dev=%s -> LAN URL (%s)", serial.c_str(),
+                 cloud_usable ? "prefer_rtsp" : "cloud unavailable");
+        if (callback) callback(std::move(lan_url));
         return BAMBU_NETWORK_SUCCESS;
     }
 
@@ -53,11 +61,16 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     // Studio's UI / MediaPlayCtrl thread returns immediately (research/08.11.1).
     // The full packed key goes to the mint: dev_ver and protocols are part of
     // the /user/ttcode request body.
-    auto mint = [a, dev_id, serial, callback]() {
-        std::string cloud_url = a->remote_camera_url(dev_id);
+    auto mint = [a, dev_id, serial, lan_url, callback]() {
+        std::string url = a->remote_camera_url(dev_id);
+        const char* kind = "TUTK cloud URL";
+        if (url.empty() && !lan_url.empty()) {
+            url  = lan_url;
+            kind = "LAN URL (mint failed)";
+        }
         OBN_INFO("get_camera_url dev=%s -> %s", serial.c_str(),
-                 cloud_url.empty() ? "(none)" : "TUTK cloud URL");
-        if (callback) callback(std::move(cloud_url));
+                 url.empty() ? "(none)" : kind);
+        if (callback) callback(std::move(url));
     };
     try {
         std::thread(std::move(mint)).detach();
@@ -88,6 +101,17 @@ OBN_ABI int bambu_network_get_hms_snapshot(void* /*agent*/,
     return BAMBU_NETWORK_SUCCESS;
 }
 
+// Private exports for this project's BambuSource (stubs/BambuSource.cpp),
+// which resolves them from the already-loaded plugin (dlsym(RTLD_DEFAULT) /
+// GetProcAddress) to switch transports mid-session: a LAN tunnel whose TLS
+// or RTSP dial fails asks for a TUTK URL, and a TUTK tunnel opened for the
+// file browser (CTRL, which our TUTK client does not carry) asks for the LAN
+// URL. Not part of Studio's ABI. `dev_id` is the bare serial. Both are
+// synchronous (the TUTK one blocks on the /user/ttcode POST), must not be
+// called from Studio's UI thread, and return a pointer to a thread_local
+// buffer that stays valid until the next call on the same thread, or
+// nullptr when no URL is available.
+
 OBN_ABI const char* obn_get_tutk_camera_url(const char* dev_id)
 {
     static thread_local std::string s_last_url;
@@ -102,9 +126,26 @@ OBN_ABI const char* obn_get_tutk_camera_url(const char* dev_id)
 
     s_last_url = a->remote_camera_url(dev_id);
     if (s_last_url.empty()) {
-        OBN_WARN("obn_get_tutk_camera_url: remote_camera_url returned empty for dev=%s", dev_id);
+        OBN_WARN("obn_get_tutk_camera_url: no TUTK URL for dev=%s", dev_id);
         return nullptr;
     }
-    OBN_INFO("obn_get_tutk_camera_url: dev=%s -> %.80s", dev_id, s_last_url.c_str());
+    OBN_INFO("obn_get_tutk_camera_url: dev=%s -> TUTK URL", dev_id);
+    return s_last_url.c_str();
+}
+
+OBN_ABI const char* obn_get_lan_camera_url(const char* dev_id)
+{
+    static thread_local std::string s_last_url;
+    s_last_url.clear();
+    if (!dev_id || !*dev_id) return nullptr;
+
+    auto* a = obn::Agent::active_instance();
+    if (!a) return nullptr;
+
+    s_last_url = a->camera_url_for(dev_id);
+    if (s_last_url.empty()) {
+        OBN_WARN("obn_get_lan_camera_url: no LAN route for dev=%s", dev_id);
+        return nullptr;
+    }
     return s_last_url.c_str();
 }
