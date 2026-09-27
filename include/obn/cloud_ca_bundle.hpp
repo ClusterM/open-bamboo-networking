@@ -11,7 +11,7 @@
 // explicitly. *.bambulab.com serves a normal, publicly-trusted
 // DigiCert-issued certificate -- it needs an ordinary root bundle, not
 // anything Bambu-specific -- so we ship one instead of skipping
-// verification.
+// verification. Built on Windows only; elsewhere the system store is used.
 
 #include <string>
 
