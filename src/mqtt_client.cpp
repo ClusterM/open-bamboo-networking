@@ -287,10 +287,19 @@ int Client::connect(const ConnectConfig& cfg)
             // makes net__tls_load_ca() fail later, so just leave both
             // cafile and capath null and ask mosquitto to use whatever the
             // OS exposes via OPENSSL_init_crypto's default verify paths.
-            // Caller-driven verification stays governed by tls_insecure.
+            // mosquitto_tls_set() rejects null/null with MOSQ_ERR_INVAL, so
+            // it is skipped below; TLS_USE_OS_CERTS alone turns TLS on. With
+            // verification enabled this most likely fails the handshake
+            // (fail closed); with tls_insecure it is what lets TLS come up
+            // without any CA file.
             cafile = nullptr;
             capath = nullptr;
             verify_peer = !cfg.tls_insecure;
+            int orc = ::mosquitto_int_option(mosq_, MOSQ_OPT_TLS_USE_OS_CERTS, 1);
+            if (orc != MOSQ_ERR_SUCCESS) {
+                OBN_ERROR("mqtt TLS_USE_OS_CERTS rc=%d (%s)", orc, err_str(orc));
+                return orc;
+            }
             OBN_DEBUG("mqtt no ca_file on Windows; using openssl default verify paths "
                       "(verify_peer=%d, tls_insecure=%d)",
                       verify_peer ? 1 : 0, cfg.tls_insecure ? 1 : 0);
@@ -309,13 +318,16 @@ int Client::connect(const ConnectConfig& cfg)
             verify_peer = !cfg.tls_insecure;
 #endif
         }
-        int rc = ::mosquitto_tls_set(mosq_, cafile, capath, nullptr, nullptr, nullptr);
-        if (rc != MOSQ_ERR_SUCCESS) {
-            OBN_ERROR("mqtt tls_set rc=%d (%s) cafile=%s capath=%s",
-                      rc, err_str(rc),
-                      cafile ? cafile : "(null)",
-                      capath ? capath : "(null)");
-            return rc;
+        int rc = MOSQ_ERR_SUCCESS;
+        if (cafile || capath) {
+            rc = ::mosquitto_tls_set(mosq_, cafile, capath, nullptr, nullptr, nullptr);
+            if (rc != MOSQ_ERR_SUCCESS) {
+                OBN_ERROR("mqtt tls_set rc=%d (%s) cafile=%s capath=%s",
+                          rc, err_str(rc),
+                          cafile ? cafile : "(null)",
+                          capath ? capath : "(null)");
+                return rc;
+            }
         }
         // SSL_VERIFY_PEER (1) vs SSL_VERIFY_NONE (0).
         rc = ::mosquitto_tls_opts_set(mosq_, verify_peer ? 1 : 0, nullptr, nullptr);
