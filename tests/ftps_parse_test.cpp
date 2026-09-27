@@ -183,6 +183,35 @@ void test_ls_junk(Result& r)
     EXPECT(r, e3.mtime == 0u);
 }
 
+void test_pasv(Result& r)
+{
+    using obn::ftps::detail::parse_pasv_reply;
+    int h[4] = {};
+    int port = 0;
+
+    EXPECT(r, parse_pasv_reply("227 Entering Passive Mode (192,168,1,50,195,80).", h, &port));
+    EXPECT(r, h[0] == 192 && h[1] == 168 && h[2] == 1 && h[3] == 50);
+    EXPECT(r, port == 195 * 256 + 80);
+    EXPECT(r, parse_pasv_reply("227 ( 10, 0, 0, 1, 0, 21 )", h, &port) && port == 21);
+    EXPECT(r, parse_pasv_reply("227 (0,0,0,0,255,255)", h, &port) && port == 65535);
+
+    // Out of range or overlong: previously sscanf("%d") territory.
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,256,0)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,-1,80)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,99999999999999999999,80)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,0255,80)", h, &port));
+    // Wrong shape.
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,195)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,195,80,1)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,195,x)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,,80)", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 Entering Passive Mode 192,168,1,50,195,80", h, &port));
+    EXPECT(r, !parse_pasv_reply("227 )192,168,1,50,195,80(", h, &port));
+    EXPECT(r, !parse_pasv_reply("", h, &port));
+    // Port 0 is not a usable data port.
+    EXPECT(r, !parse_pasv_reply("227 (192,168,1,50,0,0)", h, &port));
+}
+
 } // namespace
 
 int main()
@@ -196,6 +225,7 @@ int main()
     test_ls_symlink(r);
     test_ls_bambu_o1s_firmware(r);
     test_ls_junk(r);
+    test_pasv(r);
     std::printf("ftps_parse_test: %d passed, %d failed\n",
                 r.passed, r.failed);
     return r.failed == 0 ? 0 : 1;

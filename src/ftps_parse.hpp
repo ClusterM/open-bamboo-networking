@@ -151,6 +151,45 @@ inline void parse_ls_line(const std::string& line, Entry* e,
     if (arrow != std::string::npos) e->name = e->name.substr(0, arrow);
 }
 
+// Parses the "(h1,h2,h3,h4,p1,p2)" part of a 227 PASV reply. Every field
+// must be a plain decimal 0..255 (spaces around it allowed); the port must
+// be non-zero. Written by hand instead of sscanf("%d"), which has undefined
+// behaviour on out-of-range input - and the reply comes from the printer.
+inline bool parse_pasv_reply(const std::string& body, int octets[4], int* port)
+{
+    const auto lp = body.find('(');
+    if (lp == std::string::npos) return false;
+    const auto rp = body.find(')', lp);
+    if (rp == std::string::npos) return false;
+
+    int         f[6] = {};
+    std::size_t i    = lp + 1;
+    for (int n = 0; n < 6; ++n) {
+        while (i < rp && body[i] == ' ') ++i;
+        const std::size_t start = i;
+        int v = 0;
+        while (i < rp && i - start < 3
+               && std::isdigit(static_cast<unsigned char>(body[i]))) {
+            v = v * 10 + (body[i] - '0');
+            ++i;
+        }
+        if (i == start || v > 255) return false;
+        while (i < rp && body[i] == ' ') ++i;
+        f[n] = v;
+        if (n < 5) {
+            if (i >= rp || body[i] != ',') return false;
+            ++i;
+        }
+    }
+    if (i != rp) return false;
+
+    const int p = f[4] * 256 + f[5];
+    if (p == 0) return false;
+    if (octets) for (int k = 0; k < 4; ++k) octets[k] = f[k];
+    if (port) *port = p;
+    return true;
+}
+
 } // namespace detail
 } // namespace ftps
 } // namespace obn

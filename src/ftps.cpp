@@ -360,6 +360,13 @@ struct Client::Impl {
         return plain_write_all(ctrl_fd, buf, len, control_timeout_ms);
     }
 
+    // Control-channel replies are short status lines; these caps stop a
+    // peer that streams without a newline (or with endless "NNN-" lines)
+    // from growing our buffers without bound. The per-read timeout does not
+    // help there: data keeps arriving.
+    static constexpr std::size_t kMaxControlLine  = 16 * 1024;
+    static constexpr std::size_t kMaxControlReply = 256 * 1024;
+
     // Reads one CRLF-terminated line (without the CRLF) from the control
     // channel. Returns empty string + *ok=false on timeout/error.
     std::string read_line(bool* ok)
@@ -372,6 +379,12 @@ struct Client::Impl {
                 ctrl_buf.erase(0, nl + 1);
                 *ok = true;
                 return line;
+            }
+            if (ctrl_buf.size() > kMaxControlLine) {
+                OBN_WARN("ftps: control line exceeds %zu bytes, treating as I/O error",
+                         kMaxControlLine);
+                *ok = false;
+                return {};
             }
             char tmp[512];
             int n = ctrl_read(tmp, sizeof(tmp));
@@ -392,6 +405,11 @@ struct Client::Impl {
             if (!ok) return -1;
             if (!accumulated.empty()) accumulated += '\n';
             accumulated += line;
+            if (accumulated.size() > kMaxControlReply) {
+                OBN_WARN("ftps: control reply exceeds %zu bytes, treating as I/O error",
+                         kMaxControlReply);
+                return -1;
+            }
             // Multi-line continuation is "NNN-..." and terminated by a
             // final line starting with the same "NNN ".
             if (line.size() >= 4 && std::isdigit(static_cast<unsigned char>(line[0]))
@@ -559,21 +577,14 @@ static socket_t open_data_tcp(Client::Impl& p, const std::string& host, std::str
         err = "PASV rejected: code=" + std::to_string(code);
         return kInvalidSocket;
     }
-    auto lp = body.find('(');
-    auto rp = body.find(')');
-    if (lp == std::string::npos || rp == std::string::npos || rp <= lp) {
-        err = "PASV bad body: " + body;
+    int h[4]      = {};
+    int data_port = 0;
+    if (!detail::parse_pasv_reply(body, h, &data_port)) {
+        err = "PASV bad reply: " + body;
         return kInvalidSocket;
     }
-    std::string addr = body.substr(lp + 1, rp - lp - 1);
-    int h1, h2, h3, h4, p1, p2;
-    if (std::sscanf(addr.c_str(), "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2) != 6) {
-        err = "PASV parse: " + addr;
-        return kInvalidSocket;
-    }
-    int data_port = p1 * 256 + p2;
     OBN_DEBUG("ftps: PASV -> %d.%d.%d.%d:%d (reconnecting to control host %s)",
-              h1, h2, h3, h4, data_port, host.c_str());
+              h[0], h[1], h[2], h[3], data_port, host.c_str());
 
     std::string connect_err;
     socket_t fd = connect_tcp(host, data_port, p.control_timeout_ms, connect_err);
