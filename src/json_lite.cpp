@@ -11,8 +11,11 @@ namespace {
 
 // Nested {}/[] recurse one C++ stack frame per level with no other bound;
 // wire data (MQTT push_status, HTTP/cloud responses) can be arbitrarily
-// deeply nested, so cap it well short of a real stack overflow.
-constexpr int kMaxNestingDepth = 512;
+// deeply nested, so cap it well short of a real stack overflow. A level costs
+// roughly 0.5 KB of stack (measured with GCC), and parsing runs on threads we
+// don't size: mosquitto's loop thread and detached std::threads get only
+// 512 KB by default on macOS. Real Bambu payloads nest in single digits.
+constexpr int kMaxNestingDepth = 128;
 
 struct Parser {
     const char* p;
