@@ -496,6 +496,24 @@ void run_download_job(FT_Tunnel* t, FT_Job* j)
     deliver_result(j, FT_EIO, outcome.wire_result >= 0 ? outcome.wire_result : 0, {});
 }
 
+// Called when a job body threw. The throw may have come mid-transfer, leaving
+// the shared TLS session half-way through a frame, so drop it and let the next
+// job reconnect. The throw may also have come after the job already reported,
+// in which case Studio must not see a second result.
+void fail_job_after_exception(FT_Tunnel* t, FT_Job* j)
+{
+    {
+        std::lock_guard<std::mutex> lk(t->lan_mu);
+        if (t->conn) t->conn->disconnect();
+    }
+    bool finished = false;
+    {
+        std::lock_guard<std::mutex> lk(j->mu);
+        finished = j->finished;
+    }
+    if (!finished) deliver_result(j, FT_EIO, 0, {});
+}
+
 void spawn_job(FT_Tunnel* t, FT_Job* j)
 {
     retain(t);
@@ -518,10 +536,10 @@ void spawn_job(FT_Tunnel* t, FT_Job* j)
             }
         } catch (const std::exception& e) {
             OBN_WARN("ft: job cmd_type=%d threw: %s", j->cmd_type, e.what());
-            deliver_result(j, FT_EIO, 0, {});
+            fail_job_after_exception(t, j);
         } catch (...) {
             OBN_WARN("ft: job cmd_type=%d threw non-std::exception", j->cmd_type);
-            deliver_result(j, FT_EIO, 0, {});
+            fail_job_after_exception(t, j);
         }
         release(j);
         release(t);
