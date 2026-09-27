@@ -101,7 +101,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
     else if (key == "force_ftps")                out.force_ftps = truthy(val);
     else if (key == "disable_camera_preview")      out.disable_camera_preview = truthy(val);
-    else if (key == "prefer_rtsp")                 out.prefer_rtsp = truthy(val);
+    else if (key == "prefer_lan_over_tutk")        out.prefer_lan_over_tutk = truthy(val);
     else if (key == "mqtt_keep_connection")        out.mqtt_keep_connection = truthy(val);
     else if (key == "override_lan_ip")            out.override_lan_ip = truthy(val);
     else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);

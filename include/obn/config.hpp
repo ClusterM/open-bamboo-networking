@@ -66,7 +66,7 @@ struct Settings {
     // probe; fall back to TUTK if LAN is down or LAN liveview is off and
     // credentials can be minted.
     // Off by default, matching the stock plugin.
-    bool prefer_rtsp                 = false;
+    bool prefer_lan_over_tutk        = false;
 
     // MQTT connection persistence: Orca Slicer unconditionally tears down
     // and re-establishes the MQTT session after every print job, causing a

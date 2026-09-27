@@ -26,6 +26,8 @@ std::string query_param(const std::string& query, const std::string& key)
     return end == std::string::npos ? query.substr(pos) : query.substr(pos, end - pos);
 }
 
+} // namespace
+
 bool parse_tutk_url(const std::string& url, tutk::TutkSessionParams& p)
 {
     const std::string scheme = "bambu://";
@@ -47,6 +49,8 @@ bool parse_tutk_url(const std::string& url, tutk::TutkSessionParams& p)
     if (p.relay_id.empty()) p.relay_id = p.uid;
     return true;
 }
+
+namespace {
 
 bool jpeg_dimensions(const uint8_t* data, size_t size, int& width, int& height)
 {

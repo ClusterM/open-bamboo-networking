@@ -21,6 +21,9 @@
 namespace obn {
 namespace camera {
 
+// Fills p from a bambu:///tutk URL; false when uid or passwd is missing.
+bool parse_tutk_url(const std::string& url, tutk::TutkSessionParams& p);
+
 class TutkCameraSource : public ICameraSource {
 public:
     explicit TutkCameraSource(std::string url);

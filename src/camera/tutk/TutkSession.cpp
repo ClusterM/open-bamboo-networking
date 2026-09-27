@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <random>
 #include <thread>
 #include <vector>
@@ -83,18 +85,21 @@ std::vector<uint8_t> build_av_login(uint8_t step, uint32_t nonce, bool framed,
     return pkt;
 }
 
-// 32-byte IOCtrl body carrying io_type with the channel number as payload:
-// flag 0x70, request index, a single 12-byte slice (io type + 8 bytes).
-void build_ioctrl_body(uint8_t out[32], uint32_t io_type, uint32_t channel, uint16_t index)
+// IOCtrl body: flag 0x70, request index, a single slice of io type + data
+// (length at [8]), then the data after the io type at [20]. START / STOP
+// carry the channel number and 4 zero bytes.
+std::vector<uint8_t> build_ioctrl_body(uint32_t io_type, const uint8_t* data, size_t len,
+                                       uint16_t index)
 {
-    memset(out, 0, 32);
+    std::vector<uint8_t> out(24 + len, 0);
     out[1] = 0x70;
-    put_le16(out + 2, index);
-    put_le32(out + 4, 1);     // slice count
-    put_le32(out + 8, 12);    // slice length
-    put_le32(out + 12, index);
-    put_le32(out + 20, io_type);
-    put_le32(out + 24, channel);
+    put_le16(out.data() + 2, index);
+    put_le32(out.data() + 4, 1);     // slice count
+    put_le32(out.data() + 8, (uint32_t)(4 + len));
+    put_le32(out.data() + 12, index);
+    put_le32(out.data() + 20, io_type);
+    if (len) memcpy(out.data() + 24, data, len);
+    return out;
 }
 
 bool starts_with_start_code(const uint8_t* p, size_t n)
@@ -311,6 +316,8 @@ public:
     using FrameFn = std::function<void(const uint8_t*, size_t, bool)>;
 
     int dropped = 0;
+    // File-browser replies are self-contained; no keyframe gating.
+    bool any_frame = false;
 
     void add(const SliceHeader& h, const uint8_t* payload)
     {
@@ -387,7 +394,7 @@ private:
         }
         if (!key && starts_with_start_code(data.data(), len))
             key = h264_is_keyframe(data.data(), len);
-        if (need_key_ && !key) {
+        if (need_key_ && !key && !any_frame) {
             ++dropped;
             return;
         }
@@ -422,8 +429,12 @@ struct LinkState {
 
 struct TutkSession::Impl {
     std::atomic<bool> joined{false};
+    std::atomic<bool> ready{false};
     std::thread       worker;
     FrameCallback     cb;
+    Mode              mode = Mode::Video;
+    std::mutex        ctrl_mu;
+    std::deque<std::string> ctrl_out;
     IotcConn          conn{};
     uint16_t          out_seq       = 1;
     uint16_t          ioctrl_index  = 0;
@@ -441,7 +452,9 @@ struct TutkSession::Impl {
     void send(const uint8_t* data, size_t len) { iotc_send_app_data(&conn, data, len); }
     void put_header(uint8_t* pkt, uint8_t type, uint8_t flag);
     void send_login(const TutkSessionParams& p);
-    void send_ioctrl(uint32_t io_type, uint32_t channel);
+    void send_ioctrl(uint32_t io_type, const uint8_t* data, size_t len);
+    void send_channel_ioctrl(uint32_t io_type, uint32_t channel);
+    void drain_ctrl();
     void send_start();
     void send_stop();
     void send_transport_ack(uint16_t pkt_seq, uint16_t& ack_count);
@@ -475,27 +488,50 @@ void TutkSession::Impl::send_login(const TutkSessionParams& p)
 
 // Framed: a 0x0c packet with an empty group header in front of the body.
 // Legacy: the body follows the 8-byte AV header directly.
-void TutkSession::Impl::send_ioctrl(uint32_t io_type, uint32_t channel)
+void TutkSession::Impl::send_ioctrl(uint32_t io_type, const uint8_t* data, size_t len)
 {
-    uint8_t pkt[48] = {0};
     const size_t hdr = framed ? 16 : 8;
-    put_header(pkt, framed ? kTypeFramed : 0x00, framed ? 0 : 0x70);
-    build_ioctrl_body(pkt + hdr, io_type, channel, framed ? ioctrl_index++ : 0);
-    send(pkt, hdr + 32);
+    const auto body = build_ioctrl_body(io_type, data, len, framed ? ioctrl_index++ : 0);
+    std::vector<uint8_t> pkt(hdr + body.size(), 0);
+    put_header(pkt.data(), framed ? kTypeFramed : 0x00, framed ? 0 : 0x70);
+    memcpy(pkt.data() + hdr, body.data(), body.size());
+    send(pkt.data(), pkt.size());
+}
+
+void TutkSession::Impl::send_channel_ioctrl(uint32_t io_type, uint32_t channel)
+{
+    uint8_t data[8] = {0};
+    put_le32(data, channel);
+    send_ioctrl(io_type, data, sizeof(data));
+}
+
+void TutkSession::Impl::drain_ctrl()
+{
+    std::deque<std::string> out;
+    {
+        std::lock_guard<std::mutex> lk(ctrl_mu);
+        out.swap(ctrl_out);
+    }
+    for (const auto& json : out) {
+        OBN_DEBUG("tutk: ctrl request (%zu bytes)", json.size());
+        send_ioctrl(kIoTypeCtrl, reinterpret_cast<const uint8_t*>(json.data()), json.size());
+    }
 }
 
 // The framed stream serves the main 1080p channel only; the legacy stream
 // is requested on both channels like before.
 void TutkSession::Impl::send_start()
 {
-    send_ioctrl(kIoTypeIpcamStart, 0);
-    if (!framed) send_ioctrl(kIoTypeIpcamStart, 1);
+    if (mode == Mode::Ctrl) return;
+    send_channel_ioctrl(kIoTypeIpcamStart, 0);
+    if (!framed) send_channel_ioctrl(kIoTypeIpcamStart, 1);
 }
 
 void TutkSession::Impl::send_stop()
 {
-    send_ioctrl(kIoTypeIpcamStop, 0);
-    if (!framed) send_ioctrl(kIoTypeIpcamStop, 1);
+    if (mode == Mode::Ctrl) return;
+    send_channel_ioctrl(kIoTypeIpcamStop, 0);
+    if (!framed) send_channel_ioctrl(kIoTypeIpcamStop, 1);
 }
 
 // Legacy 20-byte transport acknowledgement (type 0x0b) for a packet whose
@@ -585,6 +621,7 @@ void TutkSession::Impl::deliver(const uint8_t* data, size_t len, bool keyframe)
 int TutkSession::Impl::connect(const TutkSessionParams& p)
 {
     iotc_close(&conn);
+    ready.store(false);
 
     for (int attempt = 1; attempt <= 3 && joined.load(); ++attempt) {
         const char* path = "lan";
@@ -619,11 +656,16 @@ int TutkSession::Impl::connect(const TutkSessionParams& p)
         int n = iotc_recv_app_data(&conn, resp, sizeof(resp), 800);
         if (n >= 40 && resp[0] == 0x00 && resp[1] == 0x21) {
             if (framed && get_le32(resp + 36) == 0) {
+                if (mode == Mode::Ctrl) {
+                    OBN_WARN("tutk: printer has no framed transport, no file browser over TUTK");
+                    return -2;
+                }
                 OBN_INFO("tutk: printer has no framed transport, using the legacy stream");
                 framed = false;
                 send_login(p);
             } else {
                 OBN_DEBUG("tutk: AV login accepted (%s)", framed ? "framed" : "legacy");
+                if (mode == Mode::Ctrl) ready.store(true);
             }
         }
         if (framed) {
@@ -785,14 +827,30 @@ int TutkSession::Impl::receive(const TutkSessionParams& p)
     auto     last_stats     = last_retry;
     std::vector<uint8_t> buf(65536);
 
+    frames_q.any_frame = mode == Mode::Ctrl;
     auto emit = [&](const uint8_t* data, size_t len, bool key) {
-        if (++frames == 1) OBN_INFO("tutk: first video frame (%zu bytes)", len);
+        if (++frames == 1 && mode == Mode::Video)
+            OBN_INFO("tutk: first video frame (%zu bytes)", len);
         deliver(data, len, key);
     };
 
     while (joined.load()) {
         const auto now = Clock::now();
-        if (frames == 0) {
+        if (mode == Mode::Ctrl) {
+            if (!ready.load() && now - last_retry >= std::chrono::milliseconds(1500)) {
+                if (++retries > 5) {
+                    OBN_WARN("tutk: ctrl login not accepted after %d attempts", retries - 1);
+                    return -1;
+                }
+                last_retry = now;
+                send_login(p);
+            }
+            if (ready.load()) drain_ctrl();
+            if (now - last_data >= std::chrono::seconds(5)) {
+                OBN_WARN("tutk: ctrl session silent for 5 s");
+                return -4;
+            }
+        } else if (frames == 0) {
             if (now - last_retry >= std::chrono::milliseconds(1500)) {
                 if (++retries > 5) {
                     OBN_WARN("tutk: no video after %d login attempts", retries - 1);
@@ -832,6 +890,10 @@ int TutkSession::Impl::receive(const TutkSessionParams& p)
 
         ++link.rx_since_ack;
         switch (pkt[0]) {
+        case 0x00:
+            if (pkt[1] == 0x21 && mode == Mode::Ctrl && !ready.exchange(true))
+                OBN_DEBUG("tutk: AV login accepted (ctrl)");
+            break;
         case kTypeFramed:
             handle_framed(pkt, (size_t)n, fecs, frames_q);
             frames_q.flush(fecs.has_holes(), emit);
@@ -859,9 +921,12 @@ int TutkSession::Impl::receive(const TutkSessionParams& p)
 void TutkSession::Impl::run(const TutkSessionParams& p)
 {
     for (int attempt = 1; attempt <= 5 && joined.load(); ++attempt) {
-        if (connect(p) == 0) {
+        const int rc = connect(p);
+        if (rc == 0) {
             if (receive(p) == 0) break;
             OBN_WARN("tutk: reconnecting (%d/5)", attempt);
+        } else if (rc == -2) {
+            break;
         } else {
             OBN_ERROR("tutk: could not establish a session (%d/5)", attempt);
         }
@@ -870,6 +935,7 @@ void TutkSession::Impl::run(const TutkSessionParams& p)
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
     iotc_close(&conn);
+    ready.store(false);
     joined.store(false);
 }
 
@@ -877,15 +943,31 @@ TutkSession::TutkSession() : impl_(std::make_unique<Impl>()) {}
 
 TutkSession::~TutkSession() { leave(); }
 
-void TutkSession::join(const TutkSessionParams& params, FrameCallback cb)
+void TutkSession::join(const TutkSessionParams& params, FrameCallback cb, Mode mode)
 {
     leave();
     impl_->cb      = std::move(cb);
+    impl_->mode    = mode;
     impl_->started = Clock::now();
     impl_->framed  = true;
+    {
+        std::lock_guard<std::mutex> lk(impl_->ctrl_mu);
+        impl_->ctrl_out.clear();
+    }
     impl_->joined.store(true);
-    OBN_INFO("tutk: starting session uid=%.20s", params.uid.c_str());
+    OBN_INFO("tutk: starting %s session uid=%.20s",
+             mode == Mode::Ctrl ? "file-browser" : "video", params.uid.c_str());
     impl_->worker = std::thread([this, params] { impl_->run(params); });
+}
+
+bool TutkSession::is_ready() const { return impl_->joined.load() && impl_->ready.load(); }
+
+bool TutkSession::send_ctrl(const std::string& json)
+{
+    if (json.empty() || json.size() > kMaxCtrlLen || !impl_->joined.load()) return false;
+    std::lock_guard<std::mutex> lk(impl_->ctrl_mu);
+    impl_->ctrl_out.push_back(json);
+    return true;
 }
 
 void TutkSession::leave()

@@ -58,6 +58,8 @@ using fn_create           = int (*)(Bambu_Tunnel*, char const*);
 using fn_set_logger       = void (*)(Bambu_Tunnel, Logger, void*);
 using fn_open             = int (*)(Bambu_Tunnel);
 using fn_start_stream     = int (*)(Bambu_Tunnel, bool);
+using fn_start_stream_ex  = int (*)(Bambu_Tunnel, int);
+using fn_send_message     = int (*)(Bambu_Tunnel, int, char const*, int);
 using fn_get_stream_count = int (*)(Bambu_Tunnel);
 using fn_get_stream_info  = int (*)(Bambu_Tunnel, int, Bambu_StreamInfo*);
 using fn_read_sample      = int (*)(Bambu_Tunnel, Bambu_Sample*);
@@ -72,6 +74,8 @@ struct Api {
     fn_set_logger       set_logger       = nullptr;
     fn_open             open             = nullptr;
     fn_start_stream     start_stream     = nullptr;
+    fn_start_stream_ex  start_stream_ex  = nullptr;
+    fn_send_message     send_message     = nullptr;
     fn_get_stream_count get_stream_count = nullptr;
     fn_get_stream_info  get_stream_info  = nullptr;
     fn_read_sample      read_sample      = nullptr;
@@ -136,7 +140,7 @@ T sym(void* h, const char* name, bool required)
 R"(usage: tutk_probe --url-file PATH|- [--lib PATH] [--seconds N]
                   [--device SERIAL] [--dev-ver VER] [--net-ver VER]
                   [--cli-id ID] [--cli-ver VER] [--dump PATH]
-                  [--no-init] [--quiet-lib]
+                  [--no-init] [--quiet-lib] [--ctrl JSON]...
 
   --url-file  file with the bambu:/// URL on its first line ('-' = stdin)
   --lib       libBambuSource.so to load
@@ -148,8 +152,89 @@ R"(usage: tutk_probe --url-file PATH|- [--lib PATH] [--seconds N]
   --dump      write raw sample payloads to PATH (inspect with ffprobe)
   --no-init   do not call Bambu_Init even if exported
   --quiet-lib do not print the library's own log lines
+  --ctrl      file-browser mode: open the CTRL channel the way Studio's
+              PrinterFileSystem does (StartStreamEx 0x3001) and send JSON
+              as one request {"cmdtype":..,"req":{..}}; "sequence" is added.
+              Repeatable. Replies are printed until --seconds elapse.
 )", stderr);
     std::exit(rc);
+}
+
+constexpr int kCtrlType = 0x3001;
+
+// Prints the JSON head of a CTRL reply and the size of any binary tail
+// (PrinterFileSystem splits them at the first "\n\n").
+void print_ctrl_reply(const Bambu_Sample& s)
+{
+    const std::string all(reinterpret_cast<const char*>(s.buffer),
+                          static_cast<std::size_t>(s.size));
+    const auto sep = all.find("\n\n");
+    const std::string head = all.substr(0, sep);
+    const std::size_t tail = sep == std::string::npos ? 0 : all.size() - sep - 2;
+    std::fprintf(stderr, "[%6lld ms] <<< %s%s\n", ms_since_start(),
+                 head.substr(0, 2000).c_str(), head.size() > 2000 ? "..." : "");
+    if (tail) std::fprintf(stderr, "             (+%zu binary bytes)\n", tail);
+}
+
+template <typename LastError>
+int run_ctrl(Bambu_Tunnel tnl, const std::vector<std::string>& reqs, int seconds,
+             LastError last_error)
+{
+    if (!g_api.start_stream_ex || !g_api.send_message) {
+        std::fprintf(stderr, "tutk_probe: library lacks StartStreamEx/SendMessage\n");
+        return 2;
+    }
+    int rc;
+    const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    do {
+        rc = g_api.start_stream_ex(tnl, kCtrlType);
+        if (rc != Bambu_would_block) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    } while (std::chrono::steady_clock::now() < start_deadline);
+    std::fprintf(stderr, "[%6lld ms] Bambu_StartStreamEx(CTRL) rc=%d %s\n",
+                 ms_since_start(), rc, last_error().c_str());
+    if (rc != Bambu_success) {
+        std::printf("{\"ok\":false,\"stage\":\"start_stream_ex\",\"rc\":%d}\n", rc);
+        g_api.close(tnl);
+        g_api.destroy(tnl);
+        return 1;
+    }
+
+    int seq = 0;
+    for (const auto& r : reqs) {
+        std::string msg = r;
+        const auto brace = msg.find('{');
+        if (brace != std::string::npos && msg.find("\"sequence\"") == std::string::npos)
+            msg.insert(brace + 1, "\"sequence\":" + std::to_string(seq) + ",");
+        ++seq;
+        std::fprintf(stderr, "[%6lld ms] >>> %s\n", ms_since_start(), msg.c_str());
+        rc = g_api.send_message(tnl, kCtrlType, msg.data(), static_cast<int>(msg.size()));
+        if (rc != Bambu_success)
+            std::fprintf(stderr, "tutk_probe: SendMessage rc=%d %s\n", rc, last_error().c_str());
+    }
+
+    int replies = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        Bambu_Sample s{};
+        rc = g_api.read_sample(tnl, &s);
+        if (rc == Bambu_would_block) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        if (rc != Bambu_success) {
+            std::fprintf(stderr, "[%6lld ms] ReadSample rc=%d %s\n", ms_since_start(), rc,
+                         last_error().c_str());
+            break;
+        }
+        ++replies;
+        if (s.buffer && s.size > 0) print_ctrl_reply(s);
+    }
+    g_api.close(tnl);
+    g_api.destroy(tnl);
+    std::printf("{\"ok\":%s,\"replies\":%d,\"last_rc\":%d}\n", replies > 0 ? "true" : "false",
+                replies, rc);
+    return replies > 0 ? 0 : 1;
 }
 
 } // namespace
@@ -160,6 +245,7 @@ int main(int argc, char** argv)
     std::string url_file;
     std::string dump_path;
     std::string device, dev_ver, net_ver, cli_id, cli_ver;
+    std::vector<std::string> ctrl_reqs;
     int  seconds = 10;
     bool do_init = true;
 
@@ -180,6 +266,7 @@ int main(int argc, char** argv)
         else if (f == "--dump")       dump_path = val();
         else if (f == "--no-init")    do_init = false;
         else if (f == "--quiet-lib")  g_quiet_lib = true;
+        else if (f == "--ctrl")       ctrl_reqs.push_back(val());
         else if (f == "-h" || f == "--help") usage(0);
         else {
             std::fprintf(stderr, "tutk_probe: unknown flag '%s'\n", f.c_str());
@@ -226,6 +313,8 @@ int main(int argc, char** argv)
     g_api.set_logger       = sym<fn_set_logger>(h, "Bambu_SetLogger", true);
     g_api.open             = sym<fn_open>(h, "Bambu_Open", true);
     g_api.start_stream     = sym<fn_start_stream>(h, "Bambu_StartStream", true);
+    g_api.start_stream_ex  = sym<fn_start_stream_ex>(h, "Bambu_StartStreamEx", false);
+    g_api.send_message     = sym<fn_send_message>(h, "Bambu_SendMessage", false);
     g_api.get_stream_count = sym<fn_get_stream_count>(h, "Bambu_GetStreamCount", true);
     g_api.get_stream_info  = sym<fn_get_stream_info>(h, "Bambu_GetStreamInfo", true);
     g_api.read_sample      = sym<fn_read_sample>(h, "Bambu_ReadSample", true);
@@ -265,6 +354,9 @@ int main(int argc, char** argv)
         g_api.destroy(tnl);
         return 1;
     }
+
+    if (!ctrl_reqs.empty())
+        return run_ctrl(tnl, ctrl_reqs, seconds, last_error);
 
     const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     do {

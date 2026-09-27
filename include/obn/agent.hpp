@@ -410,7 +410,7 @@ public:
     void note_device_lan_ip(const std::string& dev_id,
                             const std::string& ip);
     // LAN route for bambu_network_get_camera_url (used instead of TUTK
-    // when prefer_rtsp is set and the printer's video port answers a TCP
+    // when prefer_lan_over_tutk is set and the printer's video port answers a TCP
     // probe with LAN liveview on, or when
     // cloud credentials are unavailable). When the printer's LAN IP (SSDP /
     // connect_printer) and access code (connect_printer / cloud

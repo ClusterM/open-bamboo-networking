@@ -18,7 +18,7 @@ plugin.
   - [More details](#more-details)
     - [Basics (model-independent)](#basics-model-independent)
     - [Printing](#printing)
-    - [Camera liveview](#camera-liveview)
+    - [Camera liveview and file browser](#camera-liveview-and-file-browser)
     - [Status / Device tab](#status-device-tab)
   - [Cloud sign-in in Developer or LAN-only mode](#cloud-sign-in-in-developer-or-lan-only-mode)
 - [Building from source](#building-from-source)
@@ -206,8 +206,10 @@ file browsing, file transfer, camera) work normally.
   so the camera and file browser also use the reachable address.
 - **No cloud print records:** MakerWorld print history and model ratings are
   not written for LAN prints.
-- Cloud camera and cloud file browsing are unavailable — but those are not
-  implemented in either mode (LAN only, see below).
+- **No camera or file browser away from home:** without the cloud both work
+  over the LAN only (remote access over TUTK needs
+  [Option B](#option-b-cloud-mode-without-developer-mode)), so use the VPN /
+  port-forwarding setup above.
 
 ### Option B: cloud mode without Developer Mode
 
@@ -265,14 +267,14 @@ err_code: 84033543
 
 ### TL;DR: what is **not** implemented
 
-- **Camera live view over the cloud** (TUTK / Agora p2p) — video works on the
-  LAN only.
-- **File operations over the cloud** — browsing / download / delete work over
-  the LAN only (`:6000` / FTPS).
 - **Go Live** and **HMS photo snapshot** — both are cloud-only and need the
   proprietary SDK.
 
-Two things that used to be listed here now work with caveats:
+Three things that used to be listed here now work with caveats:
+
+- **Camera live view and file browsing away from the LAN** go over TUTK like
+  the stock plugin, for a cloud-bound printer with your own slicer credentials
+  — see [Camera liveview and file browser](#camera-liveview-and-file-browser).
 
 - **Printing without Developer Mode** works if you supply your own slicer
   credentials — see [Option B](#option-b-cloud-mode-without-developer-mode).
@@ -340,17 +342,19 @@ Studio does the work.
 | AMS telemetry / mapping                    | ✅                 | Passthrough | Studio consumes `push_status` directly.                                                                                                                                                                                     |
 | Nozzle mapping / multi-extruder            | ✅ (not tested)    | Passthrough | Plugin puts nozzle mapping data into JSON but the author has no such printer to test.                                                                                                                                       |
 
-#### Camera liveview
+#### Camera liveview and file browser
 
-Camera protocol differs by model (see the hardware matrix). Both paths
-share the same `libBambuSource.so` tunnel API towards Studio; the
-difference is what happens inside.
+Camera protocol differs by model (see the hardware matrix) and by route
+(LAN or TUTK). All paths share the same `libBambuSource.so` tunnel API
+towards Studio; the difference is what happens inside. On the LAN the file
+browser (Device → Storage) talks to the printer over TLS `:6000`, or FTPS
+with `force_ftps = 1`.
 
 | Feature                                 | Applies to                        | Status             | Impl   | Notes                                                                                                                                             |
 | --------------------------------------- | --------------------------------- | ------------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | MJPEG over TLS, port 6000               | A1, A1 mini, P1P, P1S             | ✅ (tested on P1S) | Native | Same TCP-over-TLS stream the stock plugin consumes. P1-family firmware serves this, not RTSPS (port 322 is closed on a P1S).                      |
 | RTSPS → H.264 byte-stream, port 322     | X1 (all), P2S, H-series, X2D      | ✅ (tested on P2S) | Native | Same wire format the stock plugin uses: raw H.264 Annex-B byte-stream out via `Bambu_ReadSample`; the slicer's vendored `gstbambusrc` decodes it. |
-| Cloud camera (TUTK / Agora p2p)         | any printer out of LAN            | ❌                 | ❌     | Proprietary libraries.                                                                                                                            |
+| Camera and file browser over TUTK p2p   | cloud-bound printers              | 🔒 (tested on P2S) | Native | Stock-style TUTK session: directly on the LAN, hole-punched from outside, or through a TUTK relay (P2S: 1080p30). The file browser (lists, thumbnails, downloads) uses the same transport. Needs your own slicer credentials ([Option B](#option-b-cloud-mode-without-developer-mode)) and `block_cloud = 0`; other models not tested. `prefer_lan_over_tutk = 1` uses the LAN paths above whenever the printer answers there. Agora is not implemented. |
 
 #### Status / Device tab
 
@@ -464,10 +468,15 @@ Spaces around `=` are optional.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). |
+| `force_ftps` | `0` | Force FTPS (port 990) for file transfer instead of the native TLS :6000 protocol. Thumbnails, timelapse files, and internal storage (eMMC) browsing are not available in this mode. Useful when the printer's :6000 file browser is broken (e.g. some A1 firmware versions). For a cloud-bound printer the file browser then uses the LAN address instead of TUTK. |
 | `disable_camera_preview` | `0` | Disable the annoying static "Printer Preview" JPEG snapshot shown in the device panel when live view is off. |
-| `prefer_rtsp` | `0` | For a cloud-bound printer (with `block_cloud = 0`), use the local RTSP(S) / :6000 camera stream instead of TUTK when the printer answers on LAN. If LAN is down or the printer reports "LAN Only Liveview" off, and the slicer key is present, fall back to TUTK. Default matches the stock plugin (TUTK). Without the slicer key TUTK is unavailable. |
 | `force_timelapse_external` | `0` | Always save timelapse to external storage (USB/SD), ignoring the Internal/External toggle in the print dialog (Studio defaults to internal). |
+
+**Live view and file browser transport:**
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `prefer_lan_over_tutk` | `0` | For a cloud-bound printer (with `block_cloud = 0`), reach live view and the file browser over the local network instead of TUTK when the printer's IP and access code are known and it answers there (video over RTSP(S) or MJPEG :6000, files over :6000). Falls back to TUTK when the printer does not answer locally or has "LAN Only Liveview" off. Default matches the stock plugin (TUTK). Without the slicer key TUTK is unavailable, so the local network is used regardless. With `force_ftps = 1` the file browser always uses the local network. |
 
 **MQTT push_status patches** (all off by default; enable only if your model needs it):
 

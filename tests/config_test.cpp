@@ -160,7 +160,7 @@ static int test_new_keys()
                "force_timelapse_external = 1\n"
                "force_ftps = 1\n"
                "disable_camera_preview = 1\n"
-               "prefer_rtsp = 1\n"
+               "prefer_lan_over_tutk = 1\n"
                "mqtt_keep_connection = yes\n"
                "override_lan_ip = yes\n"
                "patch_mqtt_home_flag = yes\n"
@@ -179,7 +179,7 @@ static int test_new_keys()
     CHECK(cfg.force_timelapse_external == true);
     CHECK(cfg.force_ftps == true);
     CHECK(cfg.disable_camera_preview == true);
-    CHECK(cfg.prefer_rtsp == true);
+    CHECK(cfg.prefer_lan_over_tutk == true);
     CHECK(cfg.mqtt_keep_connection == true);
     CHECK(cfg.override_lan_ip == true);
     CHECK(cfg.patch_mqtt_home_flag == true);
@@ -205,7 +205,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.force_timelapse_external == false);
     CHECK(cfg.force_ftps == false);
     CHECK(cfg.disable_camera_preview == false);
-    CHECK(cfg.prefer_rtsp == false);
+    CHECK(cfg.prefer_lan_over_tutk == false);
     CHECK(cfg.mqtt_keep_connection == true);
     CHECK(cfg.override_lan_ip == false);
     CHECK(cfg.patch_mqtt_home_flag == false);

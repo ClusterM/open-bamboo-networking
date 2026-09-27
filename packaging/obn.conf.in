@@ -49,7 +49,9 @@ force_timelapse_external = 0
 # native TLS :6000 CTRL protocol.  Thumbnails, timelapse files, and
 # internal storage (eMMC) browsing are not available in this mode.
 # Useful as a workaround when the printer's :6000 file browser is
-# broken (e.g. some A1 firmware versions).
+# broken (e.g. some A1 firmware versions).  FTPS needs the local network,
+# so for a cloud-bound printer the file browser then skips TUTK and uses
+# the printer's LAN address (it fails if that is unreachable).
 
 force_ftps = 0
 
@@ -65,25 +67,27 @@ force_ftps = 0
 disable_camera_preview = 0
 
 
-# --- Camera transport ------------------------------------------------
+# --- Live view and file browser transport ----------------------------
 #
-# Only matters for a printer that is bound to the cloud (the slicer builds
-# the local URL itself in LAN-only mode) and only while block_cloud = 0.
-# By default live view uses TUTK like the stock plugin: the plugin asks
-# Bambu's cloud for TUTK credentials, and the cloud wakes the printer's
-# TUTK server. Set to 1 to use the local RTSP(S) / port 6000 stream
-# instead whenever the printer's IP and access code are known; this
-# needs "LAN Only Liveview" enabled on the printer for RTSP(S) models.
+# How live view and the file browser (Device -> Storage) reach a printer
+# that is bound to the cloud.  Only matters while block_cloud = 0: in
+# LAN-only mode the slicer connects to the printer locally by itself.
+#
+# 0 (default, like the stock plugin): both go over TUTK, Bambu's P2P
+#   service.  The plugin asks the cloud for TUTK credentials, and the
+#   printer is reached directly (same network or hole punching) or through
+#   a TUTK relay, so this also works away from home.
+# 1: use the printer's local network whenever its IP and access code are
+#   known and it answers there: video over RTSP(S) (MJPEG on port 6000
+#   for A1 / P1), files over port 6000.  Falls back to TUTK when the
+#   printer does not answer locally or has "LAN Only Liveview" off.
+#
 # TUTK credentials are only handed out to a signed slicer request, so
-# without the slicer key/certificate the local stream is used regardless.
-# If the printer's video port does not answer on LAN (blocked, off-net)
-# or the printer reports "LAN Only Liveview" off, the plugin falls back to
-# TUTK when the slicer key is present; otherwise Studio gets a generic
-# "Connection Failed" instead of the LAN IP dialog.
-# With this project's BambuSource the file browser keeps using the local
-# network either way (it does not speak TUTK).
+# without the slicer key/certificate the local network is used either way.
+# With force_ftps = 1 the file browser always uses the local network.
+# If neither path works, the slicer shows "Connection Failed".
 
-prefer_rtsp = 0
+prefer_lan_over_tutk = 0
 
 
 # --- Cloud status bootstrap ------------------------------------------

@@ -30,6 +30,8 @@ static constexpr size_t kUidLen = 20;
 // AV IOCtrl types that start and stop the camera stream on a channel.
 static constexpr uint32_t kIoTypeIpcamStart = 0x01ff;
 static constexpr uint32_t kIoTypeIpcamStop  = 0x02ff;
+// PrinterFileSystem JSON (Studio's CTRL_TYPE) carried as an IOCtrl.
+static constexpr uint32_t kIoTypeCtrl       = 0x3001;
 
 struct DtlsSession {
     uint8_t  client_random[32];
