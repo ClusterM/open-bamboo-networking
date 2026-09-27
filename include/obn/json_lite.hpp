@@ -13,7 +13,9 @@
 //   * Every last JSON oddity (UTF-16 surrogate pairs in \uXXXX escapes
 //     are handled, but we don't renormalise).
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -54,7 +56,18 @@ public:
 
     bool        as_bool(bool def = false)   const { return is_bool() ? boolean_ : def; }
     double      as_number(double def = 0)   const { return is_number() ? number_ : def; }
-    std::int64_t as_int(std::int64_t d = 0) const { return is_number() ? static_cast<std::int64_t>(number_) : d; }
+    // static_cast<int64_t> of a double outside [INT64_MIN, INT64_MAX] (or NaN)
+    // is undefined behavior. Wire data (printer/cloud JSON) is untrusted, so
+    // clamp instead of trusting the field to be in range.
+    std::int64_t as_int(std::int64_t d = 0) const {
+        if (!is_number()) return d;
+        if (std::isnan(number_)) return d;
+        if (number_ >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+            return std::numeric_limits<std::int64_t>::max();
+        if (number_ <= static_cast<double>(std::numeric_limits<std::int64_t>::min()))
+            return std::numeric_limits<std::int64_t>::min();
+        return static_cast<std::int64_t>(number_);
+    }
     const std::string& as_string() const {
         static const std::string empty;
         return is_string() ? string_ : empty;
