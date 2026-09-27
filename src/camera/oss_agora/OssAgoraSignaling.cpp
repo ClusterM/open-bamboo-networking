@@ -670,6 +670,9 @@ int OssAgoraSignaling::Impl::recv_loop(const AgoraJoinParams& params)
         }
     }
 
+    // Tell the printer to free its stream workers before the session goes away.
+    send_ipcam_stop(0, client_out_seq);
+    send_ipcam_stop(1, client_out_seq);
     iotc_relay_close(&relay);
     OBN_INFO("[oss-relay] recv_loop exited (joined=%d)", joined.load() ? 1 : 0);
     return 0;
@@ -686,7 +689,7 @@ OssAgoraSignaling::~OssAgoraSignaling()
 
 int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 {
-    if (m_impl->joined.load()) leave();
+    leave();
 
     m_impl->cb = std::move(cb);
     m_impl->joined.store(true);
@@ -710,6 +713,7 @@ int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
             if (!m_impl->joined.load()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
+        bambu_net::oss_tutk::iotc_relay_close(&m_impl->relay);
         m_impl->joined.store(false);
     });
 
@@ -718,16 +722,9 @@ int OssAgoraSignaling::join(const AgoraJoinParams& params, FrameCallback cb)
 
 int OssAgoraSignaling::leave()
 {
-    OBN_INFO("[oss-relay] leave() called (joined=%d)", m_impl->joined.load() ? 1 : 0);
-    if (m_impl->joined.exchange(false)) {
-        // Send IPCAM_STOP before closing relay connection so printer frees stream worker
-        m_impl->send_ipcam_stop(0, m_impl->client_out_seq);
-        m_impl->send_ipcam_stop(1, m_impl->client_out_seq);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        OBN_INFO("[oss-relay] IPCAM_STOP sent on both channels, closing relay...");
-    }
-    // Close the relay socket to unblock recvfrom in recv_loop
-    bambu_net::oss_tutk::iotc_relay_close(&m_impl->relay);
+    // The worker owns the connection: it notices the flag within one receive
+    // step, sends IPCAM_STOP and closes the socket itself.
+    m_impl->joined.store(false);
     if (m_impl->worker_thread.joinable()) {
         m_impl->worker_thread.join();
         OBN_INFO("[oss-relay] worker thread joined — leave() complete");

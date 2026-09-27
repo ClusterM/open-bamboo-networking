@@ -426,6 +426,7 @@ struct RelayConn {
     uint8_t          relay_cookie[8];  // 8-byte session cookie from relay ping (0x23 0x05 0x42)
     bool             have_relay_cookie;
     bool             is_lan;           // found by LAN search (iotc_lan_connect)
+    int64_t          last_alive_ms;    // steady-clock ms of the last 27 04 21 alive
 };
 
 // --------------------------------------------------------------------------

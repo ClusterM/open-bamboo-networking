@@ -440,6 +440,7 @@ static int send_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* d
                              const uint8_t* dtls_data, size_t dtls_len,
                              uint16_t pkt_seq, uint32_t relay_tag = 0)
 {
+    if (dtls_len > 0xffff - 12) return -1;
     size_t total = 28 + dtls_len;
     std::vector<uint8_t> pkt(total, 0);
 
@@ -562,7 +563,10 @@ static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* p
         if (session_token_out)
             memcpy(session_token_out, raw + 20, 8);
 
-        if (dtls_len > buf_size) dtls_len = buf_size;
+        if (dtls_len > buf_size) {
+            OBN_WARN("[dtls] recv: dropping oversized record (%zu > %zu)", dtls_len, buf_size);
+            continue;
+        }
         memcpy(dtls_out, raw + 28, dtls_len);
         return (int)dtls_len;
     }
@@ -766,6 +770,9 @@ static void build_dtls_hs_hdr(uint8_t* buf, uint8_t hs_type,
     buf[11]= (uint8_t)(body_len      );
 }
 
+// TLS limit on a record's plaintext (RFC 5246 6.2.1).
+static constexpr size_t kMaxRecordPlaintext = 16384;
+
 // RFC 7366 Encrypt-then-MAC (EtM) + AES-256-CBC record protection
 static bool encrypt_record_cbc_etm(const uint8_t* key, const uint8_t* mac_key,
                                    uint8_t content_type, uint16_t epoch, uint64_t seq,
@@ -853,6 +860,10 @@ static int decrypt_record_cbc_etm(const uint8_t* key, const uint8_t* mac_key,
     const uint8_t* iv = payload;
     const uint8_t* ciphertext = payload + 16;
     size_t cipher_len = frag_len - 16;
+    if (cipher_len % 16 != 0) {
+        OBN_WARN("[dtls-etm] ciphertext length %zu is not a block multiple", cipher_len);
+        return -1;
+    }
     const uint8_t* received_mac = payload + frag_len;
 
     uint8_t mac_in_hdr[13];
@@ -901,7 +912,7 @@ static int decrypt_record_cbc_etm(const uint8_t* key, const uint8_t* mac_key,
     if (total == 0) return -1;
 
     uint8_t pad_val = decrypted[total - 1];
-    if (pad_val >= 16 || pad_val >= total) {
+    if ((int)pad_val >= total) {
         OBN_ERROR("[dtls-etm] invalid padding 0x%02x (total=%d)", pad_val, total);
         return -1;
     }
@@ -942,6 +953,7 @@ static bool dtls_encrypt_record(DtlsSession* ds, uint8_t content_type,
                                 const uint8_t* plain, size_t plain_len,
                                 std::vector<uint8_t>& out_rec)
 {
+    if (plain_len > kMaxRecordPlaintext) return false;
     if (ds->cipher_suite == 0xC038) {
         bool ok = encrypt_record_cbc_etm(ds->client_write_key, ds->client_write_mac_key,
                                          content_type, (uint16_t)ds->epoch, ds->tx_seq,
@@ -1658,7 +1670,7 @@ static int send_relay_join(obn::net::socket_t sock, const struct sockaddr_in* ds
     pkt[4] = 0x26;  // payload_len=38 LE
     pkt[8]  = 0x07; pkt[9]  = 0x10; pkt[10] = 0x18;
 
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     size_t relay_copy = strnlen(relay_id, 16);
     memcpy(pkt + 36, relay_id, relay_copy);
     pkt[52] = 0x06;
@@ -1690,7 +1702,7 @@ static int send_relay_knock(obn::net::socket_t sock, const struct sockaddr_in* d
     pkt[4] = 0x48;  // payload_len=72 LE
     pkt[8]  = 0x01; pkt[9]  = 0x06; pkt[10] = 0x21;
 
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     // [36..51] = zeros (already zeroed)
 
     uint32_t sdk_ver = htole32(0x04030304);  // TUTK SDK 4.3.3.4 at [52..55]
@@ -1817,7 +1829,7 @@ static int send_rdv_authkey(obn::net::socket_t sock, const struct sockaddr_in* d
     uint8_t pkt[48];
     write_rdv_hdr(pkt, 32, 0x14, 0x02, 0x24);
     memset(pkt + 16, 0, 32);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 40, authkey, strnlen(authkey, 8));
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0, (const struct sockaddr*)dst, sizeof(*dst));
@@ -1832,7 +1844,7 @@ static int send_rdv_token(obn::net::socket_t sock, const struct sockaddr_in* dst
     uint8_t pkt[64];
     write_rdv_hdr(pkt, 48, 0x0a, 0x02, 0x24);
     memset(pkt + 16, 0, 48);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, token, 8);
     pkt[44] = 0x3c;                    // observed constant
     memcpy(pkt + 56, authkey, strnlen(authkey, 8));
@@ -1870,7 +1882,7 @@ static int send_rdv_punch(obn::net::socket_t sock, const struct sockaddr_in* ser
     uint8_t pkt[544];
     memset(pkt, 0, sizeof(pkt));
     write_rdv_hdr(pkt, 528, 0x04, 0x08, 0x24);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     static const uint8_t kPunchConst[16] = {
         0x00, 0x02, 0xff, 0x04, 0xa6, 0xff, 0xff, 0xff,
         0x00, 0x00, 0x00, 0x00, 0x04, 0x03, 0x03, 0x04
@@ -1910,7 +1922,7 @@ static int send_rdv_random(obn::net::socket_t sock, const struct sockaddr_in* ds
     uint8_t pkt[288];
     memset(pkt, 0, sizeof(pkt));
     write_rdv_hdr(pkt, 272, 0x03, 0x02, 0x34);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     pkt[36] = 0x00; pkt[37] = 0x00;
     memcpy(pkt + 38, &local_ep->sin_port, 2);
     memcpy(pkt + 40, &local_ep->sin_addr, 4);
@@ -1932,7 +1944,7 @@ static int send_punch_to_candidate(obn::net::socket_t sock, const struct sockadd
     uint8_t pkt[52];
     memset(pkt, 0, sizeof(pkt));
     write_rdv_hdr(pkt, 36, 0x01, 0x04, 0x33);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, token, 8);
     uint32_t r = rand32();
     memcpy(pkt + 48, &r, 4);
@@ -1948,7 +1960,7 @@ static int send_rdv_punch2(obn::net::socket_t sock, const struct sockaddr_in* ds
     uint8_t pkt[60];
     write_rdv_hdr(pkt, 44, 0x09, 0x02, 0x24);
     memset(pkt + 16, 0, 44);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, token, 8);
     pkt[44] = 0x01;  // Relay request flag: 01 00 00 00 (mandatory for NAT relay fallback)
     static const uint8_t kTrailer[12] = {
@@ -1969,7 +1981,7 @@ static int send_rdv_ack(obn::net::socket_t sock, const struct sockaddr_in* dst,
     uint32_t t = htole32(tag);
     memcpy(pkt + 12, &t, 4);
     memset(pkt + 16, 0, 28);
-    memcpy(pkt + 16, uid_upper, 20);
+    memcpy(pkt + 16, uid_upper, kUidLen);
     memcpy(pkt + 36, token, 8);
     trans_code_partial(pkt, sizeof(pkt));
     ssize_t n = sendto(sock, pkt, sizeof(pkt), 0, (const struct sockaddr*)dst, sizeof(*dst));
@@ -2185,7 +2197,7 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
                        const char* region_str, const char* authkey,
                        RelayConn* out)
 {
-    if (!uid_upper || !relay_id || !region_str || !out) return -1;
+    if (!uid_upper || strlen(uid_upper) != kUidLen || !relay_id || !region_str || !out) return -1;
     if (!authkey) authkey = "";
     memset(out, 0, sizeof(*out));
     out->sock = -1;
@@ -2564,12 +2576,38 @@ int iotc_relay_send_app_data(RelayConn* rc,
     return rc_send;
 }
 
+// 24-byte direct P2P session control: 16-byte header (flags 0x0a) + session
+// token. 27 04 21 is the client alive (the printer answers 28 04 12), 17 04 21
+// closes the session.
+static void send_p2p_session_ctrl(const RelayConn* rc, uint8_t t0)
+{
+    uint8_t pkt[24];
+    write_rdv_hdr(pkt, 8, t0, 0x04, 0x21);
+    pkt[3] = 0x0a;
+    memcpy(pkt + 16, rc->session_token, 8);
+    trans_code_partial(pkt, sizeof(pkt));
+    bambu_net::oss_tutk::sendto(rc->sock, pkt, sizeof(pkt), 0,
+                                (const struct sockaddr*)&rc->relay_addr, (int)sizeof(rc->relay_addr));
+}
+
+static int64_t steady_ms()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 int iotc_relay_recv_app_data(RelayConn* rc,
                               uint8_t* out_buf, size_t out_size,
                               int timeout_ms)
 {
     if (!rc || rc->sock < 0) return -1;
     DtlsSession& ds = rc->dtls;
+
+    // Stock sends the alive every ~2 s; the printer otherwise keeps probing.
+    if (!rc->is_relay && steady_ms() - rc->last_alive_ms >= 2000) {
+        send_p2p_session_ctrl(rc, 0x27);
+        rc->last_alive_ms = steady_ms();
+    }
 
     auto start_time = std::chrono::steady_clock::now();
     auto deadline = start_time + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
@@ -2716,12 +2754,8 @@ void iotc_relay_close(RelayConn* rc)
             }
             OBN_INFO("[relay-close] sent 5x relay close packets (type=0x14 0x05 0x24, tag=%u)", rc->relay_tag);
         } else if (!rc->is_relay) {
-            // Direct P2P: MSG_P2P_CLOSE_C2D (0x18 0x02 0x24)
-            uint8_t pkt[16] = {0};
-            write_rdv_hdr(pkt, 0, 0x18, 0x02, 0x24);
-            trans_code_partial(pkt, sizeof(pkt));
-            bambu_net::oss_tutk::sendto(rc->sock, pkt, sizeof(pkt), 0,
-                                        (const struct sockaddr*)&rc->relay_addr, (int)sizeof(rc->relay_addr));
+            for (int i = 0; i < 3; ++i)
+                send_p2p_session_ctrl(rc, 0x17);
         }
         obn::net::close_socket(rc->sock);
         rc->sock = -1;
