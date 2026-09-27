@@ -1026,6 +1026,25 @@ static bool fallback_to_tutk(Tunnel* t)
     return true;
 }
 
+// Dials the Local-scheme :6000 TLS endpoint into t->fd / t->ssl.
+static bool dial_local_tls(Tunnel* t, const char* who)
+{
+    log_fmt(t->logger, t->log_ctx, "%s: dialing tls://%s:%d",
+            who, t->url.host.c_str(), t->url.port);
+    const char* serial = t->url.device.empty() ? nullptr : t->url.device.c_str();
+    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
+                           &t->fd, &t->ssl, serial) != 0) {
+        log_fmt(t->logger, t->log_ctx, "%s: TLS dial failed: %s",
+                who, obn::source::get_last_error());
+        return false;
+    }
+    log_fmt(t->logger, t->log_ctx, "%s: TLS established (cipher=%s)",
+            who, SSL_get_cipher(t->ssl));
+    t->t0      = std::chrono::steady_clock::now();
+    t->started = true;
+    return true;
+}
+
 // TUTK tunnel opened for the file browser: our TUTK client carries video
 // only, so switch the CTRL channel to the printer's LAN :6000 route.
 static bool fallback_to_lan(Tunnel* t)
@@ -1039,18 +1058,7 @@ static bool fallback_to_lan(Tunnel* t)
         return false;
     }
     obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
-    log_fmt(t->logger, t->log_ctx, "fallback_to_lan: dialing tls://%s:%d for dev=%s",
-            t->url.host.c_str(), t->url.port, dev_id.c_str());
-    const char* serial = t->url.device.empty() ? nullptr : t->url.device.c_str();
-    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
-                           &t->fd, &t->ssl, serial) != 0) {
-        log_fmt(t->logger, t->log_ctx, "fallback_to_lan: TLS dial failed: %s",
-                obn::source::get_last_error());
-        return false;
-    }
-    t->t0      = std::chrono::steady_clock::now();
-    t->started = true;
-    return true;
+    return dial_local_tls(t, "fallback_to_lan");
 }
 
 
@@ -1878,6 +1886,7 @@ static void native_ctrl_send_worker(Tunnel* t)
 static int start_native_ctrl_handshake(Tunnel* t)
 {
     if (!t->ssl) {
+        log_fmt(t->logger, t->log_ctx, "ctrl: TLS session not open");
         set_last_error("CTRL: TLS session not open");
         return -1;
     }
@@ -2042,15 +2051,7 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return Bambu_success;
     }
 
-    log_fmt(t->logger, t->log_ctx, "Bambu_Open: dialing tls://%s:%d",
-            t->url.host.c_str(), t->url.port);
-
-    const char* serial =
-        t->url.device.empty() ? nullptr : t->url.device.c_str();
-    if (obn::tls::dial_tls(t->url.host, t->url.port, /*timeout_ms=*/5000,
-                           &t->fd, &t->ssl, serial) != 0) {
-        log_fmt(t->logger, t->log_ctx, "Bambu_Open: TLS dial failed: %s",
-                obn::source::get_last_error());
+    if (!dial_local_tls(t, "Bambu_Open")) {
         if (!t->url.device.empty()) {
             log_fmt(t->logger, t->log_ctx,
                     "Bambu_Open: attempting TUTK cloud fallback for dev=%s",
@@ -2062,12 +2063,6 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
         return -1;
     }
 
-    log_fmt(t->logger, t->log_ctx,
-            "Bambu_Open: TLS established (cipher=%s)",
-            SSL_get_cipher(t->ssl));
-
-    t->t0      = std::chrono::steady_clock::now();
-    t->started = true;
     log_fmt(t->logger, t->log_ctx,
             "Bambu_Open: TLS ready (MJPEG auth deferred to StartStream)");
     return Bambu_success;
@@ -2170,6 +2165,12 @@ OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
     // :6000 open and forward CTRL JSON to printer firmware.
     if (type == kCtrlType) {
         if (t->url.scheme == Scheme::Tutk && !fallback_to_lan(t)) return -1;
+        // Bambu_Open skips the :6000 dial for lv=rtsps/rtsp URLs, which
+        // Studio also hands to the file browser.
+        if (t->url.scheme == Scheme::Local && !t->ssl &&
+            !dial_local_tls(t, "Bambu_StartStreamEx")) {
+            return -1;
+        }
         return start_native_ctrl_handshake(t);
     }
     return Bambu_StartStream(tunnel, true);
