@@ -842,6 +842,10 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_link_libraries(tunnel_local_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME tunnel_local COMMAND tunnel_local_test)
 
+    add_executable(json_lite_test tests/json_lite_test.cpp src/json_lite.cpp)
+    target_include_directories(json_lite_test PRIVATE include)
+    add_test(NAME json_lite COMMAND json_lite_test)
+
     # Portable Annex-B → AVCC helper used by the macOS BambuPlayer adapter.
     add_executable(h264_avcc_test tests/h264_avcc_test.cpp
         stubs/h264_avcc.cpp)

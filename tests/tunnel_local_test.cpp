@@ -17,6 +17,46 @@ static int fail_count = 0;
         }                                                               \
     } while (0)
 
+static bool upload_init_ok(const std::string& reply_body,
+                           std::uint32_t* kb = nullptr,
+                           std::uint64_t* off = nullptr)
+{
+    const std::string wire = R"({"result":1,"reply":)" + reply_body + "}";
+    std::uint32_t k = 0;
+    std::uint64_t o = 0;
+    int rc = -1;
+    const bool ok = obn::tunnel_local::parse_upload_init_reply(wire, &k, &o, &rc);
+    if (kb) *kb = k;
+    if (off) *off = o;
+    return ok;
+}
+
+// chunk_size drives a chunk_size * 1024 byte allocation and offset drives
+// the resume-prefix hashing loop; both come straight from the printer.
+static void test_upload_init_reply_bounds()
+{
+    std::uint32_t kb = 0;
+    std::uint64_t off = 0;
+
+    CHECK(upload_init_ok(R"({"chunk_size":255,"offset":0})", &kb));
+    CHECK(kb == 255u);
+    CHECK(upload_init_ok(R"({"chunk_size":65536,"offset":0})", &kb));
+    CHECK(kb == 65536u);
+    CHECK(!upload_init_ok(R"({"chunk_size":65537,"offset":0})"));
+    CHECK(!upload_init_ok(R"({"chunk_size":0,"offset":0})"));
+    CHECK(!upload_init_ok(R"({"chunk_size":-1,"offset":0})"));
+    CHECK(!upload_init_ok(R"({"chunk_size":4294967296,"offset":0})"));
+    CHECK(!upload_init_ok(R"({"chunk_size":1e300,"offset":0})"));
+    CHECK(!upload_init_ok(R"({"offset":0})"));
+
+    CHECK(upload_init_ok(R"({"chunk_size":64,"offset":1048576})", nullptr, &off));
+    CHECK(off == 1048576u);
+    CHECK(upload_init_ok(R"({"chunk_size":64})", nullptr, &off));
+    CHECK(off == 0u);
+    CHECK(!upload_init_ok(R"({"chunk_size":64,"offset":-1})"));
+    CHECK(!upload_init_ok(R"({"chunk_size":64,"offset":-1e300})"));
+}
+
 static void test_frame_header()
 {
     const auto hdr = obn::tunnel_local::build_frame_header(102, 0x0102013Fu, 42u);
@@ -191,6 +231,7 @@ int main()
     test_build_file_download_abi();
     test_build_sub_file_abi();
     test_build_list_info_abi();
+    test_upload_init_reply_bounds();
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
         return 1;
