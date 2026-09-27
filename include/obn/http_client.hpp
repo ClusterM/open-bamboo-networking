@@ -72,4 +72,10 @@ Response post_json(const std::string& url,
 // URL-encode a single component (RFC 3986 unreserved + percent).
 std::string url_encode(const std::string& in);
 
+// Masks credential-bearing header values (Authorization, cookies, STS
+// tokens, ...) in a raw header block, one header per line. For
+// Authorization the scheme word ("Bearer", "AWS4-HMAC-SHA256") is kept.
+// Used by the OBN_HTTP_TRACE logger: people attach those logs to issues.
+std::string redact_secret_headers(const std::string& block);
+
 } // namespace obn::http

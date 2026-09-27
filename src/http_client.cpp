@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -42,7 +43,7 @@ int on_curl_debug(CURL* /*handle*/, curl_infotype type, char* data, size_t size,
     // 100-continue, forced Transfer-Encoding: chunked).
     if (type != CURLINFO_HEADER_OUT && type != CURLINFO_HEADER_IN)
         return 0;
-    std::string s(data, size);
+    std::string s = redact_secret_headers(std::string(data, size));
     // Strip trailing CRLF run to keep the log one-line-per-header.
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
     if (s.empty()) return 0;
@@ -256,6 +257,54 @@ std::string url_encode(const std::string& in)
             out.push_back(HEX[(c >> 4) & 0xF]);
             out.push_back(HEX[c & 0xF]);
         }
+    }
+    return out;
+}
+
+std::string redact_secret_headers(const std::string& block)
+{
+    static const char* const kSecretHeaders[] = {
+        "authorization",        "proxy-authorization",
+        "cookie",               "set-cookie",
+        "x-amz-security-token", "x-oss-security-token",
+        "x-bbl-device-security-sign",
+    };
+    auto redact_line = [](const std::string& line) -> std::string {
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) return line;
+        std::string name = line.substr(0, colon);
+        for (auto& ch : name)
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        bool secret = false;
+        for (const char* k : kSecretHeaders) secret = secret || name == k;
+        if (!secret) return line;
+
+        std::size_t v = line.find_first_not_of(' ', colon + 1);
+        if (v == std::string::npos) return line;
+        std::string kept = line.substr(0, v);
+        if (name == "authorization" || name == "proxy-authorization") {
+            const auto sp = line.find(' ', v);
+            if (sp != std::string::npos) {
+                kept = line.substr(0, sp + 1);
+                v    = sp + 1;
+            }
+        }
+        std::size_t end = line.size();
+        if (end > v && line[end - 1] == '\r') --end;
+        return kept + "<redacted " + std::to_string(end - v) + " bytes>" +
+               line.substr(end);
+    };
+
+    std::string out;
+    out.reserve(block.size());
+    std::size_t pos = 0;
+    while (pos < block.size()) {
+        const auto nl = block.find('\n', pos);
+        const auto len = (nl == std::string::npos ? block.size() : nl) - pos;
+        out += redact_line(block.substr(pos, len));
+        if (nl == std::string::npos) break;
+        out += '\n';
+        pos = nl + 1;
     }
     return out;
 }

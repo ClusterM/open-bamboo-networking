@@ -846,6 +846,16 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(json_lite_test PRIVATE include)
     add_test(NAME json_lite COMMAND json_lite_test)
 
+    add_executable(http_redact_test tests/http_redact_test.cpp
+        src/http_client.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(http_redact_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(http_redact_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}")
+    target_link_libraries(http_redact_test PRIVATE obn_curl_iface)
+    add_test(NAME http_redact COMMAND http_redact_test)
+
     # Portable Annex-B → AVCC helper used by the macOS BambuPlayer adapter.
     add_executable(h264_avcc_test tests/h264_avcc_test.cpp
         stubs/h264_avcc.cpp)
