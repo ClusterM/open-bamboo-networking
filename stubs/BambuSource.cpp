@@ -33,7 +33,8 @@
 //
 // Extra query parameters (device=, net_ver=, dev_ver=, cli_id=, ...) are
 // ignored by the printer but device= is used for LAN TLS verify (SNI +
-// CN=serial). The printer only cares about the auth packet (MJPG) or
+// CN=serial) and the TUTK fallback; when Studio omits it the serial is
+// looked up by IP (fill_device_from_ip). The printer only cares about the auth packet (MJPG) or
 // the RTSP DESCRIBE/SETUP/PLAY exchange.
 //
 // Protocol summary (see OpenBambuAPI/video.md for the canonical spec):
@@ -826,8 +827,7 @@ int read_tutk(Tunnel* t, Bambu_Sample* sample)
     return Bambu_success;
 }
 
-// The plugin's private obn_get_{tutk,lan}_camera_url exports (see
-// src/abi_camera.cpp). Resolved from the already-loaded plugin module; never
+// The plugin's private obn_get_* exports (see src/abi_camera.cpp). Resolved from the already-loaded plugin module; never
 // loads it, so a stock plugin (no such symbols) simply disables the fallbacks.
 using GetUrlFn = const char* (*)(const char*);
 
@@ -872,13 +872,24 @@ static GetUrlFn resolve_plugin_url_fn(const char* name)
 #endif
 }
 
-static std::string query_plugin_url(const char* export_name, const std::string& dev_id)
+static std::string query_plugin(const char* export_name, const std::string& arg)
 {
-    if (dev_id.empty()) return {};
+    if (arg.empty()) return {};
     GetUrlFn fn = resolve_plugin_url_fn(export_name);
     if (!fn) return {};
-    const char* u = fn(dev_id.c_str());
+    const char* u = fn(arg.c_str());
     return u ? std::string(u) : std::string{};
+}
+
+// Studio omits device= from upload / part-skip tunnel URLs; recover the
+// serial from the IP so TLS verification and the transport fallbacks work.
+static void fill_device_from_ip(TunnelUrl* url)
+{
+    if (!url->device.empty() || url->host.empty() || url->scheme == Scheme::Tutk) return;
+    if (auto serial = obn::lan_tls::registry_lookup_serial(url->host))
+        url->device = *serial;
+    else
+        url->device = query_plugin("obn_get_lan_serial", url->host);
 }
 
 // Replaces t->url with a freshly resolved URL, keeping the Studio-appended
@@ -904,7 +915,7 @@ static bool fallback_to_tutk(Tunnel* t)
     log_fmt(t->logger, t->log_ctx,
             "fallback_to_tutk: querying TUTK URL for dev=%s",
             dev_id.c_str());
-    std::string tutk_url = query_plugin_url("obn_get_tutk_camera_url", dev_id);
+    std::string tutk_url = query_plugin("obn_get_tutk_camera_url", dev_id);
     if (tutk_url.empty()) {
         log_fmt(t->logger, t->log_ctx,
                 "fallback_to_tutk: failed to resolve TUTK URL for dev=%s",
@@ -945,7 +956,7 @@ static bool fallback_to_tutk(Tunnel* t)
 static bool fallback_to_lan(Tunnel* t)
 {
     const std::string dev_id = t->url.device;
-    std::string lan_url = query_plugin_url("obn_get_lan_camera_url", dev_id);
+    std::string lan_url = query_plugin("obn_get_lan_camera_url", dev_id);
     if (lan_url.empty() || !adopt_url(t, lan_url) || t->url.scheme != Scheme::Local) {
         log_fmt(t->logger, t->log_ctx,
                 "fallback_to_lan: no LAN route for dev=%s", dev_id.c_str());
@@ -1897,6 +1908,7 @@ OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
             scheme_name, t->url.host.c_str(), t->url.port,
             t->url.path.c_str(), t->url.user.c_str(),
             t->url.passwd.empty() ? "(empty!)" : "***");
+    fill_device_from_ip(&t->url);
     if (t->url.scheme != Scheme::Tutk && !t->url.device.empty() && !t->url.host.empty()) {
         obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
     }

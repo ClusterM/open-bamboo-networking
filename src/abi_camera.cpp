@@ -8,6 +8,7 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
+#include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 #include "obn/signing.hpp"
 
@@ -106,11 +107,12 @@ OBN_ABI int bambu_network_get_hms_snapshot(void* /*agent*/,
 // GetProcAddress) to switch transports mid-session: a LAN tunnel whose TLS
 // or RTSP dial fails asks for a TUTK URL, and a TUTK tunnel opened for the
 // file browser (CTRL, which our TUTK client does not carry) asks for the LAN
-// URL. Not part of Studio's ABI. `dev_id` is the bare serial. Both are
-// synchronous (the TUTK one blocks on the /user/ttcode POST), must not be
-// called from Studio's UI thread, and return a pointer to a thread_local
-// buffer that stays valid until the next call on the same thread, or
-// nullptr when no URL is available.
+// URL; obn_get_lan_serial fills in the serial for URLs without device=.
+// Not part of Studio's ABI. `dev_id` is the bare serial. All are synchronous
+// (the TUTK one blocks on the /user/ttcode POST), must not be called from
+// Studio's UI thread, and return a pointer to a thread_local buffer that
+// stays valid until the next call on the same thread, or nullptr when there
+// is no answer.
 
 OBN_ABI const char* obn_get_tutk_camera_url(const char* dev_id)
 {
@@ -148,4 +150,15 @@ OBN_ABI const char* obn_get_lan_camera_url(const char* dev_id)
         return nullptr;
     }
     return s_last_url.c_str();
+}
+
+// Serial of the printer last seen at `ip` (SSDP / connect_printer), for
+// tunnel URLs Studio builds without device= (print upload, part skip).
+OBN_ABI const char* obn_get_lan_serial(const char* ip)
+{
+    static thread_local std::string s_serial;
+    s_serial.clear();
+    if (!ip || !*ip) return nullptr;
+    if (auto serial = obn::lan_tls::registry_lookup_serial(ip)) s_serial = *serial;
+    return s_serial.empty() ? nullptr : s_serial.c_str();
 }
