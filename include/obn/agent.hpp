@@ -475,6 +475,11 @@ private:
     void harvest_tutk_server_status(const std::string& dev_id,
                                     const std::string& json);
 
+    // Records the LAN access code from the printer's system.get_access_code
+    // reply (Studio asks for it over the cloud) via note_device_access_code.
+    void harvest_access_code(const std::string& dev_id,
+                             const std::string& json);
+
     // Blocks until the printer reports it can take a TUTK session: either a
     // liveview.prepare "succeed" newer than `since` (the reply to the
     // cloud's prepare that follows a /user/ttcode mint) or tutk_server

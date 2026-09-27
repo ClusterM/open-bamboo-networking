@@ -1236,6 +1236,26 @@ void Agent::harvest_tutk_server_status(const std::string& dev_id,
     tutk_ready_cv_.notify_all();
 }
 
+void Agent::harvest_access_code(const std::string& dev_id,
+                                const std::string& json)
+{
+    if (json.find("\"get_access_code\"") == std::string::npos) return;
+
+    std::string perr;
+    auto root = obn::json::parse(json, &perr);
+    if (!root) return;
+    if (root->find("system.command").as_string() != "get_access_code") return;
+    const std::string code = root->find("system.access_code").as_string();
+    if (code.empty()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = lan_access_code_by_dev_.find(dev_id);
+        if (it != lan_access_code_by_dev_.end() && it->second == code) return;
+    }
+    OBN_INFO("dev=%s LAN access code from get_access_code reply", dev_id.c_str());
+    note_device_access_code(dev_id, code);
+}
+
 bool Agent::wait_tutk_ready(const std::string& dev_id,
                             std::chrono::steady_clock::time_point since,
                             std::chrono::milliseconds timeout)
@@ -1603,6 +1623,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
     harvest_tutk_server_status(dev_id, json);
+    harvest_access_code(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
     // defer-close the cloud report subscription for this device.
@@ -2760,6 +2781,7 @@ int Agent::connect_cloud()
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
         harvest_tutk_server_status(dev_id, json);
+        harvest_access_code(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
