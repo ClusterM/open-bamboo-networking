@@ -408,6 +408,7 @@ struct DtlsSession {
     uint64_t rx_seq;
     bool     handshake_complete;
     uint32_t relay_tag;           // tag from 03 03 43 (if relayed)
+    uint16_t pkt_seq;             // next IOTC datagram counter (header [6..7])
 };
 
 // --------------------------------------------------------------------------
@@ -424,6 +425,7 @@ struct RelayConn {
     char             uid_upper[32];
     uint8_t          relay_cookie[8];  // 8-byte session cookie from relay ping (0x23 0x05 0x42)
     bool             have_relay_cookie;
+    bool             is_lan;           // found by LAN search (iotc_lan_connect)
 };
 
 // --------------------------------------------------------------------------
@@ -443,6 +445,13 @@ struct RelayConn {
 int iotc_relay_connect(const char* uid_upper, const char* relay_id,
                        const char* region_str, const char* authkey,
                        RelayConn* out);
+
+// Find the printer on the local network by LAN search (UDP broadcast to
+// 32761) and prepare a direct session to the address it answers from.
+// timeout_ms bounds the search. Returns 0 on success, -1 when no printer with
+// this UID answered.
+int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
+                     RelayConn* out);
 
 // Run DTLS-PSK handshake over the relay socket.
 // Must be called after iotc_relay_connect().

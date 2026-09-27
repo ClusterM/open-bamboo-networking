@@ -225,9 +225,11 @@ int OssAgoraSignaling::Impl::do_join(const AgoraJoinParams& params)
         OBN_INFO("[oss-relay] do_join attempt %d/3: region=%s relay_id=%s uid=%s",
                  conn_try, rstr, channel.c_str(), uid_upper.c_str());
 
-        if (iotc_relay_connect(uid_upper.c_str(), channel.c_str(), rstr,
+        if (iotc_lan_connect(uid_upper.c_str(), params.authkey.c_str(),
+                             /*timeout_ms=*/1500, &relay) != 0 &&
+            iotc_relay_connect(uid_upper.c_str(), channel.c_str(), rstr,
                                params.authkey.c_str(), &relay) != 0) {
-            OBN_WARN("[oss-relay] iotc_relay_connect failed (try %d/3)", conn_try);
+            OBN_WARN("[oss-relay] neither LAN search nor relay reached the printer (try %d/3)", conn_try);
             iotc_relay_close(&relay);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
