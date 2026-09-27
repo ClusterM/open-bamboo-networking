@@ -1,5 +1,6 @@
 #include <functional>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -50,15 +51,20 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
 
     // Cloud URL minting is an HTTP POST. Offload to a worker thread so
     // Studio's UI / MediaPlayCtrl thread returns immediately (research/08.11.1).
-    std::thread([a, dev_id = std::move(dev_id), serial, callback = std::move(callback)]() {
+    // The full packed key goes to the mint: dev_ver and protocols are part of
+    // the /user/ttcode request body.
+    auto mint = [a, dev_id, serial, callback]() {
         std::string cloud_url = a->remote_camera_url(dev_id);
         OBN_INFO("get_camera_url dev=%s -> %s", serial.c_str(),
                  cloud_url.empty() ? "(none)" : "TUTK cloud URL");
-        if (callback) {
-            callback(std::move(cloud_url));
-        }
-    }).detach();
-
+        if (callback) callback(std::move(cloud_url));
+    };
+    try {
+        std::thread(std::move(mint)).detach();
+    } catch (const std::system_error& e) {
+        OBN_WARN("get_camera_url: thread spawn failed (%s)", e.what());
+        if (callback) callback(std::string{});
+    }
     return BAMBU_NETWORK_SUCCESS;
 }
 

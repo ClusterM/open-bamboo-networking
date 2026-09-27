@@ -1431,10 +1431,10 @@ std::string Agent::camera_url_for(const std::string& dev_id)
             lv = it->second;
     }
     if (ip.empty() || code.empty()) {
-        OBN_INFO("camera_url: no LAN route for dev=%s (ip=%s code=%s) — trying remote TUTK",
-                 dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
-                 code.empty() ? "unknown" : "known");
-        return remote_camera_url(dev_id);
+        OBN_DEBUG("camera_url: no LAN route for dev=%s (ip=%s code=%s)",
+                  dev_id.c_str(), ip.empty() ? "unknown" : ip.c_str(),
+                  code.empty() ? "unknown" : "known");
+        return {};
     }
 
     // The :6000 tunnel (and a possible RTSPS liveview redirect) verify the
