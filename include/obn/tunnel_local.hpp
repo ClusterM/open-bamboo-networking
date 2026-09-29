@@ -163,6 +163,10 @@ public:
 
     HandshakePhase phase() const { return phase_; }
 
+    // What the printer sent during the handshake that did not advance it
+    // (for logs): byte count plus the last unexpected frame, if any.
+    std::string handshake_note() const;
+
     // One handshake step per call. Returns 0 when ready, 1 while in progress
     // (caller should poll), -1 on error. `io_mu` serialises SSL access.
     int handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu);
@@ -199,6 +203,8 @@ private:
     HandshakePhase            phase_ = HandshakePhase::NotStarted;
     std::vector<std::uint8_t> recv_buf_;
     std::mutex                recv_buf_mu_;
+    std::size_t               rx_total_ = 0;
+    std::string               hs_note_;
 
     int send_frame(SSL* ssl, std::uint32_t magic, const std::uint8_t* payload,
                    std::size_t payload_len, std::mutex* io_mu);

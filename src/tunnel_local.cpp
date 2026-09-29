@@ -73,6 +73,26 @@ const char* ssl_fail_reason(SSL* ssl)
     return "SSL I/O error (no OpenSSL error queued)";
 }
 
+// Short log form of printer bytes: text as is when printable, else hex.
+std::string describe_bytes(const std::uint8_t* data, std::size_t len)
+{
+    const bool text = len > 0 && std::all_of(data, data + len, [](std::uint8_t c) {
+        return (c >= 0x20 && c < 0x7f) || c == '\n' || c == '\r' || c == '\t';
+    });
+    std::string out;
+    if (text) {
+        out.assign(reinterpret_cast<const char*>(data), std::min<std::size_t>(len, 200));
+    } else {
+        char b[4];
+        for (std::size_t i = 0; i < std::min<std::size_t>(len, 48); ++i) {
+            std::snprintf(b, sizeof(b), "%02x", data[i]);
+            out += b;
+        }
+    }
+    if (len > (text ? 200u : 48u)) out += "...";
+    return out;
+}
+
 } // namespace
 
 const char* describe_ssl_io_error(SSL* ssl)
@@ -608,7 +628,15 @@ int Session::try_read_frames(SSL* ssl, std::mutex* io_mu)
         std::lock_guard<std::mutex> lk(recv_buf_mu_);
         recv_buf_.insert(recv_buf_.end(), chunk, chunk + n);
     }
+    rx_total_ += static_cast<std::size_t>(n);
     return 0;
+}
+
+std::string Session::handshake_note() const
+{
+    std::string s = "rx=" + std::to_string(rx_total_) + " bytes";
+    if (!hs_note_.empty()) s += ", last unexpected: " + hs_note_;
+    return s;
 }
 
 int Session::poll_incoming_wire(SSL* ssl, std::mutex* io_mu,
@@ -689,7 +717,21 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
             phase_ = HandshakePhase::Failed;
             return -1;
         }
-        if (rr > 0 || !have_login_ack()) return 1;
+        if (rr > 0) return 1;
+        if (!have_login_ack()) {
+            FrameHeader hdr{};
+            if (parse_frame_header(recv_buf_.data(), recv_buf_.size(), &hdr) &&
+                hdr.magic != kMagicLoginServer) {
+                char b[64];
+                std::snprintf(b, sizeof(b), "frame magic=0x%08x len=%u: ",
+                              hdr.magic, hdr.payload_len);
+                hs_note_ = b + describe_bytes(recv_buf_.data() + 16,
+                                              recv_buf_.size() - 16);
+            } else if (!recv_buf_.empty() && recv_buf_.size() < 16) {
+                hs_note_ = "partial: " + describe_bytes(recv_buf_.data(), recv_buf_.size());
+            }
+            return 1;
+        }
         std::vector<std::vector<std::uint8_t>> bodies;
         const std::size_t consumed =
             consume_frames(recv_buf_.data(), recv_buf_.size(), &bodies);
@@ -725,12 +767,12 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
                     std::string(reinterpret_cast<const char*>(body.data()),
                                 body.size()),
                     &perr);
-                if (!v) continue;
-                if (v->find("mtype").as_int() == kMtypeCtrlSetup &&
+                if (v && v->find("mtype").as_int() == kMtypeCtrlSetup &&
                     v->find("result").as_int() == 0) {
                     phase_ = HandshakePhase::Ready;
                     return 0;
                 }
+                hs_note_ = "setup reply: " + describe_bytes(body.data(), body.size());
             }
             const int rr = try_read_frames(ssl, io_mu);
             if (rr < 0) {

@@ -565,6 +565,7 @@ struct Tunnel {
     bool             ctrl_mode = false;
 
     std::unique_ptr<obn::tunnel_local::Session> tl_session;
+    std::chrono::steady_clock::time_point       tl_t0;
 
     // ---- FTPS bridge state (force_ftps=1) ----
     // When force_ftps is enabled we serve LIST_INFO / FILE_DOWNLOAD /
@@ -1887,6 +1888,12 @@ static void native_ctrl_send_worker(Tunnel* t)
     log_fmt(t->logger, t->log_ctx, "ctrl: native send worker exited");
 }
 
+static long long tl_elapsed_ms(const Tunnel* t)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t->tl_t0).count();
+}
+
 static int start_native_ctrl_handshake(Tunnel* t)
 {
     if (!t->ssl) {
@@ -1899,6 +1906,7 @@ static int start_native_ctrl_handshake(Tunnel* t)
     if (!t->tl_session) {
         t->tl_session = std::make_unique<obn::tunnel_local::Session>(
             static_cast<std::uint32_t>(std::rand()));
+        t->tl_t0 = std::chrono::steady_clock::now();
     }
     obn::tunnel_local::Config cfg;
     cfg.username    = t->url.user;
@@ -1910,12 +1918,18 @@ static int start_native_ctrl_handshake(Tunnel* t)
         cfg.client_ver = t->url.net_ver;
     }
 
+    const auto prev = t->tl_session->phase();
     const int hs = t->tl_session->handshake_step(t->ssl, cfg, &t->mjpg_io_mu);
+    const auto ph = t->tl_session->phase();
+    if (ph != prev) {
+        log_fmt(t->logger, t->log_ctx, "ctrl: handshake phase %d -> %d after %lld ms (%s)",
+                static_cast<int>(prev), static_cast<int>(ph), tl_elapsed_ms(t),
+                t->tl_session->handshake_note().c_str());
+    }
     if (hs < 0) {
-        const auto ph = t->tl_session->phase();
         log_fmt(t->logger, t->log_ctx,
                 "ctrl: native handshake failed (phase=%d)",
-                static_cast<int>(ph));
+                static_cast<int>(prev));
         t->tl_session.reset();
         set_last_error("BambuTunnelLocal handshake failed");
         return -1;
@@ -1927,8 +1941,8 @@ static int start_native_ctrl_handshake(Tunnel* t)
         t->ctrl_stop.store(false, std::memory_order_release);
         t->ctrl_worker      = std::thread(native_ctrl_send_worker, t);
         log_fmt(t->logger, t->log_ctx,
-                "ctrl: native :6000 passthrough ready (pid=%s ver=%s)",
-                cfg.client_id.c_str(), cfg.client_ver.c_str());
+                "ctrl: native :6000 passthrough ready after %lld ms (pid=%s ver=%s)",
+                tl_elapsed_ms(t), cfg.client_id.c_str(), cfg.client_ver.c_str());
     }
     return Bambu_success;
 }
@@ -2464,6 +2478,13 @@ OBN_EXPORT void Bambu_Close(Bambu_Tunnel tunnel)
     // CTRL worker must be joined before the rest of the tunnel is
     // dismantled (it holds references to SSL that tunnel_close would
     // would invalidate).
+    if (t->tl_session &&
+        t->tl_session->phase() != obn::tunnel_local::HandshakePhase::Ready) {
+        log_fmt(t->logger, t->log_ctx,
+                "ctrl: handshake abandoned in phase %d after %lld ms (%s)",
+                static_cast<int>(t->tl_session->phase()), tl_elapsed_ms(t),
+                t->tl_session->handshake_note().c_str());
+    }
     stop_ctrl_mode(t);
     tunnel_close(t);
 }
