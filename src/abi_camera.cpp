@@ -89,6 +89,11 @@ void deliver_camera_url(const std::function<void(std::string)>& callback,
 // file browser (CTRL over :6000), the device-panel snapshot and liveview
 // all work over LAN that way; the lv= hint makes libBambuSource fetch video
 // over RTSP(S) :322 instead of MJPEG :6000 on X1/P1S/P2S printers.
+//
+// When no LAN route is known (e.g. printer remote or off-LAN), the ttcode
+// mint is followed by a proactively dispatched, signed and encrypted
+// liveview.prepare command so the printer starts its tutk_server even when
+// the cloud-pushed prepare is rejected with 84033543 on secured firmware.
 OBN_ABI int bambu_network_get_camera_url(void* agent,
                                          std::string dev_id,
                                          std::function<void(std::string)> callback)
@@ -115,7 +120,7 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
                  "ignoring prefer_lan_over_tutk", serial.c_str());
 
     // Cloud URL minting is an HTTP POST (and prefer_lan_over_tutk may probe
-    // LAN).
+    // LAN); remote_camera_url also publishes the signed liveview.prepare.
     // Offload so Studio's UI / MediaPlayCtrl thread returns immediately.
     auto work = [a, dev_id, serial, lan_url, callback, cloud_usable,
                  prefer_lan = prefer_lan && !lan_video_off]() {
