@@ -142,6 +142,9 @@ bool apply_state_line(const std::string& line)
     const std::string val = line.substr(eq + 1);
     if (key.empty()) return false;
     if (key != kEnvConfigDir && !is_obn_ipc_env_key(key.c_str())) return false;
+    // A value already in the environment (set by the user, or by the main
+    // plugin in this process) is newer than the file.
+    if (env_var_get_os(key.c_str())) return false;
     return set_env_var(key.c_str(), val.c_str());
 }
 
@@ -158,8 +161,13 @@ void restrict_user_readwrite(const std::filesystem::path& path)
 
 void hydrate_env_from_state_file_once()
 {
+    // Log outside call_once: in libBambuSource the log threshold itself
+    // reads OBN_* env through env_var_get and would re-enter this once.
     static std::once_flag once;
-    std::call_once(once, []() {
+    static std::string    hydrated_from;
+    bool                  first = false;
+    std::call_once(once, [&first]() {
+        first = true;
         for (const auto& path : state_file_search_paths()) {
             std::error_code ec;
             if (!std::filesystem::is_regular_file(path, ec)) continue;
@@ -169,10 +177,12 @@ void hydrate_env_from_state_file_once()
             while (std::getline(in, line)) {
                 (void)apply_state_line(line);
             }
-            OBN_INFO("lan_tls: hydrated env from %s", path.string().c_str());
+            hydrated_from = path.string();
             return;
         }
     });
+    if (first && !hydrated_from.empty())
+        OBN_INFO("lan_tls: hydrated env from %s", hydrated_from.c_str());
 }
 
 void write_state_file_locked()

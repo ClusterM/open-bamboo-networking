@@ -630,15 +630,34 @@ can be set in `obn.conf`; environment variables override them when set.
 | `bambusource_log_to_file`      | `OBN_BAMBUSOURCE_LOG_TO_FILE`    | `0`       | When `1`, append to `<data_dir>/obn-bambusource.log`. |
 | `bambusource_log_file`         | `OBN_BAMBUSOURCE_LOG_FILE`       | *(empty)* | Explicit path; `off`/`none`/`0` to disable, `stderr`/`-` for stderr. |
 
-The log file rolls every line through `[level]` plus a timestamp.
+Each line carries a millisecond timestamp, the level and the thread id.
 Lines are tagged with `rtsp:` (handshake / DESCRIBE / SETUP / PLAY),
 `rtsp_passthrough:` (the worker that hands the byte stream to
-gstbambusrc on Linux), and on Windows also `dshow:` (the DirectShow
-filter's connection / sample pump). If you see no video despite a
-successful `rtsp: PLAY ok` the issue is slicer-side: on Linux, missing
-GStreamer H.264 decoder (`gstreamer1.0-plugins-bad` /
+gstbambusrc on Linux), `ctrl:` (file browser), `tutk:` / `iotc` (TUTK
+sessions), `ftps:` (the `force_ftps` bridge), and on Windows also
+`dshow:` (the DirectShow filter's connection / sample pump). If you see
+no video despite a successful `rtsp: PLAY ok` the issue is slicer-side:
+on Linux, missing GStreamer H.264 decoder (`gstreamer1.0-plugins-bad` /
 `gstreamer1.0-libav`); on Windows, missing H.264 MFT (Media Feature
 Pack on N/KN editions).
+
+What the levels add:
+
+- **`debug`**: every `Bambu_*` call from the slicer with its arguments and
+  result (polled calls such as `Bambu_StartStreamEx` log the first
+  `would_block` and then the final result with the poll count and time),
+  one line per file-browser request and reply (`cmdtype`, `sequence`,
+  `result`, sizes), the port 6000 handshake phases with timings, and the
+  TUTK connection steps (LAN search, rendezvous candidates, relay, DTLS).
+- **`trace`**: everything on the wire: port 6000 frames in both directions
+  as text or hex (the login frame body with the access code is never
+  dumped), full file-browser JSON, every video sample, TUTK IOCtrl and
+  control packets, FEC recovery and per-frame delivery. Expect large
+  files; enable it only while reproducing a problem.
+
+`debug` and `trace` lines go only to the file and stderr; the slicer's
+own log receives `info` and above. The secrets warning above applies
+here too: camera URLs and file-browser JSON are logged as they are.
 
 ## Known issues
 

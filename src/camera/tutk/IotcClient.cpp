@@ -495,7 +495,7 @@ static int recv_dtls_packet(obn::net::socket_t sock, const struct sockaddr_in* p
         // DTLS content starts with 0x16 (Handshake), 0x14 (CCS), or 0x15 (Alert).
         size_t dtls_len = (size_t)(n - 28);
         if (dtls_len < 1 || (raw[28] != 0x16 && raw[28] != 0x14 && raw[28] != 0x15)) {
-            OBN_DEBUG("iotc dtls: recv: skipping non-DTLS IOTC pkt (n=%zd type=0x%02x)", n, dtls_len > 0 ? raw[28] : 0);
+            OBN_TRACE("iotc dtls: recv: skipping non-DTLS IOTC pkt (n=%zd type=0x%02x)", n, dtls_len > 0 ? raw[28] : 0);
             continue;
         }
 
@@ -1822,6 +1822,9 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
         if (resp[8] == 0x01 && resp[9] == 0x03 && resp[10] == 0x43) {
             num_candidates = parse_candidates(resp, (size_t)n, candidates, 4);
             OBN_DEBUG("iotc rdv: received 01 03 43 with %d candidate(s)", num_candidates);
+            for (int c = 0; c < num_candidates; ++c)
+                OBN_DEBUG("iotc rdv: candidate %d: %s:%u", c, inet_ntoa(candidates[c].sin_addr),
+                          ntohs(candidates[c].sin_port));
             for (int rep = 0; rep < 3; ++rep) {
                 for (int c = 0; c < num_candidates; ++c) {
                     send_punch_to_candidate(sock, &candidates[c], uid_upper, session_token);
@@ -2246,7 +2249,7 @@ int iotc_send_app_data(IotcConn* rc,
     if (rc_send != 0) {
         OBN_ERROR("iotc relay-send: send_dtls_packet failed (len=%zu, dtls_len=%zu)", len, dtls_rec.size());
     } else {
-        OBN_DEBUG("iotc relay-send: sent %zu B app data (dtls_len=%zu, epoch=%u)", len, dtls_rec.size(), ds.epoch);
+        OBN_TRACE("iotc relay-send: sent %zu B app data (dtls_len=%zu, epoch=%u)", len, dtls_rec.size(), ds.epoch);
     }
     return rc_send;
 }
@@ -2338,7 +2341,7 @@ int iotc_recv_app_data(IotcConn* rc,
             if (n >= 40) memcpy(&tag, raw + 36, 4);
             uint32_t tag_h = le32toh(tag);
             send_rdv_ack(rc->sock, &src, rc->uid_upper, rc->session_token, tag_h);
-            OBN_DEBUG("iotc relay-recv: re-ACKed 03 03 43 from relay (tag=%u)", tag_h);
+            OBN_TRACE("iotc relay-recv: re-ACKed 03 03 43 from relay (tag=%u)", tag_h);
             continue;
         }
 
@@ -2360,7 +2363,7 @@ int iotc_recv_app_data(IotcConn* rc,
             trans_code_partial(pong, sizeof(pong));
             obn::camera::tutk::sendto(rc->sock, pong, sizeof(pong), 0,
                                         (const struct sockaddr*)&rc->peer, (int)sizeof(rc->peer));
-            OBN_DEBUG("iotc relay-recv: answered relay ping 23 05 42 with pong 24 05 24 (tag=%u)", rc->relay_tag);
+            OBN_TRACE("iotc relay-recv: answered relay ping 23 05 42 with pong 24 05 24 (tag=%u)", rc->relay_tag);
             continue;
         }
 
@@ -2373,7 +2376,7 @@ int iotc_recv_app_data(IotcConn* rc,
             : (raw[9] == 0x04 && ((raw[8] == 0x08 && raw[10] == 0x12) ||
                                   (raw[8] == 0x07 && raw[10] == 0x21)));
         if (!is_dtls) {
-            OBN_DEBUG("iotc relay-recv: skipping non-DTLS packet: len=%zd type=%02x %02x %02x",
+            OBN_TRACE("iotc relay-recv: skipping non-DTLS packet: len=%zd type=%02x %02x %02x",
                       n, raw[8], raw[9], raw[10]);
             continue;
         }
@@ -2384,7 +2387,7 @@ int iotc_recv_app_data(IotcConn* rc,
 
         // Skip non-ApplicationData records (handshake/alerts)
         if (content_type != 0x17) {
-            OBN_DEBUG("iotc relay-recv: skipping DTLS record type 0x%02x", content_type);
+            OBN_TRACE("iotc relay-recv: skipping DTLS record type 0x%02x", content_type);
             continue;
         }
 

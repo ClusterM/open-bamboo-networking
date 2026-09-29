@@ -4,6 +4,7 @@
 #include "obn/config.hpp"
 #include "obn/os_compat.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdarg>
@@ -126,6 +127,9 @@ long tid()
     return obn::os::thread_id();
 }
 
+std::atomic<ForwardEmitFn>      g_fwd_emit{nullptr};
+std::atomic<ForwardThresholdFn> g_fwd_threshold{nullptr};
+
 void format_timestamp(char* buf, std::size_t n)
 {
     using namespace std::chrono;
@@ -182,8 +186,15 @@ void configure_from_log_dir(const std::string& log_dir)
     write_load_banner_to_file_locked(s);
 }
 
+void set_forward(ForwardEmitFn emit_fn, ForwardThresholdFn threshold_fn)
+{
+    g_fwd_threshold.store(threshold_fn, std::memory_order_release);
+    g_fwd_emit.store(emit_fn, std::memory_order_release);
+}
+
 Level threshold()
 {
+    if (auto fn = g_fwd_threshold.load(std::memory_order_acquire)) return fn();
     auto& s = state();
     std::lock_guard<std::mutex> lk(s.mu);
     ensure_initialized_locked(s);
@@ -214,6 +225,12 @@ void emit(Level lvl, const char* file, int line, const char* func, const char* f
             else     msg = small;
         }
         va_end(ap2);
+    }
+
+    if (auto fn = g_fwd_emit.load(std::memory_order_acquire)) {
+        fn(lvl, msg);
+        if (msg != small) std::free(msg);
+        return;
     }
 
     // File location: trim to basename to keep lines short.
@@ -260,6 +277,31 @@ std::string redact(const std::string& in, std::size_t max_chars)
         out.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '.');
     }
     if (in.size() > max_chars) out += "...";
+    return out;
+}
+
+std::string hexdump(const void* data, std::size_t len, std::size_t max_bytes)
+{
+    const auto* p = static_cast<const unsigned char*>(data);
+    if (!p || !len) return {};
+    const std::size_t n = std::min(len, max_bytes);
+    bool text = true;
+    for (std::size_t i = 0; i < n && text; ++i) {
+        const unsigned char c = p[i];
+        text = (c >= 0x20 && c != 0x7f) || c == '\n' || c == '\r' || c == '\t';
+    }
+    std::string out;
+    if (text) {
+        out.assign(reinterpret_cast<const char*>(p), n);
+    } else {
+        static const char kHex[] = "0123456789abcdef";
+        out.reserve(n * 2 + 3);
+        for (std::size_t i = 0; i < n; ++i) {
+            out.push_back(kHex[p[i] >> 4]);
+            out.push_back(kHex[p[i] & 0x0f]);
+        }
+    }
+    if (len > n) out += "...";
     return out;
 }
 

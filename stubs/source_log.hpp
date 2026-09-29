@@ -53,9 +53,9 @@ enum LogLevel {
 void noop_logger(void*, int, obn_tchar const*);
 
 // Honor-OBN_BAMBUSOURCE_LOG_LEVEL formatter. Drops messages below the
-// configured threshold for both the file mirror and the Studio
-// callback (so OBN_BAMBUSOURCE_LOG_LEVEL=debug enables extra detail
-// without spamming Studio's own log when set higher).
+// configured threshold. DEBUG and TRACE go to the file mirror / stderr
+// only; the Studio callback gets INFO and above. OBN_* lines from the
+// shared code are routed through the same sinks.
 #if defined(__GNUC__) || defined(__clang__)
 #  define OBN_SOURCE_LOG_PRINTF_ATTR(fmt_idx, args_idx) \
        [[gnu::format(printf, fmt_idx, args_idx)]]
@@ -72,7 +72,7 @@ void log_at(LogLevel lvl, Logger logger, void* ctx, const char* fmt, ...);
 OBN_SOURCE_LOG_PRINTF_ATTR(3, 4)
 void log_fmt(Logger logger, void* ctx, const char* fmt, ...);
 
-// Threshold derived from OBN_BAMBUSOURCE_LOG_LEVEL. Cached on first use.
+// Threshold derived from OBN_BAMBUSOURCE_LOG_LEVEL, re-read at most once a second.
 LogLevel current_log_level();
 
 // Writes `msg` into a thread-local string accessed by

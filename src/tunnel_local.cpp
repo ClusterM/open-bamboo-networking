@@ -1,6 +1,7 @@
 #include "obn/tunnel_local.hpp"
 
 #include "obn/json_lite.hpp"
+#include "obn/log.hpp"
 #include "obn/os_compat.hpp"
 #include "obn/tls_dial.hpp"
 
@@ -73,24 +74,19 @@ const char* ssl_fail_reason(SSL* ssl)
     return "SSL I/O error (no OpenSSL error queued)";
 }
 
-// Short log form of printer bytes: text as is when printable, else hex.
-std::string describe_bytes(const std::uint8_t* data, std::size_t len)
+// TRACE dump of one outgoing frame. The login frame body carries the
+// access code and is never dumped.
+void trace_tx(std::uint32_t magic, std::uint32_t seq, const std::uint8_t* body,
+              std::size_t len)
 {
-    const bool text = len > 0 && std::all_of(data, data + len, [](std::uint8_t c) {
-        return (c >= 0x20 && c < 0x7f) || c == '\n' || c == '\r' || c == '\t';
-    });
-    std::string out;
-    if (text) {
-        out.assign(reinterpret_cast<const char*>(data), std::min<std::size_t>(len, 200));
-    } else {
-        char b[4];
-        for (std::size_t i = 0; i < std::min<std::size_t>(len, 48); ++i) {
-            std::snprintf(b, sizeof(b), "%02x", data[i]);
-            out += b;
-        }
+    if (obn::log::threshold() > obn::log::LVL_TRACE) return;
+    if (magic == kMagicLoginClient) {
+        OBN_TRACE("tunnel_local tx magic=0x%08x seq=%u len=%zu (login, body not logged)",
+                  magic, seq, len);
+        return;
     }
-    if (len > (text ? 200u : 48u)) out += "...";
-    return out;
+    OBN_TRACE("tunnel_local tx magic=0x%08x seq=%u len=%zu: %s", magic, seq, len,
+              obn::log::hexdump(body, len, 256).c_str());
 }
 
 } // namespace
@@ -600,6 +596,7 @@ int Session::send_frame(SSL* ssl, std::uint32_t magic, const std::uint8_t* paylo
                         std::size_t payload_len, std::mutex* io_mu)
 {
     if (!ssl) return -1;
+    trace_tx(magic, seq_, payload, payload_len);
     const auto hdr = build_frame_header(static_cast<std::uint32_t>(payload_len),
                                         magic, seq_++);
     std::unique_lock<std::mutex> lk;
@@ -629,6 +626,7 @@ int Session::try_read_frames(SSL* ssl, std::mutex* io_mu)
         recv_buf_.insert(recv_buf_.end(), chunk, chunk + n);
     }
     rx_total_ += static_cast<std::size_t>(n);
+    OBN_TRACE("tunnel_local rx %d bytes: %s", n, obn::log::hexdump(chunk, n, 256).c_str());
     return 0;
 }
 
@@ -725,10 +723,10 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
                 char b[64];
                 std::snprintf(b, sizeof(b), "frame magic=0x%08x len=%u: ",
                               hdr.magic, hdr.payload_len);
-                hs_note_ = b + describe_bytes(recv_buf_.data() + 16,
-                                              recv_buf_.size() - 16);
+                hs_note_ = b + obn::log::hexdump(recv_buf_.data() + 16,
+                                                 recv_buf_.size() - 16);
             } else if (!recv_buf_.empty() && recv_buf_.size() < 16) {
-                hs_note_ = "partial: " + describe_bytes(recv_buf_.data(), recv_buf_.size());
+                hs_note_ = "partial: " + obn::log::hexdump(recv_buf_.data(), recv_buf_.size());
             }
             return 1;
         }
@@ -772,7 +770,7 @@ int Session::handshake_step(SSL* ssl, const Config& cfg, std::mutex* io_mu)
                     phase_ = HandshakePhase::Ready;
                     return 0;
                 }
-                hs_note_ = "setup reply: " + describe_bytes(body.data(), body.size());
+                hs_note_ = "setup reply: " + obn::log::hexdump(body.data(), body.size(), 200);
             }
             const int rr = try_read_frames(ssl, io_mu);
             if (rr < 0) {
@@ -839,6 +837,7 @@ int Session::send_abi_json_with_binary_stream(SSL* ssl, const std::string& abi_j
         if (static_cast<std::size_t>(bin_in.gcount()) != bin_len) return -1;
     }
 
+    trace_tx(kMagicCtrlClient, seq_, body.data(), body.size());
     const auto hdr = build_frame_header(static_cast<std::uint32_t>(body.size()),
                                         kMagicCtrlClient, seq_++);
 

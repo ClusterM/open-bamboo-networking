@@ -72,6 +72,18 @@ Level threshold();
 // by '.'. Caller-owned std::string, so it is safe to use inside %s.
 std::string redact(const std::string& in, std::size_t max_chars = 40);
 
+// Wire bytes for logs: text (ASCII or UTF-8) as is, anything with control
+// bytes as hex. Output
+// stops after `max_bytes` input bytes and then ends in "...".
+std::string hexdump(const void* data, std::size_t len, std::size_t max_bytes = 64);
+
+// Sends every OBN_* line to `emit_fn` (message text only, no location) and
+// takes the threshold from `threshold_fn` instead of OBN_LOG_* / obn.conf.
+// libBambuSource uses it to put the shared code's lines into its own log.
+using ForwardEmitFn      = void (*)(Level lvl, const char* msg);
+using ForwardThresholdFn = Level (*)();
+void set_forward(ForwardEmitFn emit_fn, ForwardThresholdFn threshold_fn);
+
 } // namespace obn::log
 
 #define OBN_LOG_IMPL(lvl, ...)                                                  \

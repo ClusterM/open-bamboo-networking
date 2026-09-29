@@ -279,6 +279,8 @@ private:
     {
         g.closed = true;
         lost += g.k - g.data_have;
+        OBN_TRACE("tutk: FEC group lost %d of %d data packets (%d parity)",
+                  g.k - g.data_have, g.k, g.parity_have);
     }
 
     void recover(Group& g, const SliceFn& on_slice)
@@ -290,6 +292,8 @@ private:
             if (!missing[i]) blocks[i].resize(g.len, 0);
         }
         g.closed = true;
+        OBN_TRACE("tutk: FEC recovering %d of %d data packets from %d parity",
+                  g.k - g.data_have, g.k, g.parity_have);
         if (!fec::recover(blocks, g.k, g.len)) {
             lost += g.k - g.data_have;
             return;
@@ -491,6 +495,8 @@ void TutkSession::Impl::send_login(const TutkSessionParams& p)
 void TutkSession::Impl::send_ioctrl(uint32_t io_type, const uint8_t* data, size_t len)
 {
     const size_t hdr = framed ? 16 : 8;
+    OBN_TRACE("tutk: IOCtrl 0x%x out, %zu bytes: %s", io_type, len,
+              obn::log::hexdump(data, len, 256).c_str());
     const auto body = build_ioctrl_body(io_type, data, len, framed ? ioctrl_index++ : 0);
     std::vector<uint8_t> pkt(hdr + body.size(), 0);
     put_header(pkt.data(), framed ? kTypeFramed : 0x00, framed ? 0 : 0x70);
@@ -615,6 +621,8 @@ void TutkSession::Impl::deliver(const uint8_t* data, size_t len, bool keyframe)
     if (!cb || len == 0) return;
     int64_t pts_us = std::chrono::duration_cast<std::chrono::microseconds>(
         Clock::now() - started).count();
+    OBN_TRACE("tutk: %s %zu bytes%s at %lld us", mode == Mode::Ctrl ? "ctrl reply" : "frame",
+              len, keyframe ? " (key)" : "", static_cast<long long>(pts_us));
     cb(data, (int)len, pts_us, keyframe);
 }
 
@@ -800,6 +808,8 @@ void TutkSession::Impl::handle_framed(const uint8_t* pkt, size_t n, FecReceiver&
     if (k == 0) {
         if (blen >= 24 && body[1] == 0x10)
             OBN_DEBUG("tutk: IOCtrl 0x%x from printer", get_le32(body + 20));
+        OBN_TRACE("tutk: control packet in, %zu bytes: %s", blen,
+                  obn::log::hexdump(body, blen, 128).c_str());
         return;
     }
     if (m > 255u - k) return;

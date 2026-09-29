@@ -751,6 +751,16 @@ if(OBN_BUILD_TESTS)
     add_test(NAME plugin_symbols
         COMMAND probe_plugin $<TARGET_FILE:bambu_networking>)
 
+    add_executable(log_test tests/log_test.cpp
+        tests/config_stub.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(log_test PRIVATE include ${OBN_GENERATED_DIR})
+    if(WIN32)
+        target_link_libraries(log_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME log COMMAND log_test)
+
     # Hermetic regression test for issue #78: the selected printer must
     # survive destruction and recreation of the networking Agent. Kept
     # cross-platform on purpose — the file-replace path in state.cpp is

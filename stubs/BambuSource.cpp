@@ -130,6 +130,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/lan_tls_env.hpp"
+#include "obn/log.hpp"
 #include "obn/tunnel_local.hpp"
 
 #include "source_log.hpp"
@@ -566,6 +567,12 @@ struct Tunnel {
 
     std::unique_ptr<obn::tunnel_local::Session> tl_session;
     std::chrono::steady_clock::time_point       tl_t0;
+
+    // Debug logging of the polled Bambu_* calls: consecutive would_block
+    // results of StartStream(Ex) and the last ReadSample result.
+    unsigned                              poll_blocks  = 0;
+    std::chrono::steady_clock::time_point poll_t0;
+    int                                   read_last_rc = 0;
 
     // ---- FTPS bridge state (force_ftps=1) ----
     // When force_ftps is enabled we serve LIST_INFO / FILE_DOWNLOAD /
@@ -1059,7 +1066,7 @@ static bool fallback_to_lan(Tunnel* t)
     if (lan_url.empty() || !adopt_url(t, lan_url) || t->url.scheme != Scheme::Local) {
         log_fmt(t->logger, t->log_ctx,
                 "fallback_to_lan: no LAN route for dev=%s", dev_id.c_str());
-        set_last_error("file browser over TUTK is not supported and no LAN route is known");
+        set_last_error("file browser: no TUTK session and no known LAN route to the printer");
         return false;
     }
     obn::lan_tls::registry_put_ip_serial(t->url.host, t->url.device);
@@ -1850,17 +1857,17 @@ static void native_ctrl_send_worker(Tunnel* t)
         // goes to firmware verbatim.
         if (parsed && ftps_bridge_enabled() &&
             ftps_dispatch(t, cmdtype, sequence, body)) {
-            log_fmt(t->logger, t->log_ctx,
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
                     "ctrl: FTPS bridge served cmd=0x%04x seq=%d",
                     cmdtype, sequence);
             continue;
         }
         if (parsed) {
-            log_fmt(t->logger, t->log_ctx,
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
                     "ctrl: native forward cmd=0x%04x seq=%d (%zu bytes)",
                     cmdtype, sequence, req.body.size());
         } else {
-            log_fmt(t->logger, t->log_ctx,
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
                     "ctrl: native forward %zu bytes (unparsed)", req.body.size());
         }
         if (t->tl_session->send_abi_json(t->ssl, req.body, &t->mjpg_io_mu) != 0) {
@@ -1878,7 +1885,7 @@ static void native_ctrl_send_worker(Tunnel* t)
             CtrlReply reply;
             reply.data.assign(reinterpret_cast<const char*>(wire.data()),
                               wire.size());
-            log_fmt(t->logger, t->log_ctx,
+            log_at(LL_DEBUG, t->logger, t->log_ctx,
                     "ctrl: native recv %zu bytes", reply.data.size());
             const int result = parse_wire_result(reply.data);
             push_reply(t, std::move(reply));
@@ -1892,6 +1899,19 @@ static long long tl_elapsed_ms(const Tunnel* t)
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - t->tl_t0).count();
+}
+
+// Studio may give up on a polled StartStreamEx and close the tunnel while
+// the :6000 handshake is still waiting for the printer.
+static void log_abandoned_handshake(Tunnel* t)
+{
+    if (!t->tl_session ||
+        t->tl_session->phase() == obn::tunnel_local::HandshakePhase::Ready)
+        return;
+    log_fmt(t->logger, t->log_ctx,
+            "ctrl: handshake abandoned in phase %d after %lld ms (%s)",
+            static_cast<int>(t->tl_session->phase()), tl_elapsed_ms(t),
+            t->tl_session->handshake_note().c_str());
 }
 
 static int start_native_ctrl_handshake(Tunnel* t)
@@ -1993,7 +2013,7 @@ static int send_tutk_ctrl(Tunnel* t, const std::string& body)
             return Bambu_success;
         }
     }
-    log_fmt(t->logger, t->log_ctx, "ctrl: TUTK forward cmd=0x%04x seq=%d (%zu bytes)",
+    log_at(LL_DEBUG, t->logger, t->log_ctx, "ctrl: TUTK forward cmd=0x%04x seq=%d (%zu bytes)",
             cmdtype, sequence, body.size());
     if (!t->tutk_ctrl->send_ctrl(body)) {
         set_last_error("CTRL over TUTK: request too long or session lost");
@@ -2044,7 +2064,7 @@ OBN_EXPORT void Bambu_Deinit()
     // different GstElement is not worth the race risk.
 }
 
-OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
+static int bambu_create_impl(Bambu_Tunnel* tunnel, char const* path)
 {
     if (!tunnel || !path) return -1;
     ssl_init_once();
@@ -2085,7 +2105,7 @@ OBN_EXPORT void Bambu_SetLogger(Bambu_Tunnel tunnel, Logger logger, void* contex
     t->log_ctx = context;
 }
 
-OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
+static int bambu_open_impl(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
@@ -2145,7 +2165,7 @@ OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
     return Bambu_success;
 }
 
-OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
+static int bambu_start_stream_impl(Bambu_Tunnel tunnel, bool /*video*/)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
@@ -2234,7 +2254,7 @@ OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool /*video*/)
     return Bambu_success;
 }
 
-OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
+static int bambu_start_stream_ex_impl(Bambu_Tunnel tunnel, int type)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return -1;
@@ -2260,10 +2280,10 @@ OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
         }
         return start_native_ctrl_handshake(t);
     }
-    return Bambu_StartStream(tunnel, true);
+    return bambu_start_stream_impl(tunnel, true);
 }
 
-OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
+static int bambu_get_stream_count_impl(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return 0;
@@ -2280,7 +2300,7 @@ OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
     return 1; // one video track (MJPEG for local-scheme, AVC1 for RTSP).
 }
 
-OBN_EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index,
+static int bambu_get_stream_info_impl(Bambu_Tunnel tunnel, int index,
                                    Bambu_StreamInfo* info)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
@@ -2328,7 +2348,7 @@ OBN_EXPORT int Bambu_Seek(Bambu_Tunnel /*tunnel*/, unsigned long /*time*/)
     return Bambu_success; // meaningless for a live stream
 }
 
-OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
+static int bambu_read_sample_impl(Bambu_Tunnel tunnel, Bambu_Sample* sample)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t || !sample) return -1;
@@ -2439,7 +2459,7 @@ OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
     return Bambu_success;
 }
 
-OBN_EXPORT int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl,
+static int bambu_send_message_impl(Bambu_Tunnel tunnel, int ctrl,
                                  char const* data, int len)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
@@ -2471,31 +2491,208 @@ OBN_EXPORT int Bambu_RecvMessage(Bambu_Tunnel /*tunnel*/, int* /*ctrl*/,
     return Bambu_would_block;
 }
 
-OBN_EXPORT void Bambu_Close(Bambu_Tunnel tunnel)
+static void bambu_close_impl(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return;
     // CTRL worker must be joined before the rest of the tunnel is
     // dismantled (it holds references to SSL that tunnel_close would
     // would invalidate).
-    if (t->tl_session &&
-        t->tl_session->phase() != obn::tunnel_local::HandshakePhase::Ready) {
-        log_fmt(t->logger, t->log_ctx,
-                "ctrl: handshake abandoned in phase %d after %lld ms (%s)",
-                static_cast<int>(t->tl_session->phase()), tl_elapsed_ms(t),
-                t->tl_session->handshake_note().c_str());
-    }
+    log_abandoned_handshake(t);
     stop_ctrl_mode(t);
     tunnel_close(t);
 }
 
-OBN_EXPORT void Bambu_Destroy(Bambu_Tunnel tunnel)
+static void bambu_destroy_impl(Bambu_Tunnel tunnel)
 {
     auto* t = static_cast<Tunnel*>(tunnel);
     if (!t) return;
+    log_abandoned_handshake(t);
     stop_ctrl_mode(t);
     tunnel_close(t);
     delete t;
+}
+
+// -----------------------------------------------------------------------
+// Exported entry points: thin wrappers that log each call at DEBUG (and
+// the per-sample detail at TRACE) around the implementations above.
+// -----------------------------------------------------------------------
+
+static const char* rc_name(int rc)
+{
+    switch (rc) {
+    case Bambu_success:      return "success";
+    case Bambu_stream_end:   return "stream_end";
+    case Bambu_would_block:  return "would_block";
+    case Bambu_buffer_limit: return "buffer_limit";
+    default:                 return "error";
+    }
+}
+
+static bool debug_on() { return obn::source::current_log_level() <= LL_DEBUG; }
+static bool trace_on() { return obn::source::current_log_level() <= LL_TRACE; }
+
+// One DEBUG line per CTRL message: cmdtype / sequence / result plus the
+// JSON and binary sizes; TRACE adds the JSON itself.
+static void log_ctrl_message(Tunnel* t, const char* dir, const char* data, std::size_t len)
+{
+    if (!debug_on()) return;
+    const std::string wire(data, len);
+    const std::size_t split = wire.find("\n\n");
+    const std::string json = wire.substr(0, split);
+    const std::size_t bin = split == std::string::npos ? 0 : len - split - 2;
+    std::string perr;
+    const auto v = obn::json::parse(json, &perr);
+    if (!v) {
+        log_at(LL_DEBUG, t->logger, t->log_ctx, "ctrl %s %zu bytes (not JSON: %s)",
+               dir, len, obn::log::hexdump(data, len).c_str());
+        return;
+    }
+    const auto result = v->find("result");
+    char       result_str[32] = "";
+    if (result.is_number())
+        std::snprintf(result_str, sizeof(result_str), " result=%lld",
+                      static_cast<long long>(result.as_number()));
+    log_at(LL_DEBUG, t->logger, t->log_ctx,
+           "ctrl %s cmd=0x%04llx seq=%lld%s json=%zu bin=%zu", dir,
+           static_cast<unsigned long long>(v->find("cmdtype").as_number()),
+           static_cast<long long>(v->find("sequence").as_number()), result_str,
+           json.size(), bin);
+    if (trace_on())
+        log_at(LL_TRACE, t->logger, t->log_ctx, "ctrl %s json: %s", dir,
+               obn::log::hexdump(json.data(), json.size(), 2048).c_str());
+}
+
+// StartStream(Ex) is polled while it returns would_block: log the first
+// would_block and then only the final result with the poll count.
+static void log_polled(Tunnel* t, const char* call, int rc)
+{
+    if (rc == Bambu_would_block) {
+        if (t->poll_blocks++ == 0) {
+            t->poll_t0 = std::chrono::steady_clock::now();
+            log_at(LL_DEBUG, t->logger, t->log_ctx, "%s -> would_block, polling", call);
+        }
+        return;
+    }
+    const long long ms = t->poll_blocks
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t->poll_t0).count()
+        : 0;
+    log_at(LL_DEBUG, t->logger, t->log_ctx,
+           "%s -> %d (%s) after %u would_block polls, %lld ms%s%s", call, rc,
+           rc_name(rc), t->poll_blocks, ms, rc < 0 ? ": " : "",
+           rc < 0 ? obn::source::get_last_error() : "");
+    t->poll_blocks = 0;
+}
+
+OBN_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
+{
+    const int rc = bambu_create_impl(tunnel, path);
+    log_at(LL_DEBUG, nullptr, nullptr, "Bambu_Create -> %d tunnel=%p", rc,
+           rc == Bambu_success ? *tunnel : nullptr);
+    return rc;
+}
+
+OBN_EXPORT int Bambu_Open(Bambu_Tunnel tunnel)
+{
+    const int rc = bambu_open_impl(tunnel);
+    if (auto* t = static_cast<Tunnel*>(tunnel))
+        log_at(LL_DEBUG, t->logger, t->log_ctx, "Bambu_Open(%p) -> %d (%s)%s%s", tunnel,
+               rc, rc_name(rc), rc < 0 ? ": " : "", rc < 0 ? obn::source::get_last_error() : "");
+    return rc;
+}
+
+OBN_EXPORT int Bambu_StartStream(Bambu_Tunnel tunnel, bool video)
+{
+    const int rc = bambu_start_stream_impl(tunnel, video);
+    if (auto* t = static_cast<Tunnel*>(tunnel)) {
+        char call[64];
+        std::snprintf(call, sizeof(call), "Bambu_StartStream(%p, video=%d)", tunnel, video ? 1 : 0);
+        log_polled(t, call, rc);
+    }
+    return rc;
+}
+
+OBN_EXPORT int Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
+{
+    const int rc = bambu_start_stream_ex_impl(tunnel, type);
+    if (auto* t = static_cast<Tunnel*>(tunnel)) {
+        char call[64];
+        std::snprintf(call, sizeof(call), "Bambu_StartStreamEx(%p, type=0x%x)", tunnel, type);
+        log_polled(t, call, rc);
+    }
+    return rc;
+}
+
+OBN_EXPORT int Bambu_GetStreamCount(Bambu_Tunnel tunnel)
+{
+    const int n = bambu_get_stream_count_impl(tunnel);
+    log_at(LL_DEBUG, nullptr, nullptr, "Bambu_GetStreamCount(%p) -> %d", tunnel, n);
+    return n;
+}
+
+OBN_EXPORT int Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index,
+                                   Bambu_StreamInfo* info)
+{
+    const int rc = bambu_get_stream_info_impl(tunnel, index, info);
+    if (rc == Bambu_success)
+        log_at(LL_DEBUG, nullptr, nullptr,
+               "Bambu_GetStreamInfo(%p, %d) -> sub_type=%d %dx%d @ %d fps", tunnel, index,
+               static_cast<int>(info->sub_type), info->format.video.width,
+               info->format.video.height, info->format.video.frame_rate);
+    else
+        log_at(LL_DEBUG, nullptr, nullptr, "Bambu_GetStreamInfo(%p, %d) -> %d", tunnel,
+               index, rc);
+    return rc;
+}
+
+OBN_EXPORT int Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
+{
+    const int rc = bambu_read_sample_impl(tunnel, sample);
+    auto* t = static_cast<Tunnel*>(tunnel);
+    if (!t) return rc;
+    if (rc == Bambu_success) {
+        if (t->ctrl_mode) {
+            log_ctrl_message(t, "<-", reinterpret_cast<const char*>(sample->buffer),
+                             static_cast<std::size_t>(sample->size));
+        } else if (trace_on()) {
+            log_at(LL_TRACE, t->logger, t->log_ctx,
+                   "Bambu_ReadSample(%p) track=%d size=%d flags=0x%x time=%llu", tunnel,
+                   sample->itrack, sample->size, sample->flags, sample->decode_time);
+        }
+    } else if (rc != Bambu_would_block && rc != t->read_last_rc) {
+        log_at(LL_DEBUG, t->logger, t->log_ctx, "Bambu_ReadSample(%p) -> %d (%s)%s%s",
+               tunnel, rc, rc_name(rc), rc < 0 ? ": " : "",
+               rc < 0 ? obn::source::get_last_error() : "");
+    }
+    if (rc != Bambu_would_block) t->read_last_rc = rc;
+    return rc;
+}
+
+OBN_EXPORT int Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl,
+                                 char const* data, int len)
+{
+    const int rc = bambu_send_message_impl(tunnel, ctrl, data, len);
+    auto* t = static_cast<Tunnel*>(tunnel);
+    if (t && data && len > 0) {
+        if (ctrl == kCtrlType) log_ctrl_message(t, "->", data, static_cast<std::size_t>(len));
+        log_at(LL_DEBUG, t->logger, t->log_ctx, "Bambu_SendMessage(%p, ctrl=0x%x, %d bytes) -> %d%s%s",
+               tunnel, ctrl, len, rc, rc < 0 ? ": " : "",
+               rc < 0 ? obn::source::get_last_error() : "");
+    }
+    return rc;
+}
+
+OBN_EXPORT void Bambu_Close(Bambu_Tunnel tunnel)
+{
+    log_at(LL_DEBUG, nullptr, nullptr, "Bambu_Close(%p)", tunnel);
+    bambu_close_impl(tunnel);
+}
+
+OBN_EXPORT void Bambu_Destroy(Bambu_Tunnel tunnel)
+{
+    log_at(LL_DEBUG, nullptr, nullptr, "Bambu_Destroy(%p)", tunnel);
+    bambu_destroy_impl(tunnel);
 }
 
 OBN_EXPORT char const* Bambu_GetLastErrorMsg()

@@ -16,6 +16,11 @@ log_file =
 # Logging for the BambuSource library (camera liveview / file browser).
 # Same pattern as the main plugin: stderr by default, file on demand.
 # Env vars (OBN_BAMBUSOURCE_LOG_*) override these when set.
+# debug: every slicer call into the library with its result, file-browser
+#   requests and replies, connection steps and timings.
+# trace: adds wire dumps (port 6000 frames, file-browser JSON, TUTK
+#   packets, every video sample). Large; use only while reproducing a
+#   problem. debug/trace lines are not copied into the slicer's own log.
 
 bambusource_log_level = info
 bambusource_log_stderr = 1
