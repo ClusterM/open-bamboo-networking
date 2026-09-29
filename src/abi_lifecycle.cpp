@@ -5,6 +5,7 @@
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
 #include "obn/log.hpp"
+#include "obn/openssl_host_check.hpp"
 
 using obn::Agent;
 using obn::as_agent;
@@ -35,6 +36,7 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
 #endif
     OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
              log_dir.c_str(), k_plugin_version);
+    obn::openssl_host_check::log_once();
     try {
         return new Agent(std::move(log_dir));
     } catch (const std::exception& e) {

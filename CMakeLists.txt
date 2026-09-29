@@ -398,6 +398,7 @@ add_library(bambu_networking SHARED
     src/lan_session.cpp
     src/lan_tls.cpp
     src/log.cpp
+    src/openssl_host_check.cpp
     src/plugin_load_banner.cpp
     src/mqtt_client.cpp
     src/os_compat.cpp
@@ -946,6 +947,26 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ABI_VERSION=${OBN_ABI_VERSION_HEX})
     target_link_libraries(cert_store_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     add_test(NAME cert_store COMMAND cert_store_test)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        foreach(_obn_variant IN ITEMS clean interposed)
+            set(_obn_tgt openssl_host_check_${_obn_variant}_test)
+            add_executable(${_obn_tgt} tests/openssl_host_check_test.cpp
+                tests/config_stub.cpp
+                src/openssl_host_check.cpp
+                src/log.cpp
+                src/os_compat.cpp)
+            target_include_directories(${_obn_tgt} PRIVATE include ${OBN_GENERATED_DIR})
+            target_link_libraries(${_obn_tgt} PRIVATE OpenSSL::SSL OpenSSL::Crypto dl)
+            add_test(NAME openssl_host_check_${_obn_variant} COMMAND ${_obn_tgt})
+        endforeach()
+        # Export the test's own EVP_PKEY_new so it wins symbol lookup, like a
+        # slicer executable carrying a static OpenSSL.
+        target_compile_definitions(openssl_host_check_interposed_test PRIVATE
+            OBN_TEST_INTERPOSE=1)
+        set_target_properties(openssl_host_check_interposed_test PROPERTIES
+            ENABLE_EXPORTS ON)
+    endif()
 
     # Agent and its transitive deps: the tests below exercise pure helpers,
     # but those live in translation units that reference the agent, so the
