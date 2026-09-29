@@ -77,3 +77,4 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [12.15. Arbitrary G-code (`gcode_line`)](12.15-gcode-line.md)
 - [14. Additional notes](14-notes.md)
 - [15. Map of key source locations](15-source-map.md)
+- [16. Community quirk index](16-quirks.md)
