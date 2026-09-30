@@ -5,6 +5,10 @@
 # only clones into the gitignored .cache/openbu-mock/ and builds a binary there.
 # Nothing from the clone is ever `git add`ed (this script never calls git add).
 #
+# Run evidence (identity.env, mock.log, tls_dump.txt, spike-order*.jsonl, probe
+# transcripts) lands in .cache/openbu-mock/run/ — recorded in README.md under
+# "Environment & spikes" and "Gap analysis".
+#
 # BUILD_PATH: docker-golang
 set -euo pipefail
 
