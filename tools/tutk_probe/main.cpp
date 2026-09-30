@@ -149,7 +149,8 @@ R"(usage: tutk_probe --url-file PATH|- [--lib PATH] [--seconds N]
   --device/--dev-ver/--net-ver/--cli-id/--cli-ver
               appended as &device=...&net_ver=... the way MediaPlayCtrl does
               before handing the URL to the source
-  --dump      write raw sample payloads to PATH (inspect with ffprobe)
+  --dump      write raw sample payloads to PATH (inspect with ffprobe);
+              with --ctrl each reply is written as LE32 length + payload
   --no-init   do not call Bambu_Init even if exported
   --quiet-lib do not print the library's own log lines
   --ctrl      file-browser mode: open the CTRL channel the way Studio's
@@ -178,7 +179,7 @@ void print_ctrl_reply(const Bambu_Sample& s)
 
 template <typename LastError>
 int run_ctrl(Bambu_Tunnel tnl, const std::vector<std::string>& reqs, int seconds,
-             LastError last_error)
+             const std::string& dump_path, LastError last_error)
 {
     if (!g_api.start_stream_ex || !g_api.send_message) {
         std::fprintf(stderr, "tutk_probe: library lacks StartStreamEx/SendMessage\n");
@@ -213,6 +214,7 @@ int run_ctrl(Bambu_Tunnel tnl, const std::vector<std::string>& reqs, int seconds
             std::fprintf(stderr, "tutk_probe: SendMessage rc=%d %s\n", rc, last_error().c_str());
     }
 
+    FILE* dump = dump_path.empty() ? nullptr : std::fopen(dump_path.c_str(), "wb");
     int replies = 0;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -228,8 +230,16 @@ int run_ctrl(Bambu_Tunnel tnl, const std::vector<std::string>& reqs, int seconds
             break;
         }
         ++replies;
-        if (s.buffer && s.size > 0) print_ctrl_reply(s);
+        if (s.buffer && s.size > 0) {
+            print_ctrl_reply(s);
+            if (dump) {
+                const std::uint32_t len = static_cast<std::uint32_t>(s.size);
+                std::fwrite(&len, sizeof len, 1, dump);
+                std::fwrite(s.buffer, 1, s.size, dump);
+            }
+        }
     }
+    if (dump) std::fclose(dump);
     g_api.close(tnl);
     g_api.destroy(tnl);
     std::printf("{\"ok\":%s,\"replies\":%d,\"last_rc\":%d}\n", replies > 0 ? "true" : "false",
@@ -356,7 +366,7 @@ int main(int argc, char** argv)
     }
 
     if (!ctrl_reqs.empty())
-        return run_ctrl(tnl, ctrl_reqs, seconds, last_error);
+        return run_ctrl(tnl, ctrl_reqs, seconds, dump_path, last_error);
 
     const auto start_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
     do {

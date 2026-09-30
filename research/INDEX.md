@@ -19,6 +19,7 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [6.4. Port 6000](06.04-port-6000.md)
   - [6.5. RTSP / RTSPS](06.05-rtsp.md)
   - [6.6. Cloud REST API](06.06-cloud-rest.md)
+  - [6.7. TUTK (cloud P2P)](06.07-tutk.md)
 - [7. Lifecycle](07-lifecycle.md)
 - [8. The main module ABI contract](08-abi-main.md)
   - [8.1. Initialization](08.01-initialization.md)

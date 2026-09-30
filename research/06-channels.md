@@ -12,6 +12,7 @@ How a client talks to a Bambu printer (and when it talks to Bambu’s cloud inst
 | 6.4 Port 6000 | [06.04-port-6000.md](06.04-port-6000.md) |
 | 6.5 RTSP / RTSPS | [06.05-rtsp.md](06.05-rtsp.md) |
 | 6.6 Cloud REST API | [06.06-cloud-rest.md](06.06-cloud-rest.md) |
+| 6.7 TUTK (cloud P2P) | [06.07-tutk.md](06.07-tutk.md) |
 
 ### Channel list
 
@@ -21,7 +22,8 @@ How a client talks to a Bambu printer (and when it talks to Bambu’s cloud inst
 | **MQTT** | bidirectional | Primary command / telemetry channel (LAN and/or cloud) | [§6.2](06.02-mqtt.md) |
 | **FTPS** | client → printer | File transfer to external/USB-style volume | [§6.3](06.03-ftps.md) |
 | **TCP :3000** | client → printer | Plaintext framed JSON **login/detect** channel used by `bind_detect` / account `bind` (device ticket mint) — not HTTP | [§8.6.2](08.06-bind.md)–[§8.6.3](08.06-bind.md) |
-| **TCP :6000** | bidirectional | CTRL file browser, `ft_*` model cache, MJPEG on some models; TUTK relay off-LAN | [§6.4](06.04-port-6000.md) |
+| **TCP :6000** | bidirectional | CTRL file browser, `ft_*` model cache, MJPEG on some models | [§6.4](06.04-port-6000.md) |
+| **TUTK (UDP)** | bidirectional | Cloud-minted IOTC/AV session: live video, file browser and `ft_*` jobs (IOCtrl `0x3001`); LAN P2P on UDP 32761 discovery, hole-punched or relayed otherwise | [§6.7](06.07-tutk.md) |
 | **RTSP(S)** | printer → client | H.264 live view on RTSP-capable models | [§6.5](06.05-rtsp.md) |
 | **Cloud REST** | client ↔ Bambu API | Account, device list, access codes, cloud print, certs — **not** TCP to the printer IP | [§6.6](06.06-cloud-rest.md) |
 

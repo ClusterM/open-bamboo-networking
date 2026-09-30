@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -276,6 +277,15 @@ struct CliArgs {
     bool        camera_cloud     = true;
     int         camera_settle_s  = 5;
 
+    // --action ft_job: open one ft_* tunnel on the URL read from
+    // --ft-url-file (LAN or a TUTK URL from camera_url) and run each
+    // --ft-job JSON on it in order, the way SendToPrinter runs ability
+    // then upload. Binary results go to <--ft-out>.<index>.
+    std::string              ft_url_file;
+    std::vector<std::string> ft_jobs;
+    std::string              ft_out;
+    int                      ft_job_timeout_s = 120;
+
     // --action account_bind extras (Studio BindJob defaults).
     std::string dev_model = "N7";
     std::string timezone  = "UTC+02:00";
@@ -388,6 +398,11 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--camera-dev-ver VER] [--camera-protocols LIST]
                      [--camera-url-out PATH] [--camera-cloud 0|1]
                      [--camera-settle-s N] [--data-dir DIR] [--country US]
+
+       plugin_runner --action ft_job --plugin-path PATH
+                     --ft-url-file PATH --ft-job JSON [--ft-job JSON]...
+                     [--ft-out PREFIX] [--ft-job-timeout-s N]
+                     [--data-dir DIR]
 
        plugin_runner --action update_cert --plugin-path PATH
                      [--user-info @session.json] [--data-dir DIR]
@@ -590,6 +605,11 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--camera-protocols")  c.camera_protocols = require(a, ++i, f);
         else if (f == "--camera-url-out")    c.camera_url_out   = require(a, ++i, f);
         else if (f == "--camera-cloud")      c.camera_cloud = (require(a, ++i, f) != "0");
+        else if (f == "--ft-url-file")       c.ft_url_file = require(a, ++i, f);
+        else if (f == "--ft-job")            c.ft_jobs.push_back(require(a, ++i, f));
+        else if (f == "--ft-out")            c.ft_out = require(a, ++i, f);
+        else if (f == "--ft-job-timeout-s")
+            c.ft_job_timeout_s = std::stoi(require(a, ++i, f));
         else if (f == "--camera-settle-s")
             c.camera_settle_s = std::stoi(require(a, ++i, f));
         else if (f == "--auto-stop")         c.auto_stop = true;
@@ -621,7 +641,8 @@ CliArgs parse_cli(int argc, char** argv)
         (c.action == "http_probe" || c.action == "mw_probe" ||
          c.action == "update_cert" || c.action == "query_bind" ||
          c.action == "gap_probe" || c.action == "filament_probe" ||
-         c.action == "device_region" || c.action == "camera_url");
+         c.action == "device_region" || c.action == "camera_url" ||
+         c.action == "ft_job");
     const bool bind_detect_only = (c.action == "bind_detect");
     const bool account_bind     = (c.action == "account_bind");
     const bool cert_probe       = (c.action == "cert_probe");
@@ -677,6 +698,11 @@ CliArgs parse_cli(int argc, char** argv)
     }
     if (c.action == "query_bind" && c.dev_id.empty()) {
         std::fprintf(stderr, "plugin_runner: --action query_bind requires --dev-id\n");
+        usage(64);
+    }
+    if (c.action == "ft_job" && (c.ft_url_file.empty() || c.ft_jobs.empty())) {
+        std::fprintf(stderr, "plugin_runner: --action ft_job requires "
+                             "--ft-url-file and at least one --ft-job\n");
         usage(64);
     }
     if (c.action == "camera_url" && (c.dev_id.empty() || c.user_info.empty())) {
@@ -1190,10 +1216,11 @@ try {
     const bool filament_probe     = (args.action == "filament_probe");
     const bool device_region_probe = (args.action == "device_region");
     const bool camera_url_probe    = (args.action == "camera_url");
+    const bool ft_job_action       = (args.action == "ft_job");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
         gap_probe_action || filament_probe || device_region_probe ||
-        camera_url_probe;
+        camera_url_probe || ft_job_action;
     // account_bind / bind_detect call bind_detect themselves then exit
     // (or call bind()); they must not open a competing LAN MQTT session.
     const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
@@ -2191,6 +2218,114 @@ try {
         pr::unload(exports);
         emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
         return ok ? 0 : 1;
+    } else if (args.action == "ft_job") {
+        struct FtResult { int ec; int resp_ec; const char* json; const void* bin; uint32_t bin_size; };
+        struct FtMsg    { int kind; const char* json; };
+        using StatusCb = void (*)(void*, int, int, int, const char*);
+        using ResultCb = void (*)(void*, FtResult);
+        using MsgCb    = void (*)(void*, FtMsg);
+        auto sym = [&](const char* n) { return ::dlsym(exports.dl_handle, n); };
+        auto tunnel_create = reinterpret_cast<int (*)(const char*, void**)>(sym("ft_tunnel_create"));
+        auto set_status    = reinterpret_cast<int (*)(void*, StatusCb, void*)>(sym("ft_tunnel_set_status_cb"));
+        auto sync_connect  = reinterpret_cast<int (*)(void*)>(sym("ft_tunnel_sync_connect"));
+        auto job_create    = reinterpret_cast<int (*)(const char*, void**)>(sym("ft_job_create"));
+        auto set_result    = reinterpret_cast<int (*)(void*, ResultCb, void*)>(sym("ft_job_set_result_cb"));
+        auto set_msg       = reinterpret_cast<int (*)(void*, MsgCb, void*)>(sym("ft_job_set_msg_cb"));
+        auto start_job     = reinterpret_cast<int (*)(void*, void*)>(sym("ft_tunnel_start_job"));
+        auto job_release   = reinterpret_cast<void (*)(void*)>(sym("ft_job_release"));
+        auto shutdown      = reinterpret_cast<int (*)(void*)>(sym("ft_tunnel_shutdown"));
+        auto tunnel_release = reinterpret_cast<void (*)(void*)>(sym("ft_tunnel_release"));
+        if (!tunnel_create || !sync_connect || !job_create || !set_result || !start_job) {
+            emit_text("fatal", "plugin missing ft_* exports");
+            return 70;
+        }
+
+        std::string url;
+        {
+            std::ifstream f(args.ft_url_file);
+            std::getline(f, url);
+        }
+        if (url.empty()) {
+            emit_text("fatal", "--ft-url-file holds no URL");
+            return 66;
+        }
+
+        void* tunnel = nullptr;
+        const int rc_create = tunnel_create(url.c_str(), &tunnel);
+        emit_event("ft_tunnel_create", {
+            {"rc", rc_create}, {"url_masked", mask_camera_url(url)},
+        });
+        if (rc_create != 0 || !tunnel) return 1;
+        if (set_status) {
+            set_status(tunnel, [](void*, int old_s, int new_s, int err, const char* msg) {
+                emit_event("ft_tunnel_status", {
+                    {"old", old_s}, {"new", new_s}, {"err", err},
+                    {"msg", msg ? msg : ""},
+                });
+            }, nullptr);
+        }
+        const auto t_conn = std::chrono::steady_clock::now();
+        const int rc_conn = sync_connect(tunnel);
+        emit_event("ft_tunnel_sync_connect", {
+            {"rc", rc_conn},
+            {"ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - t_conn).count()},
+        });
+
+        struct JobState {
+            std::mutex              mu;
+            std::condition_variable cv;
+            bool                    done = false;
+            std::string             out_path;
+        };
+        int failures = rc_conn == 0 ? 0 : 1;
+        for (std::size_t i = 0; rc_conn == 0 && i < args.ft_jobs.size(); ++i) {
+            JobState st;
+            if (!args.ft_out.empty()) st.out_path = args.ft_out + "." + std::to_string(i);
+            void* job = nullptr;
+            const int rc_job = job_create(args.ft_jobs[i].c_str(), &job);
+            emit_event("ft_job_create", { {"index", i}, {"rc", rc_job}, {"params", args.ft_jobs[i]} });
+            if (rc_job != 0 || !job) { ++failures; continue; }
+            set_result(job, [](void* user, FtResult r) {
+                auto* s = static_cast<JobState*>(user);
+                emit_event("ft_job_result", {
+                    {"ec", r.ec}, {"resp_ec", r.resp_ec},
+                    {"json", r.json ? r.json : ""}, {"bin_size", r.bin_size},
+                });
+                if (!s->out_path.empty() && r.bin && r.bin_size) {
+                    std::ofstream f(s->out_path, std::ios::binary | std::ios::trunc);
+                    f.write(static_cast<const char*>(r.bin), r.bin_size);
+                }
+                std::lock_guard<std::mutex> lk(s->mu);
+                s->done = true;
+                s->cv.notify_all();
+            }, &st);
+            if (set_msg) {
+                set_msg(job, [](void*, FtMsg m) {
+                    emit_event("ft_job_msg", { {"kind", m.kind}, {"json", m.json ? m.json : ""} });
+                }, nullptr);
+            }
+            const auto t_job = std::chrono::steady_clock::now();
+            const int rc_start = start_job(tunnel, job);
+            emit_event("ft_tunnel_start_job", { {"index", i}, {"rc", rc_start} });
+            bool done = false;
+            {
+                std::unique_lock<std::mutex> lk(st.mu);
+                done = st.cv.wait_for(lk, std::chrono::seconds(args.ft_job_timeout_s),
+                                      [&] { return st.done; });
+            }
+            emit_event("ft_job_done", {
+                {"index", i}, {"finished", done},
+                {"ms", std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t_job).count()},
+            });
+            if (!done) ++failures;
+            if (job_release) job_release(job);
+        }
+        if (shutdown) shutdown(tunnel);
+        if (tunnel_release) tunnel_release(tunnel);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+        fast_exit(failures == 0 ? 0 : 1);
     } else if (args.action == "filament_probe") {
         auto trunc = [](const std::string& s, size_t n = 2000) {
             if (s.size() <= n) return s;

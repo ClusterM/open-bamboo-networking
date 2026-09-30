@@ -218,6 +218,27 @@ The credentials in the URL are stable, but the printer only accepts TUTK
 connections for ~9.5 minutes after a mint: each `/user/ttcode` POST makes the
 cloud push `liveview.prepare` to the printer, which starts its `tutk_server`.
 Re-run `camera_url` if `tutk_probe` fails with `-90` (device offline).
+With `--ctrl JSON` (repeatable) `tutk_probe` opens the file-browser channel
+instead of video and prints each reply; `--dump FILE` then stores every reply
+as a LE32 length followed by the payload.
+
+`ft_job` opens one `ft_*` tunnel on the URL in `--ft-url-file` (a LAN
+`bambu:///local/<ip>?port=6000&user=bblp&passwd=<code>` or a TUTK URL from
+`camera_url` with Studio's `&device=…&cli_id=…` suffix) and runs each
+`--ft-job` params JSON on it in order, the way Send to Printer runs ability
+then upload. It logs the tunnel status, `sync_connect` time, every
+`ft_job_msg` and `ft_job_result`, and writes binary results to
+`<--ft-out>.<index>`. The stock `ft_*` symbols crash without an agent, which
+is why this runs inside plugin_runner rather than standalone:
+
+```bash
+./tools/plugin_runner.sh --abi 02.08.04 \
+  --plugin-path ~/.config/BambuStudio/plugins/libbambu_networking.so \
+  --action ft_job --data-dir $HOME/.config/BambuStudio \
+  --ft-url-file /tmp/ft.url --ft-out /tmp/ft_out \
+  --ft-job '{"cmd_type":7}' \
+  --ft-job '{"cmd_type":4,"path":"mem:/26","is_mem_file":true,"target_path":""}'
+```
 
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch

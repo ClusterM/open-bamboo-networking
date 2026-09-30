@@ -1,9 +1,17 @@
 // Minimal ft_* upload test against stock or open plugin.
 // Build: cc -o ft_upload_test tools/ft_upload_test.c -ldl -lpthread
 //
-// Environment (required):
+// Environment (required unless OBN_FT_URL is set):
 //   OBN_PRINTER_IP     printer LAN IP
 //   OBN_ACCESS_CODE    LAN access code
+//
+// Environment (optional):
+//   OBN_FT_URL         file holding a full bambu:/// tunnel URL on its first
+//                      line (e.g. a TUTK URL written by
+//                      `plugin_runner --camera-url-out`); overrides the LAN URL
+//   OBN_FT_JOB         raw ft_job_create JSON; overrides the default upload
+//                      job (then local_file_path is unused)
+//   OBN_FT_OUT         write the result's binary payload to this path
 //
 // Usage:
 //   OBN_PRINTER_IP=192.168.1.10 OBN_ACCESS_CODE=abcd1234 \
@@ -79,8 +87,29 @@ static void on_result(void* user, ft_job_result r)
     (void)user;
     g_ec = r.ec;
     g_resp_ec = r.resp_ec;
-    printf("result ec=%d resp_ec=%d json=%s\n", r.ec, r.resp_ec, r.json ? r.json : "");
+    printf("result ec=%d resp_ec=%d bin=%u json=%s\n", r.ec, r.resp_ec,
+           r.bin_size, r.json ? r.json : "");
+    const char* out = env_or("OBN_FT_OUT");
+    if (out && r.bin && r.bin_size) {
+        FILE* f = fopen(out, "wb");
+        if (f) {
+            fwrite(r.bin, 1, r.bin_size, f);
+            fclose(f);
+        }
+    }
     atomic_store_explicit(&g_done, 1, memory_order_release);
+}
+
+// Reads the first line of `path` into `buf`; returns 0 on success.
+static int read_url_file(const char* path, char* buf, size_t len)
+{
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    const int ok = fgets(buf, (int)len, f) != NULL;
+    fclose(f);
+    if (!ok) return -1;
+    buf[strcspn(buf, "\r\n")] = '\0';
+    return buf[0] ? 0 : -1;
 }
 
 static void on_msg(void* user, ft_job_msg msg)
@@ -93,18 +122,27 @@ int main(int argc, char** argv)
 {
     const char* ip = env_or("OBN_PRINTER_IP");
     const char* code = env_or("OBN_ACCESS_CODE");
-    if (!ip || !code) {
+    const char* url_file = env_or("OBN_FT_URL");
+    if (!url_file && (!ip || !code)) {
         fprintf(stderr,
-                "Set OBN_PRINTER_IP and OBN_ACCESS_CODE (see tools/ft_upload_test.c header).\n");
+                "Set OBN_PRINTER_IP and OBN_ACCESS_CODE or OBN_FT_URL "
+                "(see tools/ft_upload_test.c header).\n");
         return 1;
     }
 
     const char* so = argc > 1 ? argv[1] : default_plugin_path();
     const char* path = argc > 2 ? argv[2] : "/tmp/obn_test_upload.bin";
 
-    char url[512];
-    snprintf(url, sizeof(url),
-             "bambu:///local/%s?port=6000&user=bblp&passwd=%s", ip, code);
+    char url[4096];
+    if (url_file) {
+        if (read_url_file(url_file, url, sizeof(url)) != 0) {
+            fprintf(stderr, "cannot read a URL from %s\n", url_file);
+            return 1;
+        }
+    } else {
+        snprintf(url, sizeof(url),
+                 "bambu:///local/%s?port=6000&user=bblp&passwd=%s", ip, code);
+    }
 
     void* h = dlopen(so, RTLD_NOW);
     if (!h) {
@@ -140,10 +178,15 @@ int main(int argc, char** argv)
     }
 
     char params[1024];
-    snprintf(params, sizeof(params),
-             "{\"cmd_type\":5,\"dest_name\":\"ft_test.bin\",\"dest_storage\":\"emmc\","
-             "\"file_path\":\"%s\"}",
-             path);
+    const char* job_json = env_or("OBN_FT_JOB");
+    if (job_json) {
+        snprintf(params, sizeof(params), "%s", job_json);
+    } else {
+        snprintf(params, sizeof(params),
+                 "{\"cmd_type\":5,\"dest_name\":\"ft_test.bin\",\"dest_storage\":\"emmc\","
+                 "\"file_path\":\"%s\"}",
+                 path);
+    }
 
     FT_JobHandle* job = NULL;
     if (job_create(params, &job) != 0 || !job) {
