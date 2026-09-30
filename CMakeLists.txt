@@ -792,6 +792,26 @@ if(OBN_BUILD_TESTS)
     set_tests_properties(push_status_merge PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
+    # Hermetic unit tests for obn::signing — exercises key loading, canonical
+    # JSON ordering, signature round-trip and envelope structure validation.
+    # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
+    add_executable(signing_test tests/signing_test.cpp
+        tests/config_stub.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/signing.cpp)
+    target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(signing_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        # os_compat.cpp holds the Winsock wrappers (same reason as state_persist)
+        target_link_libraries(signing_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME signing COMMAND signing_test)
+
     # DOC-01 golden-fixture suite for the SSDP parser. Catch2 comes in via
     # FetchContent pinned to a fixed release tag (checkpoint OQ-1 route b2):
     # reproducible, no vendored framework header, no package-manager install.
@@ -978,22 +998,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME lan_live COMMAND lan_live_test)
-
-    # Hermetic unit tests for obn::signing — exercises key loading, canonical
-    # JSON ordering, signature round-trip and envelope structure validation.
-    # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
-    add_executable(signing_test tests/signing_test.cpp
-        tests/config_stub.cpp
-        src/json_lite.cpp
-        src/log.cpp
-        src/os_compat.cpp
-        src/signing.cpp)
-    target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
-    target_compile_definitions(signing_test PRIVATE
-        OBN_VERSION_STRING="${OBN_VERSION}"
-        ABI_VERSION=${OBN_ABI_VERSION_HEX})
-    target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    add_test(NAME signing COMMAND signing_test)
 
     add_executable(cert_store_test tests/cert_store_test.cpp
         tests/config_stub.cpp
