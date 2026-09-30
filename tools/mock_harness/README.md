@@ -67,7 +67,76 @@ commands from the workspace root.
 
 OQ4 resolved: native WSL run of the built linux-amd64 binary; Docker used as compiler only (mock binds its detected IP - openbu-mock network.go:12-18, container -p mapping breaks it; research Alternatives table)
 
-*(OQ2/OQ3 spike lines land below in Task 2; `## Gap analysis` lands in Task 3.)*
+### Spikes — Task 2, both SSDP startup orders (2026-09-30)
+
+Driver: gitignored `.cache/openbu-mock/spike_driver.sh`; artifacts in
+`.cache/openbu-mock/run/`. The connect chain is **evidence only** in this plan —
+it is never judged pass/fail here (the `:3000` sidecar does not exist until
+04-02, so `bind_detect` is expected to fail).
+
+**Order A — mock first.** Mock started from `identity.env` exactly as in Task 1
+(`../out/openbu-mock -model P1S -access-code 12345678 -count 1 -debug`), then
+from the repo root:
+
+```text
+tools/plugin_runner.sh --abi 02.08.01 --action none --timeout 6 \
+    --dev-id 01P533A160381E4 --dev-ip 192.168.2.177 --access-code 12345678 \
+    --connect-settle-ms 15000 --log-out .cache/openbu-mock/run/spike-orderA.jsonl
+```
+
+stderr captured to `spike-orderA.err`; runner rc=0. Cold run evidence (A5):
+
+- per-ABI bridge build: `configuring plugin_runner under ABI=0x020801
+  (.../tools/plugin_runner/build-0x020801)` → final `[2/2] Linking CXX
+  executable plugin_runner` (hex build dir `tools/plugin_runner/build-0x020801`)
+- CDN plugin-zip fetch: `plugin_runner.sh: downloading plugin for
+  ABI=02.08.01 from api.bambulab.com...` → `plugin_runner.sh: downloaded plugin
+  version=02.08.01.53 -> /home/santiago/.cache/obn-plugin-runner/02.08.01.53/libbambu_networking.so`
+  (**no `could not resolve a plugin for ABI` — 02.08.01 resolved, the README-blessed
+  02.05.03 fallback was never needed**)
+- `spike-orderA.jsonl` (27 lines): `plugin_loaded` present (version 02.08.01.53),
+  `agent_start` rc=0, `ssdp_msg` present (5 events), and
+
+```text
+bind_detect rc=-2 result_msg=publish login request failed
+```
+
+  verbatim (Gap-1 runtime evidence: nothing listens on `:3000` yet — research
+  08.06:126). `kickstart_pushall rc=-4` (no local session without sidecar/cert —
+  expected here).
+
+OQ3 resolved: --abi 02.08.01 (hex build dir tools/plugin_runner/build-0x020801; CDN zip resolved first try — plugin version=02.08.01.53 from api.bambulab.com, fallback 02.05.03 not needed)
+
+**Order B — runner first.** Runner started in the background with the identity
+parsed from the Order-A run (serial/IP are regenerated on every mock start —
+`identity.env` always reflects the most recent mock run, nothing is hardcoded),
+waited for `agent_start`, then:
+
+- `ss -ulnp | grep ':2021'` while the plugin is up alone →
+  `UNCONN 0 0 0.0.0.0:2021 0.0.0.0:* users:(("plugin_runner",pid=649,fd=5))`
+  (artifact `ssdp-orderB-plugin-up.txt`)
+- mock then started → **survived**: `mock-orderB.log` contains zero
+  `SSDP: failed to listen` (it would `log.Fatalf` there, ssdp.go:24-26), and
+  after start `ss` shows **both** listeners simultaneously:
+  `users:(("openbu-mock",pid=698,fd=3))` + `users:(("plugin_runner",pid=649,fd=5))`
+  on `0.0.0.0:2021` (artifact `ssdp-orderB-after-mock.txt`)
+- `spike-orderB.jsonl` (27 lines): `plugin_loaded` present, `agent_start` rc=0,
+  `bind_detect rc=-2`, `ssdp_msg` ×5 — same chain shape as Order A; runner rc=0
+- Order-B mock output goes to `mock-orderB.log` (kept separate so Task 1's
+  readiness `mock.log` evidence is never overwritten)
+
+OQ2 resolved: coexistence OK in both startup orders (ssdp_msg present in both orders; mock survived the runner-first bind with zero `SSDP: failed to listen`; both UDP :2021 listeners visible simultaneously — SO_REUSEADDR held, no Pitfall-2 cascade)
+
+**Spike environment fixes (deviations, recorded):** the first bridge builds
+failed on missing `libssl-dev` (`Could NOT find OpenSSL`) and missing `zlib.h`
+(minizip header dep) — both installed from Ubuntu repos (`apt-get install
+libssl-dev zlib1g-dev`), the stale half-configured `build-0x020801` was removed,
+and the build then completed. `tools/plugin_runner.sh` in the working tree was
+LF-normalized (autocrlf had left a CRLF shebang → `/usr/bin/env: 'bash\r':
+No such file or directory`); `.gitattributes` now pins `eol=lf` for
+`tools/plugin_runner.sh` and `tools/mock_harness/*.sh` so this cannot regress.
+
+*(OQ7 `## Gap analysis` lands below in Task 3.)*
 
 ## Gap analysis
 

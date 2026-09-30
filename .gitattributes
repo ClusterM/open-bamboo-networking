@@ -4,3 +4,4 @@ tests/fixtures/** -text
 
 # Harness scripts run under WSL bash - CRLF in the working tree breaks them.
 tools/mock_harness/*.sh text eol=lf
+tools/plugin_runner.sh text eol=lf
