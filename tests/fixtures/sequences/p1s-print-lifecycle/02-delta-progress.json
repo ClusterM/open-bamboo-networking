@@ -1,0 +1,10 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 1,
+    "sequence_id": "3",
+    "mc_percent": 42,
+    "mc_remaining_time": 96,
+    "layer_num": 57
+  }
+}

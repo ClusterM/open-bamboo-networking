@@ -1,0 +1,13 @@
+NOTIFY * HTTP/1.1
+HOST: 239.255.255.250:2021
+Server: UPnP/1.0
+Location: http://192.168.0.7:8883/desc
+NT: urn:bambulab-com:device:3dprinter:1
+USN: 01S00A000000000
+Cache-Control: max-age=1800
+DevModel.bambu.com: C11
+DevName.bambu.com: REDACTED-NAME
+DevSignal.bambu.com: -62
+DevConnect.bambu.com: lan
+DevBind.bambu.com: free
+
