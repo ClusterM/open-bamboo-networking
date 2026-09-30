@@ -450,6 +450,7 @@ struct TutkSession::Impl {
     Impl() { conn.sock = -1; }
 
     void run(const TutkSessionParams& p);
+    int  open_path(const TutkSessionParams& p);
     int  connect(const TutkSessionParams& p);
     int  receive(const TutkSessionParams& p);
 
@@ -626,6 +627,51 @@ void TutkSession::Impl::deliver(const uint8_t* data, size_t len, bool keyframe)
     cb(data, (int)len, pts_us, keyframe);
 }
 
+// Like stock, the master JOIN does not wait for the LAN search to time out:
+// after a short head start both run at once and the first path to reach the
+// printer wins, a LAN answer preferred.
+int TutkSession::Impl::open_path(const TutkSessionParams& p)
+{
+    std::atomic<bool> lan_done{false}, lan_stop{false}, relay_stop{false};
+    IotcConn lan{};
+    lan.sock = -1;
+    int lan_rc = -1;
+    std::thread lan_thread([&] {
+        lan_rc = iotc_lan_connect(p.uid.c_str(), p.authkey.c_str(), 1500, &lan,
+                                  [&] { return lan_stop.load() || !joined.load(); });
+        if (lan_rc == 0) relay_stop.store(true);
+        lan_done.store(true);
+    });
+
+    const auto head_start = Clock::now() + std::chrono::milliseconds(250);
+    while (!lan_done.load() && Clock::now() < head_start)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    IotcConn relay{};
+    relay.sock = -1;
+    int relay_rc = -1;
+    if (!lan_done.load() || lan_rc != 0) {
+        relay_rc = iotc_relay_connect(p.uid.c_str(), p.relay_id.c_str(), p.region.c_str(),
+                                      p.authkey.c_str(), &relay,
+                                      [&] { return relay_stop.load() || !joined.load(); });
+        if (relay_rc == 0) lan_stop.store(true);
+    }
+    lan_thread.join();
+
+    if (lan_rc == 0) {
+        iotc_close(&relay);
+        conn = lan;
+        return 0;
+    }
+    iotc_close(&lan);
+    if (relay_rc == 0) {
+        conn = relay;
+        return 0;
+    }
+    iotc_close(&relay);
+    return -1;
+}
+
 int TutkSession::Impl::connect(const TutkSessionParams& p)
 {
     iotc_close(&conn);
@@ -633,16 +679,12 @@ int TutkSession::Impl::connect(const TutkSessionParams& p)
 
     for (int attempt = 1; attempt <= 3 && joined.load(); ++attempt) {
         const char* path = "lan";
-        if (iotc_lan_connect(p.uid.c_str(), p.authkey.c_str(), 1500, &conn) != 0) {
-            if (iotc_relay_connect(p.uid.c_str(), p.relay_id.c_str(), p.region.c_str(),
-                                   p.authkey.c_str(), &conn) != 0) {
-                OBN_WARN("tutk: printer unreachable over LAN and relay (attempt %d/3)", attempt);
-                iotc_close(&conn);
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-            path = conn.is_relay ? "relay" : "p2p";
+        if (open_path(p) != 0) {
+            OBN_WARN("tutk: printer unreachable over LAN and relay (attempt %d/3)", attempt);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
         }
+        if (!conn.is_lan) path = conn.is_relay ? "relay" : "p2p";
         OBN_INFO("tutk: connected via %s (attempt %d/3)", path, attempt);
 
         if (iotc_dtls_handshake(&conn, p.passwd.c_str(), kAccount) != 0) {

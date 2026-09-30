@@ -1661,7 +1661,8 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
                               const uint8_t session_token[8],
                               struct sockaddr_in* peer_out,
                               uint32_t* tag_out,
-                              bool* direct_out)
+                              bool* direct_out,
+                              const IotcCancel& cancelled)
 {
     if (!authkey || !authkey[0]) return false;
     *direct_out = false;
@@ -1711,6 +1712,10 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
     auto last_cand_punch = start_time - std::chrono::seconds(1);
 
     while (std::chrono::steady_clock::now() < deadline) {
+        if (cancelled && cancelled()) {
+            OBN_DEBUG("iotc rdv: rendezvous cancelled");
+            return false;
+        }
         auto now = std::chrono::steady_clock::now();
 
         // If candidates are known, keep punching them periodically (~250ms)
@@ -1865,10 +1870,26 @@ static bool offlan_rendezvous(obn::net::socket_t sock,
     return false;
 }
 
+// recvfrom() that gives up after timeout_ms or once cancelled() returns true.
+static ssize_t recv_cancellable(obn::net::socket_t sock, uint8_t* buf, size_t len,
+                                struct sockaddr_in* src, int timeout_ms,
+                                const IotcCancel& cancelled)
+{
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(timeout_ms);
+    set_recv_timeout(sock, 100);
+    while (!(cancelled && cancelled()) && std::chrono::steady_clock::now() < deadline) {
+        socklen_t src_len = sizeof(*src);
+        ssize_t n = recvfrom(sock, buf, len, 0, (struct sockaddr*)src, &src_len);
+        if (n >= 0) return n;
+    }
+    return -1;
+}
+
 // JOIN + KNOCK×5 + receive 200B relay assignment + post-KNOCK.
 int iotc_relay_connect(const char* uid_upper, const char* relay_id,
                        const char* region_str, const char* authkey,
-                       IotcConn* out)
+                       IotcConn* out, const IotcCancel& cancelled)
 {
     if (!uid_upper || strlen(uid_upper) != kUidLen || !relay_id || !region_str || !out) return -1;
     if (!authkey) authkey = "";
@@ -1951,7 +1972,6 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     }
     OBN_DEBUG("iotc relay: JOIN sent to %d master(s)", njoined);
 
-    set_recv_timeout(sock, 3000);
     bool got_assignment = false;
     // The rendezvous (02 06 12) is sent by the printer from its own P2P media
     // address, not by the master server. That source address is the peer we must
@@ -1960,11 +1980,10 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     uint8_t master_reply[256];
     size_t  master_reply_len = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
+        if (cancelled && cancelled()) break;
         uint8_t resp[256];
         struct sockaddr_in src{};
-        socklen_t src_len = sizeof(src);
-        ssize_t n = recvfrom(sock, resp, sizeof(resp), 0,
-                              (struct sockaddr*)&src, &src_len);
+        ssize_t n = recv_cancellable(sock, resp, sizeof(resp), &src, 3000, cancelled);
         if (n < 0) {
             OBN_DEBUG("iotc relay: recv timeout attempt %d", attempt + 1);
             continue;
@@ -2022,11 +2041,11 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     // peer_addr is the printer's P2P media address or the rendezvous relay server.
     uint32_t relay_tag = 0;
     bool     punched   = false;
-    if (!got_assignment && master_reply_len > 0) {
+    if (!got_assignment && master_reply_len > 0 && !(cancelled && cancelled())) {
         OBN_DEBUG("iotc relay: no direct rendezvous; trying off-LAN candidate exchange");
         if (offlan_rendezvous(sock, master_reply, master_reply_len,
                               uid_upper, authkey, session_token, &peer_addr, &relay_tag,
-                              &punched)) {
+                              &punched, cancelled)) {
             got_assignment = true;
             char pip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &peer_addr.sin_addr, pip, sizeof(pip));
@@ -2036,7 +2055,10 @@ int iotc_relay_connect(const char* uid_upper, const char* relay_id,
     }
 
     if (!got_assignment) {
-        OBN_WARN("iotc relay: no rendezvous received");
+        if (cancelled && cancelled())
+            OBN_DEBUG("iotc relay: connect cancelled");
+        else
+            OBN_WARN("iotc relay: no rendezvous received");
         obn::net::close_socket(sock);
         return -1;
     }
@@ -2141,7 +2163,7 @@ static std::vector<struct sockaddr_in> lan_broadcast_targets()
 }
 
 int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
-                     IotcConn* out)
+                     IotcConn* out, const IotcCancel& cancelled)
 {
     if (!uid_upper || strlen(uid_upper) != kUidLen || !out) return -1;
     if (!authkey) authkey = "";
@@ -2170,6 +2192,7 @@ int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
                         + std::chrono::milliseconds(timeout_ms);
     auto next_send = std::chrono::steady_clock::now();
     while (!found && std::chrono::steady_clock::now() < deadline) {
+        if (cancelled && cancelled()) break;
         if (std::chrono::steady_clock::now() >= next_send) {
             for (const auto& t : targets)
                 sendto(sock, search, sizeof(search), 0,
@@ -2192,7 +2215,10 @@ int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
         found = true;
     }
     if (!found) {
-        OBN_DEBUG("iotc lan: no LAN search reply within %d ms", timeout_ms);
+        if (cancelled && cancelled())
+            OBN_DEBUG("iotc lan: search cancelled");
+        else
+            OBN_DEBUG("iotc lan: no LAN search reply within %d ms", timeout_ms);
         obn::net::close_socket(sock);
         return -1;
     }

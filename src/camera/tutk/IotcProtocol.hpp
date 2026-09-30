@@ -19,6 +19,7 @@
 #include "obn/net_compat.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace obn {
 namespace camera {
@@ -70,11 +71,14 @@ struct IotcConn {
     int64_t            last_alive_ms;     // steady-clock ms of the last 27 04 21
 };
 
+// Polled while connecting; returning true abandons the attempt (-1).
+using IotcCancel = std::function<bool()>;
+
 // Find the printer on the local network by LAN search and prepare a direct
 // session to the address it answers from. timeout_ms bounds the search.
 // Returns 0 on success, -1 when no printer with this UID answered.
 int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
-                     IotcConn* out);
+                     IotcConn* out, const IotcCancel& cancelled = {});
 
 // JOIN the master for region_str ("cn", "eu", "us"), rendezvous with the
 // printer and adopt its P2P address; if the printer is off-LAN, punch through
@@ -82,7 +86,7 @@ int iotc_lan_connect(const char* uid_upper, const char* authkey, int timeout_ms,
 // (its first 16 characters are used). Returns 0 on success, -1 on failure.
 int iotc_relay_connect(const char* uid_upper, const char* relay_id,
                        const char* region_str, const char* authkey,
-                       IotcConn* out);
+                       IotcConn* out, const IotcCancel& cancelled = {});
 
 // DTLS-PSK handshake. The PSK is derived from passwd (the URL's "passwd"
 // value); account is the identity suffix ("admin"). Returns 0 on success.
