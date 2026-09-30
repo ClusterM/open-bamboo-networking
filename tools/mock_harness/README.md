@@ -80,11 +80,14 @@ from the repo root:
 
 ```text
 tools/plugin_runner.sh --abi 02.08.01 --action none --timeout 6 \
-    --dev-id 01P533A160381E4 --dev-ip 192.168.2.177 --access-code 12345678 \
+    --dev-id 01P142E6C031BC9 --dev-ip 192.168.2.177 --access-code 12345678 \
     --connect-settle-ms 15000 --log-out .cache/openbu-mock/run/spike-orderA.jsonl
 ```
 
-stderr captured to `spike-orderA.err`; runner rc=0. Cold run evidence (A5):
+stderr captured to `spike-orderA.err`; runner rc=0. Cold-run stderr is
+preserved verbatim in `spike-orderA.cold.err` (the recorded spike was re-run
+once after the identity-parser fix below; the warm re-run logs
+`cache hit: …/02.08.01.53/libbambu_networking.so`). Cold run evidence (A5):
 
 - per-ABI bridge build: `configuring plugin_runner under ABI=0x020801
   (.../tools/plugin_runner/build-0x020801)` → final `[2/2] Linking CXX
@@ -113,12 +116,12 @@ parsed from the Order-A run (serial/IP are regenerated on every mock start —
 waited for `agent_start`, then:
 
 - `ss -ulnp | grep ':2021'` while the plugin is up alone →
-  `UNCONN 0 0 0.0.0.0:2021 0.0.0.0:* users:(("plugin_runner",pid=649,fd=5))`
+  `UNCONN 0 0 0.0.0.0:2021 0.0.0.0:* users:(("plugin_runner",pid=462,fd=5))`
   (artifact `ssdp-orderB-plugin-up.txt`)
 - mock then started → **survived**: `mock-orderB.log` contains zero
   `SSDP: failed to listen` (it would `log.Fatalf` there, ssdp.go:24-26), and
   after start `ss` shows **both** listeners simultaneously:
-  `users:(("openbu-mock",pid=698,fd=3))` + `users:(("plugin_runner",pid=649,fd=5))`
+  `users:(("openbu-mock",pid=514,fd=3))` + `users:(("plugin_runner",pid=462,fd=5))`
   on `0.0.0.0:2021` (artifact `ssdp-orderB-after-mock.txt`)
 - `spike-orderB.jsonl` (27 lines): `plugin_loaded` present, `agent_start` rc=0,
   `bind_detect rc=-2`, `ssdp_msg` ×5 — same chain shape as Order A; runner rc=0
@@ -135,10 +138,111 @@ and the build then completed. `tools/plugin_runner.sh` in the working tree was
 LF-normalized (autocrlf had left a CRLF shebang → `/usr/bin/env: 'bash\r':
 No such file or directory`); `.gitattributes` now pins `eol=lf` for
 `tools/plugin_runner.sh` and `tools/mock_harness/*.sh` so this cannot regress.
+The spike driver's first version transposed SERIAL/MODEL while parsing the
+mock's stdout table (the runner was invoked with `--dev-id P1S`); both orders
+were **re-run after the fix** with the true runtime-parsed serial
+(`01P142E6C031BC9`) — identical results (agent_start rc=0, bind_detect rc=-2,
+ssdp_msg ×5, dual `:2021` coexistence), cold stderr kept as
+`spike-orderA.cold.err` / `spike-orderB.cold.err`.
 
-*(OQ7 `## Gap analysis` lands below in Task 3.)*
 
 ## Gap analysis
 
-*(planned in 04-01 Task 3 — both critical gaps against our connect path, with the
-license constraint and the D-01/D-02 planned treatments.)*
+> **License constraint (read first).** openbu-mock has **no LICENSE** upstream
+> (`"license": null`, GitHub API, 2026-09-30) — per INTERESTING_REPOS.md's
+> license rule, unlicensed repos are **facts-only**. Consequences: this harness
+> uses the mock as an **external binary only**; no openbu-mock source, patch
+> diff, or derived code enters our trees; the clone and the generated
+> `ca.pem`/`ca-key.pem` live only in the gitignored `.cache/openbu-mock/`
+> (covered by subrepo `.gitignore` lines `.cache/` and `*.pem`); nothing from
+> the clone is ever `git add -f`ed (REQUIREMENTS.md Out of Scope: vendoring
+> unlicensed code; INTERESTING_REPOS.md line 6; research Pitfall 9).
+
+OQ7 resolved: gap-analysis home = tools/mock_harness/README.md (lives beside the run evidence; INTERESTING_REPOS.md §4 cross-link deferred to Phase 5 EXT-01)
+
+Source: INTERESTING_REPOS.md §4 (openbu-mock gap list). All source facts below
+were read at pin `e3db0ce7341f467e656cc860f1a0625c548a8f56` (the `MOCK_PIN`
+in `fetch_mock.sh`) — read-only, never copied.
+
+### Gap 1 — no `:3000` login/detect responder
+
+**Source-at-pin evidence:** there is no `:3000` listener anywhere in
+openbu-mock — MQTT binds `p.IP:8883` (mqtt.go:197), SSDP binds
+`239.255.255.250:2021` (ssdp.go:12-26), and the service startup table
+(main.go:286-293) starts only those listeners. There is no TCP-3000 code at
+all, so a sidecar on `:3000` can never conflict with the mock.
+
+Probe (harness run): IP=192.168.2.177 2026-09-30T23:29:37Z (mock running as the :8883 control)
+
+```text
+$ timeout 2 bash -c '</dev/tcp/192.168.2.177/3000'
+bash: connect: Connection refused
+bash: line 1: /dev/tcp/192.168.2.177/3000: Connection refused
+rc3000=1            <-- non-zero: nothing answers on :3000
+
+$ timeout 2 bash -c '</dev/tcp/192.168.2.177/8883'
+rc8883=0            <-- success: the mock's MQTT/TLS listener answers
+```
+
+**Impact on our connect path:**
+
+- with nothing listening, stock gives up after ~9 s returning `-2` with
+  `result_msg = "publish login request failed"`
+  (research/08.06-bind.md:126); this plan's spikes captured exactly that,
+  verbatim: `bind_detect rc=-2 result_msg=publish login request failed`
+- our own client hard-fails on an empty `id`:
+  `if (out.dev_id.empty()) { … return BAMBU_NETWORK_ERR_BIND_PARSE_LOGIN_REPORT_FAILED; }`
+  (src/lan_bind_tcp.cpp:335-339)
+- a conforming reply must satisfy the §8.6.2 field map
+  (research/08.06-bind.md:113): `command`, `id`, `model`, `name`, `version`,
+  `bind`, `connect` — the request frame is
+  `{"login":{"command":"detect","sequence_id":"20000"}}` (A5 A5 … A7 A7 framing)
+- a `login_report` FAILURE is the documented refusal variant for completeness
+  (research/08.06-bind.md:115, OBN #38) — the harness never sends it
+- the plugin gates the MQTT path on `bind_state`/`connect_type`
+  (plugin_loader.hpp:239-243), so the sidecar's reply values decide whether
+  LAN MQTT is even attempted (exact values are OQ5, locked in 04-02/04-03)
+
+**planned treatment (D-01):** a clean-room detect sidecar authored in
+`tools/mock_harness/` from the §8.6.2 facts above plus our own
+`obn::lan_bind_tcp` codec (`encode_frame` / `drain_frames`) only — **zero bytes
+read from openbu-mock** (facts-only license posture; no port conflict: the mock
+has no `:3000` code at all).
+
+### Gap 2 — `sequence_id` echo for arbitrary commands
+
+Evidence table pinned to `e3db0ce7341f467e656cc860f1a0625c548a8f56` (read from
+source; no code reused):
+
+| Command our chain publishes | Mock behavior at the pin | Reply carries request `sequence_id`? |
+| --- | --- | --- |
+| `pushing:pushall` (kickstart) | answered with `push_status`, but it carries `static "sequence_id":"0"` (state.go:291 via mqtt.go:482-491) | **No** |
+| `info:get_version` (kickstart) | echoes the request value (state.go:699 via mqtt.go:493-514) | **Yes** — the one command that echoes |
+| `system:get_access_code`, `security:app_cert_install` | fall through to the `unhandled command keys` log with **no reply** (mqtt.go:516-531) | **No reply at all** |
+| QoS 1 PUBACK for all of the above | sent before topic dispatch (mqtt.go:456 area) | n/a — transport ack only |
+
+Why the chain is expected to pass **without** a sequence-echo patch (the
+evidence D-02 records):
+
+1. the runner never matches responses — verbatim kickstart comment:
+   *"…uniqueness only matters for response matching, which we don't do."*
+   (tools/plugin_runner/main.cpp:1263-1266)
+2. the chain gates are transport/session-level only (README §9 golden stream) —
+   **D-08's ordered event chain is the pass contract** for this phase
+3. the mock proactively publishes `push_status` on subscribe and every 5 s
+   (mqtt.go:356-372), so keep-alive needs no echo
+4. residual risk: a stock-internal wait on an unanswered command could stall
+   something the chain surfaces as a timing anomaly — exactly what the
+   recorded harness run must observe (D-03)
+
+**planned treatment (D-02):** documented-first; escalate to a patch **only**
+inside a gitignored local clone (never committed anywhere) on the OQ6 trigger
+that 04-02 defines, with the upstream permission request opened in parallel.
+The recorded run in 04-03 (D-08 chain) is the deciding evidence.
+
+### Out-of-scope mock gaps (documented, not worked)
+
+FTPS/`990`, print-job/`project_file` flow, signing, strict single SUBSCRIBE
+topic, and multi-printer `-count` support remain out of scope (CONTEXT Deferred
+ideas) — recorded here so the gap census is complete.
+
