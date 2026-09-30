@@ -149,6 +149,142 @@ void assert_step_00(const obn::json::Value& state)
     CHECK(obj.at("subtask_name").as_string() == "benchy");
 }
 
+// Step-01 oracle (D-14): temps advance via replace; wifi_signal is ABSENT
+// from this delta and must keep its step-00 value — "absent keeps"
+// executed against a named key.
+void assert_step_01(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    // absent-keeps: delta 01 never mentions wifi_signal -> old value.
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").is_string());
+    CHECK(!obj.at("wifi_signal").is_null());
+    CHECK(obj.at("wifi_signal").as_string() == "-52dBm");
+
+    // present scalars replace wholesale (rule 3 on scalars).
+    CHECK(obj.count("bed_temper") == 1);
+    CHECK(obj.at("bed_temper").as_number() == 60.1);
+    CHECK(obj.count("nozzle_temper") == 1);
+    CHECK(obj.at("nozzle_temper").as_number() == 220.2);
+}
+
+// Step-02 oracle: progress counters replace; keys from earlier deltas
+// survive because this delta never mentions them.
+void assert_step_02(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    CHECK(obj.count("mc_percent") == 1);
+    CHECK(obj.at("mc_percent").as_number() == 42);
+    CHECK(obj.count("mc_remaining_time") == 1);
+    CHECK(obj.at("mc_remaining_time").as_number() == 96);
+    CHECK(obj.count("layer_num") == 1);
+    CHECK(obj.at("layer_num").as_number() == 57);
+
+    // absent-keeps: temps from step 01 survive delta 02 untouched.
+    CHECK(obj.count("bed_temper") == 1);
+    CHECK(obj.at("bed_temper").as_number() == 60.1);
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").as_string() == "-52dBm");
+}
+
+// Step-03 oracle: the nested `ams` OBJECT merges recursively — keys the
+// sub-delta mentions are replaced, keys it never mentions are kept.
+void assert_step_03(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    CHECK(obj.count("stg_cur") == 1);
+    CHECK(obj.at("stg_cur").as_number() == 4);
+
+    CHECK(obj.count("ams") == 1);
+    CHECK(obj.at("ams").is_object());
+    const obn::json::Object& ams = obj.at("ams").as_object();
+    // replaced by the sub-delta:
+    CHECK(ams.count("tray_now") == 1);
+    CHECK(ams.at("tray_now").as_string() == "2");
+    CHECK(ams.at("tray_pre").as_string() == "1");
+    CHECK(ams.at("tray_tar").as_string() == "2");
+    // absent-keeps INSIDE the recursion: unmentioned ams keys survive
+    // (object recursion, not wholesale object replacement).
+    CHECK(ams.count("ams_exist_bits") == 1);
+    CHECK(ams.at("ams_exist_bits").as_string() == "1");
+    CHECK(ams.count("ams") == 1);  // the nested ams list survived too
+
+    // top-level absent-keeps continues to hold
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").as_string() == "-52dBm");
+}
+
+// Step-04 oracle (the load-bearing rule): wifi_signal is PRESENT-AND-NULL
+// in this delta — the value clears while the KEY IS RETAINED. Presence is
+// discriminated at map level (count + is_null), never Value::find
+// (Pitfall 11), and a neighbouring key must survive.
+void assert_step_04(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    // present-null-clears: key retained (count == 1) AND value is null.
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").is_null());
+
+    // neighbouring key survived the null-clear (absent from delta 04).
+    CHECK(obj.count("sdcard") == 1);
+    CHECK(obj.at("sdcard").is_bool());
+    CHECK(obj.at("sdcard").as_bool());
+    CHECK(obj.count("subtask_name") == 1);
+    CHECK(obj.at("subtask_name").as_string() == "benchy");
+
+    // present scalar in the same delta still replaces
+    CHECK(obj.count("stg_cur") == 1);
+    CHECK(obj.at("stg_cur").as_number() == 0);
+}
+
+// Step-05 oracle: pause state replaces; wifi_signal is absent from this
+// delta, so the CLEARED (null) value is kept — absent-keeps applies to
+// nulls as much as to strings.
+void assert_step_05(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    CHECK(obj.count("gcode_state") == 1);
+    CHECK(obj.at("gcode_state").as_string() == "PAUSE");
+    CHECK(obj.count("stg_cur") == 1);
+    CHECK(obj.at("stg_cur").as_number() == 16);
+
+    // absent-keeps of the cleared value: still present, still null.
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").is_null());
+}
+
+// Step-06 oracle: the finish delta lands.
+void assert_step_06(const obn::json::Value& state)
+{
+    CHECK(state.is_object());
+    const obn::json::Object& obj = state.as_object();
+
+    CHECK(obj.count("gcode_state") == 1);
+    CHECK(obj.at("gcode_state").as_string() == "FINISH");
+    CHECK(obj.count("stg_cur") == 1);
+    CHECK(obj.at("stg_cur").as_number() == -1);
+    CHECK(obj.count("mc_percent") == 1);
+    CHECK(obj.at("mc_percent").as_number() == 100);
+    CHECK(obj.count("mc_remaining_time") == 1);
+    CHECK(obj.at("mc_remaining_time").as_number() == 0);
+    CHECK(obj.count("layer_num") == 1);
+    CHECK(obj.at("layer_num").as_number() == 137);
+
+    // the clear from step 04 is still in effect (delta 06 omits it)
+    CHECK(obj.count("wifi_signal") == 1);
+    CHECK(obj.at("wifi_signal").is_null());
+}
+
 } // namespace
 
 // Call sites keep the read_fixture(rel, out) shape; the line number in the
@@ -199,9 +335,58 @@ int main()
 
         deep_merge(state, print_it->second);
 
-        // TRACER scope: the step-00 oracle only; per-step oracles 01-06
-        // and the supplemental array proof land in the follow-up task.
-        if (i == 0) assert_step_00(state);
+        // Per-step oracle (D-14): assert the hand-derived expected state
+        // after EVERY frame — never final-state-only.
+        switch (i) {
+            case 0: assert_step_00(state); break;
+            case 1: assert_step_01(state); break;
+            case 2: assert_step_02(state); break;
+            case 3: assert_step_03(state); break;
+            case 4: assert_step_04(state); break;
+            case 5: assert_step_05(state); break;
+            case 6: assert_step_06(state); break;
+            default: break;
+        }
+    }
+
+    // ---- TEST-LOCAL supplemental array proof — NOT a vendored fixture ----
+    // (Pitfall 12 / OQ-3: the 7 upstream deltas carry no array keys, so
+    // "arrays replace wholesale" never executes from the sequence alone.)
+    // Both deltas below are literal strings inside this test file; no
+    // fixture is added, edited, or reordered — the 7 vendored frames stay
+    // byte-exact (D-03).
+    {
+        std::string arr_err;
+
+        // Replacement 1: hms (an array since frame 00) is replaced
+        // wholesale with a NON-EMPTY array.
+        auto arr_delta1 = obn::json::parse(
+            R"({"hms": [{"code": "0500_0002_0002"}, {"code": "0500_0003_0002"}]})",
+            &arr_err);
+        CHECK(arr_delta1.has_value());
+        if (arr_delta1) {
+            deep_merge(state, *arr_delta1);
+            const obn::json::Object& obj1 = state.as_object();
+            CHECK(obj1.count("hms") == 1);
+            CHECK(obj1.at("hms").is_array());
+            CHECK(obj1.at("hms").as_array().size() == 2);
+        }
+
+        // Replacement 2: the same key is then replaced wholesale with [].
+        auto arr_delta2 = obn::json::parse(R"({"hms": []})", &arr_err);
+        CHECK(arr_delta2.has_value());
+        if (arr_delta2) {
+            deep_merge(state, *arr_delta2);
+            const obn::json::Object& obj2 = state.as_object();
+            CHECK(obj2.count("hms") == 1);
+            CHECK(obj2.at("hms").is_array());
+            CHECK(obj2.at("hms").as_array().empty());
+            // replacement is per-key: neighbours survive both swaps
+            CHECK(obj2.count("sdcard") == 1);
+            CHECK(obj2.at("sdcard").as_bool());
+            CHECK(obj2.count("wifi_signal") == 1);
+            CHECK(obj2.at("wifi_signal").is_null());
+        }
     }
 
     if (fail_count != 0) {
