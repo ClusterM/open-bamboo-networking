@@ -1,5 +1,11 @@
 // Tests for src/signing.cpp — classifier, envelope structure, and signature
 // verification using a freshly generated RSA test keypair.
+//
+// D-07 header note (requirement-letter-vs-reality deviation, recorded per the
+// Phase 2 precedent): this file follows the repo convention (int main() +
+// fail_count + CHECK), NOT Catch2 — REQUIREMENTS calls the new case a
+// "Catch2 test", but only ssdp_listener_test.cpp is actually Catch2 in this
+// tree; Catch2 conversion of this file is deferred (test-infrastructure work).
 
 #include "obn/signing.hpp"
 #include "obn/config.hpp"
@@ -519,6 +525,42 @@ namespace obn::config {
     std::string& test_dir();
 }
 
+static int test_trailing_sibling_reconstruction()
+{
+    // SIGN-01 / D-08: trailing sibling AFTER the root key.
+    // PINNED OBSERVED BEHAVIOR: maybe_sign/build_envelope emit
+    // {"header":…,"print":<dump>} only — the trailing sibling (user_id) is
+    // silently dropped, which DIVERGES from the #72/farm consensus ("signature
+    // covers the whole envelope minus header, including user_id"), annotated
+    // in research/10.04 §Signing consensus. Pinned per the Phase 2 D-09
+    // register and NOT fixed (PROJECT.md Out of Scope: no signing change).
+    const std::string payload =
+        R"({"print":{"command":"pause","sequence_id":"11"},"user_id":"u_42"})";
+    const std::string env = obn::signing::maybe_sign(payload); // no device key → hermetic
+    CHECK(env != payload);                       // signed, not passed through
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    // (D-08.1) Byte-exact wire match: reconstruct the signed string FROM THE
+    // EMITTED envelope — the wire bytes are the oracle, not the input bytes.
+    std::string dump    = val->find("print").dump();
+    std::string to_sign = "{\"print\":" + dump + "}";
+    double plen = val->find("header.payload_len").as_number();
+    CHECK(static_cast<std::size_t>(plen) == to_sign.size());
+    // Envelope must end with the literal tail: ,"print":<dump>}
+    std::string tail = ",\"print\":" + dump + "}";
+    CHECK(env.size() >= tail.size());
+    CHECK(env.compare(env.size() - tail.size(), tail.size(), tail) == 0);
+
+    // (D-08.2) Signature round-trip against the wire-reconstructed signed string.
+    CHECK(verify_b64_sig(to_sign, val->find("header.sign_string").as_string()));
+
+    // (D-08.3) Sibling pin: dropped trailing sibling is the observed outcome.
+    CHECK(val->find("user_id").kind() == obn::json::Value::Kind::Null);
+    CHECK(env.find("\"user_id\"") == std::string::npos);
+    return 0;
+}
+
 int main()
 {
     // Generate fresh RSA-2048 keypair for signing tests.
@@ -589,6 +631,7 @@ int main()
     if (test_param_enc_idempotent()        != 0) rc = 1;
     if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
     if (test_liveview_prepare_passthrough() != 0) rc = 1;
+    if (test_trailing_sibling_reconstruction() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 
