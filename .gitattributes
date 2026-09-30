@@ -1,0 +1,6 @@
+# Fixtures are byte-for-byte recordings. Never let git convert line endings —
+# a checkout that rewrites them changes what the corpus tests.
+tests/fixtures/** -text
+
+# Harness scripts run under WSL bash - CRLF in the working tree breaks them.
+tools/mock_harness/*.sh text eol=lf
