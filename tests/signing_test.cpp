@@ -19,7 +19,17 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#ifdef _WIN32
+// MSVC port (Pitfall 3): no <unistd.h> — POSIX names are mapped to their
+// underscore-prefixed CRT equivalents below; POSIX branch stays untouched.
+#include <cstdlib>
+#include <io.h>
+#define close _close
+#define open _open
+#define unlink _unlink
+#else
 #include <unistd.h>
+#endif
 #include <vector>
 
 #define CHECK(cond) do {                                                    \
@@ -532,10 +542,28 @@ int main()
     if (!g_test_key) { std::cerr << "EVP_RSA_gen failed\n"; return 1; }
 
     // Write private key to a temp PEM file and point the config at it.
+#ifdef _WIN32
+    // Per-run unique temp path — never a fixed predictable filename: the
+    // XXXXXX template is uniquified per run, then created with _O_EXCL so
+    // parallel/repeated runs cannot clobber each other's key files.
+    char tmp_path[512];
+    const char* tmp_dir = std::getenv("TEMP");
+    std::snprintf(tmp_path, sizeof(tmp_path), "%s\\signing_test_XXXXXX",
+                  (tmp_dir && *tmp_dir) ? tmp_dir : ".");
+    if (_mktemp_s(tmp_path, sizeof(tmp_path)) != 0) {
+        std::cerr << "_mktemp_s failed\n";
+        EVP_PKEY_free(g_test_key);
+        return 1;
+    }
+    int fd = _open(tmp_path, _O_CREAT | _O_EXCL | _O_WRONLY, 0600);
+    if (fd < 0) { std::cerr << "_open temp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
+    close(fd);
+#else
     char tmp_path[] = "/tmp/signing_test_XXXXXX";
     int fd = mkstemp(tmp_path);
     if (fd < 0) { std::cerr << "mkstemp failed\n"; EVP_PKEY_free(g_test_key); return 1; }
     close(fd);
+#endif
     std::string pem_path = std::string(tmp_path) + ".pem";
 
     int pem_fd = open(pem_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
