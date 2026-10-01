@@ -9,8 +9,82 @@ sidecar and the single CI-able command.
 
 ## Usage
 
-*(planned in 04-03: `run_harness.sh` — one documented command with a real exit
-code; no GitHub workflow is added by this phase, `build.yml` stays untouched.)*
+The single CI-able command (from the `bambu_network_oss` repo root, WSL bash
+— D-07 platform):
+
+```bash
+tools/mock_harness/run_harness.sh
+```
+
+Flags and defaults:
+
+| flag | default |
+| --- | --- |
+| `--abi MM.mm.pp` | derived from this file's `OQ3 resolved:` line (`02.08.01`) |
+| `--model` | `P1S` |
+| `--access-code` | `12345678` |
+| `--timeout` | `6` |
+| `--connect-settle-ms` | `15000` |
+| `--log-out` | `.cache/openbu-mock/run/harness.jsonl` |
+| `--ssdp {off,soft,hard}` | derived from this file (`assert decision: hard` → `hard`, else `soft`) |
+
+Exit-code contract: **`0` = D-08 chain passed, `1` = assertion failed** —
+the runner's own `rc` (printed as `runner_rc=`) is informational only:
+`--action none` exits 0 even when the flow failed (Pitfall 8), so the
+verdict comes solely from `tools/mock_harness/assert_chain.py`.
+
+What one invocation does: preflight (`command -v cmake ninja g++ pkg-config
+python3 git` + `pkg-config --exists openssl libcurl minizip`, actionable
+errors on failure) → `fetch_mock.sh` pinned fetch/build if
+`.cache/openbu-mock/out/openbu-mock` is missing → `build_responder.sh` if the
+sidecar is missing → start the mock (cwd `.cache/openbu-mock/run/` so
+`ca.pem` lands in the gitignored run dir; stdout table parsed into
+`identity.env` — serial/IP/code are never hardcoded) → copy the OQ1 trust
+anchors (`slicer_base64.cer` **and** `printer.cer` = PEM copies of `ca.pem`)
+→ start the clean-room `:3000` sidecar with the identity + OQ5 values →
+readiness poll (`$IP:8883` and `:3000`, else the mock log tail) →
+`tools/plugin_runner.sh --abi $ABI --action none … --log-out …` →
+`python3 tools/mock_harness/assert_chain.py --log … --ssdp …` verdict →
+teardown (`trap` on EXIT/INT/TERM kills mock + sidecar) → **exit with the
+assertion's code**.
+
+Prerequisites (one-time, WSL Ubuntu):
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build \
+    pkg-config libcurl4-openssl-dev libminizip-dev nlohmann-json3-dev
+```
+
+Docker Desktop's daemon must be running for the **first** fetch (the
+`golang:1.22` build); later runs skip fetch+build when the binaries exist.
+
+Artifacts (all gitignored): the `<--log-out>` JSONL transcript (+ `.out` /
+`.err` runner capture), `.cache/openbu-mock/run/mock.log` (mock `-debug`),
+`identity.env`, `detect.log` (sidecar stdout).
+
+Expected output — the golden chain from `tools/plugin_runner/README.md` §9
+(event _kinds_ in order):
+
+```text
+startup → plugin_loaded → data_dir → cert_resolved →
+extra_http_header → agent_start (rc=0) → post_start_init →
+change_user_clear (rc=0) → ssdp_msg → bind_detect →
+connect_printer_call (rc=0) → local_connect (status=0) →
+session_ready (got=true) → start_subscribe → kickstart_pushall (rc=0)
+→ idle_done → shutdown
+```
+
+of which `assert_chain.py` asserts the seven-event D-08 pass contract in
+order: `bind_detect rc=0 → connect_printer_call rc=0 → local_connect
+status=0 → session_ready got=true → start_subscribe → kickstart_pushall
+rc=0 → idle_done`, plus `ssdp_msg` under `--ssdp hard`.
+
+assert decision: hard (ssdp_msg present in harness-run1/2 — 2 events each;
+coexistence proven stable in the 04-01 both-orders spikes)
+
+D-09: not included (JSONL chain unambiguous)
+
+No new GitHub workflow; .github/workflows/build.yml untouched (D-06) - CI-able means this one command plus its exit code
 
 ## Environment & spikes
 
@@ -216,7 +290,7 @@ waited for `agent_start`, then:
 - Order-B mock output goes to `mock-orderB.log` (kept separate so Task 1's
   readiness `mock.log` evidence is never overwritten)
 
-OQ2 resolved: coexistence OK in both startup orders (ssdp_msg present in both orders; mock survived the runner-first bind with zero `SSDP: failed to listen`; both UDP :2021 listeners visible simultaneously — SO_REUSEADDR held, no Pitfall-2 cascade)
+OQ2 resolved: ssdp_msg assert = hard (observed across harness-run1/2: ssdp_msg present in both runs - 2 events each; 04-01 spikes: coexistence OK in both SSDP startup orders, both UDP :2021 listeners visible simultaneously, zero 'SSDP: failed to listen')
 
 **Spike environment fixes (deviations, recorded):** the first bridge builds
 failed on missing `libssl-dev` (`Could NOT find OpenSSL`) and missing `zlib.h`
@@ -350,7 +424,7 @@ inside a gitignored local clone (never committed anywhere) on the OQ6 trigger
 that 04-02 defines, with the upstream permission request opened in parallel.
 The recorded run in 04-03 (D-08 chain) is the deciding evidence.
 
-Gap 2 decision: DOCUMENTED (D-02) - final confirmation lands with 04-03's recorded detect->connect->pushall run
+Gap 2 decision: DOCUMENTED (D-02) - confirmed by recorded run: OQ6 trigger not met (detect->connect->pushall passed without a sequence-echo patch)
 
 OQ6 trigger: the harness proves sequence-echo blocks detect->connect->pushall IFF (a) any D-08 chain element fails in a recorded run AND (b) the mock's -debug log shows 'unhandled command keys' for a command that failing element depends on (pushing:pushall | info:get_version | system:get_access_code | security:app_cert_install)
 
@@ -366,7 +440,7 @@ response matching is not done (main.cpp:1263-1266, *"…uniqueness only matters
 for response matching, which we don't do."*) make blocking unlikely — the
 passing/failing 04-03 run is the deciding evidence per D-03.
 
-OQ5 locked: detect reply values bind=free, connect=lan, model=C12, version=01.09.01.00, dev_cap=1 - locked by bind_detect rc=0 + local_connect status=0 in spike-oq1.jsonl
+OQ5 locked: detect reply values bind=free, connect=lan, model=C12, version=01.09.01.00, dev_cap=1 - locked by bind_detect rc=0 + local_connect status=0 in spike-oq1.jsonl, re-confirmed by harness-run1.jsonl
 
 Clean-room attestation: detect_responder.cpp derives solely from research/08.06-bind.md 8.6.2 and our obn::lan_bind_tcp/obn::json code - zero bytes read from openbu-mock (D-01)
 
