@@ -106,7 +106,54 @@ encrypted (main.cpp:797-801). Run logs: `.cache/openbu-mock/run/
 spike-oq1{,-b,-c,-d}.{jsonl,out,err}`, `mock-oq1.log`, `verify-oq1.txt`,
 `tls_dump-oq1.txt`, `oq1-spike-summary.txt` (all gitignored).
 
-OQ1 BLOCKED: local_connect {"_kind":"local_connect","_t":"2026-10-01T00:15:34.434602Z","dev_id":"01P953009C0D43A","msg":"-1","status":1} (attempt A, PEM ca.pem copy) and {"_kind":"local_connect","_t":"2026-10-01T00:18:01.978923Z","dev_id":"01P5136BA5239D1","msg":"-1","status":1} (attempt B, base64-DER re-encode), attempts C/D identical; mock -debug verbatim "TLS handshake failed: EOF" + "no additional bytes available after handshake failure (client closed connection)" (stock closed before ClientHello; plugin log encrypted so no OpenSSL verify text exists); openssl -CAfile ca.pem -verify_return_error on the same served chain: Verification: OK - stock rejected the mock CA in both formats; no mock-side patch without user sign-off (D-04/D-05 do not cover it)
+**Phase 2 (2026-10-01, after user sign-off on a mock-side patch — the patch
+turned out to be unnecessary):** the pre-Hello abort was bisected with
+control experiments before touching the mock:
+
+| attempt | variable tested | result |
+| --- | --- | --- |
+| E — `spike-oq1-e.jsonl` | `--cert-file` = the REAL Bambu `slicer_base64.cer` (PEM, OrcaSlicer `resources/cert/`) | handshake runs, client sends `alert=fatal desc=48(unknown_ca)` — loader accepts this file, verify fails |
+| G — `spike-oq1-g.jsonl` | mock `ca.pem` PEM, absolute path | pre-Hello abort (path not the issue) |
+| K — `spike-oq1-k.jsonl` | DigiCert Global Root alone (2nd cert of the real file) | pre-Hello abort |
+| I — `spike-oq1-i.jsonl` | bundle `mock CA + DigiCert root` | pre-Hello abort |
+| M — `spike-oq1-m.jsonl` | bundle `served mock leaf + mock CA` | pre-Hello abort |
+| P0 — `spike-oq1-p0.jsonl` | REAL `slicer_base64.cer` copied into the run dir | **pre-Hello abort — same file that worked in E; the difference is folder contents** |
+| P1 — `spike-oq1-p1.jsonl` | run dir + real `printer.cer` beside `slicer_base64.cer` (mock CA anchor) | **handshake runs**, `unknown_ca` |
+| P2 — `spike-oq1-p2.jsonl` | `printer.cer` = served mock leaf | handshake runs, `unknown_ca` |
+| P3 — `spike-oq1-p3.jsonl` | **`printer.cer` = PEM copy of mock `ca.pem`** | **`local_connect status=0`** — CONNECT accepted, `subscribed to device/<serial>/report`, `session_ready got=true`, `kickstart_pushall rc=0` |
+
+**Root cause (behavior facts):** stock's LAN TLS setup requires a
+**`printer.cer` file in the same folder as the resolved
+`slicer_base64.cer`** — without it the client aborts the connection before
+sending a ClientHello (the exact signature of attempts A–D/G/K/I/M/P0) —
+and the **verify trust anchor is the content of `printer.cer`**, not
+`slicer_base64.cer` (P1 kept the mock CA in `slicer_base64.cer` yet got
+`unknown_ca`; with `printer.cer` = mock CA, P3 verified). This contradicts
+the runner's own comment at main.cpp:797-801 (which names
+`slicer_base64.cer` as *the* trust anchor) — recorded here as observed
+behavior, not opinion.
+
+**Mock-side patch: NOT APPLIED.** The signed-off escalation (D-02-style
+patch inside the gitignored clone) was not needed — the mock's TLS chain
+verifies fine with `openssl -CAfile ca.pem -verify_return_error`
+(`Verification: OK`) and stock accepts it once the local cert-folder layout
+is right. openbu-mock source is untouched, and **no upstream permission
+request was opened** (there is nothing to request). Sign-off consumed: 0.
+
+Final recorded run with the complete recipe (`spike-oq1.jsonl`, attempt A
+re-run), verbatim ordered chain:
+
+```text
+{"_kind":"bind_detect","_t":"2026-10-01T01:04:42.656131Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01PF63F120D6498","dev_name":"3DP-01P-498","model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+{"_kind":"connect_printer_call","_t":"2026-10-01T01:04:42.658756Z","rc":0}
+{"_kind":"local_connect","_t":"2026-10-01T01:04:42.813116Z","dev_id":"01PF63F120D6498","msg":"ssl:","status":0}
+{"_kind":"session_ready","_t":"2026-10-01T01:04:42.813423Z","cap_ms":15000,"got":true}
+{"_kind":"start_subscribe","_t":"2026-10-01T01:04:42.816160Z","module":"app","rc":0}
+{"_kind":"kickstart_pushall","_t":"2026-10-01T01:04:42.816750Z","bytes":79,"rc":0}
+{"_kind":"idle_done","_t":"2026-10-01T01:04:52.318989Z","seconds":6}
+```
+
+OQ1 resolved: --cert-file .cache/openbu-mock/run/slicer_base64.cer (PEM copy of mock ca.pem) PLUS printer.cer = PEM copy of mock ca.pem in the same cert folder (printer.cer is the file stock's LAN TLS verify actually loads; without it the client aborts before ClientHello) -> local_connect status=0 (attempt A final recipe, spike-oq1.jsonl, full ordered chain in the same run; no mock-side patch was needed)
 
 ### Spikes — Task 2, both SSDP startup orders (2026-09-30)
 
@@ -319,7 +366,7 @@ response matching is not done (main.cpp:1263-1266, *"…uniqueness only matters
 for response matching, which we don't do."*) make blocking unlikely — the
 passing/failing 04-03 run is the deciding evidence per D-03.
 
-OQ5 provisional: detect reply values bind=free, connect=lan, model=C12, name=<NAME from identity.env>, version=01.09.01.00, dev_cap=1, sequence_id=20000 (JSON number) - flagged assumption, resolution step: 04-03 locks them on the first bind_detect rc=0 + local_connect status=0 pair
+OQ5 locked: detect reply values bind=free, connect=lan, model=C12, version=01.09.01.00, dev_cap=1 - locked by bind_detect rc=0 + local_connect status=0 in spike-oq1.jsonl
 
 Clean-room attestation: detect_responder.cpp derives solely from research/08.06-bind.md 8.6.2 and our obn::lan_bind_tcp/obn::json code - zero bytes read from openbu-mock (D-01)
 
