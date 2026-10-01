@@ -67,6 +67,47 @@ commands from the workspace root.
 
 OQ4 resolved: native WSL run of the built linux-amd64 binary; Docker used as compiler only (mock binds its detected IP - openbu-mock network.go:12-18, container -p mapping breaks it; research Alternatives table)
 
+### OQ1 TLS-trust spike — plan 04-03 Task 1 (2026-10-01)
+
+Driver: gitignored `.cache/openbu-mock/oq1_driver.sh` — mock started first
+(the recorded OQ2 order) from `.cache/openbu-mock/run/` (fresh identity
+parsed into `identity.env`), clean-room sidecar with the `identity.env`
+serial/name and the OQ5 defaults, `openssl s_client -showcerts` dump of the
+served chain, then `tools/plugin_runner.sh --abi 02.08.01 --action none
+--timeout 6 --connect-settle-ms 15000 --cert-file … --log-out …`. Four
+recorded attempts, one trust-anchor variant each:
+
+| attempt | `slicer_base64.cer` content | `--cert-file` arg | `local_connect` |
+| --- | --- | --- | --- |
+| A — `spike-oq1.jsonl` | PEM copy of `ca.pem` | relative `.cache/openbu-mock/run/slicer_base64.cer` | `"status":1` |
+| B — `spike-oq1-b.jsonl` | base64-DER re-encode (`openssl x509 -outform der \| base64 -w0`) | relative | `"status":1` |
+| C — `spike-oq1-c.jsonl` | base64-DER (as B) | absolute path | `"status":1` |
+| D — `spike-oq1-d.jsonl` | raw DER | relative | `"status":1` |
+
+Every attempt: sidecar logged `detect: served id=…`, `bind_detect` returned
+`rc:0 / result_msg:success`, `cert_resolved` fired
+(`"filename":"slicer_base64.cer"`), `connect_printer_call rc:0` — then the
+plugin aborted the MQTT/TLS handshake. Verbatim evidence (attempt A / B):
+
+```text
+{"_kind":"bind_detect","_t":"2026-10-01T00:15:34.227949Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01P953009C0D43A","dev_name":"3DP-01P-43A","model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+{"_kind":"local_connect","_t":"2026-10-01T00:15:34.434602Z","dev_id":"01P953009C0D43A","msg":"-1","status":1}
+{"_kind":"local_connect","_t":"2026-10-01T00:18:01.978923Z","dev_id":"01P5136BA5239D1","msg":"-1","status":1}
+mock -debug (run A): MQTT [192.168.2.177:22998]: TLS handshake failed: EOF
+mock -debug (run A): MQTT [192.168.2.177:22998]: no additional bytes available after handshake failure (client closed connection)
+openssl s_client -connect <IP>:8883 -CAfile ca.pem -verify_return_error: Verification: OK  (rc=0 — the same chain verifies with the same CA)
+```
+
+The mock's server-side first read of the handshake returns EOF (the stock
+client closes before sending a ClientHello) in all four variants, so this is
+a client-side abort during local SSL setup/verify, not a wire-level
+mismatch; no OpenSSL verify text exists to paste — the plugin's own log is
+encrypted (main.cpp:797-801). Run logs: `.cache/openbu-mock/run/
+spike-oq1{,-b,-c,-d}.{jsonl,out,err}`, `mock-oq1.log`, `verify-oq1.txt`,
+`tls_dump-oq1.txt`, `oq1-spike-summary.txt` (all gitignored).
+
+OQ1 BLOCKED: local_connect {"_kind":"local_connect","_t":"2026-10-01T00:15:34.434602Z","dev_id":"01P953009C0D43A","msg":"-1","status":1} (attempt A, PEM ca.pem copy) and {"_kind":"local_connect","_t":"2026-10-01T00:18:01.978923Z","dev_id":"01P5136BA5239D1","msg":"-1","status":1} (attempt B, base64-DER re-encode), attempts C/D identical; mock -debug verbatim "TLS handshake failed: EOF" + "no additional bytes available after handshake failure (client closed connection)" (stock closed before ClientHello; plugin log encrypted so no OpenSSL verify text exists); openssl -CAfile ca.pem -verify_return_error on the same served chain: Verification: OK - stock rejected the mock CA in both formats; no mock-side patch without user sign-off (D-04/D-05 do not cover it)
+
 ### Spikes — Task 2, both SSDP startup orders (2026-09-30)
 
 Driver: gitignored `.cache/openbu-mock/spike_driver.sh`; artifacts in
