@@ -209,6 +209,28 @@ rc8883=0            <-- success: the mock's MQTT/TLS listener answers
 read from openbu-mock** (facts-only license posture; no port conflict: the mock
 has no `:3000` code at all).
 
+Gap 1 decision: CLOSED (clean-room sidecar, D-01) - proven against the REAL
+stock client on 2026-09-30 (plan 04-02 Task 1). Build:
+`tools/mock_harness/build_responder.sh` →
+`.cache/mock_harness/build-responder/detect_responder`; run: sidecar started
+with the `identity.env` serial/name beside
+`tools/plugin_runner.sh --abi 02.08.01 --action bind_detect --log-out .cache/openbu-mock/run/gap1_bind_detect.jsonl`.
+Run evidence, verbatim from that JSONL:
+
+```text
+{"_kind":"bind_detect","_t":"2026-09-30T23:58:26.120022Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01P142E6C031BC9","dev_name":"3DP-01P-BC9","elapsed_ms":1008,"model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+```
+
+The invocation's raw exit code was `rc=0` (the `bind_detect` action exits 0
+iff `rc==0`, main.cpp:1458-1462), and the sidecar stdout
+(`.cache/openbu-mock/run/detect.log`) shows it served the request:
+
+```text
+detect: served id=01P142E6C031BC9
+```
+
+(`dev_id` is the runtime-parsed `identity.env` `SERIAL` — nothing hardcoded.)
+
 ### Gap 2 — `sequence_id` echo for arbitrary commands
 
 Evidence table pinned to `e3db0ce7341f467e656cc860f1a0625c548a8f56` (read from
@@ -239,6 +261,26 @@ evidence D-02 records):
 inside a gitignored local clone (never committed anywhere) on the OQ6 trigger
 that 04-02 defines, with the upstream permission request opened in parallel.
 The recorded run in 04-03 (D-08 chain) is the deciding evidence.
+
+Gap 2 decision: DOCUMENTED (D-02) - final confirmation lands with 04-03's recorded detect->connect->pushall run
+
+OQ6 trigger: the harness proves sequence-echo blocks detect->connect->pushall IFF (a) any D-08 chain element fails in a recorded run AND (b) the mock's -debug log shows 'unhandled command keys' for a command that failing element depends on (pushing:pushall | info:get_version | system:get_access_code | security:app_cert_install)
+
+This is research OQ6's proposed criterion, stated here as the planner's
+resolution so the documented-vs-patch decision in 04-03 is mechanical. The
+escalation procedure if the trigger fires: any patch lives **only** inside the
+gitignored `.cache/openbu-mock/src` clone; only its observed **behavior**
+(never a diff or source) is recorded in our docs; an upstream
+**permission request** is opened in parallel; nothing from the clone is ever
+committed (D-02 verbatim constraints). Documented-first is the default today because
+the source-at-pin evidence table above plus the runner's own comment that
+response matching is not done (main.cpp:1263-1266, *"…uniqueness only matters
+for response matching, which we don't do."*) make blocking unlikely — the
+passing/failing 04-03 run is the deciding evidence per D-03.
+
+OQ5 provisional: detect reply values bind=free, connect=lan, model=C12, name=<NAME from identity.env>, version=01.09.01.00, dev_cap=1, sequence_id=20000 (JSON number) - flagged assumption, resolution step: 04-03 locks them on the first bind_detect rc=0 + local_connect status=0 pair
+
+Clean-room attestation: detect_responder.cpp derives solely from research/08.06-bind.md 8.6.2 and our obn::lan_bind_tcp/obn::json code - zero bytes read from openbu-mock (D-01)
 
 ### Out-of-scope mock gaps (documented, not worked)
 
