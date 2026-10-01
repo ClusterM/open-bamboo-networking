@@ -30,7 +30,7 @@ Flags and defaults:
 
 Exit-code contract: **`0` = D-08 chain passed, `1` = assertion failed** —
 the runner's own `rc` (printed as `runner_rc=`) is informational only:
-`--action none` exits 0 even when the flow failed (Pitfall 8), so the
+`--action none` exits 0 even when the flow failed, so the
 verdict comes solely from `tools/mock_harness/assert_chain.py`.
 
 What one invocation does: preflight (`command -v cmake ninja g++ pkg-config
@@ -311,18 +311,18 @@ ssdp_msg ×5, dual `:2021` coexistence), cold stderr kept as
 ## Gap analysis
 
 > **License constraint (read first).** openbu-mock has **no LICENSE** upstream
-> (`"license": null`, GitHub API, 2026-09-30) — per INTERESTING_REPOS.md's
-> license rule, unlicensed repos are **facts-only**. Consequences: this harness
+> (`"license": null`, GitHub API, 2026-09-30) — unlicensed repos are
+> **facts-only** here. Consequences: this harness
 > uses the mock as an **external binary only**; no openbu-mock source, patch
 > diff, or derived code enters our trees; the clone and the generated
 > `ca.pem`/`ca-key.pem` live only in the gitignored `.cache/openbu-mock/`
 > (covered by subrepo `.gitignore` lines `.cache/` and `*.pem`); nothing from
-> the clone is ever `git add -f`ed (REQUIREMENTS.md Out of Scope: vendoring
-> unlicensed code; INTERESTING_REPOS.md line 6; research Pitfall 9).
+> the clone is ever `git add -f`ed (vendoring unlicensed code is out of
+> scope for this repo).
 
-OQ7 resolved: gap-analysis home = tools/mock_harness/README.md (lives beside the run evidence; INTERESTING_REPOS.md §4 cross-link deferred to Phase 5 EXT-01)
+OQ7 resolved: gap-analysis home = tools/mock_harness/README.md (lives beside the run evidence)
 
-Source: INTERESTING_REPOS.md §4 (openbu-mock gap list). All source facts below
+Source: community-survey §4 (openbu-mock gap list). All source facts below
 were read at pin `e3db0ce7341f467e656cc860f1a0625c548a8f56` (the `MOCK_PIN`
 in `fetch_mock.sh`) — read-only, never copied.
 

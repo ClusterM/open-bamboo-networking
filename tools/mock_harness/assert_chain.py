@@ -8,7 +8,7 @@ Pass contract (D-08, tools/plugin_runner/README.md section 9 golden stream):
 as an ORDERED subsequence of the log, with per-event payload checks.
 
 The runner's exit code is NEVER the verdict (`--action none` exits 0 even
-when the flow failed — main.cpp:2402-2417, Pitfall 8). Exit code of this
+when the flow failed — main.cpp:2402-2417). Exit code of this
 script is the verdict: 0 = chain passed, 1 = failed.
 
 Usage: assert_chain.py --log PATH [--ssdp {off,soft,hard}]

@@ -5,7 +5,7 @@
 # drives tools/plugin_runner --action none against them, asserts the D-08
 # ordered JSONL chain (assert_chain.py), tears everything down, and exits
 # with the ASSERTION's code. The runner's own exit code is informational
-# only (`--action none` exits 0 even on flow failure — Pitfall 8).
+# only (`--action none` exits 0 even on flow failure).
 #
 # Exit: 0 = D-08 chain passed, 1 = assertion failed.
 #
@@ -67,7 +67,7 @@ fi
 [[ "$SSDP" =~ ^(off|soft|hard)$ ]] || die "--ssdp must be off|soft|hard, got '$SSDP'"
 
 # ---------------------------------------------------------------------------
-# 1. Preflight (Pitfall 5): toolchain + pkg-config deps with actionable errors
+# 1. Preflight: toolchain + pkg-config deps with actionable errors
 # ---------------------------------------------------------------------------
 missing=""
 for c in cmake ninja g++ pkg-config python3 git; do
@@ -125,7 +125,7 @@ done
 [[ "$ready" = 1 ]] || { tail -20 "$RUN/mock.log" >&2 || true; die "mock did not become ready (see $RUN/mock.log above)"; }
 
 # Parse the mock's stdout table (fixed-width columns) — NEVER hardcode
-# serial/IP/code (Pitfall 7).
+# serial/IP/code.
 python3 - "$RUN/mock.log" "$RUN/identity.env" <<'PY'
 import re, sys
 lines = open(sys.argv[1], errors='replace').read().splitlines()
@@ -186,7 +186,7 @@ fi
 log "ready: mock=$IP:8883 sidecar=:3000"
 
 # ---------------------------------------------------------------------------
-# 8. Drive the stock plugin; runner_rc= is EVIDENCE ONLY (Pitfall 8)
+# 8. Drive the stock plugin; runner_rc= is EVIDENCE ONLY
 # ---------------------------------------------------------------------------
 mkdir -p "$(dirname "$LOG_OUT")"
 rm -f "$LOG_OUT" "$LOG_OUT.out" "$LOG_OUT.err"
