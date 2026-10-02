@@ -156,6 +156,7 @@ long long ms_since(SteadyClock::time_point t0)
 // network, always this plate's image), then the printer's copy over :6000.
 void fetch_worker(obn::tunnel_upload::ConnectParams cp,
                   std::string subtask_name,
+                  std::string model_key,
                   int         plate_idx,
                   std::string version,
                   std::string inflight)
@@ -187,12 +188,17 @@ void fetch_worker(obn::tunnel_upload::ConnectParams cp,
         return;
     }
 
+    // COVER-01: match the listing on the chosen model_key (gcode_file
+    // basename when the frame carried one); empty falls back to
+    // subtask_name, i.e. the pre-COVER-01 behavior. The cache identity
+    // below (path_for, inflight key) stays keyed on subtask_name.
     const obn::tunnel_upload::ModelThumbnailOutcome thumb =
-        conn.fetch_model_tile_thumbnail(subtask_name, plate_idx);
+        conn.fetch_model_tile_thumbnail(model_key.empty() ? subtask_name : model_key, plate_idx);
     if (!thumb.ok) {
-        OBN_DEBUG("cover_cache: %s for '%s' plate %d after %lld ms; "
-                  "no cover for the next %lld s",
-                  thumb.error.c_str(), subtask_name.c_str(), plate_idx,
+        OBN_DEBUG("cover_cache: %s for '%s' (model_key '%s') plate %d "
+                  "after %lld ms; no cover for the next %lld s",
+                  thumb.error.c_str(), subtask_name.c_str(),
+                  model_key.c_str(), plate_idx,
                   ms_since(t0), static_cast<long long>(kNegCacheTimeout.count()));
         mark_neg_cache(inflight);
         return;
@@ -336,9 +342,12 @@ void ensure(const std::string& host,
             const std::string& user,
             const std::string& password,
             const std::string& subtask_name,
+            const std::string& model_key,
             int                plate_idx,
             const std::string& version)
 {
+    // Unchanged guard: identity (subtask_name) must exist for the cache
+    // path, inflight key and Studio URL — model_key never widens this.
     if (host.empty() || subtask_name.empty()) return;
 
     std::string target = path_for(subtask_name, plate_idx, version);
@@ -362,8 +371,8 @@ void ensure(const std::string& host,
     cp.password = password;
     cp.username = user.empty() ? "bblp" : user;
 
-    std::thread(fetch_worker, std::move(cp), subtask_name, plate_idx, version,
-                std::move(key)).detach();
+    std::thread(fetch_worker, std::move(cp), subtask_name, model_key,
+                plate_idx, version, std::move(key)).detach();
 }
 
 #ifdef OBN_TESTING

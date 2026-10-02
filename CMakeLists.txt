@@ -391,6 +391,7 @@ add_library(bambu_networking SHARED
     src/cloud_session.cpp
     ${OBN_CLOUD_CA_SOURCES}
     src/cover_cache.cpp
+    src/cover_key.cpp
     src/cover_server.cpp
     src/ftps.cpp
     src/http_client.cpp
@@ -876,6 +877,17 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(cover_cache_test PRIVATE ws2_32)
     endif()
     add_test(NAME cover_cache COMMAND cover_cache_test)
+
+    # Phase 8 (COVER-01): pure primary/fallback cover listing key.
+    # cover_key.cpp is JSON string logic only (no transport, no agent,
+    # no I/O), so the link surface stays cover_key + json_lite — no new
+    # dependencies; json_lite is the parse substrate, same as
+    # push_status_merge above.
+    add_executable(cover_key_test tests/cover_key_test.cpp
+        src/cover_key.cpp
+        src/json_lite.cpp)
+    target_include_directories(cover_key_test PRIVATE include)
+    add_test(NAME cover_key COMMAND cover_key_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
@@ -998,6 +1010,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/cloud_presets.cpp
         src/cloud_session.cpp
         src/cover_cache.cpp
+        src/cover_key.cpp
         src/cover_server.cpp
         src/ftps.cpp
         src/http_client.cpp
@@ -1088,6 +1101,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/cloud_print.cpp
         src/cloud_session.cpp
         src/cover_cache.cpp
+        src/cover_key.cpp
         src/cover_server.cpp
         src/ftps.cpp
         src/http_client.cpp

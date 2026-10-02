@@ -20,6 +20,7 @@
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
+#include "obn/cover_key.hpp"
 #include "obn/cover_server.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
