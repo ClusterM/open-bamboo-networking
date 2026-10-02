@@ -21,6 +21,7 @@
 #include "obn/cover_cache.hpp"
 #include "obn/cover_server.hpp"
 #include "obn/http_client.hpp"
+#include "obn/hms_filter.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
@@ -1669,6 +1670,10 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         if (cfg.override_lan_ip)             try_override_net_ip(patched, connect_ip);
     }
 
+    // Suppress spurious 65543 (MQTT verification failure) from triggering
+    // the Studio HMS banner on local reports as well.
+    obn::hms::filter_hms_code(patched, 65543);
+
     // Per-print token used to invalidate the cover cache when the user
     // re-uploads a different .3mf under the same filename. We need a
     // value that is constant for the life of one print and changes the
@@ -2837,6 +2842,9 @@ int Agent::connect_cloud()
                       "registered on_printer_connected; will notify on a "
                       "later report", dev_id.c_str());
         }
+        // Filter out spurious 65543 (MQTT verification failure caused by
+        // cloud prepare / project_file) from the HMS array before dispatch.
+        obn::hms::filter_hms_code(json, 65543);
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
 
