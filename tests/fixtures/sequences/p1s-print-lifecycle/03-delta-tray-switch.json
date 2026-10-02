@@ -1,0 +1,13 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 1,
+    "sequence_id": "4",
+    "stg_cur": 4,
+    "ams": {
+      "tray_now": "2",
+      "tray_pre": "1",
+      "tray_tar": "2"
+    }
+  }
+}

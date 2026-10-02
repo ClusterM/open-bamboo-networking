@@ -329,6 +329,9 @@ static std::string json_str_escape(const std::string& s)
     return out;
 }
 
+// Emits {"header":…,"<root_key>":dump} ONLY — trailing siblings in the input
+// payload are not carried. See the invariant comment at to_sign (maybe_sign)
+// below, locked by test_trailing_sibling_reconstruction in tests/signing_test.cpp.
 // Builds the complete signed envelope JSON string.
 std::string build_envelope(const std::string& to_sign,
                            const std::string& sig_b64,
@@ -378,6 +381,15 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
         build_print_dump(payload_json, device_pub, developer_mode);
     if (print_dump.empty()) return payload_json; // malformed; pass through
 
+    // SINGLE-ROOT WRAPPER INVARIANT (locked by test_trailing_sibling_reconstruction
+    // in tests/signing_test.cpp): to_sign is exactly {"print":<dump>} —
+    // family key first, single root, never sorted at the root level; the dump
+    // here is byte-identical to the dump build_envelope emits (it receives the
+    // same string), so payload_len == bytes signed == wire bytes.
+    // A payload with trailing siblings (e.g. {"print":...,"user_id":...}) currently
+    // DROPS the sibling — pinned, not fixed (research/10.04 Signing consensus;
+    // diverges from the #72/farm consensus, which signs envelope-minus-header
+    // including user_id).
     const std::string to_sign = std::string("{\"print\":") + print_dump + '}';
 
     const std::string sig_b64 = rsa_sha256_sign_b64(

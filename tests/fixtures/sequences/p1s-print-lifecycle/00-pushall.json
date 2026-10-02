@@ -1,0 +1,56 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 0,
+    "sequence_id": "1",
+    "gcode_state": "RUNNING",
+    "gcode_file": "benchy_plate_1.gcode",
+    "subtask_name": "benchy",
+    "print_type": "local",
+    "stg_cur": 0,
+    "mc_percent": 9,
+    "mc_remaining_time": 118,
+    "layer_num": 12,
+    "total_layer_num": 137,
+    "bed_temper": 59.8,
+    "bed_target_temper": 60.0,
+    "nozzle_temper": 219.4,
+    "nozzle_target_temper": 220.0,
+    "chamber_temper": 33.0,
+    "cooling_fan_speed": "15",
+    "big_fan1_speed": "0",
+    "big_fan2_speed": "9",
+    "heatbreak_fan_speed": "15",
+    "spd_lvl": 2,
+    "spd_mag": 100,
+    "nozzle_diameter": "0.4",
+    "nozzle_type": "stainless_steel",
+    "wifi_signal": "-52dBm",
+    "sdcard": true,
+    "print_error": 0,
+    "hms": [],
+    "lights_report": [{ "node": "chamber_light", "mode": "on" }],
+    "ams": {
+      "ams_exist_bits": "1",
+      "tray_exist_bits": "f",
+      "tray_now": "1",
+      "tray_pre": "255",
+      "tray_tar": "1",
+      "version": 402,
+      "ams": [
+        {
+          "id": "0",
+          "humidity": "3",
+          "temp": "29.1",
+          "tray": [
+            { "id": "0", "tray_type": "PLA", "tray_color": "FFFFFFFF", "remain": 71 },
+            { "id": "1", "tray_type": "PLA", "tray_color": "00AE42FF", "remain": 92 },
+            { "id": "2", "tray_type": "PETG", "tray_color": "0A2989FF", "remain": 34 },
+            { "id": "3", "tray_type": "TPU", "tray_color": "F5A623FF", "remain": -1 }
+          ]
+        }
+      ]
+    },
+    "vt_tray": { "id": "254", "tray_type": "", "tray_color": "00000000" }
+  }
+}
