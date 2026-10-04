@@ -1103,7 +1103,14 @@ void Agent::harvest_security_report(const std::string& dev_id,
     }
 
     if (command == "app_cert_list") {
-        // {"security":{"command":"app_cert_list","cert_ids":["<serial><issuer>", ...]}}
+        // {"security":{"command":"app_cert_list","cert_ids":["<serial><issuer>", ...],
+        //              "result":"SUCCESS","type":"app"}}
+        const std::string result = sec.find("result").as_string();
+        if (result != "SUCCESS") {
+            OBN_WARN("app_cert_list dev=%s: result=%s", dev_id.c_str(),
+                     result.empty() ? "<none>" : result.c_str());
+            return;
+        }
         std::set<std::string> ids;
         // Bind the Value to a named temporary: as_array() returns a reference
         // into it, so iterating the find() rvalue directly would dangle.
@@ -2367,11 +2374,12 @@ bool Agent::request_app_cert_install(const std::string& dev_id)
 
 bool Agent::request_app_cert_list(const std::string& dev_id)
 {
-    // Shape per reverse-networking "5. MQTT.md". The printer answers on the
-    // report topic with a cert_ids array, harvested by harvest_security_report.
+    // The printer answers on the report topic with a cert_ids array, harvested
+    // by harvest_security_report. Without "type":"app" firmware replies
+    // result=FAIL and no list (research/10.02-secrets.md).
     const std::string msg =
         std::string(R"({"security":{"sequence_id":")") + now_seq_id() +
-        R"(","command":"app_cert_list"}})";
+        R"(","command":"app_cert_list","type":"app"}})";
     int rc = send_message(dev_id, msg, /*qos=*/0);
     if (rc != BAMBU_NETWORK_SUCCESS) {
         OBN_WARN("app_cert_list dev=%s: publish failed rc=%d",

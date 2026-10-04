@@ -193,9 +193,8 @@ public:
     // Returns false when the app cert PEM is missing or publish fails.
     bool request_app_cert_install(const std::string& dev_id);
 
-    // Publishes the security.app_cert_list query (see reverse-networking
-    // "5. MQTT.md"): asks the printer which app certificates it already
-    // trusts. The report response is parsed by harvest_security_report into
+    // Publishes the security.app_cert_list query (research/10.02-secrets.md):
+    // asks the printer which app certificates it already trusts. The report response is parsed by harvest_security_report into
     // app_certs_by_dev_. Returns false on publish failure.
     bool request_app_cert_list(const std::string& dev_id);
 
