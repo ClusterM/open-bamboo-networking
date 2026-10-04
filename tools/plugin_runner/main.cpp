@@ -315,6 +315,8 @@ struct CliArgs {
     // endpoints on the value: POST /my/task answers 403 for anything but
     // "BambuStudio", so faithful stock captures need --client-name.
     std::string client_name = "OpenBambooNetworking";
+    // X-BBL-Client-Version (Studio's SLIC3R_VERSION).
+    std::string client_version = "02.05.03.99";
     int         timeout_s = 90;
     int         connect_settle_ms = 800;
     bool        keep_tmpdir = false;
@@ -354,7 +356,8 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--country US] [--use-ssl-mqtt 0|1]
                      [--cert-file PATH] [--timeout SECONDS]
                      [--connect-settle-ms MS] [--cert-lan-only 0|1]
-                     [--client-name NAME] [--log-out PATH] [--keep-tmpdir]
+                     [--client-name NAME] [--client-version VER]
+                     [--log-out PATH] [--keep-tmpdir]
 
        plugin_runner --action send_raw --raw-json FILE
                      --plugin-path PATH --dev-id ID --dev-ip IP --access-code CODE
@@ -557,6 +560,7 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--connect-settle-ms") c.connect_settle_ms = std::stoi(require(a, ++i, f));
         else if (f == "--cert-lan-only")     c.cert_lan_only = std::stoi(require(a, ++i, f)) != 0;
         else if (f == "--client-name")       c.client_name = require(a, ++i, f);
+        else if (f == "--client-version")    c.client_version = require(a, ++i, f);
         else if (f == "--keep-tmpdir")       c.keep_tmpdir = true;
         else if (f == "--data-dir")          c.data_dir = require(a, ++i, f);
         else if (f == "--user-info")         c.user_info = require(a, ++i, f);
@@ -1121,13 +1125,11 @@ try {
     {
         // Studio's init_http_extra_header() — these headers propagate to
         // every outgoing HTTP request including the LAN /info ping.
-        // X-BBL-Client-Version uses Studio's full SLIC3R_VERSION; we
-        // pretend to be a current build so the API doesn't reject the
-        // request as legacy.
+        // X-BBL-Client-Version uses Studio's full SLIC3R_VERSION.
         std::map<std::string, std::string> hdrs;
         hdrs["X-BBL-Client-Type"]    = "slicer";
         hdrs["X-BBL-Client-Name"]    = args.client_name;
-        hdrs["X-BBL-Client-Version"] = "02.05.03.99";
+        hdrs["X-BBL-Client-Version"] = args.client_version;
         hdrs["X-BBL-OS-Type"]        = "linux";
         hdrs["X-BBL-OS-Version"]     = "1.0.0";
         hdrs["X-BBL-Language"]       = "en";

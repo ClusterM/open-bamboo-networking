@@ -85,6 +85,7 @@ per ABI). Plugin downloads are cached in
                           POST /my/task answers 403 for anything other
                           than `BambuStudio`, so pass that when you need a
                           faithful stock cloud-print capture.
+--client-version VER      X-BBL-Client-Version. Default 02.05.03.99.
 --cert-lan-only 0|1       lan_only argument for install_device_cert during
                           bring-up; Studio passes is_lan_mode_printer().
                           Default 1. A cloud-paired printer needs 0: only
