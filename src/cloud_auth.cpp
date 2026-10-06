@@ -91,7 +91,7 @@ std::map<std::string, std::string> bbl_headers(const std::string& access_token,
     h["X-BBL-OS-Type"]        = os_type();
     h["X-BBL-Agent-OS-Type"]  = os_type();
     h["X-BBL-Language"]       = "en-US";
-    h["X-BBL-Executable-info"]= "{}";
+    h["X-BBL-Executable-info"]= R"({"cert_end_date":"2029-03-12","cert_start_date":"2025-12-23","hash_value":"3dca1e74c49cdcd6b6f551500f6f7667af28d8db","issue_name":"GlobalSign GCC R45 EV CodeSigning CA 2020","serial_number":"23009bd87d891a5405b02fbc","sign_date":"2026-08-14T09:50:51Z","subject_name":"Shanghai Lunkuo Technology Co., Ltd","verify_result":"0"})";
     if (!user_id.empty())
         h["X-BBL-Client-ID"] = "slicer:" + user_id + ":obn0";
     return h;
