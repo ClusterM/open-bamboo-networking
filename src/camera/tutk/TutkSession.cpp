@@ -58,8 +58,8 @@ uint16_t now_ms16()
 // [18] marks the first packet. The legacy login has the step as the type,
 // the UID at [518] and 2 at [542] and gets the plain slice stream.
 std::vector<uint8_t> build_av_login(uint8_t step, uint32_t nonce, bool framed,
-                                    const std::string& passwd,
-                                    const std::string& uid_upper)
+                                                     const std::string& passwd,
+                                                     const std::string& uid_upper)
 {
     std::vector<uint8_t> pkt(570, 0);
     put_le16(pkt.data() + 2, kAvVersion);
@@ -349,8 +349,8 @@ public:
                 next_      = it->first + 1;
                 have_next_ = true;
                 pending_.erase(it);
-                continue;
-            }
+            continue;
+        }
             // The missing packets are gone once a later frame has started
             // and no FEC group can bring them back.
             const bool later_started = gap || pending_.size() > 1;
@@ -360,8 +360,8 @@ public:
             if (gap) {
                 dropped += (int)(it->first - next_);
                 next_ = it->first;
-                continue;
-            }
+            continue;
+        }
             ++dropped;
             next_      = it->first + 1;
             have_next_ = true;
@@ -682,8 +682,8 @@ int TutkSession::Impl::connect(const TutkSessionParams& p)
         if (open_path(p) != 0) {
             OBN_WARN("tutk: printer unreachable over LAN and relay (attempt %d/3)", attempt);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
-        }
+                        continue;
+                    }
         if (!conn.is_lan) path = conn.is_relay ? "relay" : "p2p";
         OBN_INFO("tutk: connected via %s (attempt %d/3)", path, attempt);
 
@@ -691,8 +691,8 @@ int TutkSession::Impl::connect(const TutkSessionParams& p)
             OBN_WARN("tutk: DTLS handshake failed (attempt %d/3)", attempt);
             iotc_close(&conn);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
-        }
+                    continue;
+                }
 
         out_seq      = 1;
         ioctrl_index = 0;
