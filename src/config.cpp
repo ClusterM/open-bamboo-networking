@@ -107,6 +107,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "patch_mqtt_home_flag")        out.patch_mqtt_home_flag = truthy(val);
     else if (key == "patch_mqtt_ipcam_file")       out.patch_mqtt_ipcam_file = truthy(val);
     else if (key == "patch_mqtt_internal_storage") out.patch_mqtt_internal_storage = truthy(val);
+    else if (key == "filter_mqtt_hms_65543")       out.filter_mqtt_hms_65543 = truthy(val);
     else if (key == "slicer_key_pem")               out.slicer_key_pem = val;
     else if (key == "slicer_cert_pem")             out.slicer_cert_pem = val;
     else if (key == "slicer_crl_pem")              out.slicer_crl_pem = val;

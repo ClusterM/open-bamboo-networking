@@ -83,6 +83,7 @@ struct Settings {
     bool patch_mqtt_home_flag        = false;
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
+    bool filter_mqtt_hms_65543       = false;
 
     // Slicer signing key and app-cert provisioning files.
     // Empty = look for the corresponding file in config_dir:

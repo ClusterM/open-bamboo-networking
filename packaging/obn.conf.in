@@ -163,6 +163,10 @@ patch_mqtt_ipcam_file = 0
 
 patch_mqtt_internal_storage = 0
 
+# Filter the "MQTT verification failure" error so the slicer does not show it.
+
+filter_mqtt_hms_65543 = 0
+
 
 # --- Cloud ----------------------------------------------------------
 #

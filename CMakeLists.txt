@@ -1050,6 +1050,22 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME agent COMMAND agent_test)
 
+    add_executable(hms_filter_test tests/hms_filter_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(hms_filter_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(hms_filter_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(hms_filter_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME hms_filter COMMAND hms_filter_test)
+
     # Pins the Filament Manager request bodies (ams/sync, slot-mappings/sync)
     # byte-for-byte against MITM captures of the stock plugin.
     add_executable(filament_body_test tests/filament_body_test.cpp

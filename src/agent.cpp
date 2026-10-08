@@ -1002,6 +1002,99 @@ bool try_rewrite_print_ids(std::string& payload,
 
 } // namespace
 
+namespace {
+
+// Skip ASCII space between a JSON key and its value.
+void skip_ws(const std::string& s, std::size_t& i)
+{
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) {
+        ++i;
+    }
+}
+
+// Index of the ']' that closes the array starting at `open`, or npos.
+// Strings and nested arrays are tracked, so a ']' inside a value does
+// not end the span.
+std::size_t matching_array_end(const std::string& s, std::size_t open)
+{
+    if (open >= s.size() || s[open] != '[') return std::string::npos;
+    int  depth  = 0;
+    bool in_str = false;
+    bool esc    = false;
+    for (std::size_t i = open; i < s.size(); ++i) {
+        const char c = s[i];
+        if (in_str) {
+            if (esc)           esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"')  in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            continue;
+        }
+        if (c == '[') {
+            ++depth;
+        } else if (c == ']') {
+            --depth;
+            if (depth == 0) return i;
+            if (depth < 0) return std::string::npos;
+        }
+    }
+    return std::string::npos;
+}
+
+} // namespace
+
+bool try_filter_hms_code(std::string& payload, int target_code)
+{
+    static const std::string kKey = "\"hms\"";
+    std::size_t search = 0;
+    for (;;) {
+        const std::size_t key_pos = payload.find(kKey, search);
+        if (key_pos == std::string::npos) return false;
+
+        std::size_t i = key_pos + kKey.size();
+        skip_ws(payload, i);
+        if (i >= payload.size() || payload[i] != ':') {
+            search = key_pos + kKey.size();
+            continue;
+        }
+        ++i;
+        skip_ws(payload, i);
+        if (i >= payload.size() || payload[i] != '[') {
+            search = key_pos + kKey.size();
+            continue;
+        }
+
+        const std::size_t arr_end = matching_array_end(payload, i);
+        if (arr_end == std::string::npos) return false;
+
+        const std::string slice = payload.substr(i, arr_end - i + 1);
+        auto parsed = json::parse(slice);
+        if (!parsed || !parsed->is_array()) return false;
+
+        json::Array kept;
+        bool dropped = false;
+        for (const auto& item : parsed->as_array()) {
+            if (item.is_object()) {
+                const json::Value code = item.find("code");
+                if (code.is_number() && code.as_int() == target_code) {
+                    dropped = true;
+                    continue;
+                }
+            }
+            kept.push_back(item);
+        }
+        if (!dropped) return false;
+
+        payload.replace(i, arr_end - i + 1, json::Value(std::move(kept)).dump());
+        OBN_DEBUG("mqtt: filtered hms code %d", target_code);
+        return true;
+    }
+}
+
 // Forward declarations for helpers defined further down; keeps the file
 // readable (firmware-cache logic lives with render_firmware_json). These
 // live in obn:: (not the anonymous namespace above) so the definition
@@ -1771,6 +1864,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         if (cfg.patch_mqtt_ipcam_file)       try_inject_ipcam_file_local(patched);
         if (cfg.patch_mqtt_internal_storage) try_patch_fun2_internal_storage(patched);
         if (cfg.override_lan_ip)             try_override_net_ip(patched, connect_ip);
+        if (cfg.filter_mqtt_hms_65543)       try_filter_hms_code(patched, 65543);
     }
 
     // Per-print token used to invalidate the cover cache when the user
@@ -2949,6 +3043,8 @@ int Agent::connect_cloud()
                       "registered on_printer_connected; will notify on a "
                       "later report", dev_id.c_str());
         }
+        if (config::current().filter_mqtt_hms_65543)
+            try_filter_hms_code(json, 65543);
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
 

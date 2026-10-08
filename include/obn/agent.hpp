@@ -764,4 +764,9 @@ private:
 // short and consistent. Returns nullptr for the one-arg handle variant.
 inline Agent* as_agent(void* h) { return static_cast<Agent*>(h); }
 
+// Drop objects in the "hms" array whose "code" equals target_code.
+// The array stays in place, possibly empty. No-op when the frame has no
+// hms array, no matching code, or a malformed array.
+bool try_filter_hms_code(std::string& payload, int target_code);
+
 } // namespace obn
