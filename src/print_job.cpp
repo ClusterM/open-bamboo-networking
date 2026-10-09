@@ -587,8 +587,16 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     // A-series firmware closes an otherwise healthy connection while an FTPS
     // transfer is in progress. Re-establish it here so a completed upload is
     // not reported as a 70% failure merely because project_file had no live
-    // transport left to publish on.
-    if (!ensure_lan_session(params.dev_id, params.dev_ip, params.password)) {
+    // transport left to publish on. The wait is up to a few seconds, so a
+    // cancel that arrives during it must win over both the failure report
+    // and the publish.
+    const bool lan_up =
+        ensure_lan_session(params.dev_id, params.dev_ip, params.password);
+    if (cancel_fn && cancel_fn()) {
+        if (update_fn) update_fn(BBL::PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "cancelled");
+        return BAMBU_NETWORK_ERR_CANCELED;
+    }
+    if (!lan_up) {
         OBN_ERROR("local_print: MQTT reconnect after upload failed");
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
