@@ -415,6 +415,10 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      --user-info @session.json --dev-id ID
                      [--data-dir DIR] [--country US]
 
+       plugin_runner --action auth_probe --plugin-path PATH
+                     --user-info @session.json
+                     [--data-dir DIR] [--country US]
+
        plugin_runner --action bind_detect --plugin-path PATH
                      --dev-ip IP [--dev-id ID] [--data-dir DIR]
                      [--country US] [--timeout SECONDS]
@@ -437,7 +441,7 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
                 | local_print_with_record | cloud_print | send_raw | none
                 | http_probe | mw_probe | filament_probe | device_region
-                | update_cert | query_bind | bind_detect | account_bind
+                | update_cert | query_bind | auth_probe | bind_detect | account_bind
                 | gap_probe | cert_probe
 
   cloud_print: bambu_network_start_print — the pure-cloud path. Uploads
@@ -498,6 +502,13 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   ([--dev-id]) and request_bind_ticket. Use under MITM for orphan
   query_bind_status URL capture. Do NOT attach strace/gdb — stock
   anti-debug aborts with a zenity dialog.
+
+  auth_probe: no printer. change_user then bambu_network_get_user_print_info.
+  Emits is_logged_in, the SDK rc, the HTTP code and the body size — never
+  the body, device ids or tokens (the body carries the LAN access code).
+  A 200 only shows the account token can read the device list; it does
+  not show the printer will accept a signed command. On success the
+  plugin also subscribes to device/<id>/report unless cloud is blocked.
 
   bind_detect: LAN only. start_discovery + bambu_network_bind_detect,
   then exit (no MQTT connect). Pair with tcpdump on udp/2021 and host
@@ -644,6 +655,7 @@ CliArgs parse_cli(int argc, char** argv)
     const bool cloud_probe =
         (c.action == "http_probe" || c.action == "mw_probe" ||
          c.action == "update_cert" || c.action == "query_bind" ||
+         c.action == "auth_probe" ||
          c.action == "gap_probe" || c.action == "filament_probe" ||
          c.action == "device_region" || c.action == "camera_url" ||
          c.action == "ft_job");
@@ -693,7 +705,8 @@ CliArgs parse_cli(int argc, char** argv)
         usage(64);
     }
     if ((c.action == "http_probe" || c.action == "mw_probe" ||
-         c.action == "query_bind" || c.action == "gap_probe" ||
+         c.action == "query_bind" || c.action == "auth_probe" ||
+         c.action == "gap_probe" ||
          c.action == "filament_probe") &&
         c.user_info.empty()) {
         std::fprintf(stderr, "plugin_runner: --action %s requires "
@@ -1211,6 +1224,7 @@ try {
     const bool mw_probe    = (args.action == "mw_probe");
     const bool update_cert_probe = (args.action == "update_cert");
     const bool query_bind_probe  = (args.action == "query_bind");
+    const bool auth_probe        = (args.action == "auth_probe");
     const bool gap_probe_action  = (args.action == "gap_probe");
     const bool cert_probe_action = (args.action == "cert_probe");
     const bool bind_detect_only  = (args.action == "bind_detect");
@@ -1221,6 +1235,7 @@ try {
     const bool ft_job_action       = (args.action == "ft_job");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
+        auth_probe ||
         gap_probe_action || filament_probe || device_region_probe ||
         camera_url_probe || ft_job_action;
     // account_bind / bind_detect call bind_detect themselves then exit
@@ -1456,6 +1471,32 @@ try {
         // Brief settle so async HTTPS (if any) lands under MITM.
         std::this_thread::sleep_for(std::chrono::seconds(3));
         emit_event("query_bind_done", json::object());
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            fast_exit(rc == 0 ? 0 : 1);
+        }
+        rc_action = rc;
+    } else if (args.action == "auth_probe") {
+        // Account-scoped read only. The body carries dev_access_code, so it
+        // is counted and then dropped.
+        bool logged = exports.is_user_login ? exports.is_user_login(agent) : false;
+        if (!exports.get_user_print_info) {
+            emit_event("get_user_print_info", {
+                {"missing", true},
+                {"is_logged_in", logged},
+            });
+            return 70;
+        }
+        unsigned http_code = 0;
+        std::string http_body;
+        int rc = exports.get_user_print_info(agent, &http_code, &http_body);
+        emit_event("get_user_print_info", {
+            {"rc", rc},
+            {"http_code", http_code},
+            {"body_bytes", http_body.size()},
+            {"is_logged_in", logged},
+        });
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });

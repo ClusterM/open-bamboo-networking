@@ -135,6 +135,8 @@ PluginExports load(const std::string& so_path)
                                       "bambu_network_bind_detect", so_path);
     out.query_bind_status       = resolve<func_query_bind_status>(out.dl_handle,
                                       "bambu_network_query_bind_status");
+    out.get_user_print_info     = resolve<func_get_user_print_info>(out.dl_handle,
+                                      "bambu_network_get_user_print_info");
     out.request_bind_ticket     = resolve<func_request_bind_ticket>(out.dl_handle,
                                       "bambu_network_request_bind_ticket");
     out.bind                    = resolve<func_bind>(out.dl_handle,

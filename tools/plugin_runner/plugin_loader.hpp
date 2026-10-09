@@ -57,6 +57,8 @@ using func_refresh_connection  = int (*)(void* agent);
 using func_bind_detect         = int (*)(void* agent, std::string dev_ip, std::string sec_link, BBL::detectResult& detect);
 using func_query_bind_status  = int (*)(void* agent, std::vector<std::string> query_list,
                                         unsigned int* http_code, std::string* http_body);
+using func_get_user_print_info = int (*)(void* agent, unsigned int* http_code,
+                                         std::string* http_body);
 using func_request_bind_ticket = int (*)(void* agent, std::string* ticket);
 using func_bind = int (*)(void* agent, std::string dev_ip, std::string dev_id, std::string dev_model,
                           std::string sec_link, std::string timezone, bool improved,
@@ -244,6 +246,8 @@ struct PluginExports {
     func_bind_detect                 bind_detect                 = nullptr;
     // Optional bind/cloud helpers (--action query_bind / account_bind).
     func_query_bind_status           query_bind_status           = nullptr;
+    // Optional account read (--action auth_probe). Not a signed-command check.
+    func_get_user_print_info         get_user_print_info         = nullptr;
     func_request_bind_ticket         request_bind_ticket         = nullptr;
     func_bind                        bind                        = nullptr;
 
