@@ -583,6 +583,19 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
     std::string json = print_job::build_project_file_json(params, opts);
     OBN_DEBUG("local_print mqtt: %s", json.c_str());
 
+    // Uploads can outlive the printer's LAN MQTT session. In particular, some
+    // A-series firmware closes an otherwise healthy connection while an FTPS
+    // transfer is in progress. Re-establish it here so a completed upload is
+    // not reported as a 70% failure merely because project_file had no live
+    // transport left to publish on.
+    if (!ensure_lan_session(params.dev_id, params.dev_ip, params.password)) {
+        OBN_ERROR("local_print: MQTT reconnect after upload failed");
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
+                                 "MQTT reconnect failed after upload");
+        return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
+    }
+
     int pub = send_message(params.dev_id, json, /*qos=*/0);
     if (pub != 0) {
         OBN_ERROR("local_print: publish project_file failed rc=%d", pub);

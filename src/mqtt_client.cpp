@@ -167,10 +167,13 @@ Client::~Client()
         // is a plain destroy. If not, shut down gracefully too so we don't
         // leave a ghost session on the printer (see disconnect()).
         if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
-            const int rc      = ::mosquitto_disconnect(mosq_);
-            const int stop_rc = ::mosquitto_loop_stop(mosq_, /*force=*/false);
+            const bool was_connected = connected_.load(std::memory_order_acquire);
+            const int  rc            = ::mosquitto_disconnect(mosq_);
+            const int  stop_rc       = ::mosquitto_loop_stop(
+                mosq_, /*force=*/!was_connected);
             OBN_INFO("mqtt destroy: sending DISCONNECT from destructor "
-                     "(disconnect_rc=%d loop_stop_rc=%d)", rc, stop_rc);
+                     "(was_connected=%d disconnect_rc=%d loop_stop_rc=%d)",
+                     was_connected ? 1 : 0, rc, stop_rc);
         }
         ::mosquitto_destroy(mosq_);
         mosq_ = nullptr;
@@ -545,11 +548,14 @@ void Client::disconnect()
     const bool was_connected = connected_.load(std::memory_order_acquire);
     const int  rc            = ::mosquitto_disconnect(mosq_);
     if (loop_started_.exchange(false, std::memory_order_acq_rel)) {
-        // force=false: mosquitto_disconnect() set the request-disconnect flag,
-        // so the loop thread flushes the DISCONNECT, closes the socket and
-        // exits on its own; loop_stop then joins it. (force=true would
-        // pthread_cancel the thread mid-write and drop the DISCONNECT.)
-        const int stop_rc = ::mosquitto_loop_stop(mosq_, /*force=*/false);
+        // A connected client gets a graceful stop so the DISCONNECT reaches
+        // the broker and immediately frees its limited session slot. Before
+        // the first CONNACK there is no MQTT session to preserve, while the
+        // loop thread may be blocked indefinitely waiting for the broker's
+        // handshake response. Force that pending attempt to stop instead of
+        // joining it on the slicer's UI thread.
+        const int stop_rc = ::mosquitto_loop_stop(
+            mosq_, /*force=*/!was_connected);
         // Log the outcome: "was the DISCONNECT actually flushed before we went
         // away?" is the first question when the next connect gets refused, and
         // it used to be unanswerable from the log.
