@@ -388,13 +388,42 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
         build_command_dump(root_key, payload_json, device_pub, developer_mode);
     if (dump.empty()) return payload_json; // malformed; pass through
 
-    const std::string to_sign = "{\"" + root_key + "\":" + dump + "}";
+    // Trailing top-level siblings (e.g. "user_id" next to "print" or next to
+    // "liveview") are part of the signed envelope-minus-header per the farm
+    // consensus (research/10.04, "Trailing-sibling invariant"): re-emit every
+    // top-level entry other than root_key after the root object. Skipping
+    // root_key (not the literal "print") keeps a sibling next to "liveview"
+    // from being dropped the same way. Zero siblings -> empty suffix -> the
+    // previous byte-exact single-root wire format.
+    std::string siblings;
+    {
+        auto root = obn::json::parse(payload_json); // parse succeeded above
+        if (root && root->is_object()) {
+            for (const auto& kv : root->as_object()) {
+                if (kv.first == root_key) continue;
+                siblings += ',';
+                siblings += obn::json::Value(kv.first).dump(); // quoted+escaped
+                siblings += ':';
+                siblings += kv.second.dump();
+            }
+        }
+    }
+    const std::string body = dump + siblings;
+
+    // INVARIANT: to_sign is exactly {"<root_key>":<body>} — the wire envelope
+    // with the header removed, trailing siblings included. The ONE `body`
+    // string feeds both to_sign and build_envelope, so payload_len == bytes
+    // signed == wire bytes (signed==wire by construction). Sibling order:
+    // root key first regardless of alphabet, remaining top-level keys in
+    // json_lite map (lexicographic) order. Locked by
+    // test_trailing_sibling_reconstruction in tests/signing_test.cpp.
+    const std::string to_sign = "{\"" + root_key + "\":" + body + "}";
 
     const std::string sig_b64 = rsa_sha256_sign_b64(
         pkey,
         reinterpret_cast<const unsigned char*>(to_sign.data()), to_sign.size());
 
-    return build_envelope(to_sign, sig_b64, root_key, dump);
+    return build_envelope(to_sign, sig_b64, root_key, body);
 }
 
 std::string sign_bytes(const std::string& data)
