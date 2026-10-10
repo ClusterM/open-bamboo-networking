@@ -779,19 +779,6 @@ if(OBN_BUILD_TESTS)
     endif()
     add_test(NAME state_persist COMMAND state_persist_test)
 
-    # TEST-02 executable spec for the push_status delta-merge (D-13/D-16):
-    # the 3-rule merge lives test-local in the test file — no production
-    # merge/accumulator helper exists (D-15 audit, recorded in the test
-    # header). Frames resolve at runtime via WORKING_DIRECTORY (D-08, same
-    # mechanism as ssdp_listener below); src/json_lite.cpp is the parse
-    # substrate and has no further link dependencies.
-    add_executable(push_status_merge_test tests/push_status_merge_test.cpp
-        src/json_lite.cpp)
-    target_include_directories(push_status_merge_test PRIVATE include)
-    add_test(NAME push_status_merge COMMAND push_status_merge_test)
-    set_tests_properties(push_status_merge PROPERTIES
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
-
     # Hermetic unit tests for obn::signing — exercises key loading, canonical
     # JSON ordering, signature round-trip and envelope structure validation.
     # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
@@ -812,32 +799,18 @@ if(OBN_BUILD_TESTS)
     endif()
     add_test(NAME signing COMMAND signing_test)
 
-    # DOC-01 golden-fixture suite for the SSDP parser. Catch2 comes in via
-    # FetchContent pinned to a fixed release tag (checkpoint OQ-1 route b2):
-    # reproducible, no vendored framework header, no package-manager install.
-    # Catch2 detects itself as a subproject here, and its own tests/docs are
-    # additionally forced off.
-    set(CATCH_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_HELPERS OFF CACHE BOOL "" FORCE)
-    include(FetchContent)
-    FetchContent_Declare(Catch2
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG        v2.13.10)
-    FetchContent_MakeAvailable(Catch2)
-
-    # Hermetic (no socket) golden-fixture test over tests/fixtures/ssdp/.
-    # WORKING_DIRECTORY is how fixtures resolve at runtime — not a compile
-    # definition, because the workspace path contains a space (D-08).
-    # src/json_lite.cpp is linked because the test parses the emitted
-    # device JSON with obn::json::parse (not used by ssdp.cpp itself).
+    # DOC-01 golden-fixture suite for the SSDP parser: plain main()+CHECK
+    # (json_lite_test.cpp style), no test framework in the configure step.
+    # Hermetic (no socket). WORKING_DIRECTORY is how fixtures resolve at
+    # runtime — not a compile definition, because the workspace path contains
+    # a space (D-08). src/json_lite.cpp is linked because the test parses the
+    # emitted device JSON with obn::json::parse (not used by ssdp.cpp itself).
     add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
         src/json_lite.cpp
         src/log.cpp
         src/os_compat.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
-    target_link_libraries(ssdp_listener_test PRIVATE Catch2::Catch2)
     if(WIN32)
         # log.cpp needs os_compat.cpp for strcasecmp_portable, and that
         # translation unit also holds the Winsock wrappers — mirror
