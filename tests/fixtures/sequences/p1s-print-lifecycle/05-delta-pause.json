@@ -1,0 +1,9 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 1,
+    "sequence_id": "6",
+    "gcode_state": "PAUSE",
+    "stg_cur": 16
+  }
+}

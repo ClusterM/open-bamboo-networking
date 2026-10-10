@@ -778,17 +778,59 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(state_persist_test PRIVATE ws2_32)
     endif()
     add_test(NAME state_persist COMMAND state_persist_test)
-endif()
-if(OBN_BUILD_TESTS AND NOT WIN32)
 
-    # Live test: skipped unless OBN_PRINTER_IP etc. are exported when ctest
-    # runs. Links against the same library as the plugin so it can exercise
-    # obn::Agent directly.
+    # Hermetic unit tests for obn::signing — exercises key loading, canonical
+    # JSON ordering, signature round-trip and envelope structure validation.
+    # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
+    add_executable(signing_test tests/signing_test.cpp
+        tests/config_stub.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/signing.cpp)
+    target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(signing_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if(WIN32)
+        # os_compat.cpp holds the Winsock wrappers (same reason as state_persist)
+        target_link_libraries(signing_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME signing COMMAND signing_test)
+
+    # DOC-01 golden-fixture suite for the SSDP parser: plain main()+CHECK
+    # (json_lite_test.cpp style), no test framework in the configure step.
+    # Hermetic (no socket). WORKING_DIRECTORY is how fixtures resolve at
+    # runtime — not a compile definition, because the workspace path contains
+    # a space (D-08). src/json_lite.cpp is linked because the test parses the
+    # emitted device JSON with obn::json::parse (not used by ssdp.cpp itself).
     add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
+        src/json_lite.cpp
         src/log.cpp
         src/os_compat.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
+    if(WIN32)
+        # log.cpp needs os_compat.cpp for strcasecmp_portable, and that
+        # translation unit also holds the Winsock wrappers — mirror
+        # state_persist above.
+        target_link_libraries(ssdp_listener_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME ssdp_listener COMMAND ssdp_listener_test)
+    set_tests_properties(ssdp_listener PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+endif()
+if(OBN_BUILD_TESTS AND NOT WIN32)
+
+    # Dev tool, NOT a test (D-07): live UDP :2021 sniffer moved verbatim
+    # out of tests/ssdp_listener_test.cpp. Deliberately has no add_test —
+    # it binds a real socket and must never run under ctest.
+    add_executable(ssdp_sniffer tools/ssdp_sniffer/main.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/ssdp.cpp)
+    target_include_directories(ssdp_sniffer PRIVATE include)
 
     add_executable(ftps_live_test tests/ftps_live_test.cpp
         src/config.cpp
@@ -929,22 +971,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME lan_live COMMAND lan_live_test)
-
-    # Hermetic unit tests for obn::signing — exercises key loading, canonical
-    # JSON ordering, signature round-trip and envelope structure validation.
-    # Generates ephemeral RSA keys at runtime; no on-disk secrets required.
-    add_executable(signing_test tests/signing_test.cpp
-        tests/config_stub.cpp
-        src/json_lite.cpp
-        src/log.cpp
-        src/os_compat.cpp
-        src/signing.cpp)
-    target_include_directories(signing_test PRIVATE include ${OBN_GENERATED_DIR})
-    target_compile_definitions(signing_test PRIVATE
-        OBN_VERSION_STRING="${OBN_VERSION}"
-        ABI_VERSION=${OBN_ABI_VERSION_HEX})
-    target_link_libraries(signing_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-    add_test(NAME signing COMMAND signing_test)
 
     add_executable(cert_store_test tests/cert_store_test.cpp
         tests/config_stub.cpp
