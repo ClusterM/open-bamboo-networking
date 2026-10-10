@@ -520,6 +520,56 @@ static int test_liveview_prepare_ttcode_encrypted()
     return 0;
 }
 
+static int check_trailing_sibling(const std::string& root_key,
+                                  const std::string& payload)
+{
+    // SIGN-03: a trailing top-level sibling is SIGNED and EMITTED — to_sign ==
+    // envelope-minus-header including user_id (farm consensus, research/10.04
+    // "Trailing-sibling invariant"). One body string feeds both the signed
+    // pre-image and the envelope, so signed bytes == wire bytes.
+    const std::string env = obn::signing::maybe_sign(payload); // no device key → hermetic
+    CHECK(env != payload);                       // signed, not passed through
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    // (1) Byte-exact wire match via the FIRMWARE reconstruction rule
+    // ("{" + everything from the root key to the final '}' — research/10.04):
+    const std::string needle = "\"" + root_key + "\":";
+    const std::size_t kpos = env.find(needle);
+    CHECK(kpos != std::string::npos);
+    const std::string to_sign = "{" + env.substr(kpos); // root + trailing sibling
+    const double plen = val->find("header.payload_len").as_number();
+    CHECK(static_cast<std::size_t>(plen) == to_sign.size());
+
+    // (2) Signature round-trip against that reconstruction.
+    CHECK(verify_b64_sig(to_sign, envelope_field(env, "sign_string")));
+
+    // (3) Sibling PRESENT at the envelope top level, outside the root object.
+    CHECK(val->find("user_id").kind() == obn::json::Value::Kind::String);
+    CHECK(val->find("user_id").as_string() == "u_42");
+    CHECK(env.find("\"user_id\"") != std::string::npos);
+    CHECK(val->find(root_key + ".user_id").kind() == obn::json::Value::Kind::Null);
+    return 0;
+}
+
+static int test_trailing_sibling_reconstruction()
+{
+    // Root-key agnostic: maybe_sign skips root_key (not the literal "print"),
+    // so the fix must hold for a sibling next to "print" AND next to
+    // "liveview" — the liveview.prepare payload is signed too.
+    if (check_trailing_sibling(
+            "print",
+            R"({"print":{"command":"pause","sequence_id":"11"},"user_id":"u_42"})")
+        != 0)
+        return 1;
+    if (check_trailing_sibling(
+            "liveview",
+            R"({"liveview":{"command":"prepare","sequence_id":"21143","ttcode":"VGC47JEVNKCHC9RZ111A"},"user_id":"u_42"})")
+        != 0)
+        return 1;
+    return 0;
+}
+
 namespace obn::config {
     Settings& test_settings();
     std::string& test_dir();
@@ -577,6 +627,7 @@ int main()
     if (test_param_enc_idempotent()        != 0) rc = 1;
     if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
     if (test_liveview_prepare_ttcode_encrypted() != 0) rc = 1;
+    if (test_trailing_sibling_reconstruction() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 
