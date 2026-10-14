@@ -1,11 +1,5 @@
 // Tests for src/signing.cpp — classifier, envelope structure, and signature
 // verification using a freshly generated RSA test keypair.
-//
-// D-07 header note (requirement-letter-vs-reality deviation, recorded per the
-// Phase 2 precedent): this file follows the repo convention (int main() +
-// fail_count + CHECK), NOT Catch2 — REQUIREMENTS calls the new case a
-// "Catch2 test", but only ssdp_listener_test.cpp is actually Catch2 in this
-// tree; Catch2 conversion of this file is deferred (test-infrastructure work).
 
 #include "obn/signing.hpp"
 #include "obn/config.hpp"
