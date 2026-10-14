@@ -1,0 +1,5 @@
+NOTIFY * HTTP/1.1
+HOST: 239.255.255.250:2021
+Location: 192.168.0.9
+NT: urn:bambulab-com:device:3dprinter:1
+

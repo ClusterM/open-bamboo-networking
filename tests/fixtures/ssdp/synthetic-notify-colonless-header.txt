@@ -1,0 +1,7 @@
+NOTIFY * HTTP/1.1
+HOST: 239.255.255.250:2021
+this-line-has-no-colon
+Location: 192.168.0.8
+USN: 01P00A000000000
+DevModel.bambu.com: C12
+

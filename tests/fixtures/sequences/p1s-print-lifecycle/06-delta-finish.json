@@ -1,0 +1,15 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 1,
+    "sequence_id": "7",
+    "gcode_state": "FINISH",
+    "stg_cur": -1,
+    "mc_percent": 100,
+    "mc_remaining_time": 0,
+    "layer_num": 137,
+    "nozzle_target_temper": 0.0,
+    "bed_target_temper": 0.0,
+    "cooling_fan_speed": "0"
+  }
+}

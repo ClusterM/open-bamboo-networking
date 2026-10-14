@@ -1,0 +1,6 @@
+{
+  "service": "_bambulab._tcp.local",
+  "port": 2021,
+  "txt": ["provenance=synthetic", "note=chatter on the same socket, not SSDP"]
+}
+

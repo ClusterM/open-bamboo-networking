@@ -1,0 +1,6 @@
+M-SEARCH * HTTP/1.1
+HOST: 239.255.255.250:2021
+MAN: "ssdp:discover"
+MX: 3
+ST: urn:bambulab-com:device:3dprinter:1
+

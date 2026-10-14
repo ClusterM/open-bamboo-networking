@@ -1,0 +1,9 @@
+{
+  "print": {
+    "command": "push_status",
+    "msg": 1,
+    "sequence_id": "5",
+    "stg_cur": 0,
+    "wifi_signal": null
+  }
+}

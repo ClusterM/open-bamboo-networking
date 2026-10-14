@@ -1,0 +1,3 @@
+# Fixtures are byte-for-byte recordings. Never let git convert line endings —
+# a checkout that rewrites them changes what the corpus tests.
+tests/fixtures/** -text

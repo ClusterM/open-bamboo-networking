@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+HOST: 239.255.255.250:2021
+Server: UPnP/1.0
+Location: 192.168.0.3
+ST: urn:bambulab-com:device:3dprinter:1
+USN: 01P00A000000000
+Cache-Control: max-age=1800
+DevModel.bambu.com: C12
+DevName.bambu.com: REDACTED-NAME
+DevSignal.bambu.com: -58
+DevConnect.bambu.com: lan
+DevBind.bambu.com: free
+

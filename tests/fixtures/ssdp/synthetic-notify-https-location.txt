@@ -1,0 +1,6 @@
+NOTIFY * HTTP/1.1
+HOST: 239.255.255.250:2021
+Location: https://192.168.0.11:8883/desc
+USN: 05A00A000000000
+DevModel.bambu.com: N2S
+
