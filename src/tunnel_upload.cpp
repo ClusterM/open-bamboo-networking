@@ -722,6 +722,16 @@ std::vector<std::string> sub_file_storage_labels(const std::string& list_storage
     return {list_storage};
 }
 
+// Collects per-storage failures as "'<storage>': <error>; ..." so the final
+// cover-fetch error names the wire result instead of a generic message.
+void append_storage_failure(std::string*       out,
+                            const std::string& storage,
+                            const std::string& error)
+{
+    if (!out->empty()) out->append("; ");
+    out->append("'" + storage + "': " + error);
+}
+
 std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
                                                   int                plate_idx)
 {
@@ -921,6 +931,11 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
     }
     if (plate_idx < 1) plate_idx = 1;
 
+    // A printer can refuse every listing, e.g. result 17 STORAGE_UNAVAILABLE
+    // (research/09.05-ctrl.md §9.5.3); that must not read as a missing model.
+    std::string list_failures;
+    bool        any_list_ok = false;
+
     for (const auto& list_storage : model_list_storages()) {
         std::uint32_t seq = 0;
         SSL* ssl = nullptr;
@@ -934,7 +949,11 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
 
         const ListInfoOutcome list =
             run_list_info(session, ssl, &impl_->io_mu, seq, list_storage);
-        if (!list.ok) continue;
+        if (!list.ok) {
+            append_storage_failure(&list_failures, list_storage, list.error);
+            continue;
+        }
+        any_list_ok = true;
 
         const ModelFileEntry* hit = find_model_entry(list, model_name);
         if (!hit) continue;
@@ -964,7 +983,13 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         return out;
     }
 
-    out.error = "model not in LIST_INFO";
+    if (!any_list_ok && !list_failures.empty()) {
+        out.error = "LIST_INFO failed (" + list_failures + ")";
+    } else if (!list_failures.empty()) {
+        out.error = "model not in LIST_INFO (failed: " + list_failures + ")";
+    } else {
+        out.error = "model not in LIST_INFO";
+    }
     return out;
 }
 
