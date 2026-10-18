@@ -235,6 +235,8 @@ Here `client_name` is `BambuStudio` or `OrcaSlicer`, and `namespace` is `com.bam
 - **Bambu Studio:** also place `network_plugins.json` in `ota/plugins` (alongside the `plugins` directory).
 - **Orca Slicer:** rename `libbambu_networking.so` (or `bambu_networking.dll` on Windows) so the filename includes the plugin version, e.g. `libbambu_networking_02.03.00.99.so`.
 
+**macOS (both slicers):** after copying, ad-hoc sign each copied library, e.g. `codesign --force -s - "<dest>/libbambu_networking.dylib"` (Orca: `libbambu_networking_<version>.dylib`), the same for `libBambuSource.dylib`, and for `liblive555.dylib` only if you copied the stub. The release libraries are linker-signed without a CMS blob and macOS syspolicyd reports them as unsigned (-67062) on first load; a codesign ad-hoc signature is evaluated on the regular "adhoc" path instead. Best-effort hardening --- `install.sh` does this automatically.
+
 Then edit the configuration file.
 
 **Bambu Studio** — `BambuStudio.conf` (under the `app` object):

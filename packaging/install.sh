@@ -260,17 +260,37 @@ case "$CLIENT" in
         ;;
 esac
 
+# ── Ad-hoc code signature (macOS) ────────────────────────────────────────
+# The release dylibs carry only a linker signature without a CMS blob,
+# which macOS syspolicyd reports as *unsigned* (errSecCSUnsigned, -67062)
+# when it first evaluates them. On one tested system (macOS 26.5) such a
+# first-load evaluation aborted once and Bambu Studio fell back to the
+# stock plugin; the same library re-signed with codesign is evaluated on
+# the regular "adhoc" path (amfid -423) with no -67062. Best-effort
+# hardening: failures are reported and the install continues.
+adhoc_sign() {
+    [ "$OS" = "Darwin" ] || return 0
+    command -v codesign >/dev/null 2>&1 || return 0
+    if codesign --force -s - "$1" 2>/dev/null; then
+        info "Ad-hoc signed $(basename "$1")"
+    else
+        warn "codesign failed for $(basename "$1"); continuing without ad-hoc signing"
+    fi
+}
+
 # Main plugin
 SRC_PLUGIN=$(ls "$MATCHED_DIR"/libbambu_networking${PLUGIN_EXT} 2>/dev/null | head -1)
 if [ -z "$SRC_PLUGIN" ]; then
     die "Plugin binary not found in $MATCHED_DIR"
 fi
 cp "$SRC_PLUGIN" "$DEST_DIR/$PLUGIN_DEST_NAME"
+adhoc_sign "$DEST_DIR/$PLUGIN_DEST_NAME"
 info "Installed $PLUGIN_DEST_NAME"
 
 # BambuSource
 if [ -f "$MATCHED_DIR/$BAMBUSOURCE_NAME" ]; then
     cp "$MATCHED_DIR/$BAMBUSOURCE_NAME" "$DEST_DIR/$BAMBUSOURCE_NAME"
+    adhoc_sign "$DEST_DIR/$BAMBUSOURCE_NAME"
     info "Installed $BAMBUSOURCE_NAME"
 fi
 
@@ -286,6 +306,7 @@ if [ -f "$MATCHED_DIR/$LIVE555_NAME" ]; then
     fi
     if [ "$INSTALL_LIVE555" = true ]; then
         cp "$MATCHED_DIR/$LIVE555_NAME" "$DEST_DIR/$LIVE555_NAME"
+        adhoc_sign "$DEST_DIR/$LIVE555_NAME"
         info "Installed $LIVE555_NAME"
     fi
 fi
