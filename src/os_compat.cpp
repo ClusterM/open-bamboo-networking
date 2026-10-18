@@ -174,6 +174,20 @@ int set_nonblocking(socket_t s)
 #endif
 }
 
+int set_blocking(socket_t s)
+{
+    if (!socket_valid(s)) return -1;
+#if defined(_WIN32)
+    u_long nb = 0;
+    return ::ioctlsocket(static_cast<SOCKET>(s), FIONBIO, &nb) == 0 ? 0 : -1;
+#else
+    int fd = static_cast<int>(s);
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return ::fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+#endif
+}
+
 int poll_one(socket_t s, short events, int timeout_ms, short* out_revents)
 {
     if (out_revents) *out_revents = 0;
