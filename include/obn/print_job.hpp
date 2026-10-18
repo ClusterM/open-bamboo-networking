@@ -24,6 +24,11 @@ std::string to_print_basename(std::string fname);
 // possible and falls back to the basename of params.filename.
 std::string pick_remote_name(const BBL::PrintParams& p);
 
+// `subtask_name` of the project_file MQTT payload: project_name, else
+// task_name. The printer reports it back in push_status, where the
+// Device-tab cover is looked up by it.
+std::string subtask_name_for(const BBL::PrintParams& p);
+
 // Remote STOR basename for start_send_gcode_to_sdcard: sanitized
 // project_name verbatim (no .gcode.3mf suffix). Empty when project_name
 // is unset — stock libbambu_networking.so fails the upload in that case.

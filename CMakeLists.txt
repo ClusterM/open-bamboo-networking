@@ -411,6 +411,7 @@ add_library(bambu_networking SHARED
     src/tunnel_local.cpp
     src/tunnel_upload.cpp
     src/tls_dial.cpp
+    src/zip_read.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
@@ -983,7 +984,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
-        src/tunnel_upload.cpp)
+        src/tunnel_upload.cpp
+        src/zip_read.cpp)
     target_include_directories(lan_live_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
@@ -1061,7 +1063,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
-        src/tunnel_upload.cpp)
+        src/tunnel_upload.cpp
+        src/zip_read.cpp)
 
     # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
     # build_task_body). OBN_TESTING promotes the anonymous-namespace
@@ -1102,6 +1105,26 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME agent COMMAND agent_test)
+
+    # Cover cache: the .3mf entry reader and the cover staged for prints
+    # this plugin starts. Files go to a temp OBN_COVER_DIR; the paths under
+    # test open no sockets.
+    add_executable(cover_cache_test tests/cover_cache_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(cover_cache_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(cover_cache_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(cover_cache_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME cover_cache COMMAND cover_cache_test)
 
     add_executable(hms_filter_test tests/hms_filter_test.cpp
         ${OBN_TEST_CORE_SOURCES})

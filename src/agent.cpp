@@ -1,5 +1,6 @@
 #include "obn/agent.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -1000,6 +1001,73 @@ bool try_rewrite_print_ids(std::string& payload,
     return touched;
 }
 
+// Fields of a report's own print object, for the cover staged by
+// run_local_print_job. Read structurally: a flat peek takes the first
+// match anywhere in the frame (print.upload.task_id, another section's
+// command / result). task_id "0" reads as "" (no job id).
+struct PrintReportFields {
+    std::string command, result, sequence_id, task_id;
+    bool        has_task_id = false;  // print.task_id present, also "" / "0"
+};
+
+// String or integer field as text ("" for anything else); firmware differ
+// in quoting ids (research/06.02-mqtt.md).
+std::string id_field(const obn::json::Value& v)
+{
+    if (v.is_string()) return v.as_string();
+    if (v.is_number() && v.as_number() == static_cast<double>(v.as_int())) {
+        return std::to_string(v.as_int());
+    }
+    return {};
+}
+
+PrintReportFields print_report_fields(const std::string& payload)
+{
+    PrintReportFields f;
+    if (payload.find("\"print\"") == std::string::npos) return f;
+    const auto root = obn::json::parse(payload);
+    if (!root) return f;
+    const obn::json::Value print = root->find("print");
+    f.command     = print.find("command").as_string();
+    f.result      = print.find("result").as_string();
+    f.sequence_id = id_field(print.find("sequence_id"));
+    const obn::json::Value task_id = print.find("task_id");
+    f.has_task_id = task_id.is_string() || task_id.is_number();
+    f.task_id     = id_field(task_id);
+    if (f.task_id == "0") f.task_id.clear();
+    return f;
+}
+
+// A project_file the printer refuses never starts the job a cover staged
+// by run_local_print_job was made for. The ack echoes the request's
+// sequence_id (research/06.02-mqtt.md). LAN and cloud reports both pass
+// here: send_message() falls back to the cloud.
+void drop_refused_project_file(const std::string&       dev_id,
+                               const PrintReportFields& f)
+{
+    if (f.command != "project_file" || f.result.empty() || f.sequence_id.empty()) {
+        return;
+    }
+    std::string result = f.result;
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (result != "success") cover_cache::drop_submission(dev_id, f.sequence_id);
+}
+
+// Any project_file this plugin publishes, also one handed in through the
+// generic send_message ABIs, starts a job whose reports could take a cover
+// staged for that name; cover_cache keeps only the stage it was made for.
+void note_outgoing_project_file(const std::string& dev_id, const std::string& json)
+{
+    // No substring prefilter: the command may be spelled with escapes.
+    const auto req = obn::json::parse(json);
+    if (!req) return;
+    const obn::json::Value print = req->find("print");
+    if (print.find("command").as_string() != "project_file") return;
+    cover_cache::note_project_file(dev_id, print.find("subtask_name").as_string(),
+                                   id_field(print.find("sequence_id")));
+}
+
 } // namespace
 
 namespace {
@@ -1478,6 +1546,7 @@ int Agent::send_message_to_printer(const std::string& dev_id,
     // session pointer (the wait may span a reconnect), and never for
     // security/pushing/info frames (would_sign() is false for them), so the
     // install path itself is never gated. See research/08.04-lan.md §8.4.7.
+    note_outgoing_project_file(dev_id, json_str);
     const bool sign = obn::signing::would_sign(json_str);
     if (sign)
         wait_for_app_cert(dev_id, std::chrono::seconds(8));
@@ -1867,6 +1936,19 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         if (cfg.filter_mqtt_hms_65543)       try_filter_hms_code(patched, 65543);
     }
 
+    // The job this report is about and a project_file ack, for the cover
+    // staged by run_local_print_job (before try_rewrite_print_ids
+    // replaces task_id "0").
+    const PrintReportFields print_fields = print_report_fields(patched);
+    drop_refused_project_file(dev_id, print_fields);
+    if (!print_fields.task_id.empty()) {
+        cover_cache::note_task_id(dev_id, print_fields.task_id);
+    } else if (print_fields.has_task_id) {
+        // LAN only: stages need the LAN session, and while it reports, the
+        // cloud report subscription is closed (maybe_prefer_lan_subscription).
+        cover_cache::note_no_task_id(dev_id);
+    }
+
     // Per-print token used to invalidate the cover cache when the user
     // re-uploads a different .3mf under the same filename. We need a
     // value that is constant for the life of one print and changes the
@@ -1954,7 +2036,8 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         }
         if (!host.empty()) {
             cover_cache::ensure(host, dev_id, user, pass,
-                                subtask_name, plate_idx, cover_version);
+                                subtask_name, plate_idx, cover_version,
+                                print_fields.task_id);
         }
     }
 
@@ -2998,6 +3081,14 @@ int Agent::connect_cloud()
         harvest_tutk_server_status(dev_id, json);
         harvest_access_code(dev_id, json);
         rescue_cloud_liveview(dev_id, json);
+        // A local print's project_file can go out over the cloud fallback,
+        // and jobs reported here belong to the printer's task history too.
+        if (json.find("\"task_id\"") != std::string::npos ||
+            json.find("\"project_file\"") != std::string::npos) {
+            const PrintReportFields fields = print_report_fields(json);
+            drop_refused_project_file(dev_id, fields);
+            cover_cache::note_task_id(dev_id, fields.task_id);
+        }
 
         // Drop rejected unsigned cloud liveview frames from notifying Studio UI
         if (json.find("\"liveview\"") != std::string::npos &&
@@ -3219,6 +3310,7 @@ int Agent::cloud_send_message(const std::string& dev_id,
                               const std::string& json_str,
                               int qos)
 {
+    note_outgoing_project_file(dev_id, json_str);
     std::shared_ptr<CloudSession> sess;
     {
         std::lock_guard<std::mutex> lk(mu_);
