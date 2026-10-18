@@ -244,11 +244,27 @@ bool wire_chunk_is_image(const std::vector<std::uint8_t>& chunk)
     return chunk.size() >= 2 && chunk[0] == 0xff && chunk[1] == 0xd8;
 }
 
+// Position of the reply's "reply.path" in `paths`; paths.size() when the
+// reply names none of them.
+std::size_t sub_file_reply_rank(const std::string&              wire_json,
+                                const std::vector<std::string>& paths)
+{
+    std::string perr;
+    const auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return paths.size();
+    const std::string path = root->find("reply.path").as_string();
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (paths[i] == path) return i;
+    }
+    return paths.size();
+}
+
 SubFileOutcome run_sub_file(obn::tunnel_local::Session* session,
                             SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
                             const SubFileRequest& req)
 {
     SubFileOutcome out;
+    std::size_t    best_rank = 0;  // rank of out.data when it is set
     if (req.paths.empty()) {
         out.error = "missing sub_file paths";
         return out;
@@ -290,8 +306,16 @@ SubFileOutcome run_sub_file(obn::tunnel_local::Session* session,
         const int rs  = obn::tunnel_local::parse_wire_sequence(wire_json);
         if (cmd == obn::tunnel_local::kCmdSubFile &&
             static_cast<std::uint32_t>(rs) == seq) {
+            // When reply.path names a requested path, keep the image for the
+            // earliest one (tile_thumbnail_sub_paths() lists them best
+            // first), whatever order the frames arrive in.
             if (!chunk.empty() && wire_chunk_is_image(chunk)) {
-                out.data = chunk;
+                const std::size_t rank =
+                    sub_file_reply_rank(wire_json, req.paths);
+                if (out.data.empty() || rank < best_rank) {
+                    out.data  = chunk;
+                    best_rank = rank;
+                }
             }
             const int result = obn::tunnel_local::parse_wire_result(wire_json);
             out.wire_result = result;
