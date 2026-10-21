@@ -243,8 +243,11 @@ is why this runs inside plugin_runner rather than standalone:
 
 `update_cert` calls `bambu_network_update_cert` (Studio `check_cert`) — no printer,
 `--user-info` optional. Under MITM this is the shared app-cert fetch
-`GET /v1/iot-service/api/user/applications/{enc_secret}/cert?aes256=…&ver=1`
-([research §10.2](../../research/10.02-secrets.md)).
+([research §10.2](../../research/10.02-secrets.md)): agents ≤ `02.08.03` use
+`GET …/applications/{enc_secret}/cert?aes256=…&ver=1` (response includes `key`);
+agents ≥ `02.08.04` use
+`GET …/applications/GLOF3813734089-c0cf542a0000/status` (cert + CRL, no `key`).
+The stock agent ignores `HTTPS_PROXY`.
 
 Capture stock HTTPS under mitmproxy:
 
