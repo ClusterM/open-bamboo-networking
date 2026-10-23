@@ -41,7 +41,12 @@ else()
                 "obn: ${_conf} has no top-level \"app\" object; "
                 "skipping patch. Error: ${_err}")
         else()
-            string(JSON _body SET "${_body}" app installed_networking "\"1\"")
+            # installed_networking must NOT be "1": every
+            # m_networking_need_update=true site in Studio's
+            # GUI_App::on_init_network is gated on it, and post_init then
+            # re-downloads + reinstalls the stock plugin with no prompt
+            # when a single component fails to dlopen once (see issue).
+            string(JSON _body SET "${_body}" app installed_networking "\"0\"")
             string(JSON _body SET "${_body}" app update_network_plugin "\"false\"")
             # Studio's GUI_App::on_init_network reads ignore_module_cert
             # before LoadLibrary'ing bambu_networking.dll: it skips the
@@ -86,7 +91,7 @@ else()
                 endif()
             else()
                 message(STATUS
-                    "obn: ${_conf} already has installed_networking=1, "
+                    "obn: ${_conf} already has installed_networking=0, "
                     "update_network_plugin=false (and ignore_module_cert=1 on Windows/macOS)")
             endif()
         endif()
