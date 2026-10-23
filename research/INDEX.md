@@ -1,6 +1,6 @@
 # Bambu Studio Network Plugin — research index
 
-Reverse-engineering reference for how Bambu Studio integrates with its proprietary **Network Plugin** (`bambu_networking`) and `libBambuSource`: download/install, validation, printer channels, C ABI (including print-job implementation in §8.8), cloud REST (§6.6), security, Studio-forwarded MQTT wire formats, and camera/file-browser CTRL.
+Reverse-engineering reference for how Bambu Studio integrates with its proprietary **Network Plugin** (`bambu_networking`) and `libBambuSource`: download/install, validation, printer channels, C ABI (including print-job implementation in §8.8), cloud REST (§6.6), security, Studio-forwarded MQTT wire formats, the printer's own cloud traffic (§13), and camera/file-browser CTRL.
 
 Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cross-ABI matrix runs — not from binary disassembly. Open-plugin implementation status lives in [STATUS.md](../STATUS.md), not here.
 
@@ -75,6 +75,11 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [12.13. Firmware upgrade](12.13-upgrade.md)
   - [12.14. Nozzle rack / mapping](12.14-nozzle-rack.md)
   - [12.15. Arbitrary G-code (`gcode_line`)](12.15-gcode-line.md)
+- [13. Printer ↔ cloud (device side)](13-printer-cloud.md)
+  - [13.1. Device login and HTTP headers](13.01-device-auth.md)
+  - [13.2. Device REST endpoints](13.02-device-endpoints.md)
+  - [13.3. Binding to an account (QR and PIN)](13.03-bind-flows.md)
+  - [13.4. Cloud MQTT session and command signing](13.04-cloud-command-signing.md)
 - [14. Additional notes](14-notes.md)
 - [15. Map of key source locations](15-source-map.md)
 - [16. Community quirk index](16-quirks.md)

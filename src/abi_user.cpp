@@ -215,7 +215,7 @@ OBN_ABI int bambu_network_get_user_info(void* agent, int* identifier)
         if (a->user_logged_in()) {
             if (identifier) {
                 // Studio uses `int` but Bambu user_ids are 32-bit unsigned
-                // values on the wire (e.g. 3575315859 > INT_MAX). std::stoi
+                // values on the wire, often above INT_MAX. std::stoi
                 // would throw out_of_range there, which unwinds through the
                 // ABI boundary and aborts. Use stoll and bit-cast.
                 try {
