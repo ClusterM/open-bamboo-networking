@@ -32,6 +32,7 @@
 
 #include "obn/cover_cache.hpp"
 #include "obn/log.hpp"
+#include "obn/net_compat.hpp"
 #include "obn/os_compat.hpp"
 
 namespace fs = std::filesystem;
@@ -42,6 +43,11 @@ namespace {
 
 using obn::os::socket_t;
 using obn::os::kInvalidSocket;
+
+// accept_loop() waits for a connection in poll_one() with this timeout
+// instead of blocking in accept(), so it notices running_ == false on its
+// own and stop() can join it before closing the listening socket.
+constexpr int kAcceptPollMs = 200;
 
 // Cheap containment check: the requested filename must live under
 // cover_cache::temp_dir() and must match the "cover-XXXXXXXX-pN.png"
@@ -263,18 +269,33 @@ int Server::start()
 void Server::stop()
 {
     if (!running_.exchange(false)) return;
+    // Join first, close second. Closing the listening socket is not a
+    // reliable way to wake a thread blocked in accept() on it: shutdown()
+    // is a no-op on a listening socket on macOS, and a close() that races
+    // the accept() can block the closing thread forever. accept_loop()
+    // polls with a timeout, so it exits on its own within kAcceptPollMs.
+    if (accept_thread_.joinable()) accept_thread_.join();
     socket_t fd = static_cast<socket_t>(listen_fd_);
     listen_fd_ = static_cast<std::uintptr_t>(kInvalidSocket);
-    if (obn::os::socket_valid(fd)) {
-        obn::os::shutdown_both(fd);
-        obn::os::close_socket(fd);
-    }
-    if (accept_thread_.joinable()) accept_thread_.join();
+    if (obn::os::socket_valid(fd)) obn::os::close_socket(fd);
 }
 
 void Server::accept_loop()
 {
+    // listen_fd_ is set before this thread starts and is only reset by
+    // stop() after joining it, so it stays valid for the whole loop.
+    const socket_t lfd = static_cast<socket_t>(listen_fd_);
     while (running_.load()) {
+        short revents = 0;
+        const int pr = obn::os::poll_one(lfd, obn::net::poll_event::in,
+                                         kAcceptPollMs, &revents);
+        if (pr == 0) continue;
+        if (pr < 0) {
+            if (obn::os::last_socket_error() == EINTR) continue;
+            break;
+        }
+        if (!(revents & obn::net::poll_event::in)) break;
+
         sockaddr_in ca{};
 #if defined(_WIN32)
         int cl = sizeof(ca);
@@ -284,9 +305,9 @@ void Server::accept_loop()
         socket_t c = static_cast<socket_t>(
             ::accept(
 #if defined(_WIN32)
-                static_cast<SOCKET>(listen_fd_),
+                static_cast<SOCKET>(lfd),
 #else
-                static_cast<int>(listen_fd_),
+                static_cast<int>(lfd),
 #endif
                 reinterpret_cast<sockaddr*>(&ca), &cl));
         if (!obn::os::socket_valid(c)) {
