@@ -43,7 +43,7 @@ In a cloud print Studio and the printer never talk to each other directly; they 
 
 ### Evidence and scope
 
-**Evidence:** printer-side MITM (TLS-terminating proxy for both HTTPS and MQTT) of one X2D (`N6`, firmware `01.02.00.00`, Developer Mode off, US region) with stock Studio `02.08.04.57` on the other side, 2026-10-22: cold boots, liveview, the file browser and a successful cloud print, a QR-code bind and a PIN bind. Model code: [N6.json:3](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L3) and [L81-L82](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L81-L82).
+**Evidence:** printer-side MITM (TLS-terminating proxy for both HTTPS and MQTT) of one X2D (`N6`, firmware `01.02.00.00`, Developer Mode off, US region) with stock Studio `02.08.04.57` on Linux (network plugin `02.08.04.60`) on the other side, 2026-10-22: cold boots, liveview, the file browser and a successful cloud print, a QR-code bind and a PIN bind. Model code: [N6.json:3](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L3) and [L81-L82](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L81-L82).
 
 Everything here comes from one printer model on one firmware. Other models may differ in header values, endpoint set and order.
 
