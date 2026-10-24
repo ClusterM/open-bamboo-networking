@@ -239,7 +239,7 @@ Then edit the configuration file.
 
 **Bambu Studio** — `BambuStudio.conf` (under the `app` object):
 
-  - set `"installed_networking"` to `"1"` (mark the plugin as installed)
+  - set `"installed_networking"` to `"0"` (NOT `"1"`: with `"1"`, a single failed load of one plugin component makes Studio silently re-download and reinstall the stock plugin during that same start-up)
   - set `"update_network_plugin"` to `"false"` (avoid auto-update replacing it with the stock plugin)
   - on **Windows** and **macOS**, set `ignore_module_cert` to `"1"` to skip publisher / certificate validation for the plugin
 

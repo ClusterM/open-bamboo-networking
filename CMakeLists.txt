@@ -206,7 +206,7 @@ endif()
 # When ON, 'cmake --install' (and therefore 'make install') will also
 # edit the slicer's conf file so it trusts this plugin:
 #   bambu_studio -> ~/.config/BambuStudio/BambuStudio.conf
-#                   ("installed_networking"="1", "update_network_plugin"="false")
+#                   ("installed_networking"="0", "update_network_plugin"="false")
 #   orca_slicer  -> ~/.config/OrcaSlicer/OrcaSlicer.conf (or the Flatpak
 #                   path) -- "installed_networking"="true",
 #                   "network_plugin_version"="<OBN_VERSION>",

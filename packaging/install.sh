@@ -336,7 +336,7 @@ if 'app' not in conf or not isinstance(conf['app'], dict):
 changed = False
 
 if client == 'bambu_studio':
-    for key, val in [('installed_networking', '1'), ('update_network_plugin', 'false')]:
+    for key, val in [('installed_networking', '0'), ('update_network_plugin', 'false')]:
         if conf['app'].get(key) != val:
             conf['app'][key] = val
             changed = True

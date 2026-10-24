@@ -340,7 +340,7 @@ if (Test-Path $ConfPath) {
         if ($null -ne $conf.app) {
             if ($Client -eq "bambu_studio") {
                 $studioPatches = @{
-                    installed_networking = "1"
+                    installed_networking = "0"
                     update_network_plugin = "false"
                     ignore_module_cert = "1"
                 }
