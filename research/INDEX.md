@@ -80,6 +80,7 @@ Derived from BambuStudio / OrcaSlicer sources, MITM of the stock plugin, and cro
   - [13.2. Device REST endpoints](13.02-device-endpoints.md)
   - [13.3. Binding to an account (QR and PIN)](13.03-bind-flows.md)
   - [13.4. Cloud MQTT session and command signing](13.04-cloud-command-signing.md)
+  - [13.5. Cloud print](13.05-cloud-print.md)
 - [14. Additional notes](14-notes.md)
 - [15. Map of key source locations](15-source-map.md)
 - [16. Community quirk index](16-quirks.md)
