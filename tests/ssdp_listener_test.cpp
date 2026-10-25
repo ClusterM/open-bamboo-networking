@@ -11,8 +11,8 @@
 //
 // Scope: this suite locks parse() + to_device_info_json(), the bare parser.
 // It says nothing about what Studio receives: Discovery's recv loop drops
-// packets whose USN or DevModel is missing/empty (src/ssdp.cpp:337-339) and
-// fills the sender IP when Location is absent (src/ssdp.cpp:343-347), so the
+// packets whose USN or DevModel is missing/empty (src/ssdp.cpp:366-368) and
+// fills the sender IP when Location is absent (src/ssdp.cpp:372-376), so the
 // empty-identity / empty-dev_ip outputs pinned below never reach the slicer
 // through the listener path. Where an observation differs from what the bare
 // parser does, the comment carries a `GAP` marker. No production behavior is
@@ -170,7 +170,7 @@ static void test_lf_lowercase_headers()
 }
 
 // Colonless header line (DOC-01 mandated): the line is dropped from the
-// bag (src/ssdp.cpp:133 skips lines without ':'), every other header
+// bag (src/ssdp.cpp:137 skips lines without ':'), every other header
 // still parses.
 static void test_colonless_line_dropped()
 {
@@ -180,7 +180,7 @@ static void test_colonless_line_dropped()
     obn::ssdp::Headers h;
     CHECK(obn::ssdp::parse(buf.data(), buf.size(), h));
 
-    // Dropped at src/ssdp.cpp:133 — absent from the bag, not "".
+    // Dropped at src/ssdp.cpp:137 — absent from the bag, not "".
     CHECK(h.get("this-line-has-no-colon") == nullptr);
 
     // Surrounding headers survive.
@@ -214,7 +214,7 @@ static void test_no_location_parser_dev_ip_empty()
     if (!device_doc(h, json, doc)) return;
     // GAP (bare parser only): with no Location header, dev_ip is "" — the
     // sender-address fallback lives in Discovery's recv loop
-    // (src/ssdp.cpp:343-347) and is unreachable from the pure
+    // (src/ssdp.cpp:372-376) and is unreachable from the pure
     // parse/to_device_info_json API. The listener fills the real source IP
     // before anything reaches Studio, so this pins the parser, not the
     // slicer (D-09, Pitfall 9). PandaSpy fills the sender IP the same way.
@@ -249,7 +249,7 @@ static void test_msearch_probe_accepted()
     // GAP (bare parser only): a discovery probe (not an advertisement) still
     // yields a Studio-shaped device JSON with empty identity fields — pinned
     // as-is (D-12). The listener path never forwards it: Discovery drops
-    // packets without USN/DevModel (src/ssdp.cpp:337-339).
+    // packets without USN/DevModel (src/ssdp.cpp:366-368).
     CHECK(doc.find("dev_id").as_string() == "");
     CHECK(doc.find("dev_ip").as_string() == "");
     CHECK(doc.find("dev_type").as_string() == "");
@@ -262,7 +262,7 @@ static void test_non_ssdp_rejected()
     if (!read_fixture("ssdp/synthetic-not-ssdp.txt", buf)) return;
 
     obn::ssdp::Headers h;
-    CHECK(!obn::ssdp::parse(buf.data(), buf.size(), h)); // start line gate, src/ssdp.cpp:121
+    CHECK(!obn::ssdp::parse(buf.data(), buf.size(), h)); // start line gate, src/ssdp.cpp:125
 }
 
 // https:// Location: accepted and passed through to dev_ip verbatim.
@@ -279,7 +279,7 @@ static void test_https_location_verbatim()
     obn::json::Value doc;
     if (!device_doc(h, json, doc)) return;
     // GAP: dev_ip is the raw Location string, not an extracted host — the
-    // parser never URL-parses Location (src/ssdp.cpp:154). Studio receives
+    // parser never URL-parses Location (src/ssdp.cpp:158). Studio receives
     // "https://192.168.0.11:8883/desc" where it expects a bare IP; pinned
     // as-is (D-12). (Location IS present, so the Discovery source-IP
     // fallback does not apply here.)
@@ -326,7 +326,7 @@ static void test_missing_identity_headers()
     // GAP (bare parser only): an advertisement with no USN/model/name still
     // emits a complete device JSON with empty identity instead of being
     // dropped — pinned as-is (D-12). Discovery filters it out before the
-    // callback (src/ssdp.cpp:337-339), so Studio never keys on "".
+    // callback (src/ssdp.cpp:366-368), so Studio never keys on "".
     CHECK(doc.find("dev_id").as_string() == "");
     CHECK(doc.find("dev_ip").as_string() == "192.168.0.9");
     CHECK(doc.find("dev_type").as_string() == "");
@@ -355,7 +355,7 @@ static void test_unknown_model_passthrough()
 }
 
 // HTTP error response. Pitfall 10: the start-line gate is a substring
-// check for "HTTP/1." (src/ssdp.cpp:121), so a 404 is ACCEPTED.
+// check for "HTTP/1." (src/ssdp.cpp:125), so a 404 is ACCEPTED.
 static void test_404_response_accepted()
 {
     std::string buf;
@@ -370,8 +370,8 @@ static void test_404_response_accepted()
     if (!device_doc(h, json, doc)) return;
     // GAP (bare parser only): an HTTP error response parses and emits
     // empty-identity device JSON instead of being rejected — pin accepted
-    // (src/ssdp.cpp:121, Pitfall 10, D-12). This fixture carries no
-    // USN/DevModel, so the listener drops it at src/ssdp.cpp:337-339 and
+    // (src/ssdp.cpp:125, Pitfall 10, D-12). This fixture carries no
+    // USN/DevModel, so the listener drops it at src/ssdp.cpp:366-368 and
     // nothing reaches Studio.
     CHECK(doc.find("dev_id").as_string() == "");
     CHECK(doc.find("dev_ip").as_string() == "");
