@@ -739,6 +739,32 @@ endif()
 option(OBN_BUILD_TESTS "Build smoke tests" OFF)
 if(OBN_BUILD_TESTS)
     enable_testing()
+
+    # A hung test must fail on its own instead of running until a CI time limit.
+    set(OBN_TEST_TIMEOUT 60 CACHE STRING
+        "Per-test ctest TIMEOUT in seconds; 0 leaves it to ctest --timeout")
+    if(NOT OBN_TEST_TIMEOUT MATCHES "^[0-9]+$")
+        # ctest would read "abc" as no limit and "1m" as one second.
+        message(FATAL_ERROR "OBN_TEST_TIMEOUT must be a whole number of "
+            "seconds, got '${OBN_TEST_TIMEOUT}'")
+    endif()
+    # Deferred to the end of this file so later add_test() calls are covered.
+    function(obn_apply_default_test_timeout)
+        get_property(_obn_tests DIRECTORY PROPERTY TESTS)
+        foreach(_obn_test IN LISTS _obn_tests)
+            get_property(_obn_has_timeout TEST ${_obn_test}
+                PROPERTY TIMEOUT SET)
+            if(NOT _obn_has_timeout)
+                set_tests_properties(${_obn_test} PROPERTIES
+                    TIMEOUT ${OBN_TEST_TIMEOUT})
+            endif()
+        endforeach()
+    endfunction()
+    # An explicit TIMEOUT 0 would also switch off `ctest --timeout`.
+    if(OBN_TEST_TIMEOUT GREATER 0)
+        cmake_language(DEFER CALL obn_apply_default_test_timeout)
+    endif()
+
     # probe_plugin is cross-platform: dlopen/dlsym on POSIX,
     # LoadLibrary/GetProcAddress on Windows. It also exercises
     # bambu_network_create_agent so the heap and std::string ABI
