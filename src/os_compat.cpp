@@ -143,6 +143,7 @@ int last_socket_error()
     case WSAEADDRINUSE:   return EADDRINUSE;
     case WSAEACCES:       return EACCES;
     case WSAEINVAL:       return EINVAL;
+    case WSAEMSGSIZE:     return EMSGSIZE;
     default:              return e;
     }
 #else

@@ -347,11 +347,14 @@ void Discovery::run_()
         ssize_t n = ::recvfrom(static_cast<int>(fd), buf.data(), kBufSize, 0,
                                reinterpret_cast<sockaddr*>(&src), &slen);
 #endif
-        if (n <= 0) {
-            if (!running_.load(std::memory_order_acquire)) break;
+        // A zero-length datagram is a valid UDP packet, not an error: any
+        // host on the LAN can send one, so it must not stop the listener.
+        if (n == 0) continue;
+        if (n < 0) {
             int e = obn::os::last_socket_error();
-            if (e == EINTR) continue;
-            if (e == EBADF) break;
+            // Winsock fails an oversized datagram with WSAEMSGSIZE where
+            // POSIX truncates it; either way drop it and keep listening.
+            if (e == EINTR || e == EMSGSIZE) continue;
             OBN_WARN("ssdp: recvfrom failed: %s", std::strerror(e));
             break;
         }
