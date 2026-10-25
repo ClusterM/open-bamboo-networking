@@ -1,6 +1,7 @@
 #include "obn/ssdp.hpp"
 
 #include "obn/log.hpp"
+#include "obn/net_compat.hpp"
 #include "obn/os_compat.hpp"
 
 #if defined(_WIN32)
@@ -27,6 +28,9 @@
 namespace obn::ssdp {
 
 namespace {
+
+// Longest time run_() waits for a datagram before re-checking running_.
+constexpr int kRecvPollMs = 200;
 
 std::string to_lower(std::string s)
 {
@@ -285,18 +289,24 @@ bool Discovery::start(int port, OnMessage cb)
 
 void Discovery::stop()
 {
-    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    // start() joins a stopped worker_ and replaces fd_: keep it out until done.
+    std::lock_guard<std::mutex> start_lk(start_mu_);
+    if (!running_.exchange(false, std::memory_order_acq_rel)) {
+        // run_() may have exited on its own and closed its socket: reap it.
+        if (worker_.joinable()) worker_.join();
+        return;
+    }
 
+    {
+        // Clear the callback first so datagrams arriving during the join are dropped.
+        std::lock_guard<std::mutex> lk(cb_mu_);
+        cb_ = {};
+    }
+    // Join before closing: run_() may still be using this socket.
+    if (worker_.joinable()) worker_.join();
     obn::os::socket_t fd = static_cast<obn::os::socket_t>(fd_);
     fd_ = static_cast<std::uintptr_t>(obn::os::kInvalidSocket);
-    // Closing the socket wakes up recvfrom() with EBADF / zero bytes.
-    obn::os::shutdown_both(fd);
     obn::os::close_socket(fd);
-
-    if (worker_.joinable()) worker_.join();
-
-    std::lock_guard<std::mutex> lk(cb_mu_);
-    cb_ = {};
     OBN_INFO("ssdp: stopped");
 }
 
@@ -306,16 +316,35 @@ void Discovery::run_()
     std::string buf;
     buf.resize(kBufSize);
 
+    // fd_ is only reset once this thread is done with the socket.
+    const obn::os::socket_t fd = static_cast<obn::os::socket_t>(fd_);
+
     while (running_.load(std::memory_order_acquire)) {
+        short revents = 0;
+        const int pr = obn::os::poll_one(fd, obn::net::poll_event::in,
+                                         kRecvPollMs, &revents);
+        if (pr == 0) continue;
+        if (pr < 0) {
+            const int e = obn::os::last_socket_error();
+            if (e == EINTR) continue;
+            OBN_WARN("ssdp: poll failed: %s", std::strerror(e));
+            break;
+        }
+        if (!(revents & obn::net::poll_event::in)) {
+            OBN_WARN("ssdp: socket error (poll revents=0x%x)",
+                     static_cast<unsigned>(revents));
+            break;
+        }
+
         sockaddr_in src{};
 #if defined(_WIN32)
         int slen = sizeof(src);
-        int n = ::recvfrom(static_cast<SOCKET>(fd_), buf.data(),
+        int n = ::recvfrom(static_cast<SOCKET>(fd), buf.data(),
                            static_cast<int>(kBufSize), 0,
                            reinterpret_cast<sockaddr*>(&src), &slen);
 #else
         socklen_t slen = sizeof(src);
-        ssize_t n = ::recvfrom(static_cast<int>(fd_), buf.data(), kBufSize, 0,
+        ssize_t n = ::recvfrom(static_cast<int>(fd), buf.data(), kBufSize, 0,
                                reinterpret_cast<sockaddr*>(&src), &slen);
 #endif
         if (n <= 0) {
@@ -365,7 +394,7 @@ void Discovery::run_()
     // the listener instead of assuming it's still running.
     if (running_.exchange(false, std::memory_order_acq_rel)) {
         OBN_WARN("ssdp: listener died unexpectedly; will restart on next start()");
-        obn::os::socket_t fd = static_cast<obn::os::socket_t>(fd_);
+        // Having won the exchange, this thread owns the socket.
         fd_ = static_cast<std::uintptr_t>(obn::os::kInvalidSocket);
         obn::os::shutdown_both(fd);
         obn::os::close_socket(fd);

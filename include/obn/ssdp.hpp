@@ -60,6 +60,8 @@ public:
 
     // Stops the listener and joins the worker thread. Safe to call when
     // not started. After stop() the Discovery can be started again.
+    // Waits up to one poll interval (200 ms) plus a callback the worker has
+    // already picked up. The callback must not call start()/stop() or destroy this.
     void stop();
 
     bool running() const { return running_.load(std::memory_order_acquire); }
