@@ -101,6 +101,7 @@ jobs:
         run: make -j"$(nproc)"
 
       - name: Run tests
+        timeout-minutes: 10
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
@@ -168,6 +169,7 @@ jobs:
 
       - name: Test (probe_plugin)
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
           Push-Location build
@@ -244,6 +246,7 @@ jobs:
         run: make -j"$(sysctl -n hw.ncpu)"
 
       - name: Run tests
+        timeout-minutes: 10
         run: make test
 
       - name: Verify built plugin exports every ABI symbol

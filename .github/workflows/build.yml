@@ -96,10 +96,12 @@ jobs:
         run: make -j"$(nproc)"
 
       - name: Run tests
-        # The only ctest target that does real I/O is `lan_live`, and it
-        # self-skips when OBN_PRINTER_IP / _SERIAL / _ACCESS_CODE are unset,
+        # The only ctest target that talks to a printer is `lan_live`, and it
+        # self-skips if OBN_PRINTER_IP, _SERIAL or OBN_ACCESS_CODE is unset,
         # which is always the case here. `plugin_symbols` is a pure dlopen
         # smoke test and exercises every ABI symbol Studio looks up.
+        # Backstop: every test already has a ctest TIMEOUT (OBN_TEST_TIMEOUT).
+        timeout-minutes: 10
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
@@ -170,6 +172,7 @@ jobs:
 
       - name: Test (probe_plugin)
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $ErrorActionPreference = 'Stop'
           Push-Location build
@@ -242,6 +245,7 @@ jobs:
         run: make -j"$(sysctl -n hw.ncpu)"
 
       - name: Run tests
+        timeout-minutes: 10
         run: make test
 
       - name: Verify built plugin exports every ABI symbol
@@ -322,6 +326,7 @@ jobs:
   #       run: make -j"$(sysctl -n hw.ncpu)"
   #
   #     - name: Run tests
+  #       timeout-minutes: 10
   #       run: make test
   #
   #     - name: Verify built plugin exports every ABI symbol

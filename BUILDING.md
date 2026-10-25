@@ -77,7 +77,10 @@ and the config location, then picks sensible defaults for a typical user.
 
 `make uninstall` walks the install manifest and removes whatever was put
 down; `make clean` / `make distclean` drop build artefacts; `make test`
-runs the smoke tests via `ctest`.
+runs the smoke tests via `ctest`. Each test fails if it runs longer than
+60 seconds; to change that, add `--cmake-arg=-DOBN_TEST_TIMEOUT=<seconds>`
+to your `./configure --enable-tests ...` call (`0` sets no per-test limit;
+`ctest --test-dir build --timeout <seconds>` can then set one).
 
 #### `./configure` options
 
