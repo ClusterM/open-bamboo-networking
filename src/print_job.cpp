@@ -451,9 +451,6 @@ std::string build_project_file_json(const BBL::PrintParams& p,
     std::string plate_param = "Metadata/plate_" +
                               std::to_string(p.plate_index <= 0 ? 1 : p.plate_index) +
                               ".gcode";
-    // sdcard_print has no url/url_enc at all — stock 02.05.00–02.08.02
-    // omit the key and the firmware looks the file up by basename +
-    // md5="from_sd_card". An empty opts.url is how we signal that.
     const std::string url_field = opts.url.empty()
         ? std::string{}
         : ",\"url\":" + json_escape(opts.url);
@@ -650,14 +647,13 @@ int Agent::run_sdcard_print_job(const BBL::PrintParams& params,
     }
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
-    // Stock ignores dst_file on the wire: `file` is the project_name
-    // basename (pick_remote_name), there is no url/url_enc key, and
-    // md5 is the literal "from_sd_card". dst_file is still required
-    // above because that's the ABI contract Studio fills for
-    // from_sdcard_view — we just don't forward it.
+    // `file` is the project_name basename (pick_remote_name), not dst_file;
+    // dst_file only feeds `url`. Secured firmware rejects a project_file
+    // without url_enc at file verify (err_code 84033544), and the signing
+    // path turns this cleartext url into url_enc.
     print_job::ProjectFileOpts opts;
     opts.file_path  = print_job::pick_remote_name(params);
-    opts.url        = "";
+    opts.url        = print_job::build_file_url(params.dst_file);
     opts.md5        = "from_sd_card";
     opts.project_id = "0";
     opts.profile_id = "0";

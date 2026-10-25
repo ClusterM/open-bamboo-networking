@@ -620,7 +620,9 @@ static void test_project_file_omits_url_when_empty_and_md5_is_literal()
 #if ABI_VERSION >= 0x020400
 // Field-level pin against the stock 02.08.02.54 L1 sdcard_print capture
 // (max sentinel). sequence_id is excluded: we seed it randomly in the
-// same 20000–29999 window rather than hardcoding 20001.
+// same 20000–29999 window rather than hardcoding 20001. `url` deviates on
+// purpose: that capture came from a Developer Mode P2S and carried none,
+// but secured firmware needs it (as url_enc) to locate the file.
 static void test_project_file_matches_stock_l1()
 {
     BBL::PrintParams p = default_params();
@@ -649,7 +651,7 @@ static void test_project_file_matches_stock_l1()
 
     obn::print_job::ProjectFileOpts opts;
     opts.file_path = "obn-probe-L1.gcode.3mf";
-    opts.url       = "";
+    opts.url       = obn::print_job::build_file_url("media/usb0/cache/obn-probe-L1.gcode.3mf");
     opts.md5       = "from_sd_card";
 
     const std::string json = obn::print_job::build_project_file_json(p, opts);
@@ -676,7 +678,8 @@ static void test_project_file_matches_stock_l1()
     CHECK(json.find("\"extrude_cali_flag\":3") != std::string::npos);
     CHECK(json.find("\"nozzle_offset_cali\":4") != std::string::npos);
     CHECK(json.find("\"extrude_cali_manual_mode\":1") != std::string::npos);
-    CHECK(json.find("\"url\"") == std::string::npos);
+    CHECK(field(json, "print.url") == "file:///media/usb0/cache/obn-probe-L1.gcode.3mf");
+    CHECK(json.find("\"url_enc\"") == std::string::npos);
 #if ABI_VERSION >= 0x020801
     CHECK(field(json, "print.slicer_uid") == "OBNUIDAAAA1111");
 #endif
