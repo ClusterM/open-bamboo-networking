@@ -982,6 +982,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         const ModelFileEntry* hit = find_model_entry(list, model_name);
         if (!hit) continue;
 
+        std::string sub_failures;
         for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
             {
                 std::lock_guard<std::mutex> lk(impl_->io_mu);
@@ -996,6 +997,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             const SubFileOutcome sf =
                 run_sub_file(session, ssl, &impl_->io_mu, seq, req);
             if (!sf.ok || sf.data.empty() || !wire_chunk_is_image(sf.data)) {
+                append_storage_failure(&sub_failures, wire_storage, sf.error);
                 continue;
             }
             out.ok   = true;
@@ -1003,7 +1005,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             out.data = sf.data;
             return out;
         }
-        out.error = "SUB_FILE thumbnail failed";
+        out.error = "SUB_FILE thumbnail failed (" + sub_failures + ")";
         return out;
     }
 
