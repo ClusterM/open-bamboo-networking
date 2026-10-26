@@ -54,8 +54,11 @@ public:
     Discovery& operator=(const Discovery&) = delete;
 
     // Starts the listener. Returns true on success (socket bound, thread
-    // spawned). Safe to call repeatedly: calls after the first while still
-    // running are no-ops and return true.
+    // spawned), false if the socket could not be created or bound, or the
+    // worker thread could not be started; a false start leaves the
+    // listener stopped, so start() can simply be called again. Safe to
+    // call repeatedly: calls after the first while still running are
+    // no-ops and return true.
     bool start(int port, OnMessage cb);
 
     // Stops the listener and joins the worker thread. Safe to call when
