@@ -56,9 +56,9 @@ std::unordered_map<std::string, SteadyClock::time_point> g_neg_cache;
 // plate takes the image, under that report's cache file (also when the
 // write fails, the stage is used up). Reports without a task_id never take
 // it: they cannot be told apart from another job's, and Studio asks for the
-// cover of the report that carries the task_id (on an H2C the push right
-// after this plugin's project_file still has task_id "0"; the next one has
-// the new id).
+// cover of the report that carries the task_id (on an H2C the report right
+// after this plugin's project_file is the project_file ack, which still
+// carries task_id "0"; the next push_status has the new id).
 //
 // Whenever the owner can no longer be told, the stage becomes a tombstone
 // (no image, never bound or taken) that also keeps further submissions of
