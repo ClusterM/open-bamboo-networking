@@ -10,11 +10,19 @@
 #include "obn/tunnel_local.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <random>
+#include <tuple>
+#include <utility>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -91,6 +99,27 @@ int wait_ssl_readable(SSL* ssl, int timeout_ms)
     }
     return (revents & obn::net::poll_event::in) ? 1 : 0;
 }
+
+// A blocking SSL_read waits out a TLS record however slowly it trickles in.
+class NonBlockingScope {
+public:
+    explicit NonBlockingScope(SSL* ssl)
+        : fd_(static_cast<obn::os::socket_t>(SSL_get_fd(ssl)))
+    {
+        ok_ = obn::os::socket_valid(fd_) && obn::os::set_nonblocking(fd_) == 0;
+    }
+    ~NonBlockingScope()
+    {
+        if (ok_) obn::os::set_blocking(fd_);
+    }
+    NonBlockingScope(const NonBlockingScope&)            = delete;
+    NonBlockingScope& operator=(const NonBlockingScope&) = delete;
+    bool ok() const { return ok_; }
+
+private:
+    obn::os::socket_t fd_;
+    bool              ok_ = false;
+};
 
 int recv_json_payload(obn::tunnel_local::Session* session, SSL* ssl,
                       std::mutex* io_mu, std::string* json_out)
@@ -233,6 +262,7 @@ struct SubFileOutcome {
     std::vector<std::uint8_t> data;
     int                       wire_result = 0;
     std::string               error;
+    bool                      timed_out = false;  // set by run_sub_file_data()
 };
 
 bool wire_chunk_is_image(const std::vector<std::uint8_t>& chunk)
@@ -773,6 +803,431 @@ std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
     return out;
 }
 
+// --- Fallback: match a print to its file by the 3MF title ------------------
+
+// Bounds a misbehaving peer; a sliced project's 3dmodel.model has no meshes.
+constexpr std::size_t kMaxModelXmlBytes = 256 * 1024;
+
+// Only a listing's newest 64 .3mf files are candidates; one fetch can read them all.
+constexpr std::size_t kMaxTitleCandidates   = 64;
+constexpr int         kMaxTitleReadsPerFetch = 64;
+
+// A silent or trickling reply must not hold the cover worker past the deadline.
+constexpr int  kTitleReadPollMs   = 1000;
+constexpr auto kTitleReadDeadline = std::chrono::seconds(10);
+
+// Printer x storage scopes kept; past this the title cache starts over.
+constexpr std::size_t kMaxTitleScopes = 64;
+
+void append_utf8(std::string* out, unsigned long cp)
+{
+    if (cp < 0x80) {
+        out->push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out->push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else if (cp < 0x10000) {
+        out->push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out->push_back(static_cast<char>(0xf0 | (cp >> 18)));
+        out->push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
+        out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out->push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+}
+
+// Only predefined entities and character references; anything else stays verbatim.
+std::string decode_xml_text(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size());
+    std::size_t i = 0;
+    while (i < s.size()) {
+        const std::size_t semi = s[i] == '&' ? s.find(';', i + 1) : std::string::npos;
+        if (semi == std::string::npos || semi - i > 12) {
+            out.push_back(s[i++]);
+            continue;
+        }
+        const std::string ent = s.substr(i + 1, semi - i - 1);
+        bool ok = true;
+        if (ent == "amp") out.push_back('&');
+        else if (ent == "lt") out.push_back('<');
+        else if (ent == "gt") out.push_back('>');
+        else if (ent == "quot") out.push_back('"');
+        else if (ent == "apos") out.push_back('\'');
+        else if (ent.size() > 1 && ent[0] == '#') {
+            const bool hex = ent[1] == 'x' || ent[1] == 'X';
+            const char* digits = ent.c_str() + (hex ? 2 : 1);
+            char* end = nullptr;
+            const unsigned long cp = std::strtoul(digits, &end, hex ? 16 : 10);
+            ok = *digits != '\0' && end && *end == '\0' && cp != 0 &&
+                 cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff);
+            if (ok) append_utf8(&out, cp);
+        } else {
+            ok = false;
+        }
+        if (!ok) out.append(s, i, semi - i + 1);
+        i = semi + 1;
+    }
+    return out;
+}
+
+bool is_xml_space(char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// Text inside another attribute's value is never taken for an attribute.
+bool xml_attribute(const std::string& attrs, const std::string& name,
+                   std::string* value)
+{
+    const std::size_t n = attrs.size();
+    std::size_t i = 0;
+    while (i < n) {
+        while (i < n && is_xml_space(attrs[i])) ++i;
+        const std::size_t key_start = i;
+        while (i < n && !is_xml_space(attrs[i]) && attrs[i] != '=') ++i;
+        const std::string key = attrs.substr(key_start, i - key_start);
+        while (i < n && is_xml_space(attrs[i])) ++i;
+        if (i >= n || attrs[i] != '=') {
+            if (i == key_start) ++i;  // stray character
+            continue;
+        }
+        ++i;
+        while (i < n && is_xml_space(attrs[i])) ++i;
+        if (i >= n || (attrs[i] != '"' && attrs[i] != '\'')) return false;
+        const std::size_t vend = attrs.find(attrs[i], i + 1);
+        if (vend == std::string::npos) return false;
+        if (key == name) {
+            *value = attrs.substr(i + 1, vend - i - 1);
+            return true;
+        }
+        i = vend + 1;
+    }
+    return false;
+}
+
+// A '>' inside a quoted attribute value does not end the tag.
+std::size_t xml_tag_end(const std::string& xml, std::size_t pos)
+{
+    char quote = 0;
+    for (; pos < xml.size(); ++pos) {
+        const char c = xml[pos];
+        if (quote) {
+            if (c == quote) quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '>') {
+            return pos;
+        }
+    }
+    return std::string::npos;
+}
+
+// Empty when the element is unterminated or has child elements.
+std::string xml_element_text(const std::string& xml, std::size_t pos,
+                             const std::string& close_tag)
+{
+    std::string out;
+    while (pos < xml.size()) {
+        const std::size_t lt = xml.find('<', pos);
+        if (lt == std::string::npos) return {};
+        out += decode_xml_text(xml.substr(pos, lt - pos));
+        if (xml.compare(lt, 9, "<![CDATA[") == 0) {
+            const std::size_t e = xml.find("]]>", lt + 9);
+            if (e == std::string::npos) return {};
+            out.append(xml, lt + 9, e - lt - 9);
+            pos = e + 3;
+        } else if (xml.compare(lt, 4, "<!--") == 0) {
+            const std::size_t e = xml.find("-->", lt + 4);
+            if (e == std::string::npos) return {};
+            pos = e + 3;
+        } else if (xml.compare(lt, close_tag.size(), close_tag) == 0) {
+            return out;
+        } else {
+            return {};
+        }
+    }
+    return {};
+}
+
+// A Title inside a comment, CDATA section or processing instruction does not count.
+std::string model_title_from_3dmodel(const std::string& xml)
+{
+    static const std::string kOpen = "<metadata";
+    std::size_t pos = 0;
+    while ((pos = xml.find('<', pos)) != std::string::npos) {
+        const char* skip_to = nullptr;
+        std::size_t skip_from = 0;
+        if (xml.compare(pos, 4, "<!--") == 0) {
+            skip_to = "-->";
+            skip_from = pos + 4;
+        } else if (xml.compare(pos, 9, "<![CDATA[") == 0) {
+            skip_to = "]]>";
+            skip_from = pos + 9;
+        } else if (xml.compare(pos, 2, "<?") == 0) {
+            skip_to = "?>";
+            skip_from = pos + 2;
+        }
+        if (skip_to) {
+            const std::size_t e = xml.find(skip_to, skip_from);
+            if (e == std::string::npos) break;
+            pos = e + std::strlen(skip_to);
+            continue;
+        }
+        const std::size_t after = pos + kOpen.size();
+        if (xml.compare(pos, kOpen.size(), kOpen) != 0 ||
+            (after < xml.size() && !is_xml_space(xml[after]) &&
+             xml[after] != '>' && xml[after] != '/')) {
+            ++pos;  // another element, or <metadatagroup> and the like
+            continue;
+        }
+        const std::size_t tag_end = xml_tag_end(xml, after);
+        if (tag_end == std::string::npos) break;
+        std::string attrs = xml.substr(after, tag_end - after);
+        pos = tag_end + 1;
+        const bool self_closing = !attrs.empty() && attrs.back() == '/';
+        if (self_closing) attrs.pop_back();
+        std::string name;
+        if (!xml_attribute(attrs, "name", &name) || name != "Title") continue;
+        if (self_closing) return {};
+        return xml_element_text(xml, pos, "</metadata");
+    }
+    return {};
+}
+
+// run_sub_file() keeps only images. wire_result 0 with !ok: the reply did not complete.
+SubFileOutcome run_sub_file_data(obn::tunnel_local::Session* session,
+                                 SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
+                                 const std::string& path,
+                                 const std::string& storage,
+                                 std::size_t        max_bytes)
+{
+    SubFileOutcome out;
+    drain_stale_wire_json(session, "pre-sub_file");
+
+    const std::string abi =
+        obn::tunnel_local::build_sub_file_abi(seq, {path}, storage);
+    if (session->send_abi_json(ssl, abi, io_mu) != 0) {
+        out.error = obn::tunnel_local::describe_ssl_io_error(ssl);
+        return out;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + kTitleReadDeadline;
+    const auto fail = [&out](std::string why) {
+        out.wire_result = 0;
+        out.error = std::move(why);
+        return out;
+    };
+    const NonBlockingScope nonblocking(ssl);
+    if (!nonblocking.ok()) return fail("socket not switched to non-blocking");
+    for (;;) {
+        std::vector<std::uint8_t> payload;
+        const int rc = session->recv_payload_until(ssl, &payload, io_mu, deadline);
+        if (rc == 2) {
+            out.timed_out = true;
+            return fail("sub_file reply timeout");
+        }
+        if (rc < 0) return fail(obn::tunnel_local::describe_ssl_io_error(ssl));
+        if (rc > 0) {
+            if (wait_ssl_readable(ssl, 100) < 0) {
+                return fail(obn::tunnel_local::describe_ssl_io_error(ssl));
+            }
+            continue;
+        }
+
+        std::string wire_json;
+        std::vector<std::uint8_t> chunk;
+        if (!obn::tunnel_local::split_json_prefix(payload.data(), payload.size(),
+                                                  &wire_json, &chunk)) {
+            wire_json.assign(reinterpret_cast<const char*>(payload.data()),
+                             payload.size());
+        }
+        if (obn::tunnel_local::parse_wire_cmdtype(wire_json) !=
+                obn::tunnel_local::kCmdSubFile ||
+            static_cast<std::uint32_t>(
+                obn::tunnel_local::parse_wire_sequence(wire_json)) != seq) {
+            continue;
+        }
+        if (out.data.size() < max_bytes) {
+            const std::size_t take =
+                std::min(chunk.size(), max_bytes - out.data.size());
+            out.data.insert(out.data.end(), chunk.begin(),
+                            chunk.begin() + static_cast<std::ptrdiff_t>(take));
+        }
+        const int result = obn::tunnel_local::parse_wire_result(wire_json);
+        if (result == 1) continue;
+        out.wire_result = result;
+        out.ok = result == 0;
+        if (!out.ok) {
+            out.error = "sub_file failed wire result=" + std::to_string(result);
+        }
+        return out;
+    }
+}
+
+// Printer-state codes (research/09.05-ctrl.md) are retried; others are cached as final.
+bool title_refusal_is_final(int result)
+{
+    switch (result) {
+    case -1:  // no numeric result
+    case 3:   // ERROR_PIPE
+    case 4:   // ERROR_CANCEL
+    case 5:   // ERROR_RES_BUSY
+    case 6:   // ERROR_TIME_OUT
+    case 17:  // STORAGE_UNAVAILABLE
+    case 20:  // STORAGE_SPACE_NOT_ENOUGH
+    case 25:  // SEND_ERR
+        return false;
+    default:
+        return true;
+    }
+}
+
+// Refused file: answered, empty title. !answered: uncached until a second timeout.
+struct TitleRead {
+    bool        answered = false;
+    std::string title;
+    bool        timed_out = false;  // no complete reply before the deadline
+};
+using TitleReader =
+    std::function<TitleRead(const std::string& path, const std::string& storage)>;
+using TileFetcher = std::function<bool(
+    const ModelFileEntry& hit, const std::string& storage, std::string* failures)>;
+
+// Two timeouts cache a file untitled (research/09.06-commands.md: raw size limit).
+struct TitleScope {
+    std::unordered_map<std::string, std::string> titles;
+    std::unordered_set<std::string>              timed_out;  // once so far
+};
+
+// Scope (printer + storage) -> TitleScope by path + '\x01' + mtime, current candidates.
+std::mutex g_title_mu;
+std::unordered_map<std::string, TitleScope> g_titles;
+
+// With no budget left, stops at the first unknown title: cache history never picks.
+const ModelFileEntry* find_model_entry_by_title(const ListInfoOutcome& list,
+                                                const std::string& list_storage,
+                                                const std::string& scope,
+                                                const std::string& model_name,
+                                                int*               reads_left,
+                                                const TitleReader& read_title,
+                                                bool*              transport,
+                                                bool*              exhausted)
+{
+    std::vector<const ModelFileEntry*> order;
+    for (const auto& f : list.files) {
+        if (ends_with(f.name, ".3mf") || ends_with(f.path, ".3mf")) {
+            order.push_back(&f);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [](const ModelFileEntry* a, const ModelFileEntry* b) {
+                         return a->time > b->time;
+                     });
+    if (order.size() > kMaxTitleCandidates) order.resize(kMaxTitleCandidates);
+
+    const auto key_of = [](const ModelFileEntry& f) {
+        return f.path + "\x01" + std::to_string(f.time);
+    };
+    {
+        // Bounded, and never drops a title a rescan of this listing still needs.
+        std::lock_guard<std::mutex> lk(g_title_mu);
+        if (g_titles.size() >= kMaxTitleScopes && !g_titles.count(scope)) {
+            g_titles.clear();
+        }
+        auto& cached = g_titles[scope];
+        TitleScope kept;
+        for (const ModelFileEntry* f : order) {
+            const std::string key = key_of(*f);
+            const auto it = cached.titles.find(key);
+            if (it != cached.titles.end()) kept.titles.emplace(key, it->second);
+            if (cached.timed_out.count(key)) kept.timed_out.insert(key);
+        }
+        std::swap(cached, kept);
+    }
+
+    for (const ModelFileEntry* f : order) {
+        const std::string key = key_of(*f);
+        std::string title;
+        bool        known = false;
+        {
+            std::lock_guard<std::mutex> lk(g_title_mu);
+            const auto& cached = g_titles[scope].titles;
+            const auto it = cached.find(key);
+            if (it != cached.end()) {
+                title = it->second;
+                known = true;
+            }
+        }
+        if (!known) {
+            if (*reads_left <= 0) {
+                *exhausted = true;
+                return nullptr;
+            }
+            --*reads_left;
+            const TitleRead r = read_title(f->path, list_storage);
+            if (!r.answered) {
+                *transport = true;
+                if (r.timed_out) {
+                    std::lock_guard<std::mutex> lk(g_title_mu);
+                    auto& s = g_titles[scope];
+                    // A title another fetch read meanwhile wins over this timeout.
+                    if (!s.titles.count(key) && !s.timed_out.insert(key).second) {
+                        s.timed_out.erase(key);
+                        s.titles[key] = "";
+                        OBN_DEBUG("tunnel_upload: 3MF title of %s: timed out twice",
+                                  f->path.c_str());
+                    }
+                }
+                return nullptr;
+            }
+            title = r.title;
+            OBN_DEBUG("tunnel_upload: 3MF title of %s: '%s'", f->path.c_str(),
+                      title.c_str());
+            std::lock_guard<std::mutex> lk(g_title_mu);
+            g_titles[scope].titles[key] = title;
+        }
+        if (!title.empty() && title == model_name) {
+            OBN_DEBUG("tunnel_upload: '%s' matched by 3MF title: %s",
+                      model_name.c_str(), f->path.c_str());
+            return f;
+        }
+    }
+    return nullptr;
+}
+
+// A listing the budget left unfinished ends the pass, so a cached later one can't win.
+const ModelFileEntry* match_model_by_title(
+    const std::vector<std::pair<std::string, ListInfoOutcome>>& unmatched,
+    const std::string& printer, const std::string& model_name,
+    const TitleReader& read_title, const TileFetcher& fetch_tile,
+    std::string* error)
+{
+    int         reads_left  = kMaxTitleReadsPerFetch;
+    bool        tile_failed = false;
+    std::string tile_failures;
+    for (const auto& [storage, list] : unmatched) {
+        bool transport = false;
+        bool exhausted = false;
+        const ModelFileEntry* hit = find_model_entry_by_title(
+            list, storage, printer + "\x01" + storage, model_name, &reads_left,
+            read_title, &transport, &exhausted);
+        if (transport) {
+            *error = "3MF title read failed";
+            return nullptr;
+        }
+        if (exhausted) break;
+        if (!hit) continue;
+        if (fetch_tile(*hit, storage, &tile_failures)) return hit;
+        tile_failed = true;
+    }
+    if (tile_failed) *error = "SUB_FILE thumbnail failed (" + tile_failures + ")";
+    return nullptr;
+}
+
 } // namespace
 
 struct Connection::Impl {
@@ -945,6 +1400,40 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
     const std::string& model_name, int plate_idx)
 {
     ModelThumbnailOutcome out;
+    // Listings without a file-name match, for the 3MF title pass.
+    std::vector<std::pair<std::string, ListInfoOutcome>> unmatched;
+    const auto next_wire = [this](std::uint32_t* seq, SSL** ssl,
+                                  obn::tunnel_local::Session** session) {
+        std::lock_guard<std::mutex> lk(impl_->io_mu);
+        *seq     = impl_->wire_seq++;
+        *ssl     = impl_->ssl;
+        *session = impl_->session.get();
+    };
+    const auto fetch_tile = [&](const ModelFileEntry& hit,
+                                const std::string&    list_storage,
+                                std::string*          failures) {
+        for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
+            std::uint32_t seq = 0;
+            SSL* ssl = nullptr;
+            obn::tunnel_local::Session* session = nullptr;
+            next_wire(&seq, &ssl, &session);
+
+            SubFileRequest req;
+            req.paths   = tile_thumbnail_sub_paths(hit.path, plate_idx);
+            req.storage = wire_storage;
+            const SubFileOutcome sf =
+                run_sub_file(session, ssl, &impl_->io_mu, seq, req);
+            if (!sf.ok || sf.data.empty() || !wire_chunk_is_image(sf.data)) {
+                append_storage_failure(failures, wire_storage, sf.error);
+                continue;
+            }
+            out.ok   = true;
+            out.path = hit.path;
+            out.data = sf.data;
+            return true;
+        }
+        return false;
+    };
     if (!is_connected()) {
         out.error = "not connected";
         return out;
@@ -980,33 +1469,63 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         any_list_ok = true;
 
         const ModelFileEntry* hit = find_model_entry(list, model_name);
-        if (!hit) continue;
-
-        std::string sub_failures;
-        for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
-            {
-                std::lock_guard<std::mutex> lk(impl_->io_mu);
-                seq = impl_->wire_seq++;
-                ssl = impl_->ssl;
-                session = impl_->session.get();
-            }
-
-            SubFileRequest req;
-            req.paths   = tile_thumbnail_sub_paths(hit->path, plate_idx);
-            req.storage = wire_storage;
-            const SubFileOutcome sf =
-                run_sub_file(session, ssl, &impl_->io_mu, seq, req);
-            if (!sf.ok || sf.data.empty() || !wire_chunk_is_image(sf.data)) {
-                append_storage_failure(&sub_failures, wire_storage, sf.error);
-                continue;
-            }
-            out.ok   = true;
-            out.path = hit->path;
-            out.data = sf.data;
-            return out;
+        if (!hit) {
+            unmatched.emplace_back(list_storage, list);
+            continue;
         }
+        std::string sub_failures;
+        if (fetch_tile(*hit, list_storage, &sub_failures)) return out;
         out.error = "SUB_FILE thumbnail failed (" + sub_failures + ")";
         return out;
+    }
+    if (!unmatched.empty()) {
+        // A print started on the printer reports its 3MF title, not the file name.
+        const TitleReader read_title = [&](const std::string& path,
+                                           const std::string& storage) {
+            TitleRead r;
+            bool transient = false;
+            const bool fd_ok = obn::os::socket_valid(impl_->fd);
+            if (fd_ok) obn::tls::set_socket_io_timeout(impl_->fd, kTitleReadPollMs);
+            for (const auto& label : sub_file_storage_labels(storage)) {
+                std::uint32_t seq = 0;
+                SSL* ssl = nullptr;
+                obn::tunnel_local::Session* session = nullptr;
+                next_wire(&seq, &ssl, &session);
+                const SubFileOutcome sf = run_sub_file_data(
+                    session, ssl, &impl_->io_mu, seq, path + "#3D/3dmodel.model",
+                    label, kMaxModelXmlBytes);
+                if (sf.ok) {
+                    r.answered = true;
+                    r.title    = model_title_from_3dmodel(
+                        std::string(sf.data.begin(), sf.data.end()));
+                    transient  = false;
+                    break;
+                }
+                if (sf.wire_result == 0) {  // no complete reply
+                    r = TitleRead{};
+                    r.timed_out = sf.timed_out;
+                    transient = false;
+                    break;
+                }
+                // A transient refusal stays uncached unless another label answers.
+                if (!title_refusal_is_final(sf.wire_result)) transient = true;
+                r.answered = true;
+            }
+            if (transient) r = TitleRead{};
+            if (fd_ok) obn::tls::clear_socket_io_timeout(impl_->fd);
+            return r;
+        };
+        const std::string printer =
+            impl_->params.dev_id.empty() ? impl_->params.dev_ip : impl_->params.dev_id;
+        std::string title_error;
+        if (match_model_by_title(unmatched, printer, model_name, read_title,
+                                 fetch_tile, &title_error)) {
+            return out;
+        }
+        if (!title_error.empty()) {
+            out.error = title_error;
+            return out;
+        }
     }
 
     if (!any_list_ok && !list_failures.empty()) {
@@ -1055,5 +1574,92 @@ ConnectParams connect_params_from_print(const std::string& dev_ip,
     p.password   = password;
     return p;
 }
+
+#ifdef OBN_TESTING
+// Title fallback hooks, driven by a scripted title reader and tile fetcher.
+using TestFiles = std::vector<std::tuple<std::string, std::string, std::int64_t>>;
+using TestRead  = std::function<std::pair<bool, std::string>(const std::string&,
+                                                             const std::string&)>;
+
+namespace {
+ListInfoOutcome test_listing(const TestFiles& files)
+{
+    ListInfoOutcome list;
+    list.ok = true;
+    for (const auto& f : files) {
+        list.files.push_back({std::get<0>(f), std::get<1>(f), std::get<2>(f)});
+    }
+    return list;
+}
+
+// {false, "timeout"}: no complete reply by the deadline; other {false, ...}: none.
+TitleReader test_reader(const TestRead& read)
+{
+    return [read](const std::string& path, const std::string& storage) {
+        const auto r = read(path, storage);
+        if (!r.first) return TitleRead{false, {}, r.second == "timeout"};
+        return TitleRead{true, r.second};
+    };
+}
+} // namespace
+
+std::string test_model_title_from_3dmodel(const std::string& xml)
+{
+    return model_title_from_3dmodel(xml);
+}
+
+bool test_title_refusal_is_final(int result)
+{
+    return title_refusal_is_final(result);
+}
+
+std::string test_find_model_entry_by_title(const TestFiles& files,
+                                           const std::string& list_storage,
+                                           const std::string& scope,
+                                           const std::string& model_name,
+                                           int* reads_left, const TestRead& read,
+                                           bool* transport)
+{
+    const ListInfoOutcome list = test_listing(files);
+    bool exhausted = false;
+    const ModelFileEntry* hit = find_model_entry_by_title(
+        list, list_storage, scope, model_name, reads_left, test_reader(read),
+        transport, &exhausted);
+    return hit ? hit->path : std::string{};
+}
+
+std::string test_match_model_by_title(
+    const std::vector<std::pair<std::string, TestFiles>>& listings,
+    const std::string& printer, const std::string& model_name,
+    const TestRead& read,
+    const std::function<bool(const std::string&, const std::string&,
+                             std::string*)>& tile,
+    std::string* error)
+{
+    std::vector<std::pair<std::string, ListInfoOutcome>> unmatched;
+    for (const auto& l : listings) {
+        unmatched.emplace_back(l.first, test_listing(l.second));
+    }
+    const ModelFileEntry* hit = match_model_by_title(
+        unmatched, printer, model_name, test_reader(read),
+        [&tile](const ModelFileEntry& f, const std::string& storage,
+                std::string* failures) { return tile(f.path, storage, failures); },
+        error);
+    return hit ? hit->path : std::string{};
+}
+
+void test_clear_title_cache()
+{
+    std::lock_guard<std::mutex> lk(g_title_mu);
+    g_titles.clear();
+}
+
+std::size_t test_title_cache_size(const std::string& scope)
+{
+    std::lock_guard<std::mutex> lk(g_title_mu);
+    const auto it = g_titles.find(scope);
+    return it == g_titles.end() ? 0 : it->second.titles.size();
+}
+#endif
 
 } // namespace obn::tunnel_upload

@@ -1189,4 +1189,22 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     target_include_directories(camera_url_test PRIVATE include)
     add_test(NAME camera_url COMMAND camera_url_test)
 
+    # Cover lookup by 3MF title, through the OBN_TESTING hooks in tunnel_upload.cpp.
+    add_executable(model_title_test tests/model_title_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(model_title_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(model_title_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(model_title_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME model_title COMMAND model_title_test)
+
 endif()
