@@ -411,6 +411,7 @@ add_library(bambu_networking SHARED
     src/tunnel_local.cpp
     src/tunnel_upload.cpp
     src/tls_dial.cpp
+    src/zip_read.cpp
 )
 
 target_include_directories(bambu_networking PRIVATE include ${OBN_GENERATED_DIR})
@@ -846,6 +847,32 @@ if(OBN_BUILD_TESTS)
     add_test(NAME ssdp_listener COMMAND ssdp_listener_test)
     set_tests_properties(ssdp_listener PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+
+    # Cover cache: the .3mf entry reader and the staged-cover fallback. No
+    # Agent; the failing fetches dial loopback port 1 at most.
+    add_executable(cover_cache_test tests/cover_cache_test.cpp
+        tests/config_stub.cpp
+        src/cover_cache.cpp
+        src/json_lite.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp
+        src/tls_dial.cpp
+        src/tunnel_local.cpp
+        src/tunnel_upload.cpp
+        src/zip_read.cpp)
+    target_include_directories(cover_cache_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(cover_cache_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(cover_cache_test PRIVATE
+        OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+    if(WIN32)
+        # Winsock wrappers in os_compat.cpp, as above.
+        target_link_libraries(cover_cache_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME cover_cache COMMAND cover_cache_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
@@ -983,7 +1010,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
-        src/tunnel_upload.cpp)
+        src/tunnel_upload.cpp
+        src/zip_read.cpp)
     target_include_directories(lan_live_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(lan_live_test PRIVATE
         OBN_VERSION_STRING="${OBN_VERSION}"
@@ -1061,7 +1089,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/ssdp.cpp
         src/tls_dial.cpp
         src/tunnel_local.cpp
-        src/tunnel_upload.cpp)
+        src/tunnel_upload.cpp
+        src/zip_read.cpp)
 
     # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
     # build_task_body). OBN_TESTING promotes the anonymous-namespace

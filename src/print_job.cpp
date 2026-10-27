@@ -19,6 +19,7 @@
 
 #include "obn/bambu_networking.hpp"
 #include "obn/config.hpp"
+#include "obn/cover_cache.hpp"
 #include "obn/ftps.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
@@ -323,6 +324,11 @@ int ftp_upload(const BBL::PrintParams&    p,
     return 0;
 }
 
+std::string subtask_name_for(const BBL::PrintParams& p)
+{
+    return p.project_name.empty() ? p.task_name : p.project_name;
+}
+
 namespace {
 
 // Shared body for the `project_file` MQTT command. Emits cleartext `url` /
@@ -334,7 +340,7 @@ std::string build_project_file_json_impl(const BBL::PrintParams& p,
                                          const std::string&      param_field,
                                          const std::string&      url_field)
 {
-    std::string subtask     = p.project_name.empty() ? p.task_name : p.project_name;
+    std::string subtask     = subtask_name_for(p);
     std::string bed_type    = p.task_bed_type.empty() ? "auto" : p.task_bed_type;
     std::string ams_mapping = format_ams_mapping(p.ams_mapping);
 
@@ -601,9 +607,17 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
+    // Some printers refuse SUB_FILE on internal storage (H2C); staged before
+    // project_file because its ack already starts a cover fetch.
+    const std::string cover_name = print_job::subtask_name_for(params);
+    cover_cache::stage_from_3mf(params.dev_id, cover_name, params.filename,
+                                params.plate_index);
+
     int pub = send_message(params.dev_id, json, /*qos=*/0);
     if (pub != 0) {
         OBN_ERROR("local_print: publish project_file failed rc=%d", pub);
+        // No job started, so no later job of the name may get this image.
+        cover_cache::unstage(params.dev_id, cover_name, params.plate_index);
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
                                  "MQTT publish failed");
