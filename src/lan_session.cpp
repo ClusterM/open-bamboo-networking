@@ -1,6 +1,5 @@
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
-#include "obn/cover_cache.hpp"
 #include "obn/lan_tls.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_client.hpp"
@@ -121,8 +120,6 @@ int LanSession::start(ConnectedCb on_connected, MessageCb on_message)
 
     client->set_on_disconnect([this](int rc) {
         OBN_INFO("LanSession disconnect rc=%d (%s)", rc, mqtt::Client::err_str(rc));
-        // Reports may have been missed, whatever the reason (also rc 0).
-        cover_cache::reports_interrupted(dev_id_);
         // libmosquitto uses keepalive as a connect timeout. On a P1 that is
         // still holding a ghost session the first TLS handshake sits there
         // until that timer fires (MOSQ_ERR_KEEPALIVE), then the library
@@ -220,7 +217,6 @@ int LanSession::disconnect()
     // Joins the loop thread. A publisher still holding a snapshot keeps the
     // object alive; its final release is then a plain mosquitto_destroy.
     if (client) client->disconnect();
-    cover_cache::reports_interrupted(dev_id_);
     return BAMBU_NETWORK_SUCCESS;
 }
 

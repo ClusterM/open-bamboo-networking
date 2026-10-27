@@ -21,7 +21,6 @@
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
 #include "obn/ftps.hpp"
-#include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
@@ -608,38 +607,22 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
-    // Device-tab cover for this print, straight from the archive we just
-    // uploaded: the :6000 fetch cannot read it back on printers that
-    // refuse SUB_FILE on their internal storage (H2C). Read before
-    // project_file and handed to that job's first report with its task_id
-    // once project_file is out; best effort, the print goes ahead either
-    // way.
-    const std::string subtask = print_job::subtask_name_for(params);
-    std::string sequence_id;
-    {
-        std::string perr;
-        const auto req = obn::json::parse(json, &perr);
-        if (req) sequence_id = req->find("print.sequence_id").as_string();
-    }
-    cover_cache::stage_from_3mf(params.dev_id, subtask, params.filename,
-                                params.plate_index, sequence_id);
-    if (cancel_fn && cancel_fn()) {
-        cover_cache::drop_submission(params.dev_id, sequence_id);
-        if (update_fn) update_fn(BBL::PrintingStageERROR, BAMBU_NETWORK_ERR_CANCELED, "cancelled");
-        return BAMBU_NETWORK_ERR_CANCELED;
-    }
+    // Some printers refuse SUB_FILE on internal storage (H2C); staged before
+    // project_file because its ack already starts a cover fetch.
+    const std::string cover_name = print_job::subtask_name_for(params);
+    cover_cache::stage_from_3mf(params.dev_id, cover_name, params.filename,
+                                params.plate_index);
 
     int pub = send_message(params.dev_id, json, /*qos=*/0);
     if (pub != 0) {
-        cover_cache::drop_submission(params.dev_id, sequence_id);
         OBN_ERROR("local_print: publish project_file failed rc=%d", pub);
+        // No job started, so no later job of the name may get this image.
+        cover_cache::unstage(params.dev_id, cover_name, params.plate_index);
         if (update_fn) update_fn(BBL::PrintingStageERROR,
                                  BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED,
                                  "MQTT publish failed");
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
-
-    cover_cache::activate_stage(params.dev_id, subtask, sequence_id);
 
     print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("local_print dev=%s: queued for printing (uploaded %llu bytes, plate=%d)",
