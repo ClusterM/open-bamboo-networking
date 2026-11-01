@@ -804,20 +804,42 @@ std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
 }
 
 // --- Fallback: match a print to its file by the 3MF title ------------------
+//
+// A print started on the printer's screen reports the project title
+// (<metadata name="Title"> in 3D/3dmodel.model) as subtask_name, not the
+// file name, and only the extracted plate (/data/Metadata/plate_N.gcode) as
+// gcode_file. When no file name matches, the files of every storage are
+// merged, and the newest sliced ones are opened with SUB_FILE: a file is the
+// print's when its title matches and its Metadata/slice_info.config lists
+// plate N (Studio exports each plate of a project under the same title and
+// lists only the sliced plate there). The limits below cap what one cover
+// fetch may cost; Studio asks for the cover once and cover_server waits 15 s
+// for it, so a fetch must stay short.
 
-// Bounds a misbehaving peer; a sliced project's 3dmodel.model has no meshes.
+// Only sliced projects can be started from the screen, and their
+// 3dmodel.model holds no meshes (a plain .3mf can carry megabytes of them).
+constexpr const char* kTitleCandidateSuffix = ".gcode.3mf";
+
+// Newest files over all storages that are considered at all (older ones never).
+constexpr std::size_t kMaxTitleCandidates = 64;
+
+// Per fetch: uncached members read (round-trips: every unknown title, plus
+// slice_info.config for a title that matches) and bytes received for them.
+// Room for every candidate's title and a few plate checks, so a cold listing
+// resolves in the fetch Studio waits for. Cached files cost nothing; reads
+// the budget cuts off resume on the next fetch.
+constexpr int         kMaxTitleReadsPerFetch = static_cast<int>(kMaxTitleCandidates) + 16;
+constexpr std::size_t kMaxTitleBytesPerFetch = 4 * 1024 * 1024;
+
+// Per member: bytes kept of one reply; bounds a misbehaving peer.
 constexpr std::size_t kMaxModelXmlBytes = 256 * 1024;
-
-// Only a listing's newest 64 .3mf files are candidates; one fetch can read them all.
-constexpr std::size_t kMaxTitleCandidates   = 64;
-constexpr int         kMaxTitleReadsPerFetch = 64;
 
 // A silent or trickling reply must not hold the cover worker past the deadline.
 constexpr int  kTitleReadPollMs   = 1000;
 constexpr auto kTitleReadDeadline = std::chrono::seconds(10);
 
-// Printer x storage scopes kept; past this the title cache starts over.
-constexpr std::size_t kMaxTitleScopes = 64;
+// Printers kept in the title cache; past this it starts over.
+constexpr std::size_t kMaxTitlePrinters = 64;
 
 void append_utf8(std::string* out, unsigned long cp)
 {
@@ -998,6 +1020,43 @@ std::string model_title_from_3dmodel(const std::string& xml)
     return {};
 }
 
+// Plates sliced into the file: the first <metadata key="index" value="N"/> of
+// each <plate> in Metadata/slice_info.config. Comments are not skipped; Studio
+// writes none there.
+std::vector<int> plates_from_slice_info(const std::string& xml)
+{
+    std::vector<int> out;
+    std::size_t pos = 0;
+    while ((pos = xml.find("<plate", pos)) != std::string::npos) {
+        const std::size_t after = pos + 6;
+        if (after >= xml.size() || (xml[after] != '>' && !is_xml_space(xml[after]))) {
+            pos = after;  // <plate_...> and the like
+            continue;
+        }
+        std::size_t end = xml.find("</plate>", after);
+        if (end == std::string::npos) end = xml.size();
+        std::size_t m = after;
+        while ((m = xml.find("<metadata", m)) != std::string::npos && m < end) {
+            const std::size_t tag_end = xml_tag_end(xml, m + 9);
+            if (tag_end == std::string::npos || tag_end > end) break;
+            std::string attrs = xml.substr(m + 9, tag_end - m - 9);
+            if (!attrs.empty() && attrs.back() == '/') attrs.pop_back();
+            m = tag_end + 1;
+            std::string key, value;
+            if (!xml_attribute(attrs, "key", &key) || key != "index") continue;
+            if (!xml_attribute(attrs, "value", &value)) break;
+            char* num_end = nullptr;
+            const long n = std::strtol(value.c_str(), &num_end, 10);
+            if (!value.empty() && num_end && *num_end == '\0' && n > 0 && n < 1000) {
+                out.push_back(static_cast<int>(n));
+            }
+            break;
+        }
+        pos = end;
+    }
+    return out;
+}
+
 // run_sub_file() keeps only images. wire_result 0 with !ok: the reply did not complete.
 SubFileOutcome run_sub_file_data(obn::tunnel_local::Session* session,
                                  SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
@@ -1086,46 +1145,95 @@ bool title_refusal_is_final(int result)
     }
 }
 
-// Refused file: answered, empty title. !answered: uncached until a second timeout.
-struct TitleRead {
-    bool        answered = false;
-    std::string title;
-    bool        timed_out = false;  // no complete reply before the deadline
+constexpr const char* kModelMember     = "3D/3dmodel.model";
+constexpr const char* kSliceInfoMember = "Metadata/slice_info.config";
+
+// One archive member read over SUB_FILE. Refused by the printer: answered,
+// empty data. !answered: no usable reply (timed_out once the deadline passed).
+struct MemberRead {
+    bool        answered  = false;
+    std::string data;
+    bool        timed_out = false;
+    std::size_t bytes     = 0;  // received, charged to the budget whatever the outcome
 };
-using TitleReader =
-    std::function<TitleRead(const std::string& path, const std::string& storage)>;
+using MemberReader = std::function<MemberRead(
+    const std::string& path, const std::string& storage, const char* member)>;
 using TileFetcher = std::function<bool(
     const ModelFileEntry& hit, const std::string& storage, std::string* failures)>;
 
-// Two timeouts cache a file untitled (research/09.06-commands.md: raw size limit).
-struct TitleScope {
-    std::unordered_map<std::string, std::string> titles;
-    std::unordered_set<std::string>              timed_out;  // once so far
+// What one fetch may still spend on uncached members.
+struct TitleBudget {
+    int         reads_left = kMaxTitleReadsPerFetch;
+    std::size_t bytes_left = kMaxTitleBytesPerFetch;
+
+    bool exhausted() const { return reads_left <= 0 || bytes_left == 0; }
+    void charge(std::size_t bytes)
+    {
+        --reads_left;
+        bytes_left -= std::min(bytes, bytes_left);
+    }
 };
 
-// Scope (printer + storage) -> TitleScope by path + '\x01' + mtime, current candidates.
-std::mutex g_title_mu;
-std::unordered_map<std::string, TitleScope> g_titles;
+struct TitleFileInfo {
+    std::string      title;
+    bool             plates_known = false;
+    std::vector<int> plates;  // plates sliced into the file
+};
 
-// With no budget left, stops at the first unknown title: cache history never picks.
-const ModelFileEntry* find_model_entry_by_title(const ListInfoOutcome& list,
-                                                const std::string& list_storage,
-                                                const std::string& scope,
-                                                const std::string& model_name,
-                                                int*               reads_left,
-                                                const TitleReader& read_title,
-                                                bool*              transport,
-                                                bool*              exhausted)
+// Two timeouts cache a file untitled (research/09.06-commands.md: raw size limit).
+struct TitleCache {
+    std::unordered_map<std::string, TitleFileInfo> files;
+    std::unordered_set<std::string>                timed_out;  // once so far
+};
+
+// Printer -> TitleCache by path + '\x01' + mtime, current candidates only.
+// LIST_INFO paths are absolute, so one cache serves every storage.
+std::mutex g_title_mu;
+std::unordered_map<std::string, TitleCache> g_titles;
+
+bool is_title_candidate(const ModelFileEntry& f)
 {
-    std::vector<const ModelFileEntry*> order;
-    for (const auto& f : list.files) {
-        if (ends_with(f.name, ".3mf") || ends_with(f.path, ".3mf")) {
-            order.push_back(&f);
+    return ends_with(f.name, kTitleCandidateSuffix) ||
+           ends_with(f.path, kTitleCandidateSuffix);
+}
+
+// Plate images only for plate_idx: an exported plate file carries the images
+// of every plate of the project, so no fallback to another plate.
+std::vector<std::string> exact_plate_sub_paths(const std::string& path, int plate_idx)
+{
+    const std::string n = std::to_string(plate_idx < 1 ? 1 : plate_idx);
+    return {path + "#Metadata/plate_" + n + ".png",
+            path + "#Metadata/plate_no_light_" + n + ".png"};
+}
+
+// Merges the listings (a path listed twice, e.g. by "internal" and "emmc",
+// counts once), keeps the kMaxTitleCandidates newest sliced files and walks
+// them newest first. The first file whose title is model_name, whose
+// slice_info.config lists plate_idx and whose plate image fetch_tile() got is
+// the hit, whatever storage it is on. With no budget left, stops at the first
+// unknown file: cache history never picks.
+const ModelFileEntry* match_model_by_title(
+    const std::vector<std::pair<std::string, ListInfoOutcome>>& unmatched,
+    const std::string& printer, const std::string& model_name, int plate_idx,
+    const MemberReader& read_member, const TileFetcher& fetch_tile,
+    TitleBudget* budget, std::string* error)
+{
+    struct Candidate {
+        const ModelFileEntry* file;
+        const std::string*    storage;
+    };
+    std::vector<Candidate>          order;
+    std::unordered_set<std::string> seen;
+    for (const auto& [storage, list] : unmatched) {
+        for (const auto& f : list.files) {
+            if (is_title_candidate(f) && seen.insert(f.path).second) {
+                order.push_back({&f, &storage});
+            }
         }
     }
     std::stable_sort(order.begin(), order.end(),
-                     [](const ModelFileEntry* a, const ModelFileEntry* b) {
-                         return a->time > b->time;
+                     [](const Candidate& a, const Candidate& b) {
+                         return a.file->time > b.file->time;
                      });
     if (order.size() > kMaxTitleCandidates) order.resize(kMaxTitleCandidates);
 
@@ -1133,95 +1241,87 @@ const ModelFileEntry* find_model_entry_by_title(const ListInfoOutcome& list,
         return f.path + "\x01" + std::to_string(f.time);
     };
     {
-        // Bounded, and never drops a title a rescan of this listing still needs.
+        // Bounded, and never drops an entry a rescan of these listings still needs.
         std::lock_guard<std::mutex> lk(g_title_mu);
-        if (g_titles.size() >= kMaxTitleScopes && !g_titles.count(scope)) {
+        if (g_titles.size() >= kMaxTitlePrinters && !g_titles.count(printer)) {
             g_titles.clear();
         }
-        auto& cached = g_titles[scope];
-        TitleScope kept;
-        for (const ModelFileEntry* f : order) {
-            const std::string key = key_of(*f);
-            const auto it = cached.titles.find(key);
-            if (it != cached.titles.end()) kept.titles.emplace(key, it->second);
+        auto& cached = g_titles[printer];
+        TitleCache kept;
+        for (const Candidate& c : order) {
+            const std::string key = key_of(*c.file);
+            const auto it = cached.files.find(key);
+            if (it != cached.files.end()) kept.files.emplace(key, it->second);
             if (cached.timed_out.count(key)) kept.timed_out.insert(key);
         }
         std::swap(cached, kept);
     }
 
-    for (const ModelFileEntry* f : order) {
-        const std::string key = key_of(*f);
-        std::string title;
-        bool        known = false;
+    bool        tile_failed = false;
+    std::string tile_failures;
+    for (const Candidate& c : order) {
+        const ModelFileEntry& f   = *c.file;
+        const std::string     key = key_of(f);
+        TitleFileInfo info;
+        bool          known = false;
         {
             std::lock_guard<std::mutex> lk(g_title_mu);
-            const auto& cached = g_titles[scope].titles;
-            const auto it = cached.find(key);
-            if (it != cached.end()) {
-                title = it->second;
+            const auto& files = g_titles[printer].files;
+            const auto  it    = files.find(key);
+            if (it != files.end()) {
+                info  = it->second;
                 known = true;
             }
         }
         if (!known) {
-            if (*reads_left <= 0) {
-                *exhausted = true;
-                return nullptr;
-            }
-            --*reads_left;
-            const TitleRead r = read_title(f->path, list_storage);
+            if (budget->exhausted()) break;
+            const MemberRead r = read_member(f.path, *c.storage, kModelMember);
+            budget->charge(r.bytes);
             if (!r.answered) {
-                *transport = true;
                 if (r.timed_out) {
                     std::lock_guard<std::mutex> lk(g_title_mu);
-                    auto& s = g_titles[scope];
+                    auto& s = g_titles[printer];
                     // A title another fetch read meanwhile wins over this timeout.
-                    if (!s.titles.count(key) && !s.timed_out.insert(key).second) {
+                    if (!s.files.count(key) && !s.timed_out.insert(key).second) {
                         s.timed_out.erase(key);
-                        s.titles[key] = "";
+                        s.files[key] = TitleFileInfo{};
                         OBN_DEBUG("tunnel_upload: 3MF title of %s: timed out twice",
-                                  f->path.c_str());
+                                  f.path.c_str());
                     }
                 }
+                *error = "3MF title read failed";
                 return nullptr;
             }
-            title = r.title;
-            OBN_DEBUG("tunnel_upload: 3MF title of %s: '%s'", f->path.c_str(),
-                      title.c_str());
+            info.title = model_title_from_3dmodel(r.data);
+            OBN_DEBUG("tunnel_upload: 3MF title of %s: '%s'", f.path.c_str(),
+                      info.title.c_str());
             std::lock_guard<std::mutex> lk(g_title_mu);
-            g_titles[scope].titles[key] = title;
+            g_titles[printer].files[key] = info;
         }
-        if (!title.empty() && title == model_name) {
-            OBN_DEBUG("tunnel_upload: '%s' matched by 3MF title: %s",
-                      model_name.c_str(), f->path.c_str());
-            return f;
-        }
-    }
-    return nullptr;
-}
+        if (info.title.empty() || info.title != model_name) continue;
 
-// A listing the budget left unfinished ends the pass, so a cached later one can't win.
-const ModelFileEntry* match_model_by_title(
-    const std::vector<std::pair<std::string, ListInfoOutcome>>& unmatched,
-    const std::string& printer, const std::string& model_name,
-    const TitleReader& read_title, const TileFetcher& fetch_tile,
-    std::string* error)
-{
-    int         reads_left  = kMaxTitleReadsPerFetch;
-    bool        tile_failed = false;
-    std::string tile_failures;
-    for (const auto& [storage, list] : unmatched) {
-        bool transport = false;
-        bool exhausted = false;
-        const ModelFileEntry* hit = find_model_entry_by_title(
-            list, storage, printer + "\x01" + storage, model_name, &reads_left,
-            read_title, &transport, &exhausted);
-        if (transport) {
-            *error = "3MF title read failed";
-            return nullptr;
+        if (!info.plates_known) {
+            if (budget->exhausted()) break;
+            const MemberRead r = read_member(f.path, *c.storage, kSliceInfoMember);
+            budget->charge(r.bytes);
+            if (!r.answered) {
+                *error = "3MF slice info read failed";
+                return nullptr;
+            }
+            info.plates       = plates_from_slice_info(r.data);
+            info.plates_known = true;
+            std::lock_guard<std::mutex> lk(g_title_mu);
+            g_titles[printer].files[key] = info;
         }
-        if (exhausted) break;
-        if (!hit) continue;
-        if (fetch_tile(*hit, storage, &tile_failures)) return hit;
+        if (std::find(info.plates.begin(), info.plates.end(), plate_idx) ==
+            info.plates.end()) {
+            OBN_DEBUG("tunnel_upload: %s has title '%s' but not plate %d",
+                      f.path.c_str(), model_name.c_str(), plate_idx);
+            continue;
+        }
+        OBN_DEBUG("tunnel_upload: '%s' plate %d matched by 3MF title: %s",
+                  model_name.c_str(), plate_idx, f.path.c_str());
+        if (fetch_tile(f, *c.storage, &tile_failures)) return &f;
         tile_failed = true;
     }
     if (tile_failed) *error = "SUB_FILE thumbnail failed (" + tile_failures + ")";
@@ -1409,9 +1509,10 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         *ssl     = impl_->ssl;
         *session = impl_->session.get();
     };
-    const auto fetch_tile = [&](const ModelFileEntry& hit,
-                                const std::string&    list_storage,
-                                std::string*          failures) {
+    const auto fetch_tile_paths = [&](const ModelFileEntry&           hit,
+                                      const std::string&              list_storage,
+                                      const std::vector<std::string>& paths,
+                                      std::string*                    failures) {
         for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
             std::uint32_t seq = 0;
             SSL* ssl = nullptr;
@@ -1419,7 +1520,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             next_wire(&seq, &ssl, &session);
 
             SubFileRequest req;
-            req.paths   = tile_thumbnail_sub_paths(hit.path, plate_idx);
+            req.paths   = paths;
             req.storage = wire_storage;
             const SubFileOutcome sf =
                 run_sub_file(session, ssl, &impl_->io_mu, seq, req);
@@ -1474,16 +1575,22 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             continue;
         }
         std::string sub_failures;
-        if (fetch_tile(*hit, list_storage, &sub_failures)) return out;
+        if (fetch_tile_paths(*hit, list_storage,
+                             tile_thumbnail_sub_paths(hit->path, plate_idx),
+                             &sub_failures)) {
+            return out;
+        }
         out.error = "SUB_FILE thumbnail failed (" + sub_failures + ")";
         return out;
     }
     if (!unmatched.empty()) {
         // A print started on the printer reports its 3MF title, not the file name.
-        const TitleReader read_title = [&](const std::string& path,
-                                           const std::string& storage) {
-            TitleRead r;
-            bool transient = false;
+        const MemberReader read_member = [&](const std::string& path,
+                                             const std::string& storage,
+                                             const char*        member) {
+            MemberRead  r;
+            std::size_t bytes     = 0;
+            bool        transient = false;
             const bool fd_ok = obn::os::socket_valid(impl_->fd);
             if (fd_ok) obn::tls::set_socket_io_timeout(impl_->fd, kTitleReadPollMs);
             for (const auto& label : sub_file_storage_labels(storage)) {
@@ -1492,17 +1599,17 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
                 obn::tunnel_local::Session* session = nullptr;
                 next_wire(&seq, &ssl, &session);
                 const SubFileOutcome sf = run_sub_file_data(
-                    session, ssl, &impl_->io_mu, seq, path + "#3D/3dmodel.model",
-                    label, kMaxModelXmlBytes);
+                    session, ssl, &impl_->io_mu, seq, path + "#" + member, label,
+                    kMaxModelXmlBytes);
+                bytes += sf.data.size();
                 if (sf.ok) {
                     r.answered = true;
-                    r.title    = model_title_from_3dmodel(
-                        std::string(sf.data.begin(), sf.data.end()));
-                    transient  = false;
+                    r.data.assign(sf.data.begin(), sf.data.end());
+                    transient = false;
                     break;
                 }
                 if (sf.wire_result == 0) {  // no complete reply
-                    r = TitleRead{};
+                    r = MemberRead{};
                     r.timed_out = sf.timed_out;
                     transient = false;
                     break;
@@ -1511,15 +1618,25 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
                 if (!title_refusal_is_final(sf.wire_result)) transient = true;
                 r.answered = true;
             }
-            if (transient) r = TitleRead{};
+            if (transient) r = MemberRead{};
+            r.bytes = bytes;
             if (fd_ok) obn::tls::clear_socket_io_timeout(impl_->fd);
             return r;
+        };
+        const TileFetcher fetch_plate_tile = [&](const ModelFileEntry& hit,
+                                                 const std::string&    storage,
+                                                 std::string*          failures) {
+            return fetch_tile_paths(hit, storage,
+                                    exact_plate_sub_paths(hit.path, plate_idx),
+                                    failures);
         };
         const std::string printer =
             impl_->params.dev_id.empty() ? impl_->params.dev_ip : impl_->params.dev_id;
         std::string title_error;
-        if (match_model_by_title(unmatched, printer, model_name, read_title,
-                                 fetch_tile, &title_error)) {
+        TitleBudget budget;
+        if (match_model_by_title(unmatched, printer, model_name, plate_idx,
+                                 read_member, fetch_plate_tile, &budget,
+                                 &title_error)) {
             return out;
         }
         if (!title_error.empty()) {
@@ -1577,9 +1694,12 @@ ConnectParams connect_params_from_print(const std::string& dev_ip,
 
 #ifdef OBN_TESTING
 // Title fallback hooks, driven by a scripted title reader and tile fetcher.
-using TestFiles = std::vector<std::tuple<std::string, std::string, std::int64_t>>;
-using TestRead  = std::function<std::pair<bool, std::string>(const std::string&,
-                                                             const std::string&)>;
+using TestFiles  = std::vector<std::tuple<std::string, std::string, std::int64_t>>;
+using TestRead   = std::function<std::pair<bool, std::string>(const std::string&,
+                                                              const std::string&)>;
+using TestPlates = std::function<std::pair<bool, std::vector<int>>(const std::string&)>;
+using TestTile   = std::function<bool(const std::string&, const std::string&,
+                                      std::string*)>;
 
 namespace {
 ListInfoOutcome test_listing(const TestFiles& files)
@@ -1592,13 +1712,46 @@ ListInfoOutcome test_listing(const TestFiles& files)
     return list;
 }
 
-// {false, "timeout"}: no complete reply by the deadline; other {false, ...}: none.
-TitleReader test_reader(const TestRead& read)
+// Bytes every scripted read is charged with (test_set_title_read_bytes()).
+std::size_t g_test_read_bytes = 0;
+
+// Titles: {false, "timeout"} no complete reply by the deadline, other {false, ...}
+// none. Plates: an empty hook lists plates 1..16 in every file.
+MemberReader test_reader(const TestRead& read, const TestPlates& plates)
 {
-    return [read](const std::string& path, const std::string& storage) {
-        const auto r = read(path, storage);
-        if (!r.first) return TitleRead{false, {}, r.second == "timeout"};
-        return TitleRead{true, r.second};
+    return [read, plates](const std::string& path, const std::string& storage,
+                          const char* member) {
+        MemberRead out;
+        out.bytes = g_test_read_bytes;
+        if (std::string(member) == kModelMember) {
+            const auto r = read(path, storage);
+            if (!r.first) {
+                out.timed_out = r.second == "timeout";
+                return out;
+            }
+            out.answered = true;
+            if (!r.second.empty()) {
+                out.data = "<model><metadata name=\"Title\">" + r.second +
+                           "</metadata></model>";
+            }
+            return out;
+        }
+        std::vector<int> list;
+        if (plates) {
+            const auto r = plates(path);
+            if (!r.first) return out;
+            list = r.second;
+        } else {
+            for (int i = 1; i <= 16; ++i) list.push_back(i);
+        }
+        out.answered = true;
+        out.data = "<config>";
+        for (int n : list) {
+            out.data += "<plate><metadata key=\"index\" value=\"" +
+                        std::to_string(n) + "\"/></plate>";
+        }
+        out.data += "</config>";
+        return out;
     };
 }
 } // namespace
@@ -1608,43 +1761,42 @@ std::string test_model_title_from_3dmodel(const std::string& xml)
     return model_title_from_3dmodel(xml);
 }
 
+std::vector<int> test_plates_from_slice_info(const std::string& xml)
+{
+    return plates_from_slice_info(xml);
+}
+
 bool test_title_refusal_is_final(int result)
 {
     return title_refusal_is_final(result);
 }
 
-std::string test_find_model_entry_by_title(const TestFiles& files,
-                                           const std::string& list_storage,
-                                           const std::string& scope,
-                                           const std::string& model_name,
-                                           int* reads_left, const TestRead& read,
-                                           bool* transport)
+void test_set_title_read_bytes(std::size_t bytes)
 {
-    const ListInfoOutcome list = test_listing(files);
-    bool exhausted = false;
-    const ModelFileEntry* hit = find_model_entry_by_title(
-        list, list_storage, scope, model_name, reads_left, test_reader(read),
-        transport, &exhausted);
-    return hit ? hit->path : std::string{};
+    g_test_read_bytes = bytes;
 }
 
+// Null reads_left / bytes_left: the production budget; otherwise in and out.
 std::string test_match_model_by_title(
     const std::vector<std::pair<std::string, TestFiles>>& listings,
-    const std::string& printer, const std::string& model_name,
-    const TestRead& read,
-    const std::function<bool(const std::string&, const std::string&,
-                             std::string*)>& tile,
-    std::string* error)
+    const std::string& printer, const std::string& model_name, int plate_idx,
+    const TestRead& read, const TestPlates& plates, const TestTile& tile,
+    int* reads_left, std::size_t* bytes_left, std::string* error)
 {
     std::vector<std::pair<std::string, ListInfoOutcome>> unmatched;
     for (const auto& l : listings) {
         unmatched.emplace_back(l.first, test_listing(l.second));
     }
+    TitleBudget budget;
+    if (reads_left) budget.reads_left = *reads_left;
+    if (bytes_left) budget.bytes_left = *bytes_left;
     const ModelFileEntry* hit = match_model_by_title(
-        unmatched, printer, model_name, test_reader(read),
+        unmatched, printer, model_name, plate_idx, test_reader(read, plates),
         [&tile](const ModelFileEntry& f, const std::string& storage,
                 std::string* failures) { return tile(f.path, storage, failures); },
-        error);
+        &budget, error);
+    if (reads_left) *reads_left = budget.reads_left;
+    if (bytes_left) *bytes_left = budget.bytes_left;
     return hit ? hit->path : std::string{};
 }
 
@@ -1658,7 +1810,7 @@ std::size_t test_title_cache_size(const std::string& scope)
 {
     std::lock_guard<std::mutex> lk(g_title_mu);
     const auto it = g_titles.find(scope);
-    return it == g_titles.end() ? 0 : it->second.titles.size();
+    return it == g_titles.end() ? 0 : it->second.files.size();
 }
 #endif
 

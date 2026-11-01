@@ -1,5 +1,6 @@
 // Cover lookup by 3MF title (tunnel_upload.cpp), with a scripted reader; no sockets.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -10,28 +11,52 @@
 #include <utility>
 #include <vector>
 
-using Files = std::vector<std::tuple<std::string, std::string, std::int64_t>>;
-using Read  = std::function<std::pair<bool, std::string>(const std::string&,
-                                                         const std::string&)>;
-using Tile  = std::function<bool(const std::string&, const std::string&,
-                                 std::string*)>;
+using Files  = std::vector<std::tuple<std::string, std::string, std::int64_t>>;
+using Read   = std::function<std::pair<bool, std::string>(const std::string&,
+                                                          const std::string&)>;
+using Plates = std::function<std::pair<bool, std::vector<int>>(const std::string&)>;
+using Tile   = std::function<bool(const std::string&, const std::string&,
+                                  std::string*)>;
+using Listings = std::vector<std::pair<std::string, Files>>;
 
 namespace obn::tunnel_upload {
 std::string test_model_title_from_3dmodel(const std::string& xml);
+std::vector<int> test_plates_from_slice_info(const std::string& xml);
 bool test_title_refusal_is_final(int result);
-std::string test_find_model_entry_by_title(const Files& files,
-                                           const std::string& list_storage,
-                                           const std::string& scope,
-                                           const std::string& model_name,
-                                           int* reads_left, const Read& read,
-                                           bool* transport);
-std::string test_match_model_by_title(
-    const std::vector<std::pair<std::string, Files>>& listings,
-    const std::string& printer, const std::string& model_name,
-    const Read& read, const Tile& tile, std::string* error);
+void test_set_title_read_bytes(std::size_t bytes);
+std::string test_match_model_by_title(const Listings& listings,
+                                      const std::string& printer,
+                                      const std::string& model_name, int plate_idx,
+                                      const Read& read, const Plates& plates,
+                                      const Tile& tile, int* reads_left,
+                                      std::size_t* bytes_left, std::string* error);
 void test_clear_title_cache();
 std::size_t test_title_cache_size(const std::string& scope);
 } // namespace obn::tunnel_upload
+
+static bool any_tile(const std::string&, const std::string&, std::string*)
+{
+    return true;
+}
+
+// Fails and notes the attempt, as tunnel_upload.cpp notes each failed label.
+static bool failing_tile(const std::string& path, const std::string& st,
+                         std::string* failures)
+{
+    if (!failures->empty()) failures->append("; ");
+    failures->append("'" + st + "': " + path);
+    return false;
+}
+
+// One pass with the production budget, plate 1, every plate in every file.
+static std::string match_all(const Listings& listings, const std::string& printer,
+                             const std::string& name, const Read& read,
+                             const Tile& tile, std::string* error,
+                             int plate = 1, const Plates& plates = {})
+{
+    return obn::tunnel_upload::test_match_model_by_title(
+        listings, printer, name, plate, read, plates, tile, nullptr, nullptr, error);
+}
 
 static int fail_count = 0;
 
@@ -149,14 +174,18 @@ struct Reader {
     }
 };
 
+// One USB listing with an explicit read budget, as one cover fetch.
 static std::string match(const Files& files, const std::string& name, Reader& r,
                          int reads = 32, const std::string& scope = "P1",
-                         bool* transport_out = nullptr)
+                         bool* transport_out = nullptr, const Tile& tile = any_tile,
+                         std::size_t* bytes_left = nullptr, int plate = 1,
+                         const Plates& plates = {})
 {
-    bool transport = false;
-    const std::string hit = obn::tunnel_upload::test_find_model_entry_by_title(
-        files, "", scope, name, &reads, r.fn(), &transport);
-    if (transport_out) *transport_out = transport;
+    std::string error;
+    const std::string hit = obn::tunnel_upload::test_match_model_by_title(
+        {{"", files}}, scope, name, plate, r.fn(), plates, tile, &reads, bytes_left,
+        &error);
+    if (transport_out) *transport_out = error == "3MF title read failed";
     return hit;
 }
 
@@ -209,6 +238,7 @@ static void test_pick_does_not_depend_on_cache_history()
     CHECK(match({files[1], files[2]}, "T", r) == "/media/usb0/old.gcode.3mf");
     // ... and with no budget left, the newest unknown title is not skipped.
     CHECK(match(files, "T", r, 0).empty());
+    CHECK(match(files, "T", r, 1).empty());  // title read, no room for its plates
     CHECK(match(files, "T", r, 1) == "/media/usb0/new.gcode.3mf");
 }
 
@@ -251,7 +281,7 @@ static void test_long_listing_reaches_every_candidate()
         ++fetches;
     }
     CHECK(hit == "/media/usb0/f63.gcode.3mf");
-    CHECK(fetches == 2);
+    CHECK(fetches == 3);  // two fetches of titles, the third checks its plates
     CHECK(r.calls.size() == 64);
     // The 65th newest is never read, however often it is retried.
     for (int i = 0; i < 5; ++i) CHECK(match(files, "Too old", r, 32).empty());
@@ -332,18 +362,160 @@ static void test_rewritten_file_is_read_again()
     CHECK(r.calls.size() == 2);
 }
 
-static void test_only_3mf_entries_are_read()
+// Only sliced projects can be started from the screen; a plain .3mf (meshes
+// in 3dmodel.model, maybe megabytes) is never opened.
+static void test_only_sliced_3mf_entries_are_read()
 {
     test_clear_title_cache();
     const Files files = {
         {"timelapse.mp4", "/media/usb0/timelapse.mp4", 5},
         {"raw.gcode", "/media/usb0/raw.gcode", 4},
         {"part.3mf", "/media/usb0/part.3mf", 3},
+        {"part.gcode.3mf", "/media/usb0/part.gcode.3mf", 2},
     };
     Reader r;
     r.answers["/media/usb0/part.3mf"] = {true, "Part"};
-    CHECK(match(files, "Part", r) == "/media/usb0/part.3mf");
-    CHECK(r.calls == std::vector<std::string>({"/media/usb0/part.3mf"}));
+    r.answers["/media/usb0/part.gcode.3mf"] = {true, "Sliced"};
+    CHECK(match(files, "Part", r).empty());
+    CHECK(match(files, "Sliced", r) == "/media/usb0/part.gcode.3mf");
+    CHECK(r.calls == std::vector<std::string>({"/media/usb0/part.gcode.3mf"}));
+}
+
+// Studio exports every plate of a project under one title, with the images of
+// all plates; only slice_info.config tells which plate a file holds.
+static void test_plate_decides_among_same_title_files()
+{
+    test_clear_title_cache();
+    const Files files = {
+        {"proj_plate_1.gcode.3mf", "/media/usb0/proj_plate_1.gcode.3mf", 30},
+        {"proj_plate_3.gcode.3mf", "/media/usb0/proj_plate_3.gcode.3mf", 20},
+        {"proj_plate_2.gcode.3mf", "/media/usb0/proj_plate_2.gcode.3mf", 10},
+        {"other.gcode.3mf", "/media/usb0/other.gcode.3mf", 5},
+    };
+    Reader r;
+    for (const auto& f : files) r.answers[std::get<1>(f)] = {true, "Project"};
+    r.answers["/media/usb0/other.gcode.3mf"] = {true, "Other"};
+    std::vector<std::string> plate_reads;
+    const Plates plates = [&plate_reads](const std::string& path) {
+        plate_reads.push_back(path);
+        const char n = path[path.size() - std::string(".gcode.3mf").size() - 1];
+        return std::make_pair(true, std::vector<int>{n - '0'});
+    };
+    std::vector<std::string> tiles;
+    const Tile tile = [&tiles](const std::string& path, const std::string&,
+                               std::string*) {
+        tiles.push_back(path);
+        return true;
+    };
+    CHECK(match(files, "Project", r, 32, "P1", nullptr, tile, nullptr, 2, plates) ==
+          "/media/usb0/proj_plate_2.gcode.3mf");
+    CHECK(tiles == std::vector<std::string>({"/media/usb0/proj_plate_2.gcode.3mf"}));
+    CHECK(plate_reads.size() == 3);
+    CHECK(r.calls.size() == 3);  // "other" is never read
+    // Plates are cached with the title.
+    CHECK(match(files, "Project", r, 32, "P1", nullptr, tile, nullptr, 3, plates) ==
+          "/media/usb0/proj_plate_3.gcode.3mf");
+    CHECK(plate_reads.size() == 3);
+    // No file holds plate 4.
+    CHECK(match(files, "Project", r, 32, "P1", nullptr, tile, nullptr, 4, plates)
+              .empty());
+    // A file that matches but whose image fails: older candidates are still tried.
+    test_clear_title_cache();
+    tiles.clear();
+    const Tile flaky = [&tiles](const std::string& path, const std::string& st,
+                                std::string* failures) {
+        tiles.push_back(path);
+        if (path == "/media/usb0/proj_plate_1.gcode.3mf") {
+            return failing_tile(path, st, failures);
+        }
+        return true;
+    };
+    const Plates all_one = [](const std::string&) {
+        return std::make_pair(true, std::vector<int>{1});
+    };
+    CHECK(match(files, "Project", r, 32, "P1", nullptr, flaky, nullptr, 1, all_one) ==
+          "/media/usb0/proj_plate_3.gcode.3mf");
+    CHECK(tiles.size() == 2);
+}
+
+// A refused or empty slice_info.config holds no plate; an unanswered read ends the pass.
+static void test_slice_info_failures()
+{
+    test_clear_title_cache();
+    const Files files = {{"x.gcode.3mf", "/media/usb0/x.gcode.3mf", 1}};
+    Reader r;
+    r.answers["/media/usb0/x.gcode.3mf"] = {true, "X"};
+    std::string error;
+    const Plates none = [](const std::string&) {
+        return std::make_pair(true, std::vector<int>{});
+    };
+    CHECK(match_all({{"", files}}, "P1", "X", r.fn(), any_tile, &error, 1, none)
+              .empty());
+    CHECK(error.empty());
+    test_clear_title_cache();
+    const Plates lost = [](const std::string&) {
+        return std::make_pair(false, std::vector<int>{});
+    };
+    CHECK(match_all({{"", files}}, "P1", "X", r.fn(), any_tile, &error, 1, lost)
+              .empty());
+    CHECK(error == "3MF slice info read failed");
+}
+
+static void test_plates_parser()
+{
+    using obn::tunnel_upload::test_plates_from_slice_info;
+    // Shape Studio writes (bbs_3mf.cpp), one plate exported.
+    const std::string one =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n  <header>\n"
+        "    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n  </header>\n"
+        "  <plate>\n    <metadata key=\"index\" value=\"2\"/>\n"
+        "    <metadata key=\"printer_model_id\" value=\"N6\"/>\n"
+        "    <object identify_id=\"1\" name=\"a\" skipped=\"false\" />\n"
+        "    <filament id=\"1\" type=\"PLA\"/>\n  </plate>\n</config>\n";
+    CHECK(test_plates_from_slice_info(one) == std::vector<int>({2}));
+    // All plates exported; only the plate's own index counts.
+    CHECK(test_plates_from_slice_info(
+              "<config><plate><metadata key=\"index\" value=\"1\"/>"
+              "<metadata key=\"index\" value=\"9\"/></plate>"
+              "<plate><metadata value=\"3\" key=\"index\"/></plate></config>") ==
+          std::vector<int>({1, 3}));
+    CHECK(test_plates_from_slice_info("").empty());
+    CHECK(test_plates_from_slice_info("<config><plates_x/></config>").empty());
+    CHECK(test_plates_from_slice_info(
+              "<plate><metadata key=\"index\" value=\"x\"/></plate>").empty());
+    CHECK(test_plates_from_slice_info(
+              "<plate><metadata key=\"index\" value=\"0\"/></plate>").empty());
+}
+
+// Bytes received for titles are capped per fetch; cached titles are free.
+static void test_bytes_budget_limits_reads()
+{
+    test_clear_title_cache();
+    const Files files = {
+        {"a.gcode.3mf", "/media/usb0/a.gcode.3mf", 3},
+        {"b.gcode.3mf", "/media/usb0/b.gcode.3mf", 2},
+        {"c.gcode.3mf", "/media/usb0/c.gcode.3mf", 1},
+    };
+    Reader r;
+    r.answers["/media/usb0/c.gcode.3mf"] = {true, "Target"};
+    obn::tunnel_upload::test_set_title_read_bytes(1000);
+    std::size_t bytes = 1500;  // room for one read, the second overdraws it
+    CHECK(match(files, "Target", r, 32, "P1", nullptr, any_tile, &bytes).empty());
+    CHECK(r.calls.size() == 2);
+    CHECK(bytes == 0);
+    bytes = 1500;  // a and b come from the cache: c's title, then its slice info
+    CHECK(match(files, "Target", r, 32, "P1", nullptr, any_tile, &bytes) ==
+          "/media/usb0/c.gcode.3mf");
+    CHECK(r.calls.size() == 3);
+    CHECK(bytes == 0);
+    // A timed-out or refused read is charged too.
+    test_clear_title_cache();
+    Reader r2;
+    r2.answers["/media/usb0/a.gcode.3mf"] = {false, "timeout"};
+    bytes = 1500;
+    CHECK(match(files, "Target", r2, 32, "P1", nullptr, any_tile, &bytes).empty());
+    CHECK(bytes == 500);
+    obn::tunnel_upload::test_set_title_read_bytes(0);
 }
 
 // A file the printer never answers (too big for a raw reply) stops blocking the pass.
@@ -351,36 +523,36 @@ static void test_second_timeout_caches_untitled()
 {
     test_clear_title_cache();
     const Files files = {
-        {"big.3mf", "/media/usb0/big.3mf", 20},
+        {"big.gcode.3mf", "/media/usb0/big.gcode.3mf", 20},
         {"target.gcode.3mf", "/media/usb0/target.gcode.3mf", 10},
     };
     Reader r;
-    r.answers["/media/usb0/big.3mf"] = {false, "timeout"};
+    r.answers["/media/usb0/big.gcode.3mf"] = {false, "timeout"};
     r.answers["/media/usb0/target.gcode.3mf"] = {true, "Target"};
     bool transport = false;
     for (int fetch = 0; fetch < 2; ++fetch) {
         CHECK(match(files, "Target", r, 64, "P1", &transport).empty());
         CHECK(transport);
     }
-    CHECK(r.calls == std::vector<std::string>(2, "/media/usb0/big.3mf"));
+    CHECK(r.calls == std::vector<std::string>(2, "/media/usb0/big.gcode.3mf"));
     CHECK(match(files, "Target", r, 64, "P1", &transport) ==
           "/media/usb0/target.gcode.3mf");
     CHECK(!transport);
-    CHECK(r.calls.size() == 3);  // big.3mf not asked again
+    CHECK(r.calls.size() == 3);  // big.gcode.3mf not asked again
     CHECK(obn::tunnel_upload::test_title_cache_size("P1") == 2);
 
     // A file that leaves the listing forgets its first timeout.
     test_clear_title_cache();
     Reader r2;
-    r2.answers["/media/usb0/big.3mf"] = {false, "timeout"};
+    r2.answers["/media/usb0/big.gcode.3mf"] = {false, "timeout"};
     CHECK(match(files, "Target", r2, 64).empty());
     CHECK(match({files[1]}, "None", r2, 64).empty());
     CHECK(match(files, "Target", r2, 64).empty());
     CHECK(match(files, "Target", r2, 64).empty());
-    CHECK(r2.calls == std::vector<std::string>({"/media/usb0/big.3mf",
+    CHECK(r2.calls == std::vector<std::string>({"/media/usb0/big.gcode.3mf",
                                                 "/media/usb0/target.gcode.3mf",
-                                                "/media/usb0/big.3mf",
-                                                "/media/usb0/big.3mf"}));
+                                                "/media/usb0/big.gcode.3mf",
+                                                "/media/usb0/big.gcode.3mf"}));
 }
 
 // Refusals that may pass and broken connections never count as a timeout.
@@ -417,11 +589,9 @@ static void test_late_timeout_keeps_a_title_read_meanwhile()
         b_hit = match(files, "X", b) == "/media/usb0/x.gcode.3mf";
         return std::make_pair(false, std::string("timeout"));
     };
-    bool transport = false;
-    int reads = 32;
-    CHECK(obn::tunnel_upload::test_find_model_entry_by_title(
-              files, "", "P1", "X", &reads, slow, &transport).empty());
-    CHECK(b_hit && transport);
+    std::string error;
+    CHECK(match_all({{"", files}}, "P1", "X", slow, any_tile, &error).empty());
+    CHECK(b_hit && error == "3MF title read failed");
     Reader none;
     CHECK(match(files, "X", none) == "/media/usb0/x.gcode.3mf");
     CHECK(none.calls.empty());
@@ -440,17 +610,8 @@ static void test_transient_refusals_are_not_final()
 }
 
 // ---------------------------------------------------------------------------
-// Pass over the unmatched listings
+// Pass over the merged listings
 // ---------------------------------------------------------------------------
-
-// Fails and notes the attempt, as tunnel_upload.cpp notes each failed label.
-static bool failing_tile(const std::string& path, const std::string& st,
-                         std::string* failures)
-{
-    if (!failures->empty()) failures->append("; ");
-    failures->append("'" + st + "': " + path);
-    return false;
-}
 
 static void test_title_hit_without_tile_tries_next_listing()
 {
@@ -471,7 +632,7 @@ static void test_title_hit_without_tile_tries_next_listing()
         return failing_tile(path, st, failures);
     };
     std::string error;
-    CHECK(obn::tunnel_upload::test_match_model_by_title(listings, "P1", "Target",
+    CHECK(match_all(listings, "P1", "Target",
                                                         r.fn(), tile, &error) ==
           "/userdata/model/mmc.gcode.3mf");
     CHECK(tiles == std::vector<std::string>(
@@ -483,14 +644,14 @@ static void test_title_hit_without_tile_tries_next_listing()
     // No tile anywhere: a thumbnail error listing every listing's attempts.
     test_clear_title_cache();
     error.clear();
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
+    CHECK(match_all(
               listings, "P1", "Target", r.fn(), failing_tile, &error).empty());
     CHECK(error == "SUB_FILE thumbnail failed ('': /media/usb0/usb.gcode.3mf; "
                    "'internal': /userdata/model/mmc.gcode.3mf)");
 
     // No title match at all: no error, the caller reports the missing model.
     error.clear();
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
+    CHECK(match_all(
               listings, "P1", "Nothing", r.fn(), tile, &error).empty());
     CHECK(error.empty());
 }
@@ -506,7 +667,7 @@ static void test_transport_failure_ends_the_pass()
     r.answers["/media/usb0/a.gcode.3mf"] = {false, ""};
     r.answers["/userdata/model/b.gcode.3mf"] = {true, "B"};
     std::string error;
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
+    CHECK(match_all(
               listings, "P1", "B", r.fn(),
               [](const std::string&, const std::string&, std::string*) {
                   return true;
@@ -521,35 +682,39 @@ static void test_transport_failure_ends_the_pass()
     r2.answers["/media/usb0/a.gcode.3mf"] = {true, "B"};
     r2.answers["/userdata/model/b.gcode.3mf"] = {false, ""};
     error.clear();
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
+    CHECK(match_all(
               listings, "P1", "B", r2.fn(), failing_tile, &error).empty());
     CHECK(error == "3MF title read failed");
     CHECK(r2.calls.size() == 2);
 }
 
-static void test_read_budget_is_shared_by_the_listings()
+// The newest candidates are taken over all storages together.
+static void test_newest_candidates_over_all_storages()
 {
     test_clear_title_cache();
     Files usb, mmc;
-    for (int i = 0; i < 70; ++i) {  // 64 candidates spend the whole budget
+    for (int i = 0; i < 70; ++i) {
         const std::string n = "u" + std::to_string(i) + ".gcode.3mf";
         usb.emplace_back(n, "/media/usb0/" + n, 100 - i);
     }
-    mmc.emplace_back("m.gcode.3mf", "/userdata/model/m.gcode.3mf", 1);
+    mmc.emplace_back("new.gcode.3mf", "/userdata/model/new.gcode.3mf", 1000);
+    mmc.emplace_back("old.gcode.3mf", "/userdata/model/old.gcode.3mf", 1);
     Reader r;
-    r.answers["/userdata/model/m.gcode.3mf"] = {true, "M"};
+    r.answers["/userdata/model/new.gcode.3mf"] = {true, "New"};
+    r.answers["/userdata/model/old.gcode.3mf"] = {true, "Old"};
     std::string error;
-    const auto tile = [](const std::string&, const std::string&, std::string*) {
-        return true;
-    };
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
-              {{"", usb}, {"internal", mmc}}, "P1", "M", r.fn(), tile, &error)
-              .empty());
+    // Newest overall, on internal storage: the first file read.
+    CHECK(match_all({{"", usb}, {"internal", mmc}}, "P1", "New", r.fn(), any_tile,
+                    &error) == "/userdata/model/new.gcode.3mf");
+    CHECK(r.calls == std::vector<std::string>({"/userdata/model/new.gcode.3mf"}));
+    // Older than the 64 newest: never read, however often it is retried.
+    for (int i = 0; i < 3; ++i) {
+        CHECK(match_all({{"", usb}, {"internal", mmc}}, "P1", "Old", r.fn(),
+                        any_tile, &error).empty());
+    }
     CHECK(r.calls.size() == 64);
-    CHECK(obn::tunnel_upload::test_match_model_by_title(
-              {{"", usb}, {"internal", mmc}}, "P1", "M", r.fn(), tile, &error) ==
-          "/userdata/model/m.gcode.3mf");
-    CHECK(r.calls.size() == 65);
+    CHECK(std::count(r.calls.begin(), r.calls.end(),
+                     std::string("/userdata/model/old.gcode.3mf")) == 0);
 }
 
 // A cold first listing is read in one fetch, in time for Studio's one request.
@@ -567,53 +732,72 @@ static void test_first_listing_resolves_in_one_fetch()
     const auto tile = [](const std::string&, const std::string&, std::string*) {
         return true;
     };
-    CHECK(obn::tunnel_upload::test_match_model_by_title({{"", usb}}, "P1", "Oldest",
+    CHECK(match_all({{"", usb}}, "P1", "Oldest",
                                                         r.fn(), tile, &error) ==
           "/media/usb0/u63.gcode.3mf");
     CHECK(r.calls.size() == 64);
 }
 
-// An unfinished listing ends the pass: a cached later listing must not win.
-static void test_unfinished_listing_ends_the_pass()
+// Title and plate decide, not the storage: the newest file with both wins.
+static void test_storage_does_not_matter()
 {
-    Files usb;  // 64 untitled candidates spend the whole budget
-    for (int i = 0; i < 64; ++i) {
-        const std::string n = "u" + std::to_string(i) + ".gcode.3mf";
-        usb.emplace_back(n, "/media/usb0/" + n, 200 - i);
-    }
-    const Files mmc = {{"first.gcode.3mf", "/userdata/model/first.gcode.3mf", 2}};
-    const Files emmc = {{"later.gcode.3mf", "/userdata/model/later.gcode.3mf", 1}};
-    const auto tile = [](const std::string&, const std::string&, std::string*) {
-        return true;
+    const Files usb = {{"usb.gcode.3mf", "/media/usb0/usb.gcode.3mf", 5}};
+    const Files mmc = {{"mmc.gcode.3mf", "/userdata/model/mmc.gcode.3mf", 9}};
+    Reader r;
+    r.answers["/media/usb0/usb.gcode.3mf"] = {true, "Same"};
+    r.answers["/userdata/model/mmc.gcode.3mf"] = {true, "Same"};
+    std::string error;
+    test_clear_title_cache();
+    CHECK(match_all({{"", usb}, {"internal", mmc}}, "P1", "Same", r.fn(), any_tile,
+                    &error) == "/userdata/model/mmc.gcode.3mf");
+    // The newer internal file lacks plate 2: the USB one has it.
+    test_clear_title_cache();
+    const Plates plates = [](const std::string& path) {
+        return std::make_pair(true, path == "/media/usb0/usb.gcode.3mf"
+                                        ? std::vector<int>{2}
+                                        : std::vector<int>{1});
     };
-    for (const bool warm_emmc : {false, true}) {
-        test_clear_title_cache();
-        Reader r;
-        r.answers["/userdata/model/first.gcode.3mf"] = {true, "Same"};
-        r.answers["/userdata/model/later.gcode.3mf"] = {true, "Same"};
-        std::string error;
-        if (warm_emmc) {
-            CHECK(obn::tunnel_upload::test_match_model_by_title(
-                      {{"emmc", emmc}}, "P1", "Same", r.fn(), tile, &error) ==
-                  "/userdata/model/later.gcode.3mf");
-        }
-        // First fetch: the budget runs out before "internal" is read -> no pick.
-        CHECK(obn::tunnel_upload::test_match_model_by_title(
-                  {{"", usb}, {"internal", mmc}, {"emmc", emmc}}, "P1", "Same",
-                  r.fn(), tile, &error).empty());
-        CHECK(error.empty());
-        // Retry: the "internal" file wins, cold or warm.
-        CHECK(obn::tunnel_upload::test_match_model_by_title(
-                  {{"", usb}, {"internal", mmc}, {"emmc", emmc}}, "P1", "Same",
-                  r.fn(), tile, &error) == "/userdata/model/first.gcode.3mf");
-    }
+    CHECK(match_all({{"", usb}, {"internal", mmc}}, "P1", "Same", r.fn(), any_tile,
+                    &error, 2, plates) == "/media/usb0/usb.gcode.3mf");
+    CHECK(match_all({{"", usb}, {"internal", mmc}}, "P1", "Same", r.fn(), any_tile,
+                    &error, 1, plates) == "/userdata/model/mmc.gcode.3mf");
+}
+
+// "internal" and "emmc" list the same internal files: each is read once per pass.
+static void test_internal_aliases_are_read_once()
+{
+    test_clear_title_cache();
+    const Files usb = {{"u.gcode.3mf", "/media/usb0/u.gcode.3mf", 1}};
+    const Files internal = {
+        {"a.gcode.3mf", "/userdata/model/history/a.gcode.3mf", 9},
+        {"b.gcode.3mf", "/userdata/model/history/b.gcode.3mf", 8},
+    };
+    const std::vector<std::pair<std::string, Files>> listings = {
+        {"", usb}, {"internal", internal}, {"emmc", internal}};
+    Reader r;
+    r.answers["/media/usb0/u.gcode.3mf"] = {true, "U"};
+    r.answers["/userdata/model/history/a.gcode.3mf"] = {true, "A"};
+    r.answers["/userdata/model/history/b.gcode.3mf"] = {true, "U"};
+    std::string error;
+    CHECK(match_all(listings, "P1", "None",
+                                                        r.fn(), any_tile, &error)
+              .empty());
+    CHECK(r.calls.size() == 3);
+    CHECK(r.storages == std::vector<std::string>({"internal", "internal", ""}));
+    CHECK(match_all(listings, "P1", "U", r.fn(),
+                                                        any_tile, &error) ==
+          "/userdata/model/history/b.gcode.3mf");
+    CHECK(match_all(listings, "P1", "A", r.fn(),
+                                                        any_tile, &error) ==
+          "/userdata/model/history/a.gcode.3mf");
+    CHECK(r.calls.size() == 3);  // all from the cache
 }
 
 // Earlier tile failures stay the error when a later listing picks nothing.
 static void test_tile_failure_then_no_pick()
 {
-    const Files usb = {{"usb.gcode.3mf", "/media/usb0/usb.gcode.3mf", 5}};
-    Files unknown;  // more unknown titles than the budget left after usb
+    const Files usb = {{"usb.gcode.3mf", "/media/usb0/usb.gcode.3mf", 1000}};
+    Files unknown;  // more files than the candidates left after usb
     for (int i = 0; i < 70; ++i) {
         const std::string n = "m" + std::to_string(i) + ".gcode.3mf";
         unknown.emplace_back(n, "/userdata/model/" + n, 100 - i);
@@ -625,7 +809,7 @@ static void test_tile_failure_then_no_pick()
         r.answers["/media/usb0/usb.gcode.3mf"] = {true, "Target"};
         r.answers["/userdata/model/o.gcode.3mf"] = {true, "Other"};
         std::string error;
-        CHECK(obn::tunnel_upload::test_match_model_by_title(
+        CHECK(match_all(
                   {{"", usb}, {"internal", second}}, "P1", "Target", r.fn(),
                   failing_tile, &error).empty());
         CHECK(error == "SUB_FILE thumbnail failed ('': /media/usb0/usb.gcode.3mf)");
@@ -654,7 +838,11 @@ int main()
     test_refusal_cached_transport_error_not();
     test_cache_holds_only_current_candidates();
     test_rewritten_file_is_read_again();
-    test_only_3mf_entries_are_read();
+    test_only_sliced_3mf_entries_are_read();
+    test_plate_decides_among_same_title_files();
+    test_slice_info_failures();
+    test_plates_parser();
+    test_bytes_budget_limits_reads();
     test_second_timeout_caches_untitled();
     test_only_timeouts_cache_unanswered();
     test_late_timeout_keeps_a_title_read_meanwhile();
@@ -663,8 +851,9 @@ int main()
     test_title_hit_without_tile_tries_next_listing();
     test_transport_failure_ends_the_pass();
     test_first_listing_resolves_in_one_fetch();
-    test_read_budget_is_shared_by_the_listings();
-    test_unfinished_listing_ends_the_pass();
+    test_newest_candidates_over_all_storages();
+    test_storage_does_not_matter();
+    test_internal_aliases_are_read_once();
     test_tile_failure_then_no_pick();
 
     if (fail_count) {
