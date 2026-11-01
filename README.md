@@ -484,7 +484,7 @@ Spaces around `=` are optional.
 | --- | --- | --- |
 | `patch_mqtt_home_flag` | `0` | Rewrite home_flag SD-card bits from NO_SDCARD to HAS_SDCARD. Useful on some A-series where Studio greys out storage UI even though USB storage works. |
 | `patch_mqtt_ipcam_file` | `0` | Inject `ipcam.file` block into push_status when firmware omits it. Without this, Studio may refuse to open the file browser on some models. |
-| `patch_mqtt_internal_storage` | `0` | Set the internal storage capability bit so Studio shows the eMMC tab in the file browser. Firmware often omits this bit even when :6000/FTPS lists eMMC, and browsing internal memory may still be slow or unreliable (e.g. on P2S). |
+| `patch_mqtt_internal_storage` | `0` | Set the internal storage capability bit (`fun2` bit 17) so Studio shows the Internal tab for models in the file browser. On printers whose firmware leaves this bit clear, internal storage support is incomplete: the tab appears, but browsing is glitchy and not every function works. |
 | `filter_mqtt_hms_65543` | `0` | Filter the "MQTT verification failure" error so the slicer does not show it. |
 
 **Cloud endpoints** (change only for CN accounts or a dev host):
