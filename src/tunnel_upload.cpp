@@ -718,49 +718,41 @@ bool name_matches_model(const std::string& listing_name,
     return false;
 }
 
-const ModelFileEntry* find_model_entry(const ListInfoOutcome& list,
-                                       const std::string&     model_name)
+// A print Studio starts reports the uploaded file's base name as subtask_name.
+bool entry_named_after_model(const ModelFileEntry& f, const std::string& model_name)
 {
-    const ModelFileEntry* best = nullptr;
-    int match_count = 0;
+    if (name_matches_model(f.name, model_name)) return true;
+    const auto slash = f.path.rfind('/');
+    const std::string base =
+        slash != std::string::npos ? f.path.substr(slash + 1) : f.path;
+    return name_matches_model(base, model_name);
+}
 
-    auto consider = [&](const ModelFileEntry& f) {
-        if (!name_matches_model(f.name, model_name)) {
-            const auto slash = f.path.rfind('/');
-            const std::string base =
-                slash != std::string::npos ? f.path.substr(slash + 1) : f.path;
-            if (!name_matches_model(base, model_name)) return;
-        }
-        ++match_count;
-        if (!best) {
-            best = &f;
-            return;
-        }
-        const auto in_cache = [](const std::string& path) {
-            return path.find("/cache/") != std::string::npos;
-        };
-        const int cache_a = in_cache(f.path) ? 1 : 0;
-        const int cache_b = in_cache(best->path) ? 1 : 0;
-        if (cache_a != cache_b) {
-            if (cache_a > cache_b) best = &f;
-            return;
-        }
-        if (f.time != best->time) {
-            if (f.time > best->time) best = &f;
-            return;
-        }
-        const bool gcode_a = ends_with(f.name, ".gcode.3mf");
-        const bool gcode_b = ends_with(best->name, ".gcode.3mf");
-        if (gcode_a != gcode_b && gcode_a) best = &f;
-    };
+// A listed file with the storage label it was listed under (for SUB_FILE).
+struct Candidate {
+    const ModelFileEntry* file;
+    const std::string*    storage;
+};
 
-    for (const auto& f : list.files) consider(f);
-
-    if (best && match_count > 1) {
-        OBN_DEBUG("tunnel_upload: %d listing(s) match '%s', picked %s",
-                  match_count, model_name.c_str(), best->path.c_str());
+// Merges the listings into one list, newest first. A path listed twice
+// ("internal" and "emmc" name the same files) counts once, under the label
+// it was listed under first; ties in time keep the listing order (USB first).
+std::vector<Candidate> merged_candidates(
+    const std::vector<std::pair<std::string, ListInfoOutcome>>& listings,
+    const std::function<bool(const ModelFileEntry&)>&           keep)
+{
+    std::vector<Candidate>          order;
+    std::unordered_set<std::string> seen;
+    for (const auto& [storage, list] : listings) {
+        for (const auto& f : list.files) {
+            if (keep(f) && seen.insert(f.path).second) order.push_back({&f, &storage});
+        }
     }
-    return best;
+    std::stable_sort(order.begin(), order.end(),
+                     [](const Candidate& a, const Candidate& b) {
+                         return a.file->time > b.file->time;
+                     });
+    return order;
 }
 
 std::vector<std::string> model_list_storages()
@@ -786,21 +778,14 @@ void append_storage_failure(std::string*       out,
     out->append("'" + storage + "': " + error);
 }
 
-std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
-                                                  int                plate_idx)
+// Images of plate_idx only. Every exported plate file of a project carries
+// the images of all its plates, so another plate's image is never this
+// print's cover, and "#thumbnail" on a .3mf is refused (research §9.6.2).
+std::vector<std::string> plate_image_sub_paths(const std::string& path, int plate_idx)
 {
-    if (plate_idx < 1) plate_idx = 1;
-    const std::string n = std::to_string(plate_idx);
-    std::vector<std::string> out = {
-        path + "#Metadata/plate_" + n + ".png",
-        path + "#Metadata/plate_no_light_" + n + ".png",
-        path + "#thumbnail",
-    };
-    if (plate_idx != 1) {
-        out.push_back(path + "#Metadata/plate_1.png");
-        out.push_back(path + "#Metadata/plate_no_light_1.png");
-    }
-    return out;
+    const std::string n = std::to_string(plate_idx < 1 ? 1 : plate_idx);
+    return {path + "#Metadata/plate_" + n + ".png",
+            path + "#Metadata/plate_no_light_" + n + ".png"};
 }
 
 // --- Fallback: match a print to its file by the 3MF title ------------------
@@ -1197,15 +1182,6 @@ bool is_title_candidate(const ModelFileEntry& f)
            ends_with(f.path, kTitleCandidateSuffix);
 }
 
-// Plate images only for plate_idx: an exported plate file carries the images
-// of every plate of the project, so no fallback to another plate.
-std::vector<std::string> exact_plate_sub_paths(const std::string& path, int plate_idx)
-{
-    const std::string n = std::to_string(plate_idx < 1 ? 1 : plate_idx);
-    return {path + "#Metadata/plate_" + n + ".png",
-            path + "#Metadata/plate_no_light_" + n + ".png"};
-}
-
 // Merges the listings (a path listed twice, e.g. by "internal" and "emmc",
 // counts once), keeps the kMaxTitleCandidates newest sliced files and walks
 // them newest first. The first file whose title is model_name, whose
@@ -1213,28 +1189,13 @@ std::vector<std::string> exact_plate_sub_paths(const std::string& path, int plat
 // the hit, whatever storage it is on. With no budget left, stops at the first
 // unknown file: cache history never picks.
 const ModelFileEntry* match_model_by_title(
-    const std::vector<std::pair<std::string, ListInfoOutcome>>& unmatched,
+    const std::vector<std::pair<std::string, ListInfoOutcome>>& listings,
     const std::string& printer, const std::string& model_name, int plate_idx,
     const MemberReader& read_member, const TileFetcher& fetch_tile,
     TitleBudget* budget, std::string* error)
 {
-    struct Candidate {
-        const ModelFileEntry* file;
-        const std::string*    storage;
-    };
-    std::vector<Candidate>          order;
-    std::unordered_set<std::string> seen;
-    for (const auto& [storage, list] : unmatched) {
-        for (const auto& f : list.files) {
-            if (is_title_candidate(f) && seen.insert(f.path).second) {
-                order.push_back({&f, &storage});
-            }
-        }
-    }
-    std::stable_sort(order.begin(), order.end(),
-                     [](const Candidate& a, const Candidate& b) {
-                         return a.file->time > b.file->time;
-                     });
+    std::vector<Candidate> order = merged_candidates(listings, is_title_candidate);
+    const std::size_t listed = order.size();
     if (order.size() > kMaxTitleCandidates) order.resize(kMaxTitleCandidates);
 
     const auto key_of = [](const ModelFileEntry& f) {
@@ -1257,7 +1218,26 @@ const ModelFileEntry* match_model_by_title(
         std::swap(cached, kept);
     }
 
+    const int         reads0 = budget->reads_left;
+    const std::size_t bytes0 = budget->bytes_left;
+    std::size_t       cached = 0;
+    std::size_t       checked = 0;  // candidates whose title is known by now
+    const auto summary = [&](const char* outcome) {
+        OBN_DEBUG("tunnel_upload: title pass for '%s' plate %d: %zu of %zu "
+                  "sliced files considered, %zu checked (%zu from cache), "
+                  "%d reads / %zu bytes spent: %s",
+                  model_name.c_str(), plate_idx, order.size(), listed, checked,
+                  cached, reads0 - budget->reads_left,
+                  bytes0 - budget->bytes_left, outcome);
+    };
+    const auto plates_text = [](const std::vector<int>& plates) {
+        std::string t;
+        for (int n : plates) t += (t.empty() ? "" : ",") + std::to_string(n);
+        return t.empty() ? std::string("none") : t;
+    };
+
     bool        tile_failed = false;
+    bool        out_of_budget = false;
     std::string tile_failures;
     for (const Candidate& c : order) {
         const ModelFileEntry& f   = *c.file;
@@ -1273,11 +1253,18 @@ const ModelFileEntry* match_model_by_title(
                 known = true;
             }
         }
-        if (!known) {
-            if (budget->exhausted()) break;
+        if (known) {
+            ++cached;
+        } else {
+            if (budget->exhausted()) {
+                out_of_budget = true;
+                break;
+            }
             const MemberRead r = read_member(f.path, *c.storage, kModelMember);
             budget->charge(r.bytes);
             if (!r.answered) {
+                const char* why = r.timed_out ? "no complete reply in time"
+                                              : "read failed";
                 if (r.timed_out) {
                     std::lock_guard<std::mutex> lk(g_title_mu);
                     auto& s = g_titles[printer];
@@ -1285,46 +1272,68 @@ const ModelFileEntry* match_model_by_title(
                     if (!s.files.count(key) && !s.timed_out.insert(key).second) {
                         s.timed_out.erase(key);
                         s.files[key] = TitleFileInfo{};
-                        OBN_DEBUG("tunnel_upload: 3MF title of %s: timed out twice",
-                                  f.path.c_str());
+                        why = "no complete reply twice, treated as untitled";
                     }
                 }
-                *error = "3MF title read failed";
+                OBN_DEBUG("tunnel_upload: 3MF title of %s: %s", f.path.c_str(), why);
+                *error = "3MF title read failed (" + f.path + ": " + why + ")";
+                summary(error->c_str());
                 return nullptr;
             }
             info.title = model_title_from_3dmodel(r.data);
-            OBN_DEBUG("tunnel_upload: 3MF title of %s: '%s'", f.path.c_str(),
-                      info.title.c_str());
+            OBN_DEBUG("tunnel_upload: 3MF title of %s: '%s'%s", f.path.c_str(),
+                      info.title.c_str(),
+                      r.data.empty() ? " (read refused by the printer)" : "");
             std::lock_guard<std::mutex> lk(g_title_mu);
             g_titles[printer].files[key] = info;
         }
+        ++checked;
         if (info.title.empty() || info.title != model_name) continue;
 
         if (!info.plates_known) {
-            if (budget->exhausted()) break;
+            if (budget->exhausted()) {
+                out_of_budget = true;
+                break;
+            }
             const MemberRead r = read_member(f.path, *c.storage, kSliceInfoMember);
             budget->charge(r.bytes);
             if (!r.answered) {
-                *error = "3MF slice info read failed";
+                *error = "3MF slice info read failed (" + f.path + ")";
+                summary(error->c_str());
                 return nullptr;
             }
             info.plates       = plates_from_slice_info(r.data);
             info.plates_known = true;
+            OBN_DEBUG("tunnel_upload: plates sliced into %s: %s", f.path.c_str(),
+                      plates_text(info.plates).c_str());
             std::lock_guard<std::mutex> lk(g_title_mu);
             g_titles[printer].files[key] = info;
         }
         if (std::find(info.plates.begin(), info.plates.end(), plate_idx) ==
             info.plates.end()) {
-            OBN_DEBUG("tunnel_upload: %s has title '%s' but not plate %d",
-                      f.path.c_str(), model_name.c_str(), plate_idx);
+            OBN_DEBUG("tunnel_upload: %s has title '%s' but not plate %d (has %s)",
+                      f.path.c_str(), model_name.c_str(), plate_idx,
+                      plates_text(info.plates).c_str());
             continue;
         }
         OBN_DEBUG("tunnel_upload: '%s' plate %d matched by 3MF title: %s",
                   model_name.c_str(), plate_idx, f.path.c_str());
-        if (fetch_tile(f, *c.storage, &tile_failures)) return &f;
+        if (fetch_tile(f, *c.storage, &tile_failures)) {
+            summary(("cover from " + f.path).c_str());
+            return &f;
+        }
+        OBN_DEBUG("tunnel_upload: no plate %d image in %s, trying older files",
+                  plate_idx, f.path.c_str());
         tile_failed = true;
     }
-    if (tile_failed) *error = "SUB_FILE thumbnail failed (" + tile_failures + ")";
+    if (tile_failed) {
+        *error = "SUB_FILE thumbnail failed (" + tile_failures + ")";
+    } else if (out_of_budget) {
+        *error = "3MF title pass out of budget (" +
+                 std::to_string(order.size() - checked) + " of " +
+                 std::to_string(order.size()) + " files unchecked)";
+    }
+    summary(error->empty() ? "no file with this title and plate" : error->c_str());
     return nullptr;
 }
 
@@ -1500,8 +1509,6 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
     const std::string& model_name, int plate_idx)
 {
     ModelThumbnailOutcome out;
-    // Listings without a file-name match, for the 3MF title pass.
-    std::vector<std::pair<std::string, ListInfoOutcome>> unmatched;
     const auto next_wire = [this](std::uint32_t* seq, SSL** ssl,
                                   obn::tunnel_local::Session** session) {
         std::lock_guard<std::mutex> lk(impl_->io_mu);
@@ -1509,10 +1516,11 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         *ssl     = impl_->ssl;
         *session = impl_->session.get();
     };
-    const auto fetch_tile_paths = [&](const ModelFileEntry&           hit,
-                                      const std::string&              list_storage,
-                                      const std::vector<std::string>& paths,
-                                      std::string*                    failures) {
+    // Plate image of one listed file, tried under each SUB_FILE label of its
+    // storage; fills `out` on success.
+    const TileFetcher fetch_tile = [&](const ModelFileEntry& hit,
+                                       const std::string&    list_storage,
+                                       std::string*          failures) {
         for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
             std::uint32_t seq = 0;
             SSL* ssl = nullptr;
@@ -1520,7 +1528,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             next_wire(&seq, &ssl, &session);
 
             SubFileRequest req;
-            req.paths   = paths;
+            req.paths   = plate_image_sub_paths(hit.path, plate_idx);
             req.storage = wire_storage;
             const SubFileOutcome sf =
                 run_sub_file(session, ssl, &impl_->io_mu, seq, req);
@@ -1547,43 +1555,48 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
 
     // A printer can refuse every listing, e.g. result 17 STORAGE_UNAVAILABLE
     // (research/09.05-ctrl.md §9.5.3); that must not read as a missing model.
+    std::vector<std::pair<std::string, ListInfoOutcome>> listings;
     std::string list_failures;
-    bool        any_list_ok = false;
-
     for (const auto& list_storage : model_list_storages()) {
         std::uint32_t seq = 0;
         SSL* ssl = nullptr;
         obn::tunnel_local::Session* session = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(impl_->io_mu);
-            seq = impl_->wire_seq++;
-            ssl = impl_->ssl;
-            session = impl_->session.get();
-        }
-
-        const ListInfoOutcome list =
+        next_wire(&seq, &ssl, &session);
+        ListInfoOutcome list =
             run_list_info(session, ssl, &impl_->io_mu, seq, list_storage);
         if (!list.ok) {
+            OBN_DEBUG("tunnel_upload: LIST_INFO storage '%s': %s",
+                      list_storage.c_str(), list.error.c_str());
             append_storage_failure(&list_failures, list_storage, list.error);
             continue;
         }
-        any_list_ok = true;
+        OBN_DEBUG("tunnel_upload: LIST_INFO storage '%s': %zu files",
+                  list_storage.c_str(), list.files.size());
+        listings.emplace_back(list_storage, std::move(list));
+    }
 
-        const ModelFileEntry* hit = find_model_entry(list, model_name);
-        if (!hit) {
-            unmatched.emplace_back(list_storage, list);
-            continue;
+    // First by file name: a print Studio starts is named after its file.
+    // The newest file of the name over all storages, then older ones when
+    // its plate image cannot be read.
+    const std::vector<Candidate> by_name = merged_candidates(
+        listings, [&](const ModelFileEntry& f) {
+            return entry_named_after_model(f, model_name);
+        });
+    if (!by_name.empty()) {
+        OBN_DEBUG("tunnel_upload: %zu file(s) named after '%s', newest %s",
+                  by_name.size(), model_name.c_str(), by_name[0].file->path.c_str());
+        std::string failures;
+        for (const Candidate& c : by_name) {
+            if (fetch_tile(*c.file, *c.storage, &failures)) return out;
+            OBN_DEBUG("tunnel_upload: no plate %d image in %s%s", plate_idx,
+                      c.file->path.c_str(),
+                      &c == &by_name.back() ? "" : ", trying the next file");
         }
-        std::string sub_failures;
-        if (fetch_tile_paths(*hit, list_storage,
-                             tile_thumbnail_sub_paths(hit->path, plate_idx),
-                             &sub_failures)) {
-            return out;
-        }
-        out.error = "SUB_FILE thumbnail failed (" + sub_failures + ")";
+        out.error = "SUB_FILE thumbnail failed (" + failures + ")";
         return out;
     }
-    if (!unmatched.empty()) {
+
+    if (!listings.empty()) {
         // A print started on the printer reports its 3MF title, not the file name.
         const MemberReader read_member = [&](const std::string& path,
                                              const std::string& storage,
@@ -1623,20 +1636,12 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             if (fd_ok) obn::tls::clear_socket_io_timeout(impl_->fd);
             return r;
         };
-        const TileFetcher fetch_plate_tile = [&](const ModelFileEntry& hit,
-                                                 const std::string&    storage,
-                                                 std::string*          failures) {
-            return fetch_tile_paths(hit, storage,
-                                    exact_plate_sub_paths(hit.path, plate_idx),
-                                    failures);
-        };
         const std::string printer =
             impl_->params.dev_id.empty() ? impl_->params.dev_ip : impl_->params.dev_id;
         std::string title_error;
         TitleBudget budget;
-        if (match_model_by_title(unmatched, printer, model_name, plate_idx,
-                                 read_member, fetch_plate_tile, &budget,
-                                 &title_error)) {
+        if (match_model_by_title(listings, printer, model_name, plate_idx,
+                                 read_member, fetch_tile, &budget, &title_error)) {
             return out;
         }
         if (!title_error.empty()) {
@@ -1645,7 +1650,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
         }
     }
 
-    if (!any_list_ok && !list_failures.empty()) {
+    if (listings.empty() && !list_failures.empty()) {
         out.error = "LIST_INFO failed (" + list_failures + ")";
     } else if (!list_failures.empty()) {
         out.error = "model not in LIST_INFO (failed: " + list_failures + ")";
@@ -1783,15 +1788,15 @@ std::string test_match_model_by_title(
     const TestRead& read, const TestPlates& plates, const TestTile& tile,
     int* reads_left, std::size_t* bytes_left, std::string* error)
 {
-    std::vector<std::pair<std::string, ListInfoOutcome>> unmatched;
+    std::vector<std::pair<std::string, ListInfoOutcome>> lists;
     for (const auto& l : listings) {
-        unmatched.emplace_back(l.first, test_listing(l.second));
+        lists.emplace_back(l.first, test_listing(l.second));
     }
     TitleBudget budget;
     if (reads_left) budget.reads_left = *reads_left;
     if (bytes_left) budget.bytes_left = *bytes_left;
     const ModelFileEntry* hit = match_model_by_title(
-        unmatched, printer, model_name, plate_idx, test_reader(read, plates),
+        lists, printer, model_name, plate_idx, test_reader(read, plates),
         [&tile](const ModelFileEntry& f, const std::string& storage,
                 std::string* failures) { return tile(f.path, storage, failures); },
         &budget, error);

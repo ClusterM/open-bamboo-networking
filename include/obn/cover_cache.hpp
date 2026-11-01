@@ -3,10 +3,10 @@
 // Cover-image cache for the "currently printing" thumbnail in Studio's
 // Device tab.
 //
-// Fetches via tunnel_upload::fetch_model_tile_thumbnail — the same
-// LIST_INFO + SUB_FILE #thumbnail path as Device → Storage → Model.
-// When that fails, LAN prints this plugin uploaded itself fall back to the
-// image staged from their .3mf (stage_from_3mf).
+// Sources, best first: for LAN prints this plugin uploaded itself, the
+// image staged from their .3mf (stage_from_3mf); otherwise the printer's
+// copy via tunnel_upload::fetch_model_tile_thumbnail, the same
+// LIST_INFO + SUB_FILE path as Device → Storage → Model.
 
 #include <cstdint>
 #include <string>
@@ -20,9 +20,9 @@ std::string path_for(const std::string& subtask_name,
                      int                plate_idx,
                      const std::string& version = {});
 
-// Plate image of a local .3mf: Metadata/plate_N.png, then the same
-// fallbacks as the :6000 fetch (plate_no_light_N, then plate 1 when
-// N != 1). `*entry` (optional) gets the archive entry that was used.
+// Plate image of a local .3mf: Metadata/plate_N.png, else
+// plate_no_light_N.png, as the :6000 fetch; never another plate's image.
+// `*entry` (optional) gets the archive entry that was used.
 bool read_local_thumbnail(const std::string&         path_3mf,
                           int                        plate_idx,
                           std::vector<std::uint8_t>* png,
@@ -30,7 +30,7 @@ bool read_local_thumbnail(const std::string&         path_3mf,
                           std::string*               err = nullptr);
 
 // Keeps the plate image of a .3mf this plugin uploads for a few hours; a
-// failed :6000 fetch for that printer, name and plate writes it instead.
+// cover fetch for that printer, name and plate writes it before trying :6000.
 // The next call for the name and plate replaces it, or removes it when
 // that archive has no plate image. True when an image was staged.
 bool stage_from_3mf(const std::string& dev_id,

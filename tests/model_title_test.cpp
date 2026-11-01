@@ -60,6 +60,11 @@ static std::string match_all(const Listings& listings, const std::string& printe
 
 static int fail_count = 0;
 
+static bool starts_with(const std::string& s, const std::string& prefix)
+{
+    return s.rfind(prefix, 0) == 0;
+}
+
 #define CHECK(cond)                                                        \
     do {                                                                   \
         if (!(cond)) {                                                     \
@@ -185,7 +190,7 @@ static std::string match(const Files& files, const std::string& name, Reader& r,
     const std::string hit = obn::tunnel_upload::test_match_model_by_title(
         {{"", files}}, scope, name, plate, r.fn(), plates, tile, &reads, bytes_left,
         &error);
-    if (transport_out) *transport_out = error == "3MF title read failed";
+    if (transport_out) *transport_out = starts_with(error, "3MF title read failed");
     return hit;
 }
 
@@ -458,7 +463,7 @@ static void test_slice_info_failures()
     };
     CHECK(match_all({{"", files}}, "P1", "X", r.fn(), any_tile, &error, 1, lost)
               .empty());
-    CHECK(error == "3MF slice info read failed");
+    CHECK(starts_with(error, "3MF slice info read failed"));
 }
 
 static void test_plates_parser()
@@ -591,7 +596,7 @@ static void test_late_timeout_keeps_a_title_read_meanwhile()
     };
     std::string error;
     CHECK(match_all({{"", files}}, "P1", "X", slow, any_tile, &error).empty());
-    CHECK(b_hit && error == "3MF title read failed");
+    CHECK(b_hit && starts_with(error, "3MF title read failed"));
     Reader none;
     CHECK(match(files, "X", none) == "/media/usb0/x.gcode.3mf");
     CHECK(none.calls.empty());
@@ -673,7 +678,7 @@ static void test_transport_failure_ends_the_pass()
                   return true;
               },
               &error).empty());
-    CHECK(error == "3MF title read failed");
+    CHECK(starts_with(error, "3MF title read failed"));
     CHECK(r.calls.size() == 1);
 
     // A failed tile on an earlier listing does not reach the read error.
@@ -684,7 +689,7 @@ static void test_transport_failure_ends_the_pass()
     error.clear();
     CHECK(match_all(
               listings, "P1", "B", r2.fn(), failing_tile, &error).empty());
-    CHECK(error == "3MF title read failed");
+    CHECK(starts_with(error, "3MF title read failed"));
     CHECK(r2.calls.size() == 2);
 }
 

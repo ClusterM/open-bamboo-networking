@@ -193,13 +193,14 @@ static Bytes read_file(const std::string& path)
 
 // Mirrors a Studio print archive: plate images first, then the model,
 // configs and the deflated G-code.
-static std::vector<Entry> studio_entries(const Bytes& plate_png)
+static std::vector<Entry> studio_entries(const Bytes& plate_png, int plate = 1)
 {
+    const std::string n = std::to_string(plate);
     return {
-        {"Metadata/plate_1.png", plate_png},
-        {"Metadata/plate_1_small.png", fake_png("small", 4154)},
-        {"Metadata/plate_no_light_1.png", fake_png("nolight", 3782)},
-        {"Metadata/top_1.png", fake_png("top", 7209)},
+        {"Metadata/plate_" + n + ".png", plate_png},
+        {"Metadata/plate_" + n + "_small.png", fake_png("small", 4154)},
+        {"Metadata/plate_no_light_" + n + ".png", fake_png("nolight", 3782)},
+        {"Metadata/top_" + n + ".png", fake_png("top", 7209)},
         {"3D/3dmodel.model", bytes_of(std::string(1081, 'm')), 8},
         {"Metadata/plate_1.gcode", bytes_of(std::string(200000, 'G')), 8},
         {"Metadata/slice_info.config", bytes_of(std::string(1685, 's')), 8},
@@ -346,20 +347,19 @@ static void test_local_thumbnail_priority()
 
     const std::string only1 = write_file("only1.3mf", make_zip({
         {"Metadata/plate_no_light_1.png", nl1}, {"Metadata/plate_1.png", p1}}));
-    CHECK(obn::cover_cache::read_local_thumbnail(only1, 2, &png, &entry));
-    CHECK(png == p1);
-    CHECK(entry == "Metadata/plate_1.png");
     // Plate index 0 (Orca's "plate_0") means plate 1.
     CHECK(obn::cover_cache::read_local_thumbnail(only1, 0, &png, &entry));
     CHECK(entry == "Metadata/plate_1.png");
 
-    // Plate 1 never falls back to another plate's image.
-    const std::string only2 = write_file("only2.3mf",
-        make_zip({{"Metadata/plate_2.png", p2}}));
+    // No plate ever falls back to another plate's image.
     Bytes untouched = bytes_of("sentinel");
     std::string err;
-    CHECK(!obn::cover_cache::read_local_thumbnail(only2, 1, &untouched, &entry, &err));
+    CHECK(!obn::cover_cache::read_local_thumbnail(only1, 2, &untouched, &entry, &err));
     CHECK(untouched == bytes_of("sentinel"));
+    CHECK(err == "Metadata/plate_2.png: entry not found");
+    const std::string only2 = write_file("only2.3mf",
+        make_zip({{"Metadata/plate_2.png", p2}}));
+    CHECK(!obn::cover_cache::read_local_thumbnail(only2, 1, &untouched, &entry, &err));
     CHECK(err == "Metadata/plate_1.png: entry not found");
 
     // A zero-byte image counts as missing.
@@ -370,7 +370,7 @@ static void test_local_thumbnail_priority()
 }
 
 // ---------------------------------------------------------------------------
-// Staged cover: written when the :6000 fetch fails
+// Staged cover: the first source a fetch tries, before :6000
 // ---------------------------------------------------------------------------
 
 using obn::cover_cache::stage_from_3mf;
@@ -393,12 +393,13 @@ static Bytes fetch_failing(const std::string& dev_id, const std::string& name,
     return read_file(out);
 }
 
-static std::string studio_3mf(const std::string& file, const Bytes& plate_png)
+static std::string studio_3mf(const std::string& file, const Bytes& plate_png,
+                              int plate = 1)
 {
-    return write_file(file, make_zip(studio_entries(plate_png)));
+    return write_file(file, make_zip(studio_entries(plate_png, plate)));
 }
 
-static void test_failed_fetch_writes_the_staged_image()
+static void test_fetch_writes_the_staged_image()
 {
     const Bytes png = fake_png("cube");
     CHECK(stage_from_3mf("DEV1", "Cube", studio_3mf("cube.3mf", png), 1));
@@ -406,7 +407,7 @@ static void test_failed_fetch_writes_the_staged_image()
     // own before the job's task_id is reported: both get the image.
     CHECK(fetch_failing("DEV1", "Cube", 1, "") == png);
     CHECK(fetch_failing("DEV1", "Cube", 1, "8442") == png);
-    // Nothing staged for the name: a failed fetch leaves no cover.
+    // Nothing staged for the name and no printer: no cover.
     CHECK(fetch_failing("DEV1", "Sphere", 1, "8443").empty());
 }
 
@@ -431,7 +432,7 @@ static void test_unstage_drops_only_that_entry()
     // its image must not reach a later job of the name.
     const Bytes p1 = fake_png("hinge-p1"), p2 = fake_png("hinge-p2");
     CHECK(stage_from_3mf("DEV1", "Hinge", studio_3mf("hinge1.3mf", p1), 1));
-    CHECK(stage_from_3mf("DEV1", "Hinge", studio_3mf("hinge2.3mf", p2), 2));
+    CHECK(stage_from_3mf("DEV1", "Hinge", studio_3mf("hinge2.3mf", p2, 2), 2));
     obn::cover_cache::unstage("DEV1", "Hinge", 1);
     CHECK(fetch_failing("DEV1", "Hinge", 1, "5001").empty());
     CHECK(fetch_failing("DEV1", "Hinge", 2, "5001") == p2);
@@ -451,7 +452,7 @@ static void test_expired_stage_is_ignored()
 static void test_stage_is_per_printer_name_and_plate()
 {
     const Bytes png = fake_png("gear");
-    CHECK(stage_from_3mf("DEV1", "Gear", studio_3mf("gear.3mf", png), 2));
+    CHECK(stage_from_3mf("DEV1", "Gear", studio_3mf("gear.3mf", png, 2), 2));
     CHECK(fetch_failing("DEV2", "Gear", 2, "6001").empty());
     CHECK(fetch_failing("DEV1", "Gear", 1, "6001").empty());
     CHECK(fetch_failing("DEV1", "Gear box", 2, "6001").empty());
@@ -492,7 +493,7 @@ int main()
     test_local_thumbnail_priority();
 
     // Staged cover for prints this plugin starts.
-    test_failed_fetch_writes_the_staged_image();
+    test_fetch_writes_the_staged_image();
     test_newer_stage_replaces_the_older_one();
     test_unstage_drops_only_that_entry();
     test_expired_stage_is_ignored();

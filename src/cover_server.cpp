@@ -160,10 +160,8 @@ void handle_one(socket_t fd)
     // to kWaitMs: a 20 MB .3mf takes ~2s over LAN FTPS.
     constexpr int kWaitMs = 15000;
     constexpr int kPollMs = 100;
-    for (int waited = 0;
-         waited < kWaitMs && (!fs::exists(full, ec) || ec);
-         waited += kPollMs)
-    {
+    int waited = 0;
+    for (; waited < kWaitMs && (!fs::exists(full, ec) || ec); waited += kPollMs) {
         std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
     }
     if (!fs::exists(full, ec) || ec) {
@@ -172,6 +170,9 @@ void handle_one(socket_t fd)
         // webrequest (triggered by a user click on the thumbnail) will
         // retry us - by which point the FTPS worker should have
         // finished.
+        OBN_WARN("cover_server: %s not written within %d ms, answering 503; "
+                 "Studio shows the placeholder until the thumbnail is clicked",
+                 base.c_str(), waited);
         std::string r = "HTTP/1.1 503 Service Unavailable\r\n"
                         "Connection: close\r\nContent-Length: 0\r\n\r\n";
         send_all(fd, r);
@@ -186,8 +187,8 @@ void handle_one(socket_t fd)
         "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
     send_all(fd, hdr);
     if (method == "GET") send_all(fd, body);
-    OBN_DEBUG("cover_server: served %s %zu bytes",
-              base.c_str(), body.size());
+    OBN_DEBUG("cover_server: served %s %zu bytes after %d ms",
+              base.c_str(), body.size(), waited);
 }
 
 } // namespace

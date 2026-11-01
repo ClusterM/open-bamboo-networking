@@ -607,8 +607,9 @@ int Agent::run_local_print_job(const BBL::PrintParams&   params,
         return BAMBU_NETWORK_ERR_PRINT_LP_PUBLISH_MSG_FAILED;
     }
 
-    // Some printers refuse SUB_FILE on internal storage (H2C); staged before
-    // project_file because its ack already starts a cover fetch.
+    // The cover comes from this archive without a :6000 round-trip (some
+    // printers refuse SUB_FILE on internal storage anyway, H2C); staged
+    // before project_file because its ack already starts a cover fetch.
     const std::string cover_name = print_job::subtask_name_for(params);
     cover_cache::stage_from_3mf(params.dev_id, cover_name, params.filename,
                                 params.plate_index);

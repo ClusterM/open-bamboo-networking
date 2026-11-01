@@ -119,7 +119,7 @@ bool is_neg_cached(const std::string& key)
     return true;
 }
 
-// After a failed :6000 fetch; true when a staged image became the cover.
+// True when a staged image became the cover.
 bool write_staged(const std::string& dev_id,
                   const std::string& subtask_name,
                   int                plate_idx,
@@ -146,6 +146,14 @@ bool write_staged(const std::string& dev_id,
     return true;
 }
 
+long long ms_since(SteadyClock::time_point t0)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               SteadyClock::now() - t0).count();
+}
+
+// Sources, best first: the archive this plugin uploaded for the print (no
+// network, always this plate's image), then the printer's copy over :6000.
 void fetch_worker(obn::tunnel_upload::ConnectParams cp,
                   std::string subtask_name,
                   int         plate_idx,
@@ -156,30 +164,37 @@ void fetch_worker(obn::tunnel_upload::ConnectParams cp,
         std::string key;
         ~ScopeRelease() { release_inflight(key); }
     } release{inflight};
-    const auto fetch_failed = [&] {
-        if (!write_staged(cp.dev_id, subtask_name, plate_idx, version)) {
-            mark_neg_cache(inflight);
-        }
-    };
+    const auto t0 = SteadyClock::now();
+
+    if (write_staged(cp.dev_id, subtask_name, plate_idx, version)) return;
 
     // TODO: add FTPS fallback — when :6000 is unreachable (A1 Mini and
     // other printers that don't expose the BambuTunnel port), download
     // /cache/<subtask_name>.gcode.3mf via FTPS RETR and extract
     // Metadata/plate_N.png from the zip archive instead.
+    OBN_DEBUG("cover_cache: fetching '%s' plate %d ver=%s from %s over :6000",
+              subtask_name.c_str(), plate_idx,
+              version.empty() ? "-" : version.c_str(), cp.dev_ip.c_str());
     obn::tunnel_upload::Connection conn;
     std::string err;
     if (conn.connect(cp, &err) != 0) {
-        OBN_DEBUG("cover_cache: :6000 connect %s: %s", cp.dev_ip.c_str(), err.c_str());
-        fetch_failed();
+        OBN_DEBUG("cover_cache: :6000 connect %s failed after %lld ms: %s; "
+                  "no cover for '%s' for the next %lld s",
+                  cp.dev_ip.c_str(), ms_since(t0), err.c_str(),
+                  subtask_name.c_str(),
+                  static_cast<long long>(kNegCacheTimeout.count()));
+        mark_neg_cache(inflight);
         return;
     }
 
     const obn::tunnel_upload::ModelThumbnailOutcome thumb =
         conn.fetch_model_tile_thumbnail(subtask_name, plate_idx);
     if (!thumb.ok) {
-        OBN_DEBUG("cover_cache: %s for '%s'",
-                  thumb.error.c_str(), subtask_name.c_str());
-        fetch_failed();
+        OBN_DEBUG("cover_cache: %s for '%s' plate %d after %lld ms; "
+                  "no cover for the next %lld s",
+                  thumb.error.c_str(), subtask_name.c_str(), plate_idx,
+                  ms_since(t0), static_cast<long long>(kNegCacheTimeout.count()));
+        mark_neg_cache(inflight);
         return;
     }
 
@@ -189,8 +204,9 @@ void fetch_worker(obn::tunnel_upload::ConnectParams cp,
         mark_neg_cache(inflight);
         return;
     }
-    OBN_INFO("cover_cache: wrote %s (%zu bytes) from %s",
-             out.string().c_str(), thumb.data.size(), thumb.path.c_str());
+    OBN_INFO("cover_cache: wrote %s (%zu bytes) from %s in %lld ms",
+             out.string().c_str(), thumb.data.size(), thumb.path.c_str(),
+             ms_since(t0));
 }
 
 } // namespace
@@ -240,16 +256,12 @@ bool read_local_thumbnail(const std::string&         path_3mf,
     if (!png) return false;
     if (plate_idx < 1) plate_idx = 1;
     const std::string n = std::to_string(plate_idx);
-    // Same order as tile_thumbnail_sub_paths() in tunnel_upload.cpp,
-    // minus the printer-side "#thumbnail" alias.
-    std::vector<std::string> names = {
+    // Same order as plate_image_sub_paths() in tunnel_upload.cpp. Only this
+    // plate's images: another plate's would be the wrong cover.
+    const std::vector<std::string> names = {
         "Metadata/plate_" + n + ".png",
         "Metadata/plate_no_light_" + n + ".png",
     };
-    if (plate_idx != 1) {
-        names.push_back("Metadata/plate_1.png");
-        names.push_back("Metadata/plate_no_light_1.png");
-    }
     std::string first_err;
     for (const std::string& name : names) {
         std::vector<std::uint8_t> data;
