@@ -22,6 +22,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <sstream>
 #include <string>
 
@@ -282,7 +283,20 @@ bool Discovery::start(int port, OnMessage cb)
 
     fd_ = static_cast<std::uintptr_t>(fd);
     running_.store(true, std::memory_order_release);
-    worker_ = std::thread([this] { run_(); });
+    try {
+        worker_ = std::thread([this] { run_(); });
+    } catch (const std::exception& e) {
+        // The worker never started (std::system_error from thread creation,
+        // or std::bad_alloc from its internal allocation), so undo the state
+        // it would have owned: running_ was already set above, and every
+        // later start() would take the already-running no-op path and
+        // return true with no listener behind it.
+        running_.store(false, std::memory_order_release);
+        fd_ = static_cast<std::uintptr_t>(obn::os::kInvalidSocket);
+        obn::os::close_socket(fd);
+        OBN_ERROR("ssdp: thread creation failed: %s", e.what());
+        return false;
+    }
     OBN_INFO("ssdp: listening on 0.0.0.0:%d", port_);
     return true;
 }

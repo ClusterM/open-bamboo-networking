@@ -294,7 +294,7 @@ The five ABI symbols above are thin wrappers around **`obn::Agent`** methods. Th
 | Gap | Open plugin | Stock / notes |
 | --- | --- | --- |
 | Cloud print pipeline | `cloud_print.cpp`: shared config→S3; **cloud** = main→S3 + PATCH https; **LAN+record** = main→FTPS + PATCH `ftp://`; both finish with `/my/task` cloud dispatch (no plugin MQTT). Needs `slicer_key.pem` + `client_name = BambuStudio` | Stock `_with_record` still dual-uploads (FTPS + S3) and leaves the S3 URL winning — OBN keeps LAN local on purpose ([§8.8.3](research/08.08-print-abi.md#883-bambu_network_start_local_print_with_record)). Extra cloud-start `project_file` fields (`job_id`/`job_type`/`design_id`) still unemitted — see [research §8.8.1](research/08.08-print-abi.md#mqtt-project_file-payload) |
-| Cover cache after brtc print | `SUB_FILE` on `:6000`, else the plate image of the uploaded `.3mf` | Jobs started elsewhere rely on `:6000`; one on the same printer with the name and plate of this plugin's print from the last 3 h gets that print's image when the fetch fails |
+| LAN cover for a model kept only in internal storage | `cover_cache` finds the model with `:6000` `LIST_INFO` (`""`, then `internal` / `emmc`) and reads `Metadata/plate_N.png` with `SUB_FILE`. On printers with `fun2` bit 17 clear (P2S, H2C, H2D) the firmware answers `2` to any `/userdata/model/…` read; the X2D (bit set) serves it. When the fetch fails, prints this plugin uploads itself take the plate image of the uploaded `.3mf`, kept per printer, name and plate for 3 h | Stock never fetches these: Studio hides internal models when the bit is clear ([research §9.6.1](research/09.06-commands.md#961-storage-selection-reqstorage)). Jobs started elsewhere (touchscreen, other clients) still get no cover there; another job with the same name and plate within those 3 h gets this plugin's image when the fetch fails. No FTPS fallback for printers without `:6000` |
 
 Wire-format reference for `project_file` field semantics and URL schemes: [research §8.8.1](research/08.08-print-abi.md#mqtt-project_file-payload). Cloud REST step list observed on stock (MITM): [research §8.8.3](research/08.08-print-abi.md#883-bambu_network_start_local_print_with_record) / [§8.8.4](research/08.08-print-abi.md#884-bambu_network_start_print).
 
@@ -493,7 +493,7 @@ The build is intentionally minimal-dependency: only OpenSSL and zlib, **no `liba
 
 Studio opens TLS **:6000** via `libBambuSource.so`, runs `Bambu_StartStreamEx(CTRL_TYPE)`, then exchanges framed CTRL JSON (`LIST_INFO`, `SUB_FILE`, `FILE_DOWNLOAD`, …) — same as stock ([research/09.05-ctrl.md §9.5.1](research/09.05-ctrl.md#951-where-the-printer-side-bytes-actually-come-from)). With a `bambu:///tutk?…` URL (cloud-bound printer, `get_camera_url`) the same JSON goes over TUTK instead (`start_tutk_ctrl`, [research §6.7](research/06.07-tutk.md)); with `force_ftps` set it switches to the LAN route instead, since the FTPS bridge needs the printer's LAN address.
 
-**Default (open plugin, May 2026):** `start_native_ctrl_handshake()` keeps the socket open and **forwards** each Studio JSON request to firmware (`native_ctrl_send_worker`). Thumbnails use stock **`SUB_FILE`**: e.g. `req.paths=["/foo.gcode.3mf#thumbnail"]` → firmware returns PNG bytes; no client-side ZIP parse.
+**Default (open plugin, May 2026):** `start_native_ctrl_handshake()` keeps the socket open and **forwards** each Studio JSON request to firmware (`native_ctrl_send_worker`). Thumbnails use stock **`SUB_FILE`**: e.g. `req.paths=["/media/usb0/foo.gcode.3mf#Metadata/plate_1.png"]` → firmware returns PNG bytes; no client-side ZIP parse (`#thumbnail` is only for timelapse videos, [research §9.6.2](research/09.06-commands.md#962-sub_file-archive-members)).
 
 | `cmdtype` | Status |
 | --- | :--: |
@@ -506,7 +506,7 @@ Studio opens TLS **:6000** via `libBambuSource.so`, runs `Bambu_StartStreamEx(CT
 
 Send to Printer uploads use `ft_*` in `libbambu_networking.so` (§8.14), not this CTRL channel.
 
-**In-print Device-panel cover** (separate from file browser): `cover_cache` in `libbambu_networking.so` uses **`SUB_FILE`** on the same `:6000` wire (e.g. `/cache/<subtask>.gcode.3mf#thumbnail`) — see §8.x `get_subtask_info`. When that fails, prints the plugin uploads itself (`start_local_print`, and `start_local_print_with_record` when it prints locally) take the image from the uploaded `.3mf` instead.
+**In-print Device-panel cover** (separate from file browser): `cover_cache` in `libbambu_networking.so` uses **`LIST_INFO`** to find `<subtask>.gcode.3mf`, then **`SUB_FILE`** on the same `:6000` wire for `<path>#Metadata/plate_N.png` (then `plate_no_light_N.png`, `#thumbnail`). See `get_subtask_info` above. When that fails (e.g. internal-storage models on printers with `fun2` bit 17 clear, see the gaps table), prints the plugin uploads itself (`start_local_print`, and `start_local_print_with_record` when it prints locally) take the image from the uploaded `.3mf` instead.
 
 **`ipcam.file` in MQTT `push_status`:** if firmware advertises this block, Studio opens the MediaFilePanel; P2S firmware includes it natively.
 

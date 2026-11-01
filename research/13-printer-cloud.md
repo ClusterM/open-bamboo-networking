@@ -23,7 +23,11 @@ This chapter documents that device side as seen on the wire. A networking plugin
 3. MQTT `CONNECT` to the regional broker (`us.mqtt.bambulab.com:8883` here) and `SUBSCRIBE device/<serial>/request` ([§13.4](13.04-cloud-command-signing.md)).
 4. `PUT …/device/info`, a burst of `POST …/device/ota`, HMS lookups, owner profile and avatar for the screen.
 
-**While idle:** `GET …/device/bind` again at irregular intervals, from tens of seconds to tens of minutes, to check that the printer is still bound ([§13.2](13.02-device-endpoints.md#device-state)).
+**While idle** (and while printing):
+
+- every hour after login, `GET …/device/security/crls` and `GET …/device/security` ([§13.2](13.02-device-endpoints.md#security-material));
+- every 6 hours, with `improvement_policy` on, a small encrypted `event_track` upload ([§13.5](13.05-cloud-print.md#6-camera-data-uploads));
+- sometimes `GET …/device/bind` again; what triggers it is not known yet ([§13.2](13.02-device-endpoints.md#device-state)).
 
 **On demand:**
 
@@ -36,7 +40,7 @@ This chapter documents that device side as seen on the wire. A networking plugin
 
 ### Evidence and scope
 
-**Evidence:** printer-side MITM (TLS-terminating proxy for both HTTPS and MQTT) of one X2D (`N6`, firmware `01.02.00.00`, Developer Mode off, US region) with stock Studio `02.08.04.57` on Linux (network plugin `02.08.04.60`) on the other side, 2026-10-22: cold boots, liveview, the file browser and a successful cloud print, a QR-code bind and a PIN bind. 2026-10-25: a QR bind after a factory reset, a refresh in the printer's filament picker, a second cloud print, this one with the model sent over LAN FTPS and different policy flags, three that paused on an error (objects on the bed, no build plate) and were then cancelled, a full cloud print without timelapse that paused on objects on the bed, was resumed and finished, two hybrid prints cancelled from Studio without any error (with and without timelapse), and three prints from the printer's USB drive, started in Studio or on the printer screen (one of them with objects on the bed). Model code: [N6.json:3](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L3) and [L81-L82](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L81-L82).
+**Evidence:** printer-side MITM (TLS-terminating proxy for both HTTPS and MQTT) of one X2D (`N6`, firmware `01.02.00.00`, Developer Mode off, US region) with stock Studio `02.08.04.57` on Linux (network plugin `02.08.04.60`) on the other side, 2026-10-22: cold boots, liveview, the file browser and a successful cloud print, a QR-code bind and a PIN bind. 2026-10-25: a QR bind after a factory reset, a refresh in the printer's filament picker, a second cloud print, this one with the model sent over LAN FTPS and different policy flags, three that paused on an error (objects on the bed, no build plate) and were then cancelled, a full cloud print without timelapse that paused on objects on the bed, was resumed and finished, two hybrid prints cancelled from Studio without any error (with and without timelapse), and three prints from the printer's USB drive, started in Studio or on the printer screen (one of them with objects on the bed). 2026-10-25/26: 14 hours idle overnight. Model code: [N6.json:3](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L3) and [L81-L82](https://github.com/bambulab/BambuStudio/blob/12f17b06f4f537f9c03162d08bb70cf733c42839/resources/printers/N6.json#L81-L82).
 
 Everything here comes from one printer model on one firmware. Other models may differ in header values, endpoint set and order.
 
