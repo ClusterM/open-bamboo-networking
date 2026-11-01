@@ -4,6 +4,7 @@
 // See ../../research/09-bambusource.md §9.5.1.1 and tools/bambu6000_repl.py.
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -194,6 +195,12 @@ public:
 
     // Blocking read of one framed payload body (may include json\\n\\nbinary).
     int recv_payload(SSL* ssl, std::vector<std::uint8_t>* out, std::mutex* io_mu);
+
+    // Returns 2 once `deadline` passes; a hard bound needs a non-blocking socket.
+    // Otherwise 0 = payload in *out, 1 = would block (poll, call again), -1 = error.
+    int recv_payload_until(SSL* ssl, std::vector<std::uint8_t>* out,
+                           std::mutex* io_mu,
+                           std::chrono::steady_clock::time_point deadline);
 
     // JSON bodies from frames already sitting in the session recv buffer.
     std::vector<std::string> drain_pending_wire_json();

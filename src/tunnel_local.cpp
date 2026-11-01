@@ -883,6 +883,14 @@ std::vector<std::string> Session::drain_pending_wire_json()
 
 int Session::recv_payload(SSL* ssl, std::vector<std::uint8_t>* out, std::mutex* io_mu)
 {
+    return recv_payload_until(ssl, out, io_mu,
+                              std::chrono::steady_clock::time_point::max());
+}
+
+int Session::recv_payload_until(SSL* ssl, std::vector<std::uint8_t>* out,
+                                std::mutex* io_mu,
+                                std::chrono::steady_clock::time_point deadline)
+{
     if (!ssl || !out) return -1;
     out->clear();
     for (;;) {
@@ -902,6 +910,7 @@ int Session::recv_payload(SSL* ssl, std::vector<std::uint8_t>* out, std::mutex* 
             *out = std::move(bodies.front());
             return 0;
         }
+        if (std::chrono::steady_clock::now() >= deadline) return 2;
         const int rc = try_read_frames(ssl, io_mu);
         if (rc < 0) return -1;
         if (rc > 0) return 1;

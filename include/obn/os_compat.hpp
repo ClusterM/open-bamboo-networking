@@ -97,6 +97,9 @@ bool socket_in_progress(int err);
 // ioctlsocket FIONBIO 1.
 int set_nonblocking(socket_t s);
 
+// Back to blocking mode (undoes set_nonblocking). Same return values.
+int set_blocking(socket_t s);
+
 // poll() / WSAPoll() with a single fd. `events` and `revents` use the
 // usual POLLIN / POLLOUT / POLLHUP names. Returns 0 on timeout,
 // >0 with revents written to *out_revents on activity, -1 on error
