@@ -177,7 +177,9 @@ public:
     // Blocks (up to `timeout`) until the printer has acknowledged
     // security.app_cert_install for `dev_id` this session (app_cert_install_sent_
     // latched from a SUCCESS report), kicking an install if none is in flight.
-    // Returns true when acknowledged. Used to gate signed `print` publishes so a
+    // Returns true when acknowledged; returns false at once when the printer
+    // answered the install with a failure recently (it would not ack within the
+    // timeout anyway). Used to gate signed `print` publishes so a
     // secured printer does not reject an early signature with 84033545
     // ("need reset device pub key"). Never called for security/pushing/info
     // frames (they are unsigned), so it cannot block the install itself.
@@ -663,6 +665,12 @@ private:
     // printer acknowledged security.app_cert_install). wait_for_app_cert()
     // waits on this instead of polling. Waits on mu_.
     std::condition_variable app_cert_cv_;
+    // Devices whose last app_cert_install was answered with a failure
+    // (result != SUCCESS or no printer_cert), and when. While a failure is
+    // recent, wait_for_app_cert() returns at once instead of blocking every
+    // signed publish for the full timeout on an install the printer already
+    // refused. Cleared by a later SUCCESS. Guarded by mu_; notifies app_cert_cv_.
+    std::map<std::string, std::chrono::steady_clock::time_point> app_cert_install_failed_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.
