@@ -19,6 +19,9 @@ enum class CloudPrintMode {
     CloudOnly,    // both ABIs → run_cloud_print_job (default)
     TryLanFirst,  // _with_record → local; fail lets Studio fall back to cloud
     LanOnly,      // _with_record → local; start_print always refused
+    // Per job: CloudOnly when the .3mf carries a MakerWorld DesignModelId,
+    // LanOnly otherwise.
+    CloudForMakerWorldOnly,
 };
 
 struct Settings {

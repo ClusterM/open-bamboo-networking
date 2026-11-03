@@ -243,6 +243,15 @@ client_name = OpenBambooNetworking
 #                    always send and start the print locally. Never fall
 #                    back to uploading the full model to the cloud. If the
 #                    local send fails, the print simply fails.
+#
+#   cloud_for_makerworld_only
+#                  — Decide per print by looking inside the sliced file.
+#                    A project downloaded from MakerWorld (the file carries
+#                    a MakerWorld model id, "DesignModelId") is printed like
+#                    cloud_only, so MakerWorld counts the print and lets you
+#                    rate the model and support its designer. Everything
+#                    else, e.g. your own models and test versions, is
+#                    printed like lan_only and leaves no cloud print history.
 
 cloud_print = cloud_only
 

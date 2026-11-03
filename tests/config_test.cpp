@@ -270,6 +270,9 @@ int main()
         write_conf(dir, "cloud_print = lan_only\n");
         CHECK(obn::config::load_or_create(dir.string()).cloud_print
               == obn::config::CloudPrintMode::LanOnly);
+        write_conf(dir, "cloud_print = Cloud_For_MakerWorld_Only\n");
+        CHECK(obn::config::load_or_create(dir.string()).cloud_print
+              == obn::config::CloudPrintMode::CloudForMakerWorldOnly);
         write_conf(dir, "cloud_print = not_a_mode\n");
         CHECK(obn::config::load_or_create(dir.string()).cloud_print
               == obn::config::CloudPrintMode::CloudOnly);

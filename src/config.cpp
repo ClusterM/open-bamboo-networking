@@ -92,6 +92,8 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
             out.cloud_print = CloudPrintMode::TryLanFirst;
         else if (v == "lan_only")
             out.cloud_print = CloudPrintMode::LanOnly;
+        else if (v == "cloud_for_makerworld_only")
+            out.cloud_print = CloudPrintMode::CloudForMakerWorldOnly;
         else {
             OBN_WARN("config: unknown cloud_print='%s', using cloud_only",
                      val.c_str());

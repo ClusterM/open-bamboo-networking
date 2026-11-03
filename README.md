@@ -255,6 +255,15 @@ LAN.
 print over the LAN without writing a cloud record at all, and
 `cloud_hide_history = 1` to hide the cloud print history in Studio.
 
+**Or keep the cloud record only for MakerWorld models:** with
+`cloud_print = cloud_for_makerworld_only` the plugin looks inside each sliced
+`.gcode.3mf` before sending it. A project downloaded from MakerWorld carries
+its MakerWorld model id (`DesignModelId` in `3D/3dmodel.model`) and is printed
+like `cloud_only`, so MakerWorld counts the print and you can rate the model
+and support its designer. Everything else, such as your own models and the
+dozens of test versions you print while designing them, is printed like
+`lan_only` and never shows up in your cloud print history.
+
 If you run **neither** Developer Mode **nor** valid credentials, the printer
 rejects every `print` / `project_file` command and shows on its screen:
 
@@ -337,7 +346,7 @@ Studio does the work.
 | "Send to Printer" dialog (`ft_*`)          | ✅ (tested on P2S) | Native    | `ft_*` over TLS :6000 — upload `cmd_type=5`, ability `7`, Printer Preview `cmd_type=4` (`mem:/26`). See [STATUS.md §8.14](STATUS.md#814-file-transfer-abi-ft_). |
 | Cloud 3MF upload to S3                     | ✅                 | Native      | 6-step upload sequence reversed from MITM of the stock plugin.                                                                                                                                                              |
 | Cloud print dispatch (`start_print`)       | ⚠️                 | Native      | (new in v2.0.0) Full cloud pipeline: `POST /user/project` → presigned S3 upload → `POST /my/task`. Requires `block_cloud = 0`, `client_name = BambuStudio`, cloud login, and (on a verified printer) your own `slicer_key.pem`. Governed by `cloud_print` (see [Configuration file](#configuration-file)). |
-| `create_task` (MakerWorld entry)           | ⚠️                 | Native      | (new in v2.0.0) Writes the MakerWorld task/print-history record as part of the cloud print flow. Needs `client_name = BambuStudio` (otherwise `POST /my/task` → HTTP 403). Not written for pure LAN prints (`try_lan_first` / `lan_only`). |
+| `create_task` (MakerWorld entry)           | ⚠️                 | Native      | (new in v2.0.0) Writes the MakerWorld task/print-history record as part of the cloud print flow. Needs `client_name = BambuStudio` (otherwise `POST /my/task` → HTTP 403). Not written for pure LAN prints (`try_lan_first` / `lan_only`), and with `cloud_for_makerworld_only` only for MakerWorld projects. |
 | "Print from Device" (`start_sdcard_print`) | ✅ (tested on P2S) | Alternative | Stock plugin: cloud REST endpoint we can't sign. Ours: publish `project_file` on LAN MQTT for a file already on the printer.                                                                                                |
 | AMS telemetry / mapping                    | ✅                 | Passthrough | Studio consumes `push_status` directly.                                                                                                                                                                                     |
 | Nozzle mapping / multi-extruder            | ✅ (not tested)    | Passthrough | Plugin puts nozzle mapping data into JSON but the author has no such printer to test.                                                                                                                                       |
@@ -504,7 +513,7 @@ Spaces around `=` are optional.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `block_cloud` | `1` | Block background cloud MQTT/REST connections **and cloud printing**. Login, preset sync, Filament Manager and bind/unbind are still allowed. Set to `0` to enable the cloud MQTT session and any `cloud_print` mode. |
-| `cloud_print` | `cloud_only` | (new in v2.0.0) How a print is sent when cloud mode is on. `cloud_only`: write a cloud print record (history / MakerWorld); the model itself still goes to the printer over your LAN when possible, and is uploaded to Bambu only if the printer is not reachable locally. `try_lan_first`: print entirely over the LAN with no cloud record, falling back to a cloud print only if that fails. `lan_only`: always local, never upload. |
+| `cloud_print` | `cloud_only` | (new in v2.0.0) How a print is sent when cloud mode is on. `cloud_only`: write a cloud print record (history / MakerWorld); the model itself still goes to the printer over your LAN when possible, and is uploaded to Bambu only if the printer is not reachable locally. `try_lan_first`: print entirely over the LAN with no cloud record, falling back to a cloud print only if that fails. `lan_only`: always local, never upload. `cloud_for_makerworld_only`: decided per print, `cloud_only` for a project downloaded from MakerWorld (the file carries a MakerWorld model id), `lan_only` for everything else. |
 | `cloud_hide_history` | `0` | (new in v2.0.0) Return an empty task list so the Bambu Studio home page shows no cloud print history. Handy with the true-LAN `cloud_print` modes. |
 | `cloud_pushall_on_connect` | `1` | Ask each printer for one full status snapshot (`pushall`) per cloud session, as soon as its report subscription goes live. Without it the device panel can stay empty until the printer volunteers telemetry, because the slicer only requests a snapshot after the first report it sees. Set to `0` to keep the cloud session silent. |
 | `slicer_cert_pem` | *(empty)* | (new in v2.0.0) Path to the slicer certificate (PEM). Empty = look for `slicer_cert.pem` in the config directory. |
