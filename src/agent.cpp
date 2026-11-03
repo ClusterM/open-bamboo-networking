@@ -1773,9 +1773,22 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
 
         OBN_INFO("camera_url(remote): dispatching liveview prepare for dev=%s uid=%s",
                  serial.c_str(), tt_resp.uid.c_str());
-        int rc = send_message(serial, req_json, /*qos=*/0);
-        OBN_INFO("camera_url(remote): liveview prepare dev=%s rc=%d",
-                 serial.c_str(), rc);
+        // A cloud-bound printer acts on liveview.prepare from the cloud broker, which is where Bambu
+        // Studio sends it. send_message() prefers any connected LAN session, and an X1C silently
+        // ignored prepare over LAN, so remote liveview never started. Use the cloud when it is up and
+        // fall back to the usual route otherwise.
+        int rc = BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
+        const char* route = "lan-first";
+        if (cloud_connected()) {
+            rc = cloud_send_message(serial, req_json, /*qos=*/0);
+            route = "cloud";
+        }
+        if (rc != BAMBU_NETWORK_SUCCESS) {
+            rc = send_message(serial, req_json, /*qos=*/0);
+            if (route[0] == 'c') route = "cloud-failed, lan-first";
+        }
+        OBN_INFO("camera_url(remote): liveview prepare dev=%s rc=%d route=%s",
+                 serial.c_str(), rc, route);
     }
 
     std::string turl = obn::camera::build_tutk_url(
