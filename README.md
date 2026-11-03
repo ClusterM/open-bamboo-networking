@@ -19,7 +19,7 @@ plugin.
     - [Basics (model-independent)](#basics-model-independent)
     - [Printing](#printing)
     - [Camera liveview and file browser](#camera-liveview-and-file-browser)
-    - [Status / Device tab](#status-device-tab)
+    - [Status / Device tab](#status--device-tab)
   - [Cloud sign-in in Developer or LAN-only mode](#cloud-sign-in-in-developer-or-lan-only-mode)
 - [Building from source](#building-from-source)
 - [Configuration file](#configuration-file)

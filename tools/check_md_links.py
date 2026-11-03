@@ -61,9 +61,8 @@ def github_slug(heading: str) -> str:
     s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
     s = re.sub(r"\*([^*]+)\*", r"\1", s)
     s = _PUNCT_RE.sub("", s)
-    s = re.sub(r"\s+", "-", s.strip())
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s
+    # One hyphen per space, never collapsed: "A / B" -> "a--b", as on GitHub.
+    return s.strip().replace(" ", "-")
 
 
 def heading_slugs(text: str) -> set[str]:
