@@ -191,6 +191,20 @@ const char* kBambuNetworkSymbols[] = {
 #endif
 #if ABI_VERSION >= 0x020802
     "bambu_network_sync_slot_mappings",
+    "bambu_network_start_print_queue_task",
+    "bambu_network_upload_print_queue_content",
+    "bambu_network_create_print_queue_project",
+    "bambu_network_get_print_queue_projects",
+    "bambu_network_update_print_queue_project",
+    "bambu_network_sort_print_queue_project",
+    "bambu_network_delete_print_queue_project",
+    "bambu_network_update_print_queue_plate",
+    "bambu_network_sort_print_queue_plate",
+    "bambu_network_delete_print_queue_plate",
+    "bambu_network_extract_print_queue_plate",
+    "bambu_network_delete_unavailable_print_queue_plates",
+    "bambu_network_get_print_queue_model_profile",
+    "bambu_network_download_print_queue_config",
 #endif
 #if ABI_VERSION >= 0x020803
     "bambu_network_get_soft_match_pending",
@@ -198,6 +212,10 @@ const char* kBambuNetworkSymbols[] = {
 #endif
 #if ABI_VERSION >= 0x020804
     "bambu_network_post_device_region",
+#endif
+#if ABI_VERSION >= 0x020901
+    "bambu_network_get_minors_decisions",
+    "bambu_network_get_child_registration_key",
 #endif
     "bambu_network_get_printer_firmware",
     "bambu_network_get_task_plate_index",

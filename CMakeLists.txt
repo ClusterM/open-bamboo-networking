@@ -369,6 +369,7 @@ add_library(bambu_networking SHARED
     src/abi_user.cpp
     src/abi_bind.cpp
     src/abi_print.cpp
+    src/abi_print_queue.cpp
     src/abi_presets.cpp
     src/abi_http.cpp
     src/abi_filament.cpp
@@ -1190,6 +1191,45 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME device_region COMMAND device_region_test)
+
+    # Pins the 02.09.01 minors query / parser and the block_cloud and
+    # logged-out short-circuits.
+    add_executable(minors_test tests/minors_test.cpp
+        src/abi_user.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(minors_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(minors_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(minors_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME minors COMMAND minors_test)
+
+    # Print Queue stubs: per-call error codes, cleared outputs, no callbacks.
+    add_executable(print_queue_stub_test tests/print_queue_stub_test.cpp
+        src/abi_print_queue.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(print_queue_stub_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(print_queue_stub_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(print_queue_stub_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME print_queue_stub COMMAND print_queue_stub_test)
 
     # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
     # the AWS SigV4 signing-key derivation against the vendors' published

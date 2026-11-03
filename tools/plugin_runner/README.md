@@ -86,6 +86,8 @@ per ABI). Plugin downloads are cached in
                           than `BambuStudio`, so pass that when you need a
                           faithful stock cloud-print capture.
 --client-version VER      X-BBL-Client-Version. Default 02.05.03.99.
+--x-bbl-device-id UUID    X-BBL-Device-ID (Studio's slicer_uuid). Omitted by
+                          default; POST /device/region answers 400 without it.
 --cert-lan-only 0|1       lan_only argument for install_device_cert during
                           bring-up; Studio passes is_lan_mode_printer().
                           Default 1. A cloud-paired printer needs 0: only
@@ -160,6 +162,11 @@ per ABI). Plugin downloads are cached in
 --device-region-country CC     country field (stock does not put this on the wire)
 --device-region-x-client-country CC
                                XClientCountry (same)
+
+# --action minors_decisions flags (no printer; cloud HTTP only)
+--minors-scene CODE            scene code; repeat for several. Without any,
+                               the login set from GUI_App is sent
+--minors-no-scenes             send an empty list instead
 ```
 
 `http_probe` calls `get_studio_info_url`, `get_my_message`, `check_user_task_report`,
@@ -189,6 +196,16 @@ prints the return code plus the raw body. `--user-info` is optional.
 fields default to empty. `--country` still selects the API host via
 `set_country_code` (`CN` → `api.bambulab.cn`)
 ([research §8.10.12](../../research/08.10-http.md#81012-bambu_network_post_device_region)).
+
+`minors_decisions` and `child_registration_key` (ABI `02.09.01` or newer) call
+`get_minors_decisions` / `get_child_registration_key` once and print the return
+code plus the decoded results or the raw body. `--user-info` is optional:
+logged out, stock fails both calls without a request. Without `--minors-scene`
+the scene list is the one Studio sends at login (`REMOTE_CONTROL_PRINTER`,
+`JOIN_USER_EXPERIENCE_PROGRAM`, `ACCESS_MAKER_WORLD`, `ACCESS_MAKER_LAB`,
+`ACCESS_MAKER_SUPPLY`). `get_child_registration_key` is a `POST`, but for an
+adult account the server only answers 400
+([research §8.10.13](../../research/08.10-http.md#81013-bambu_network_get_minors_decisions)).
 
 `camera_url` makes one `get_camera_url` call with Studio's packed key
 `<dev-id>|<--camera-dev-ver>|<--camera-protocols>` (default protocols

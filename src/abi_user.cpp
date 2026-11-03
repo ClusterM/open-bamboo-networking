@@ -1,12 +1,18 @@
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "obn/abi_export.hpp"
 #include "obn/agent.hpp"
 #include "obn/bambu_networking.hpp"
 #include "obn/cloud_auth.hpp"
+#include "obn/config.hpp"
+#include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/minors.hpp"
 
 using obn::as_agent;
 
@@ -263,3 +269,165 @@ OBN_ABI int bambu_network_set_user_selected_machine(void* agent, std::string dev
 }
 
 OBN_IGNORE_RETURN_CXX_IN_EXTERN_C_END
+
+#if ABI_VERSION >= 0x020901
+
+namespace obn::detail {
+
+bool minors_scene_codes_valid(const std::vector<std::string>& scene_codes)
+{
+    if (scene_codes.empty()) return false;
+    std::set<std::string> seen;
+    for (const auto& s : scene_codes)
+        if (!seen.insert(s).second) return false;
+    return true;
+}
+
+std::string build_minors_decisions_query(const std::vector<std::string>& scene_codes)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const auto& code : scene_codes) {
+        out += out.empty() ? "?sceneCodes=" : "&sceneCodes=";
+        for (unsigned char c : code) {
+            const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                              (c >= '0' && c <= '9') || c == '-' || c == '.' ||
+                              c == '_' || c == '~' || c == '/';
+            if (keep) {
+                out += static_cast<char>(c);
+            } else {
+                out += '%';
+                out += hex[c >> 4];
+                out += hex[c & 0x0F];
+            }
+        }
+    }
+    return out;
+}
+
+bool parse_minors_decisions(const std::string& body,
+                            const std::vector<std::string>& scene_codes,
+                            std::vector<BBL::MinorsDecisionResult>* out)
+{
+    if (!out) return false;
+    out->clear();
+    auto root = obn::json::parse(body);
+    if (!root || !root->is_object()) return false;
+    const auto& obj = root->as_object();
+    auto it = obj.find("decisions");
+    if (it == obj.end() || !it->second.is_array()) return false;
+
+    std::map<std::string, BBL::MinorsDecisionResult> by_scene;
+    for (const auto& v : it->second.as_array()) {
+        if (!v.is_object()) return false;
+        const auto& e = v.as_object();
+        auto field = [&e](const char* key) -> const obn::json::Value* {
+            auto f = e.find(key);
+            return f == e.end() ? nullptr : &f->second;
+        };
+        const auto* scene   = field("sceneCode");
+        const auto* fl_en   = field("familyLinkEnable");
+        const auto* fl_dec  = field("familyLinkDecision");
+        const auto* dec     = field("decision");
+        if (!scene || !scene->is_string() || !fl_en || !fl_en->is_bool() ||
+            !fl_dec || !fl_dec->is_string() || !dec || !dec->is_string())
+            return false;
+
+        BBL::MinorsDecisionResult r;
+        r.scene_code           = scene->as_string();
+        r.family_link_enable   = fl_en->as_bool();
+        r.family_link_decision = fl_dec->as_string();
+        const std::string& d   = dec->as_string();
+        if (d == "ALLOW")         r.decision = BBL::MinorDecision::Allow;
+        else if (d == "DENY")     r.decision = BBL::MinorDecision::Deny;
+        else if (d == "NEED_IDV") r.decision = BBL::MinorDecision::NeedIdv;
+        else return false;
+        if (!by_scene.emplace(r.scene_code, std::move(r)).second) return false;
+    }
+
+    if (by_scene.size() != scene_codes.size()) return false;
+    std::vector<BBL::MinorsDecisionResult> ordered;
+    ordered.reserve(scene_codes.size());
+    for (const auto& code : scene_codes) {
+        auto f = by_scene.find(code);
+        if (f == by_scene.end()) return false;
+        ordered.push_back(f->second);
+    }
+    *out = std::move(ordered);
+    return true;
+}
+
+} // namespace obn::detail
+
+// Studio (GUI_App::fetch_minors_decisions) calls this right after login and
+// treats any non-zero return as "not restricted". With block_cloud we answer
+// SUCCESS with no decisions, which Studio reads the same way.
+OBN_ABI int bambu_network_get_minors_decisions(void* agent,
+                                               const std::vector<std::string>& scene_codes,
+                                               std::vector<BBL::MinorsDecisionResult>* decisions)
+{
+    if (decisions) decisions->clear();
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("bambu_network_get_minors_decisions: blocked by block_cloud");
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    if (!decisions || !obn::detail::minors_scene_codes_valid(scene_codes)) {
+        OBN_WARN("get_minors_decisions: rejected locally (scenes=%zu)", scene_codes.size());
+        return BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED;
+    }
+    auto hdrs = a->cloud_api_http_headers();
+    if (hdrs.find("Authorization") == hdrs.end()) {
+        OBN_WARN("get_minors_decisions: not logged in");
+        return BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED;
+    }
+    hdrs.erase("Content-Type");
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+                          + "/v1/user-service/minors/decisions"
+                          + obn::detail::build_minors_decisions_query(scene_codes);
+    auto resp = obn::http::get_json(url, hdrs);
+    OBN_INFO("get_minors_decisions scenes=%zu http=%ld bytes=%zu",
+             scene_codes.size(), resp.status_code, resp.body.size());
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300)
+        return BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED;
+    if (!obn::detail::parse_minors_decisions(resp.body, scene_codes, decisions)) {
+        OBN_WARN("get_minors_decisions: unexpected body: %s", resp.body.c_str());
+        return BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED;
+    }
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+// Only reached when a minor without a guardian has to be logged out; Studio
+// parses childRegistrationKey from the body itself. The body is forwarded
+// verbatim on any HTTP answer, 2xx or not.
+OBN_ABI int bambu_network_get_child_registration_key(void* agent, std::string* http_body)
+{
+    if (http_body) http_body->clear();
+    if (obn::config::current().block_cloud) {
+        OBN_DEBUG("bambu_network_get_child_registration_key: blocked by block_cloud");
+        return BAMBU_NETWORK_SUCCESS;
+    }
+
+    auto* a = as_agent(agent);
+    if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    const auto hdrs = a->cloud_api_http_headers();
+    if (hdrs.find("Authorization") == hdrs.end()) {
+        OBN_WARN("get_child_registration_key: not logged in");
+        return BAMBU_NETWORK_ERR_GET_CHILD_REGISTRATION_KEY_FAILED;
+    }
+
+    const std::string url = obn::cloud::api_host(a->cloud_region())
+                          + "/v1/user-service/my/familyhub/child-registration/key";
+    auto resp = obn::http::post_json(url, "{}", hdrs);
+    OBN_INFO("get_child_registration_key http=%ld bytes=%zu",
+             resp.status_code, resp.body.size());
+    if (http_body) *http_body = std::move(resp.body);
+    if (!resp.error.empty() || resp.status_code < 200 || resp.status_code >= 300)
+        return BAMBU_NETWORK_ERR_GET_CHILD_REGISTRATION_KEY_FAILED;
+    return BAMBU_NETWORK_SUCCESS;
+}
+
+#endif

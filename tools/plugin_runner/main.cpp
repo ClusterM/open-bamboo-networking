@@ -267,6 +267,14 @@ struct CliArgs {
     std::optional<std::string> device_region_country;
     std::optional<std::string> device_region_x_client_country;
 
+    // --action minors_decisions (ABI >= 02.09.01): one get_minors_decisions
+    // call. Without --minors-scene the scene list is the one
+    // GUI_App::fetch_minors_decisions sends at login; --minors-no-scenes
+    // sends an empty list. --action child_registration_key calls
+    // get_child_registration_key once.
+    std::vector<std::string> minors_scenes;
+    bool                     minors_no_scenes = false;
+
     // --action camera_url: one get_camera_url call with Studio's packed
     // "serial|dev_ver|protocols" key (MediaPlayCtrl::Play). The minted URL
     // carries TUTK credentials, so events only show a masked copy; the raw
@@ -317,6 +325,9 @@ struct CliArgs {
     std::string client_name = "OpenBambooNetworking";
     // X-BBL-Client-Version (Studio's SLIC3R_VERSION).
     std::string client_version = "02.05.03.99";
+    // X-BBL-Device-ID (Studio's slicer_uuid). Studio always sends it; some
+    // user-service endpoints answer 400 without it. Omitted when empty.
+    std::string x_bbl_device_id;
     int         timeout_s = 90;
     int         connect_settle_ms = 800;
     bool        keep_tmpdir = false;
@@ -357,6 +368,7 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--cert-file PATH] [--timeout SECONDS]
                      [--connect-settle-ms MS] [--cert-lan-only 0|1]
                      [--client-name NAME] [--client-version VER]
+                     [--x-bbl-device-id UUID]
                      [--log-out PATH] [--keep-tmpdir]
 
        plugin_runner --action send_raw --raw-json FILE
@@ -394,6 +406,15 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
                      [--device-region-client-type TYPE]
                      [--device-region-country CC]
                      [--device-region-x-client-country CC]
+                     [--country US]
+
+       plugin_runner --action minors_decisions --plugin-path PATH
+                     [--user-info @session.json] [--data-dir DIR]
+                     [--minors-scene CODE]... [--minors-no-scenes]
+                     [--country US]
+
+       plugin_runner --action child_registration_key --plugin-path PATH
+                     [--user-info @session.json] [--data-dir DIR]
                      [--country US]
 
        plugin_runner --action camera_url --plugin-path PATH
@@ -441,6 +462,7 @@ R"(usage: plugin_runner --plugin-path PATH --params-json FILE --action ACTION
 ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
                 | local_print_with_record | cloud_print | send_raw | none
                 | http_probe | mw_probe | filament_probe | device_region
+                | minors_decisions | child_registration_key
                 | update_cert | query_bind | auth_probe | bind_detect | account_bind
                 | gap_probe | cert_probe
 
@@ -492,6 +514,17 @@ ACTION is one of: send_gcode_to_sdcard | local_print | sdcard_print
   other three fields default to empty. Pass an empty string to force
   ClientType blank. --country still selects the cloud region via
   set_country_code. Run under MITM to capture the request.
+
+  minors_decisions: no printer. Optional change_user, then one
+  get_minors_decisions (ABI >= 02.09.01). Each --minors-scene adds one
+  scene code; without any, the login set from GUI_App is sent
+  (REMOTE_CONTROL_PRINTER, JOIN_USER_EXPERIENCE_PROGRAM, ACCESS_MAKER_WORLD,
+  ACCESS_MAKER_LAB, ACCESS_MAKER_SUPPLY). --minors-no-scenes sends [].
+  Emits rc and every decoded MinorsDecisionResult.
+
+  child_registration_key: no printer. Optional change_user, then one
+  get_child_registration_key (ABI >= 02.09.01). Studio calls it only for
+  a minor account without a guardian, right before a forced logout.
 
   update_cert: no printer. Mirrors Studio GUI_App::check_cert →
   bambu_network_update_cert. Under MITM this should be the shared app
@@ -572,6 +605,7 @@ CliArgs parse_cli(int argc, char** argv)
         else if (f == "--cert-lan-only")     c.cert_lan_only = std::stoi(require(a, ++i, f)) != 0;
         else if (f == "--client-name")       c.client_name = require(a, ++i, f);
         else if (f == "--client-version")    c.client_version = require(a, ++i, f);
+        else if (f == "--x-bbl-device-id")   c.x_bbl_device_id = require(a, ++i, f);
         else if (f == "--keep-tmpdir")       c.keep_tmpdir = true;
         else if (f == "--data-dir")          c.data_dir = require(a, ++i, f);
         else if (f == "--user-info")         c.user_info = require(a, ++i, f);
@@ -616,6 +650,8 @@ CliArgs parse_cli(int argc, char** argv)
             c.device_region_country = require(a, ++i, f);
         else if (f == "--device-region-x-client-country")
             c.device_region_x_client_country = require(a, ++i, f);
+        else if (f == "--minors-scene")      c.minors_scenes.push_back(require(a, ++i, f));
+        else if (f == "--minors-no-scenes")  c.minors_no_scenes = true;
         else if (f == "--camera-dev-ver")    c.camera_dev_ver   = require(a, ++i, f);
         else if (f == "--camera-protocols")  c.camera_protocols = require(a, ++i, f);
         else if (f == "--camera-url-out")    c.camera_url_out   = require(a, ++i, f);
@@ -658,6 +694,7 @@ CliArgs parse_cli(int argc, char** argv)
          c.action == "auth_probe" ||
          c.action == "gap_probe" || c.action == "filament_probe" ||
          c.action == "device_region" || c.action == "camera_url" ||
+         c.action == "minors_decisions" || c.action == "child_registration_key" ||
          c.action == "ft_job");
     const bool bind_detect_only = (c.action == "bind_detect");
     const bool account_bind     = (c.action == "account_bind");
@@ -1146,6 +1183,8 @@ try {
         hdrs["X-BBL-OS-Type"]        = "linux";
         hdrs["X-BBL-OS-Version"]     = "1.0.0";
         hdrs["X-BBL-Language"]       = "en";
+        if (!args.x_bbl_device_id.empty())
+            hdrs["X-BBL-Device-ID"] = args.x_bbl_device_id;
         exports.set_extra_http_header(agent, hdrs);
         emit_event("extra_http_header", { {"count", hdrs.size()} });
     }
@@ -1231,13 +1270,15 @@ try {
     const bool account_bind_probe = (args.action == "account_bind");
     const bool filament_probe     = (args.action == "filament_probe");
     const bool device_region_probe = (args.action == "device_region");
+    const bool minors_probe        = (args.action == "minors_decisions" ||
+                                      args.action == "child_registration_key");
     const bool camera_url_probe    = (args.action == "camera_url");
     const bool ft_job_action       = (args.action == "ft_job");
     const bool cloud_probe =
         http_probe || mw_probe || update_cert_probe || query_bind_probe ||
         auth_probe ||
         gap_probe_action || filament_probe || device_region_probe ||
-        camera_url_probe || ft_job_action;
+        minors_probe || camera_url_probe || ft_job_action;
     // account_bind / bind_detect call bind_detect themselves then exit
     // (or call bind()); they must not open a competing LAN MQTT session.
     const bool skip_lan_mqtt = cloud_probe || bind_detect_only || account_bind_probe;
@@ -2085,6 +2126,62 @@ try {
             {"rc", rc},
             {"body", body},
         });
+        bool fast = args.fast_exit.value_or(true);
+        if (fast) {
+            emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });
+            fast_exit(rc == 0 ? 0 : 1);
+        }
+        guard.a = nullptr;
+        if (exports.disconnect_printer) exports.disconnect_printer(agent);
+        exports.destroy_agent(agent);
+        pr::unload(exports);
+        emit_event("shutdown", { {"finished", true}, {"fast_exit", false} });
+        return rc == 0 ? 0 : 1;
+#endif
+    } else if (minors_probe) {
+#if ABI_VERSION < 0x020901
+        emit_event(args.action, { {"unsupported_abi", true} });
+        emit_text("fatal", args.action + " requires a runner built for ABI >= 02.09.01");
+        return 70;
+#else
+        int rc = 0;
+        if (args.action == "minors_decisions") {
+            if (!exports.get_minors_decisions) {
+                emit_event("get_minors_decisions", { {"missing", true} });
+                emit_text("fatal", "plugin missing bambu_network_get_minors_decisions");
+                return 70;
+            }
+            std::vector<std::string> scenes = args.minors_scenes;
+            if (scenes.empty() && !args.minors_no_scenes) {
+                scenes = {BBL::MINORS_SCENE_REMOTE_CONTROL_PRINTER,
+                          BBL::MINORS_SCENE_JOIN_USER_EXPERIENCE_PROGRAM,
+                          BBL::MINORS_SCENE_ACCESS_MAKER_WORLD,
+                          BBL::MINORS_SCENE_ACCESS_MAKER_LAB,
+                          BBL::MINORS_SCENE_ACCESS_MAKER_SUPPLY};
+            }
+            emit_event("get_minors_decisions_request", { {"scene_codes", scenes} });
+            std::vector<BBL::MinorsDecisionResult> decisions;
+            rc = exports.get_minors_decisions(agent, scenes, &decisions);
+            json out = json::array();
+            for (const auto& d : decisions) {
+                out.push_back({
+                    {"scene_code", d.scene_code},
+                    {"family_link_enable", d.family_link_enable},
+                    {"family_link_decision", d.family_link_decision},
+                    {"decision", static_cast<int>(d.decision)},
+                });
+            }
+            emit_event("get_minors_decisions", { {"rc", rc}, {"decisions", out} });
+        } else {
+            if (!exports.get_child_registration_key) {
+                emit_event("get_child_registration_key", { {"missing", true} });
+                emit_text("fatal", "plugin missing bambu_network_get_child_registration_key");
+                return 70;
+            }
+            std::string body;
+            rc = exports.get_child_registration_key(agent, &body);
+            emit_event("get_child_registration_key", { {"rc", rc}, {"body", body} });
+        }
         bool fast = args.fast_exit.value_or(true);
         if (fast) {
             emit_event("shutdown", { {"finished", true}, {"fast_exit", true} });

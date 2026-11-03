@@ -161,6 +161,12 @@ using func_post_device_region = int (*)(void* agent,
                                         BBL::DeviceRegionParams params,
                                         std::string* http_body);
 #endif
+#if ABI_VERSION >= 0x020901
+using func_get_minors_decisions = int (*)(void* agent,
+                                          const std::vector<std::string>& scene_codes,
+                                          std::vector<BBL::MinorsDecisionResult>* decisions);
+using func_get_child_registration_key = int (*)(void* agent, std::string* http_body);
+#endif
 
 // Resolved entry points. Required pointers are validated by load(); optional
 // pointers stay null if absent so the caller can branch on availability
@@ -295,6 +301,10 @@ struct PluginExports {
 #endif
 #if ABI_VERSION >= 0x020804
     func_post_device_region          post_device_region          = nullptr;
+#endif
+#if ABI_VERSION >= 0x020901
+    func_get_minors_decisions        get_minors_decisions        = nullptr;
+    func_get_child_registration_key  get_child_registration_key  = nullptr;
 #endif
 };
 

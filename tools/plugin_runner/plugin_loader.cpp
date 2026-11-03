@@ -218,6 +218,12 @@ PluginExports load(const std::string& so_path)
     out.post_device_region = resolve<func_post_device_region>(
         out.dl_handle, "bambu_network_post_device_region");
 #endif
+#if ABI_VERSION >= 0x020901
+    out.get_minors_decisions = resolve<func_get_minors_decisions>(
+        out.dl_handle, "bambu_network_get_minors_decisions");
+    out.get_child_registration_key = resolve<func_get_child_registration_key>(
+        out.dl_handle, "bambu_network_get_child_registration_key");
+#endif
 
     if (out.get_version) {
         try { out.version = out.get_version(); } catch (...) { out.version.clear(); }

@@ -59,9 +59,9 @@ namespace BBL {
 #define BAMBU_NETWORK_ERR_GET_SOFT_MATCH_PENDING_FAILED -34
 #define BAMBU_NETWORK_ERR_POST_SOFT_MATCH_PENDING_FAILED -35
 
-// -36 … -59 belong to the Print Queue feature Studio 02.08.02 declares but
-// does not call yet, though the stock plugin already implements it.
-// Mirrored for fidelity; nothing returns them yet.
+// -36 … -59 belong to the Print Queue feature. Studio 02.08.02 declares it,
+// 02.09.01 resolves the entry points but compiles the UI out; the stock
+// plugin implements it. Our stubs return the per-call "failed" code.
 // See research/08.16-errors.md §8.16.9.
 #define BAMBU_NETWORK_ERR_CREATE_PRINT_QUEUE_PROJECT_FAILED       -36
 #define BAMBU_NETWORK_ERR_GET_PRINT_QUEUE_PROJECTS_FAILED         -37
@@ -88,6 +88,8 @@ namespace BBL {
 #define BAMBU_NETWORK_ERR_DOWNLOAD_PRINT_QUEUE_CONFIG_FAILED      -58
 #define BAMBU_NETWORK_ERR_START_PRINT_QUEUE_TASK_FAILED           -59
 #define BAMBU_NETWORK_ERR_POST_DEVICE_REGION_FAILED               -60
+#define BAMBU_NETWORK_ERR_GET_MINORS_DECISIONS_FAILED             -61
+#define BAMBU_NETWORK_ERR_GET_CHILD_REGISTRATION_KEY_FAILED       -62
 
 //bind error
 #define BAMBU_NETWORK_ERR_BIND_CREATE_SOCKET_FAILED          -1010 //failed to create socket
@@ -312,10 +314,10 @@ struct TaskQueryParams
 };
 
 #if ABI_VERSION >= 0x020802
-// Print Queue: declared by Studio 02.08.02 but not wired up anywhere in it —
-// no NetworkAgent method, no dlsym, no UI. The stock plugin, however, already
-// exports all 14 bambu_network_*_print_queue_* entry points, so this is a
-// feature the plugin ships ahead of Studio rather than a dead declaration.
+// Print Queue: declared by Studio 02.08.02 but not wired up there. Studio
+// 02.09.01 resolves all 14 bambu_network_*_print_queue_* entry points and
+// keeps the UI compiled out (STUDIO_ENABLE_PRINT_QUENE 0). The stock plugin
+// exports them since 02.08.02; we export stubs (src/abi_print_queue.cpp).
 // Mirrored verbatim so our header stays a faithful copy of the ABI surface;
 // see research/08.16-errors.md §8.16.9.
 //
@@ -509,6 +511,38 @@ struct DeviceRegionParams {
     std::string ClientType;
     std::string country;
     std::string XClientCountry;
+};
+#endif
+
+#if ABI_VERSION >= 0x020901
+enum class MinorDecision : int
+{
+    Allow   = 0,
+    Deny    = 1,
+    NeedIdv = 2,
+};
+
+// Scene codes accepted by bambu_network_get_minors_decisions.
+inline constexpr const char* MINORS_SCENE_STUDIO_LOGIN_VIA_EMAIL = "STUDIO_LOGIN_VIA_EMAIL"; // Studio email login
+inline constexpr const char* MINORS_SCENE_STUDIO_LOGIN_VIA_3P = "STUDIO_LOGIN_VIA_3P"; // Studio third-party login
+inline constexpr const char* MINORS_SCENE_JOIN_USER_EXPERIENCE_PROGRAM = "JOIN_USER_EXPERIENCE_PROGRAM"; // Join user experience program
+inline constexpr const char* MINORS_SCENE_REMOTE_CONTROL_PRINTER = "REMOTE_CONTROL_PRINTER"; // Remote printer control
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_WORLD = "ACCESS_MAKER_WORLD"; // Access MakerWorld
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_LAB = "ACCESS_MAKER_LAB"; // Access MakerLab
+inline constexpr const char* MINORS_SCENE_ACCESS_MAKER_SUPPLY = "ACCESS_MAKER_SUPPLY"; // Access MakerSupply
+inline constexpr const char* MINORS_SCENE_FORUM_LOGIN_VIA_EMAIL = "FORUM_LOGIN_VIA_EMAIL"; // Forum email login
+inline constexpr const char* MINORS_SCENE_FORUM_LOGIN_VIA_3P = "FORUM_LOGIN_VIA_3P"; // Forum third-party login
+
+// Possible values of MinorsDecisionResult::family_link_decision.
+inline constexpr const char* FAMILY_LINK_DECISION_NO_CONFIG = "no_config";
+inline constexpr const char* FAMILY_LINK_DECISION_ALLOW = "allow";
+inline constexpr const char* FAMILY_LINK_DECISION_DENY = "deny";
+
+struct MinorsDecisionResult {
+    std::string   scene_code;
+    bool          family_link_enable = false;
+    std::string   family_link_decision;
+    MinorDecision decision = MinorDecision::NeedIdv;
 };
 #endif
 
