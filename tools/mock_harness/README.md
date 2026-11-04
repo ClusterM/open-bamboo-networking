@@ -1,0 +1,452 @@
+# openbu-mock harness (`tools/mock_harness/`)
+
+Hardware-free integration harness for TEST-01: run **openbu-mock as an external
+binary** (never vendored — no LICENSE upstream), drive
+`tools/plugin_runner --action none` against it, and assert the
+detect→connect→pushall event chain. This plan (04-01) establishes the fetch/build
+spike, the environment record, and the gap analysis; later plans add the clean-room
+sidecar and the single CI-able command.
+
+## Usage
+
+The single CI-able command (from the `bambu_network_oss` repo root, WSL bash
+— D-07 platform):
+
+```bash
+tools/mock_harness/run_harness.sh
+```
+
+Flags and defaults:
+
+| flag | default |
+| --- | --- |
+| `--abi MM.mm.pp` | derived from this file's `OQ3 resolved:` line (`02.08.01`) |
+| `--model` | `P1S` |
+| `--access-code` | `12345678` |
+| `--timeout` | `6` |
+| `--connect-settle-ms` | `15000` |
+| `--log-out` | `.cache/openbu-mock/run/harness.jsonl` |
+| `--ssdp {off,soft,hard}` | derived from this file (`assert decision: hard` → `hard`, else `soft`) |
+
+Exit-code contract: **`0` = D-08 chain passed, `1` = assertion failed** —
+the runner's own `rc` (printed as `runner_rc=`) is informational only:
+`--action none` exits 0 even when the flow failed, so the
+verdict comes solely from `tools/mock_harness/assert_chain.py`.
+
+What one invocation does: preflight (`command -v cmake ninja g++ pkg-config
+python3 git` + `pkg-config --exists openssl libcurl minizip`, actionable
+errors on failure) → `fetch_mock.sh` pinned fetch/build if
+`.cache/openbu-mock/out/openbu-mock` is missing → `build_responder.sh` if the
+sidecar is missing → start the mock (cwd `.cache/openbu-mock/run/` so
+`ca.pem` lands in the gitignored run dir; stdout table parsed into
+`identity.env` — serial/IP/code are never hardcoded) → copy the OQ1 trust
+anchors (`slicer_base64.cer` **and** `printer.cer` = PEM copies of `ca.pem`)
+→ start the clean-room `:3000` sidecar with the identity + OQ5 values →
+readiness poll (`$IP:8883` and `:3000`, else the mock log tail) →
+`tools/plugin_runner.sh --abi $ABI --action none … --log-out …` →
+`python3 tools/mock_harness/assert_chain.py --log … --ssdp …` verdict →
+teardown (`trap` on EXIT/INT/TERM kills mock + sidecar) → **exit with the
+assertion's code**.
+
+Prerequisites (one-time, WSL Ubuntu):
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build \
+    pkg-config libcurl4-openssl-dev libminizip-dev nlohmann-json3-dev
+```
+
+Docker Desktop's daemon must be running for the **first** fetch (the
+`golang:1.22` build); later runs skip fetch+build when the binaries exist.
+
+Artifacts (all gitignored): the `<--log-out>` JSONL transcript (+ `.out` /
+`.err` runner capture), `.cache/openbu-mock/run/mock.log` (mock `-debug`),
+`identity.env`, `detect.log` (sidecar stdout).
+
+Expected output — the golden chain from `tools/plugin_runner/README.md` §9
+(event _kinds_ in order):
+
+```text
+startup → plugin_loaded → data_dir → cert_resolved →
+extra_http_header → agent_start (rc=0) → post_start_init →
+change_user_clear (rc=0) → ssdp_msg → bind_detect →
+connect_printer_call (rc=0) → local_connect (status=0) →
+session_ready (got=true) → start_subscribe → kickstart_pushall (rc=0)
+→ idle_done → shutdown
+```
+
+of which `assert_chain.py` asserts the seven-event D-08 pass contract in
+order: `bind_detect rc=0 → connect_printer_call rc=0 → local_connect
+status=0 → session_ready got=true → start_subscribe → kickstart_pushall
+rc=0 → idle_done`, plus `ssdp_msg` under `--ssdp hard`.
+
+assert decision: hard (ssdp_msg present in harness-run1/2 — 2 events each;
+coexistence proven stable in the 04-01 both-orders spikes)
+
+D-09: not included (JSONL chain unambiguous)
+
+No new GitHub workflow; .github/workflows/build.yml untouched (D-06) - CI-able means this one command plus its exit code
+
+## Environment & spikes
+
+Recorded 2026-09-30 (plan 04-01 Task 1), host = Windows + WSL Ubuntu, all
+commands from the workspace root.
+
+- **WSL deps:** `wsl -d Ubuntu -- bash -c 'command -v cmake ninja g++ pkg-config python3 git'`
+  → all found **after** the one-time README §1 apt install
+  (`build-essential cmake ninja-build pkg-config libcurl4-openssl-dev libminizip-dev nlohmann-json3-dev`),
+  run as root via `wsl -u root` (user sudo requires a password). Asserts:
+  `pkg-config --exists openssl` rc=0, `pkg-config --exists libcurl minizip` rc=0,
+  `dpkg -s nlohmann-json3-dev` rc=0. `jq` deliberately **not** installed —
+  `python3` is this project's JSON tool (research Standard Stack).
+- **Docker:** client 29.8.0 present, daemon was stopped → started via
+  `powershell.exe -Command "Start-Process 'C:\Program Files\Docker\Docker\Docker Desktop.exe'"`;
+  `docker info` healthy after ~5 s. The WSL distro has **no native `docker`**
+  (Docker Desktop WSL integration is off for Ubuntu) and the Windows daemon
+  cannot mount `/mnt/...` drvfs paths, so `fetch_mock.sh` falls back to
+  `docker.exe` (interop) with `/mnt/<drive>/…` → `<Drive>:/…` path translation.
+- **BUILD_PATH: docker-golang** (D-04 preferred path; local-Go fallback never fired)
+- **Pin:** `MOCK_PIN` = `e3db0ce7341f467e656cc860f1a0625c548a8f56` (openbu-mock
+  `master` at research time; hard-asserted in `fetch_mock.sh` — drift is recorded,
+  the pin is never auto-bumped).
+  `git -C .cache/openbu-mock/src rev-parse HEAD` raw output:
+
+  ```text
+  e3db0ce7341f467e656cc860f1a0625c548a8f56
+  ```
+
+- **Build:** `golang:1.22` image, `CGO_ENABLED=0 GOOS=linux GOARCH=amd64`,
+  `go build -trimpath -ldflags="-s -w" -o /out/openbu-mock .` (mirrors upstream
+  `build.sh`) → `.cache/openbu-mock/out/openbu-mock`, 4735128 bytes,
+  `test -x` rc=0. Re-running `fetch_mock.sh` skips fetch+build (idempotent).
+- **Native run (D-07 venue):** from `.cache/openbu-mock/run/` (cwd so
+  `ca.pem`/`ca-key.pem` land in the gitignored run dir):
+  `../out/openbu-mock -model P1S -access-code 12345678 -count 1 -debug > mock.log 2>&1 &`
+  (D-05: single printer, minimal flags). Parsed identity →
+  `.cache/openbu-mock/run/identity.env` (public fields only — no CA key material):
+
+  ```text
+  IP=192.168.2.177
+  SERIAL=01P6953E514809E
+  MODEL=P1S
+  NAME=3DP-01P-09E
+  CODE=12345678
+  ```
+
+- **TLS readiness:** `timeout 15 openssl s_client -connect 192.168.2.177:8883 -showcerts </dev/null`
+  → `run/tls_dump.txt` contains issuer `CN=Virtual Printer CA` (6 matches), rc=0.
+- **SSDP readiness:** `ss -ulnp | grep ':2021'` →
+  `UNCONN 0 0 0.0.0.0:2021 0.0.0.0:* users:(("openbu-mock",pid=379,fd=3))`;
+  `run/mock.log` has **zero** `SSDP: failed to listen` lines. Mock killed after
+  each task (each task owns its processes).
+
+OQ4 resolved: native WSL run of the built linux-amd64 binary; Docker used as compiler only (mock binds its detected IP - openbu-mock network.go:12-18, container -p mapping breaks it; research Alternatives table)
+
+### OQ1 TLS-trust spike — plan 04-03 Task 1 (2026-10-01)
+
+Driver: gitignored `.cache/openbu-mock/oq1_driver.sh` — mock started first
+(the recorded OQ2 order) from `.cache/openbu-mock/run/` (fresh identity
+parsed into `identity.env`), clean-room sidecar with the `identity.env`
+serial/name and the OQ5 defaults, `openssl s_client -showcerts` dump of the
+served chain, then `tools/plugin_runner.sh --abi 02.08.01 --action none
+--timeout 6 --connect-settle-ms 15000 --cert-file … --log-out …`. Four
+recorded attempts, one trust-anchor variant each:
+
+| attempt | `slicer_base64.cer` content | `--cert-file` arg | `local_connect` |
+| --- | --- | --- | --- |
+| A — `spike-oq1.jsonl` | PEM copy of `ca.pem` | relative `.cache/openbu-mock/run/slicer_base64.cer` | `"status":1` |
+| B — `spike-oq1-b.jsonl` | base64-DER re-encode (`openssl x509 -outform der \| base64 -w0`) | relative | `"status":1` |
+| C — `spike-oq1-c.jsonl` | base64-DER (as B) | absolute path | `"status":1` |
+| D — `spike-oq1-d.jsonl` | raw DER | relative | `"status":1` |
+
+Every attempt: sidecar logged `detect: served id=…`, `bind_detect` returned
+`rc:0 / result_msg:success`, `cert_resolved` fired
+(`"filename":"slicer_base64.cer"`), `connect_printer_call rc:0` — then the
+plugin aborted the MQTT/TLS handshake. Verbatim evidence (attempt A / B):
+
+```text
+{"_kind":"bind_detect","_t":"2026-10-01T00:15:34.227949Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01P953009C0D43A","dev_name":"3DP-01P-43A","model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+{"_kind":"local_connect","_t":"2026-10-01T00:15:34.434602Z","dev_id":"01P953009C0D43A","msg":"-1","status":1}
+{"_kind":"local_connect","_t":"2026-10-01T00:18:01.978923Z","dev_id":"01P5136BA5239D1","msg":"-1","status":1}
+mock -debug (run A): MQTT [192.168.2.177:22998]: TLS handshake failed: EOF
+mock -debug (run A): MQTT [192.168.2.177:22998]: no additional bytes available after handshake failure (client closed connection)
+openssl s_client -connect <IP>:8883 -CAfile ca.pem -verify_return_error: Verification: OK  (rc=0 — the same chain verifies with the same CA)
+```
+
+The mock's server-side first read of the handshake returns EOF (the stock
+client closes before sending a ClientHello) in all four variants, so this is
+a client-side abort during local SSL setup/verify, not a wire-level
+mismatch; no OpenSSL verify text exists to paste — the plugin's own log is
+encrypted (main.cpp:797-801). Run logs: `.cache/openbu-mock/run/
+spike-oq1{,-b,-c,-d}.{jsonl,out,err}`, `mock-oq1.log`, `verify-oq1.txt`,
+`tls_dump-oq1.txt`, `oq1-spike-summary.txt` (all gitignored).
+
+**Phase 2 (2026-10-01, after user sign-off on a mock-side patch — the patch
+turned out to be unnecessary):** the pre-Hello abort was bisected with
+control experiments before touching the mock:
+
+| attempt | variable tested | result |
+| --- | --- | --- |
+| E — `spike-oq1-e.jsonl` | `--cert-file` = the REAL Bambu `slicer_base64.cer` (PEM, OrcaSlicer `resources/cert/`) | handshake runs, client sends `alert=fatal desc=48(unknown_ca)` — loader accepts this file, verify fails |
+| G — `spike-oq1-g.jsonl` | mock `ca.pem` PEM, absolute path | pre-Hello abort (path not the issue) |
+| K — `spike-oq1-k.jsonl` | DigiCert Global Root alone (2nd cert of the real file) | pre-Hello abort |
+| I — `spike-oq1-i.jsonl` | bundle `mock CA + DigiCert root` | pre-Hello abort |
+| M — `spike-oq1-m.jsonl` | bundle `served mock leaf + mock CA` | pre-Hello abort |
+| P0 — `spike-oq1-p0.jsonl` | REAL `slicer_base64.cer` copied into the run dir | **pre-Hello abort — same file that worked in E; the difference is folder contents** |
+| P1 — `spike-oq1-p1.jsonl` | run dir + real `printer.cer` beside `slicer_base64.cer` (mock CA anchor) | **handshake runs**, `unknown_ca` |
+| P2 — `spike-oq1-p2.jsonl` | `printer.cer` = served mock leaf | handshake runs, `unknown_ca` |
+| P3 — `spike-oq1-p3.jsonl` | **`printer.cer` = PEM copy of mock `ca.pem`** | **`local_connect status=0`** — CONNECT accepted, `subscribed to device/<serial>/report`, `session_ready got=true`, `kickstart_pushall rc=0` |
+
+**Root cause (behavior facts):** stock's LAN TLS setup requires a
+**`printer.cer` file in the same folder as the resolved
+`slicer_base64.cer`** — without it the client aborts the connection before
+sending a ClientHello (the exact signature of attempts A–D/G/K/I/M/P0) —
+and the **verify trust anchor is the content of `printer.cer`**, not
+`slicer_base64.cer` (P1 kept the mock CA in `slicer_base64.cer` yet got
+`unknown_ca`; with `printer.cer` = mock CA, P3 verified). This contradicts
+the runner's own comment at main.cpp:797-801 (which names
+`slicer_base64.cer` as *the* trust anchor) — recorded here as observed
+behavior, not opinion.
+
+**Mock-side patch: NOT APPLIED.** The signed-off escalation (D-02-style
+patch inside the gitignored clone) was not needed — the mock's TLS chain
+verifies fine with `openssl -CAfile ca.pem -verify_return_error`
+(`Verification: OK`) and stock accepts it once the local cert-folder layout
+is right. openbu-mock source is untouched, and **no upstream permission
+request was opened** (there is nothing to request). Sign-off consumed: 0.
+
+Final recorded run with the complete recipe (`spike-oq1.jsonl`, attempt A
+re-run), verbatim ordered chain:
+
+```text
+{"_kind":"bind_detect","_t":"2026-10-01T01:04:42.656131Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01PF63F120D6498","dev_name":"3DP-01P-498","model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+{"_kind":"connect_printer_call","_t":"2026-10-01T01:04:42.658756Z","rc":0}
+{"_kind":"local_connect","_t":"2026-10-01T01:04:42.813116Z","dev_id":"01PF63F120D6498","msg":"ssl:","status":0}
+{"_kind":"session_ready","_t":"2026-10-01T01:04:42.813423Z","cap_ms":15000,"got":true}
+{"_kind":"start_subscribe","_t":"2026-10-01T01:04:42.816160Z","module":"app","rc":0}
+{"_kind":"kickstart_pushall","_t":"2026-10-01T01:04:42.816750Z","bytes":79,"rc":0}
+{"_kind":"idle_done","_t":"2026-10-01T01:04:52.318989Z","seconds":6}
+```
+
+OQ1 resolved: --cert-file .cache/openbu-mock/run/slicer_base64.cer (PEM copy of mock ca.pem) PLUS printer.cer = PEM copy of mock ca.pem in the same cert folder (printer.cer is the file stock's LAN TLS verify actually loads; without it the client aborts before ClientHello) -> local_connect status=0 (attempt A final recipe, spike-oq1.jsonl, full ordered chain in the same run; no mock-side patch was needed)
+
+### Spikes — Task 2, both SSDP startup orders (2026-09-30)
+
+Driver: gitignored `.cache/openbu-mock/spike_driver.sh`; artifacts in
+`.cache/openbu-mock/run/`. The connect chain is **evidence only** in this plan —
+it is never judged pass/fail here (the `:3000` sidecar does not exist until
+04-02, so `bind_detect` is expected to fail).
+
+**Order A — mock first.** Mock started from `identity.env` exactly as in Task 1
+(`../out/openbu-mock -model P1S -access-code 12345678 -count 1 -debug`), then
+from the repo root:
+
+```text
+tools/plugin_runner.sh --abi 02.08.01 --action none --timeout 6 \
+    --dev-id 01P142E6C031BC9 --dev-ip 192.168.2.177 --access-code 12345678 \
+    --connect-settle-ms 15000 --log-out .cache/openbu-mock/run/spike-orderA.jsonl
+```
+
+stderr captured to `spike-orderA.err`; runner rc=0. Cold-run stderr is
+preserved verbatim in `spike-orderA.cold.err` (the recorded spike was re-run
+once after the identity-parser fix below; the warm re-run logs
+`cache hit: …/02.08.01.53/libbambu_networking.so`). Cold run evidence (A5):
+
+- per-ABI bridge build: `configuring plugin_runner under ABI=0x020801
+  (.../tools/plugin_runner/build-0x020801)` → final `[2/2] Linking CXX
+  executable plugin_runner` (hex build dir `tools/plugin_runner/build-0x020801`)
+- CDN plugin-zip fetch: `plugin_runner.sh: downloading plugin for
+  ABI=02.08.01 from api.bambulab.com...` → `plugin_runner.sh: downloaded plugin
+  version=02.08.01.53 -> /home/santiago/.cache/obn-plugin-runner/02.08.01.53/libbambu_networking.so`
+  (**no `could not resolve a plugin for ABI` — 02.08.01 resolved, the README-blessed
+  02.05.03 fallback was never needed**)
+- `spike-orderA.jsonl` (27 lines): `plugin_loaded` present (version 02.08.01.53),
+  `agent_start` rc=0, `ssdp_msg` present (5 events), and
+
+```text
+bind_detect rc=-2 result_msg=publish login request failed
+```
+
+  verbatim (Gap-1 runtime evidence: nothing listens on `:3000` yet — research
+  08.06:126). `kickstart_pushall rc=-4` (no local session without sidecar/cert —
+  expected here).
+
+OQ3 resolved: --abi 02.08.01 (hex build dir tools/plugin_runner/build-0x020801; CDN zip resolved first try — plugin version=02.08.01.53 from api.bambulab.com, fallback 02.05.03 not needed)
+
+**Order B — runner first.** Runner started in the background with the identity
+parsed from the Order-A run (serial/IP are regenerated on every mock start —
+`identity.env` always reflects the most recent mock run, nothing is hardcoded),
+waited for `agent_start`, then:
+
+- `ss -ulnp | grep ':2021'` while the plugin is up alone →
+  `UNCONN 0 0 0.0.0.0:2021 0.0.0.0:* users:(("plugin_runner",pid=462,fd=5))`
+  (artifact `ssdp-orderB-plugin-up.txt`)
+- mock then started → **survived**: `mock-orderB.log` contains zero
+  `SSDP: failed to listen` (it would `log.Fatalf` there, ssdp.go:24-26), and
+  after start `ss` shows **both** listeners simultaneously:
+  `users:(("openbu-mock",pid=514,fd=3))` + `users:(("plugin_runner",pid=462,fd=5))`
+  on `0.0.0.0:2021` (artifact `ssdp-orderB-after-mock.txt`)
+- `spike-orderB.jsonl` (27 lines): `plugin_loaded` present, `agent_start` rc=0,
+  `bind_detect rc=-2`, `ssdp_msg` ×5 — same chain shape as Order A; runner rc=0
+- Order-B mock output goes to `mock-orderB.log` (kept separate so Task 1's
+  readiness `mock.log` evidence is never overwritten)
+
+OQ2 resolved: ssdp_msg assert = hard (observed across harness-run1/2: ssdp_msg present in both runs - 2 events each; 04-01 spikes: coexistence OK in both SSDP startup orders, both UDP :2021 listeners visible simultaneously, zero 'SSDP: failed to listen')
+
+**Spike environment fixes (deviations, recorded):** the first bridge builds
+failed on missing `libssl-dev` (`Could NOT find OpenSSL`) and missing `zlib.h`
+(minizip header dep) — both installed from Ubuntu repos (`apt-get install
+libssl-dev zlib1g-dev`), the stale half-configured `build-0x020801` was removed,
+and the build then completed. `tools/plugin_runner.sh` in the working tree was
+LF-normalized (autocrlf had left a CRLF shebang → `/usr/bin/env: 'bash\r':
+No such file or directory`); `.gitattributes` now pins `eol=lf` for
+`tools/plugin_runner.sh` and `tools/mock_harness/*.sh` so this cannot regress.
+The spike driver's first version transposed SERIAL/MODEL while parsing the
+mock's stdout table (the runner was invoked with `--dev-id P1S`); both orders
+were **re-run after the fix** with the true runtime-parsed serial
+(`01P142E6C031BC9`) — identical results (agent_start rc=0, bind_detect rc=-2,
+ssdp_msg ×5, dual `:2021` coexistence), cold stderr kept as
+`spike-orderA.cold.err` / `spike-orderB.cold.err`.
+
+
+## Gap analysis
+
+> **License constraint (read first).** openbu-mock has **no LICENSE** upstream
+> (`"license": null`, GitHub API, 2026-09-30) — unlicensed repos are
+> **facts-only** here. Consequences: this harness
+> uses the mock as an **external binary only**; no openbu-mock source, patch
+> diff, or derived code enters our trees; the clone and the generated
+> `ca.pem`/`ca-key.pem` live only in the gitignored `.cache/openbu-mock/`
+> (covered by subrepo `.gitignore` lines `.cache/` and `*.pem`); nothing from
+> the clone is ever `git add -f`ed (vendoring unlicensed code is out of
+> scope for this repo).
+
+OQ7 resolved: gap-analysis home = tools/mock_harness/README.md (lives beside the run evidence)
+
+Source: community-survey §4 (openbu-mock gap list). All source facts below
+were read at pin `e3db0ce7341f467e656cc860f1a0625c548a8f56` (the `MOCK_PIN`
+in `fetch_mock.sh`) — read-only, never copied.
+
+### Gap 1 — no `:3000` login/detect responder
+
+**Source-at-pin evidence:** there is no `:3000` listener anywhere in
+openbu-mock — MQTT binds `p.IP:8883` (mqtt.go:197), SSDP binds
+`239.255.255.250:2021` (ssdp.go:12-26), and the service startup table
+(main.go:286-293) starts only those listeners. There is no TCP-3000 code at
+all, so a sidecar on `:3000` can never conflict with the mock.
+
+Probe (harness run): IP=192.168.2.177 2026-09-30T23:29:37Z (mock running as the :8883 control)
+
+```text
+$ timeout 2 bash -c '</dev/tcp/192.168.2.177/3000'
+bash: connect: Connection refused
+bash: line 1: /dev/tcp/192.168.2.177/3000: Connection refused
+rc3000=1            <-- non-zero: nothing answers on :3000
+
+$ timeout 2 bash -c '</dev/tcp/192.168.2.177/8883'
+rc8883=0            <-- success: the mock's MQTT/TLS listener answers
+```
+
+**Impact on our connect path:**
+
+- with nothing listening, stock gives up after ~9 s returning `-2` with
+  `result_msg = "publish login request failed"`
+  (research/08.06-bind.md:126); this plan's spikes captured exactly that,
+  verbatim: `bind_detect rc=-2 result_msg=publish login request failed`
+- our own client hard-fails on an empty `id`:
+  `if (out.dev_id.empty()) { … return BAMBU_NETWORK_ERR_BIND_PARSE_LOGIN_REPORT_FAILED; }`
+  (src/lan_bind_tcp.cpp:335-339)
+- a conforming reply must satisfy the §8.6.2 field map
+  (research/08.06-bind.md:113): `command`, `id`, `model`, `name`, `version`,
+  `bind`, `connect` — the request frame is
+  `{"login":{"command":"detect","sequence_id":"20000"}}` (A5 A5 … A7 A7 framing)
+- a `login_report` FAILURE is the documented refusal variant for completeness
+  (research/08.06-bind.md:115, OBN #38) — the harness never sends it
+- the plugin gates the MQTT path on `bind_state`/`connect_type`
+  (plugin_loader.hpp:239-243), so the sidecar's reply values decide whether
+  LAN MQTT is even attempted (exact values are OQ5, locked in 04-02/04-03)
+
+**planned treatment (D-01):** a clean-room detect sidecar authored in
+`tools/mock_harness/` from the §8.6.2 facts above plus our own
+`obn::lan_bind_tcp` codec (`encode_frame` / `drain_frames`) only — **zero bytes
+read from openbu-mock** (facts-only license posture; no port conflict: the mock
+has no `:3000` code at all).
+
+Gap 1 decision: CLOSED (clean-room sidecar, D-01) - proven against the REAL
+stock client on 2026-09-30 (plan 04-02 Task 1). Build:
+`tools/mock_harness/build_responder.sh` →
+`.cache/mock_harness/build-responder/detect_responder`; run: sidecar started
+with the `identity.env` serial/name beside
+`tools/plugin_runner.sh --abi 02.08.01 --action bind_detect --log-out .cache/openbu-mock/run/gap1_bind_detect.jsonl`.
+Run evidence, verbatim from that JSONL:
+
+```text
+{"_kind":"bind_detect","_t":"2026-09-30T23:58:26.120022Z","bind_state":"free","command":"detect","connect_type":"lan","dev_id":"01P142E6C031BC9","dev_name":"3DP-01P-BC9","elapsed_ms":1008,"model_id":"C12","rc":0,"result_msg":"success","version":"01.09.01.00"}
+```
+
+The invocation's raw exit code was `rc=0` (the `bind_detect` action exits 0
+iff `rc==0`, main.cpp:1458-1462), and the sidecar stdout
+(`.cache/openbu-mock/run/detect.log`) shows it served the request:
+
+```text
+detect: served id=01P142E6C031BC9
+```
+
+(`dev_id` is the runtime-parsed `identity.env` `SERIAL` — nothing hardcoded.)
+
+### Gap 2 — `sequence_id` echo for arbitrary commands
+
+Evidence table pinned to `e3db0ce7341f467e656cc860f1a0625c548a8f56` (read from
+source; no code reused):
+
+| Command our chain publishes | Mock behavior at the pin | Reply carries request `sequence_id`? |
+| --- | --- | --- |
+| `pushing:pushall` (kickstart) | answered with `push_status`, but it carries `static "sequence_id":"0"` (state.go:291 via mqtt.go:482-491) | **No** |
+| `info:get_version` (kickstart) | echoes the request value (state.go:699 via mqtt.go:493-514) | **Yes** — the one command that echoes |
+| `system:get_access_code`, `security:app_cert_install` | fall through to the `unhandled command keys` log with **no reply** (mqtt.go:516-531) | **No reply at all** |
+| QoS 1 PUBACK for all of the above | sent before topic dispatch (mqtt.go:456 area) | n/a — transport ack only |
+
+Why the chain is expected to pass **without** a sequence-echo patch (the
+evidence D-02 records):
+
+1. the runner never matches responses — verbatim kickstart comment:
+   *"…uniqueness only matters for response matching, which we don't do."*
+   (tools/plugin_runner/main.cpp:1263-1266)
+2. the chain gates are transport/session-level only (README §9 golden stream) —
+   **D-08's ordered event chain is the pass contract** for this phase
+3. the mock proactively publishes `push_status` on subscribe and every 5 s
+   (mqtt.go:356-372), so keep-alive needs no echo
+4. residual risk: a stock-internal wait on an unanswered command could stall
+   something the chain surfaces as a timing anomaly — exactly what the
+   recorded harness run must observe (D-03)
+
+**planned treatment (D-02):** documented-first; escalate to a patch **only**
+inside a gitignored local clone (never committed anywhere) on the OQ6 trigger
+that 04-02 defines, with the upstream permission request opened in parallel.
+The recorded run in 04-03 (D-08 chain) is the deciding evidence.
+
+Gap 2 decision: DOCUMENTED (D-02) - confirmed by recorded run: OQ6 trigger not met (detect->connect->pushall passed without a sequence-echo patch)
+
+OQ6 trigger: the harness proves sequence-echo blocks detect->connect->pushall IFF (a) any D-08 chain element fails in a recorded run AND (b) the mock's -debug log shows 'unhandled command keys' for a command that failing element depends on (pushing:pushall | info:get_version | system:get_access_code | security:app_cert_install)
+
+This is research OQ6's proposed criterion, stated here as the planner's
+resolution so the documented-vs-patch decision in 04-03 is mechanical. The
+escalation procedure if the trigger fires: any patch lives **only** inside the
+gitignored `.cache/openbu-mock/src` clone; only its observed **behavior**
+(never a diff or source) is recorded in our docs; an upstream
+**permission request** is opened in parallel; nothing from the clone is ever
+committed (D-02 verbatim constraints). Documented-first is the default today because
+the source-at-pin evidence table above plus the runner's own comment that
+response matching is not done (main.cpp:1263-1266, *"…uniqueness only matters
+for response matching, which we don't do."*) make blocking unlikely — the
+passing/failing 04-03 run is the deciding evidence per D-03.
+
+OQ5 locked: detect reply values bind=free, connect=lan, model=C12, version=01.09.01.00, dev_cap=1 - locked by bind_detect rc=0 + local_connect status=0 in spike-oq1.jsonl, re-confirmed by harness-run1.jsonl
+
+Clean-room attestation: detect_responder.cpp derives solely from research/08.06-bind.md 8.6.2 and our obn::lan_bind_tcp/obn::json code - zero bytes read from openbu-mock (D-01)
+
+### Out-of-scope mock gaps (documented, not worked)
+
+FTPS/`990`, print-job/`project_file` flow, signing, strict single SUBSCRIBE
+topic, and multi-printer `-count` support remain out of scope (CONTEXT Deferred
+ideas) — recorded here so the gap census is complete.
+
