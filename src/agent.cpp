@@ -1339,12 +1339,16 @@ void Agent::harvest_tutk_server_status(const std::string& dev_id,
 
     // A refused prepare was invisible before ("no liveview.prepare within 5s"
     // was all the log showed). Log the printer's reason; no credentials.
+    // Replies with sequence_id "0" answer a prepare the plugin did not send
+    // (one arrives with every liveview start, refused with "no ttcode" even
+    // when ours succeeds), so they are not logged.
     if (root->find("liveview.command").as_string() == "prepare") {
         const std::string result = root->find("liveview.result").as_string();
-        if (!result.empty() && result != "succeed")
+        const std::string seq    = root->find("liveview.sequence_id").as_string();
+        if (!result.empty() && result != "succeed" && seq != "0")
             OBN_WARN("dev=%s liveview.prepare %s: reason=%s seq=%s", dev_id.c_str(),
                      result.c_str(), root->find("liveview.reason").as_string().c_str(),
-                     root->find("liveview.sequence_id").as_string().c_str());
+                     seq.c_str());
     }
 
     const auto& server = root->find("print.ipcam.tutk_server");
