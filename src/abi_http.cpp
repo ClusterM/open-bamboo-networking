@@ -552,6 +552,11 @@ OBN_ABI int bambu_network_get_subtask_info(void* agent,
                       subtask_id.c_str(), info.url.c_str(), body.c_str());
             return BAMBU_NETWORK_SUCCESS;
         }
+        // Studio asked for an id we minted and then lost (the history
+        // cap) or never stored. Say so: an empty body here is what
+        // leaves the Device panel without a cover.
+        OBN_WARN("get_subtask_info: no cover for synthetic id=%s",
+                 subtask_id.c_str());
     }
 
     // Real cloud task / subtask id (Device panel cover while a cloud-

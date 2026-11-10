@@ -293,6 +293,46 @@ static void test_cloud_subtask_id_is_not_mapped_to_local_cover()
     CHECK(!a.lookup_synthetic_subtask("1261510494", &info));
 }
 
+static std::string mint_cover(obn::Agent& a, int n)
+{
+    const std::string payload =
+        R"({"print":{"subtask_name":"part-)" + std::to_string(n) +
+        R"(.gcode.3mf","task_id":"0","subtask_id":"0","project_id":"0",)"
+        R"("profile_id":"0","gcode_start_time":")" + std::to_string(1700000000 + n) +
+        R"("}})";
+    const std::string out = run_local_msg(a, "dev", payload);
+    auto parsed = obn::json::parse(out);
+    return parsed ? parsed->find("print.subtask_id").as_string() : std::string{};
+}
+
+static void test_synthetic_subtask_history_drops_the_oldest()
+{
+    // The cap used to erase std::map::begin(), the smallest id. A new
+    // print whose id sorted first was deleted before Studio could ask
+    // for its cover. History is insertion order: the oldest goes, and
+    // a repeat status of an existing print does not move it.
+    obn::Agent a(".");
+    const std::size_t cap = obn::Agent::kMaxSyntheticSubtasks;
+    std::vector<std::string> ids;
+    ids.reserve(cap + 1);
+    for (std::size_t n = 0; n < cap; ++n) {
+        ids.push_back(mint_cover(a, static_cast<int>(n)));
+        CHECK(ids.back().rfind("lan-", 0) == 0);
+    }
+
+    // Refresh the oldest print. It must stay the oldest.
+    const std::string again = mint_cover(a, 0);
+    CHECK(again == ids.front());
+
+    ids.push_back(mint_cover(a, static_cast<int>(cap)));
+    CHECK(ids.back().rfind("lan-", 0) == 0);
+
+    obn::Agent::SubtaskCoverInfo info{};
+    CHECK(!a.lookup_synthetic_subtask(ids.front(), &info));
+    CHECK(a.lookup_synthetic_subtask(ids[1], &info));
+    CHECK(a.lookup_synthetic_subtask(ids.back(), &info));
+}
+
 // ---------------------------------------------------------------------------
 // Selected-printer memory (issue #78)
 // ---------------------------------------------------------------------------
@@ -449,6 +489,7 @@ int main()
     test_synthetic_subtask_id_is_deterministic();
     test_synthetic_subtask_id_varies_with_timestamp();
     test_cloud_subtask_id_is_not_mapped_to_local_cover();
+    test_synthetic_subtask_history_drops_the_oldest();
 
     // Selected-printer memory.
     test_selection_survives_agent_restart();

@@ -1,5 +1,6 @@
 #include "obn/agent.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -1937,14 +1938,25 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
                 user = lan_session_->username();
                 pass = lan_session_->password();
             }
-            new_job = !synthetic_subtasks_.count(cover_id);
-            synthetic_subtasks_[cover_id] =
-                SyntheticSubtask{subtask_name, plate_idx, cover_version};
-            // Cap the map; the user only ever cares about the current
-            // print but we keep a short history for races between
-            // subtask switches and Studio's thumbnail re-request.
-            while (synthetic_subtasks_.size() > 16) {
-                synthetic_subtasks_.erase(synthetic_subtasks_.begin());
+            const auto same_id = [&](const auto& entry) {
+                return entry.first == cover_id;
+            };
+            auto it = std::find_if(synthetic_subtasks_.begin(),
+                                   synthetic_subtasks_.end(), same_id);
+            new_job = it == synthetic_subtasks_.end();
+            const SyntheticSubtask task{subtask_name, plate_idx, cover_version};
+            if (new_job) {
+                // Append, then drop the oldest. Erasing the front of a
+                // map instead used to delete the smallest id, which on
+                // a busy day was the print Studio was about to ask for.
+                synthetic_subtasks_.emplace_back(cover_id, task);
+                if (synthetic_subtasks_.size() > kMaxSyntheticSubtasks) {
+                    synthetic_subtasks_.erase(synthetic_subtasks_.begin());
+                }
+            } else {
+                // A repeat status of the same print refreshes the fields
+                // in place and stays where it is in the history.
+                it->second = task;
             }
             if (!cover_server_) {
                 cover_server_ = std::make_unique<cover_server::Server>();
@@ -2235,7 +2247,9 @@ bool Agent::lookup_synthetic_subtask(const std::string& subtask_id,
 {
     if (!out) return false;
     std::lock_guard<std::mutex> lk(mu_);
-    auto it = synthetic_subtasks_.find(subtask_id);
+    const auto it = std::find_if(
+        synthetic_subtasks_.begin(), synthetic_subtasks_.end(),
+        [&](const auto& entry) { return entry.first == subtask_id; });
     if (it == synthetic_subtasks_.end()) return false;
     out->subtask_name = it->second.subtask_name;
     out->plate_idx    = it->second.plate_idx;

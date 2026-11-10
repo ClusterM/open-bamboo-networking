@@ -285,6 +285,11 @@ public:
     // Cloud REST non-2xx → on_http_error_fn (research/08.02-callbacks.md).
     void notify_http_error(unsigned int status, const std::string& body);
 
+    // How many LAN cover ids get_subtask_info can still resolve. Past this,
+    // the oldest id is dropped. Order is when the print first appeared,
+    // not the sort order of the id.
+    static constexpr std::size_t kMaxSyntheticSubtasks = 16;
+
     // Lookup: given a synthetic subtask id we minted in notify_local_message,
     // returns the (subtask_name, plate_idx) combo and a ready-to-fetch
     // URL for its cover PNG. Used by bambu_network_get_subtask_info to
@@ -584,14 +589,15 @@ private:
     // every fresh print of a same-named .3mf gets a distinct cache
     // file and a distinct URL (otherwise Studio's wxImage cache would
     // pin the first thumbnail forever - see cover_cache.hpp).
-    // Trimmed when the user swaps the active print, bounded to a
-    // handful of entries.
+    // Insertion order, oldest first. Trimmed to kMaxSyntheticSubtasks by
+    // dropping the front, so a new id is never the one removed just
+    // because it sorts first.
     struct SyntheticSubtask {
         std::string subtask_name;
         int         plate_idx = 1;
         std::string version;
     };
-    std::map<std::string, SyntheticSubtask> synthetic_subtasks_;
+    std::vector<std::pair<std::string, SyntheticSubtask>> synthetic_subtasks_;
 
     // Per-device firmware snapshot, populated from MQTT forwarded
     // through notify_local_message. Keyed by dev_id; value is the
