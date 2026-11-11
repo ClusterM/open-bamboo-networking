@@ -1258,14 +1258,35 @@ void Agent::harvest_developer_mode(const std::string& dev_id,
                                    const std::string& json)
 {
     // Prefilter: fun is a push_status/pushall field. The closing quote keeps
-    // this from matching "fun2".
-    if (json.find("\"fun\"") == std::string::npos) return;
+    // this from matching "fun2". Full status frames (msg 0) are parsed even
+    // without it, to spot firmware that never reports fun.
+    const bool has_fun = json.find("\"fun\"") != std::string::npos;
+    const bool maybe_full = json.find("\"push_status\"") != std::string::npos &&
+                            json.find("\"msg\":0") != std::string::npos;
+    if (!has_fun && !maybe_full) return;
 
     std::string perr;
     auto root = obn::json::parse(json, &perr);
     if (!root) return;
     const auto& fun = root->find("print.fun");
-    if (!fun.is_string()) return;
+    if (!fun.is_string()) {
+        // A full status report without print.fun comes from firmware that
+        // predates the secured mode (seen on an X1C running X1Plus,
+        // ota 99.00.00.00). Such firmware reads only the cleartext fields:
+        // with ttcode dropped in favour of ttcode_enc it answers
+        // liveview.prepare with "no ttcode" and never starts its TUTK server.
+        // Treat it like Developer Mode so cleartext is kept. A later frame
+        // that does carry fun overrides this.
+        const auto& msg = root->find("print.msg");
+        if (root->find("print.command").as_string() != "push_status" ||
+            !msg.is_number() || msg.as_int() != 0)
+            return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (dev_mode_on_by_dev_.emplace(dev_id, true).second)
+            OBN_INFO("dev=%s full status has no print.fun: firmware without "
+                     "secured mode, keeping cleartext fields", dev_id.c_str());
+        return;
+    }
     const std::string& hex = fun.as_string();
     if (hex.empty()) return;
 
@@ -1316,6 +1337,20 @@ void Agent::harvest_tutk_server_status(const std::string& dev_id,
     std::string perr;
     auto root = obn::json::parse(json, &perr);
     if (!root) return;
+
+    // A refused prepare was invisible before ("no liveview.prepare within 5s"
+    // was all the log showed). Log the printer's reason; no credentials.
+    // Replies with sequence_id "0" answer a prepare the plugin did not send
+    // (one arrives with every liveview start, refused with "no ttcode" even
+    // when ours succeeds), so they are not logged.
+    if (root->find("liveview.command").as_string() == "prepare") {
+        const std::string result = root->find("liveview.result").as_string();
+        const std::string seq    = root->find("liveview.sequence_id").as_string();
+        if (!result.empty() && result != "succeed" && seq != "0")
+            OBN_WARN("dev=%s liveview.prepare %s: reason=%s seq=%s", dev_id.c_str(),
+                     result.c_str(), root->find("liveview.reason").as_string().c_str(),
+                     seq.c_str());
+    }
 
     const auto& server = root->find("print.ipcam.tutk_server");
     const bool has_server = server.is_string() &&
