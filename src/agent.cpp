@@ -2922,11 +2922,83 @@ void Agent::clear_session()
 // Cloud MQTT plumbing.
 // --------------------------------------------------------------------------
 
+BBL::OnMessageFn Agent::make_cloud_message_callback()
+{
+    return [this]
+        (std::string dev_id, std::string json)
+    {
+        harvest_security_report(dev_id, json);
+        harvest_security_flags(dev_id, json);
+        harvest_developer_mode(dev_id, json);
+        harvest_media_caps(dev_id, json);
+        harvest_tutk_server_status(dev_id, json);
+        harvest_access_code(dev_id, json);
+        rescue_cloud_liveview(dev_id, json);
+
+        // Drop rejected unsigned cloud liveview frames from notifying Studio UI
+        if (json.find("\"liveview\"") != std::string::npos &&
+            json.find("84033543") != std::string::npos) {
+            return;
+        }
+
+        // Mirror Bambu's plugin: the FIRST cloud report we receive
+        // for a device kicks off an on_printer_connected("tunnel/<id>")
+        // notification so Studio moves the device from "subscribing"
+        // to "online" in its UI. App-cert provisioning is Studio-driven
+        // via bambu_network_install_device_cert (not eager on report).
+        //
+        // Both slicers answer that notification with pushall
+        // (GUI_App::init_networking_callbacks -> command_request_push_all),
+        // which is what fills the device panel — AMS trays, temperatures,
+        // job state. Losing it leaves that panel empty until something else
+        // asks, so read the callback *fresh* here instead of using the
+        // snapshot taken when connect_cloud() ran: Studio may register it
+        // after connect_server, and a stale null capture would stay null for
+        // the whole session. For the same reason the notification latch is
+        // separate from the seen-this-session set — a report that arrives
+        // before the callback exists must not swallow the notification.
+        bool                      first_report = false;
+        bool                      notify       = false;
+        BBL::OnPrinterConnectedFn printer_connected_cb;
+        BBL::QueueOnMainFn        q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            first_report         = cloud_connected_devs_.insert(dev_id).second;
+            printer_connected_cb = on_printer_connected_;
+            q                    = queue_on_main_;
+            if (printer_connected_cb)
+                notify = cloud_notified_devs_.insert(dev_id).second;
+        }
+        if (notify) {
+            auto invoke = [printer_connected_cb, dev_id]() {
+                printer_connected_cb("tunnel/" + dev_id);
+            };
+            if (q) q(invoke); else invoke();
+        } else if (first_report && !printer_connected_cb) {
+            OBN_DEBUG("cloud: first report for dev=%s arrived before Studio "
+                      "registered on_printer_connected; will notify on a "
+                      "later report", dev_id.c_str());
+        }
+        if (config::current().filter_mqtt_hms_65543)
+            try_filter_hms_code(json, 65543);
+
+        // Orca can register, replace or clear this handler after the cloud
+        // session starts (e.g. when switching printer agents). Read it for
+        // each report, then call it outside mu_ so it can re-enter Agent.
+        // Keep direct delivery: the slicer handles message threading itself.
+        BBL::OnMessageFn on_msg;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            on_msg = on_message_;
+        }
+        if (on_msg) on_msg(std::move(dev_id), std::move(json));
+    };
+}
+
 int Agent::connect_cloud()
 {
     auth::Session s;
     BBL::OnServerConnectedFn on_server;
-    BBL::OnMessageFn         on_msg;
     BBL::GetSubscribeFailureFn on_sub_fail;
     BBL::QueueOnMainFn       queue;
     BBL::OnPrinterConnectedFn on_printer_connected;
@@ -2936,7 +3008,6 @@ int Agent::connect_cloud()
         if (!cloud_session_) cloud_session_ = std::make_shared<CloudSession>();
         session              = cloud_session_;
         on_server            = on_server_connected_;
-        on_msg               = on_message_;
         on_sub_fail          = on_subscribe_failure_;
         queue                = queue_on_main_;
         on_printer_connected = on_printer_connected_;
@@ -3011,65 +3082,7 @@ int Agent::connect_cloud()
         }
     };
 
-    auto on_msg_cb = [this, on_msg]
-        (std::string dev_id, std::string json)
-    {
-        harvest_security_report(dev_id, json);
-        harvest_security_flags(dev_id, json);
-        harvest_developer_mode(dev_id, json);
-        harvest_media_caps(dev_id, json);
-        harvest_tutk_server_status(dev_id, json);
-        harvest_access_code(dev_id, json);
-        rescue_cloud_liveview(dev_id, json);
-
-        // Drop rejected unsigned cloud liveview frames from notifying Studio UI
-        if (json.find("\"liveview\"") != std::string::npos &&
-            json.find("84033543") != std::string::npos) {
-            return;
-        }
-
-        // Mirror Bambu's plugin: the FIRST cloud report we receive
-        // for a device kicks off an on_printer_connected("tunnel/<id>")
-        // notification so Studio moves the device from "subscribing"
-        // to "online" in its UI. App-cert provisioning is Studio-driven
-        // via bambu_network_install_device_cert (not eager on report).
-        //
-        // Both slicers answer that notification with pushall
-        // (GUI_App::init_networking_callbacks -> command_request_push_all),
-        // which is what fills the device panel — AMS trays, temperatures,
-        // job state. Losing it leaves that panel empty until something else
-        // asks, so read the callback *fresh* here instead of using the
-        // snapshot taken when connect_cloud() ran: Studio may register it
-        // after connect_server, and a stale null capture would stay null for
-        // the whole session. For the same reason the notification latch is
-        // separate from the seen-this-session set — a report that arrives
-        // before the callback exists must not swallow the notification.
-        bool                      first_report = false;
-        bool                      notify       = false;
-        BBL::OnPrinterConnectedFn printer_connected_cb;
-        BBL::QueueOnMainFn        q;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            first_report         = cloud_connected_devs_.insert(dev_id).second;
-            printer_connected_cb = on_printer_connected_;
-            q                    = queue_on_main_;
-            if (printer_connected_cb)
-                notify = cloud_notified_devs_.insert(dev_id).second;
-        }
-        if (notify) {
-            auto invoke = [printer_connected_cb, dev_id]() {
-                printer_connected_cb("tunnel/" + dev_id);
-            };
-            if (q) q(invoke); else invoke();
-        } else if (first_report && !printer_connected_cb) {
-            OBN_DEBUG("cloud: first report for dev=%s arrived before Studio "
-                      "registered on_printer_connected; will notify on a "
-                      "later report", dev_id.c_str());
-        }
-        if (config::current().filter_mqtt_hms_65543)
-            try_filter_hms_code(json, 65543);
-        if (on_msg) on_msg(std::move(dev_id), std::move(json));
-    };
+    auto on_msg_cb = make_cloud_message_callback();
 
     auto on_sub_fail_cb = [this, on_sub_fail](std::string dev_id) {
         if (on_sub_fail) {

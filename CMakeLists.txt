@@ -1118,13 +1118,15 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_test(NAME cloud_print COMMAND cloud_print_test)
 
     # In-process tests for obn::Agent itself: SSDP bind-detect lookup,
-    # firmware JSON rendering, synthetic subtask ids and the selected-printer
-    # memory from issue #78. No printer is contacted, but the SSDP listener
-    # (UDP 2021) and the loopback cover_server are started and stopped.
+    # firmware JSON rendering, synthetic subtask ids, selected-printer memory
+    # from issue #78 and cloud callback registration. No printer is contacted,
+    # but the SSDP listener (UDP 2021) and the loopback cover_server are
+    # started and stopped.
     add_executable(agent_test tests/agent_test.cpp
         ${OBN_TEST_CORE_SOURCES})
     target_include_directories(agent_test PRIVATE include ${OBN_GENERATED_DIR})
     target_compile_definitions(agent_test PRIVATE
+        OBN_TESTING
         OBN_VERSION_STRING="${OBN_VERSION}"
         ABI_VERSION=${OBN_ABI_VERSION_HEX}
     )
