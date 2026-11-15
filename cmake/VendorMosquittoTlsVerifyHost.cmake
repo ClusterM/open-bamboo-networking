@@ -40,11 +40,11 @@ function(obn_patch_mosquitto_tls_verify_host _src_root)
     if(_pos LESS 0)
         string(REPLACE
             "#include <openssl/ui.h>"
-            "#include <openssl/ui.h>\n#include <openssl/x509v3.h> /* ${_partial_mark} */"
+            "#include <openssl/ui.h>\n#include <openssl/x509v3.h>\n#include <openssl/x509_vfy.h> /* ${_partial_mark} */"
             _body "${_body}")
         string(REPLACE
             "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t}"
-            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t\tX509_VERIFY_PARAM *vpm = SSL_CTX_get0_param(mosq->ssl_ctx); /* ${_partial_mark} */\n\t\t\t\tif(vpm){\n\t\t\t\t\tX509_VERIFY_PARAM_set_flags(vpm, X509_VERIFY_PARAM_get_flags(vpm) | X509_V_FLAG_PARTIAL_CHAIN);\n\t\t\t\t}\n\t\t\t}"
+            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t\tX509_VERIFY_PARAM *vpm = SSL_CTX_get0_param(mosq->ssl_ctx); /* ${_partial_mark} */\n\t\t\t\tif(vpm){\n\t\t\t\t\tX509_VERIFY_PARAM_set_flags(vpm, X509_VERIFY_PARAM_get_flags(vpm) | X509_V_FLAG_PARTIAL_CHAIN);\n\t\t\t\tX509_VERIFY_PARAM_set_hostflags(vpm, (X509_VERIFY_PARAM_get_hostflags(vpm) | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);\n\t\t\t\t}\n\t\t\t}"
             _body "${_body}")
         file(WRITE "${_net}" "${_body}")
     endif()
