@@ -2008,10 +2008,29 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         // branch of StatusPanel (active print, zero-id frames) reads only
         // push_status thumbnail_url and would otherwise never GET us.
         if (cover_server_) {
-            inject_thumbnail_url(
-                patched, cover_server_->url_for(subtask_name, plate_idx,
-                                                cover_version));
+            const std::string url = cover_server_->url_for(
+                subtask_name, plate_idx, cover_version);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                cover_url_by_dev_[dev_id] = url;
+            }
+            inject_thumbnail_url(patched, url);
         }
+    }
+
+    // Identity frames (subtask_name + zero ids) only ride the printer's
+    // full push_status, roughly every five minutes — too late for a short
+    // print. Once a job's URL is known, staple it onto every later frame
+    // too, so the id-less partial pushes Studio polls during an active
+    // print carry thumbnail_url as well.
+    if (cover_id.empty() && cover_server_) {
+        std::string url;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = cover_url_by_dev_.find(dev_id);
+            if (it != cover_url_by_dev_.end()) url = it->second;
+        }
+        inject_thumbnail_url(patched, url);
     }
 
     OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d print_ids=%d "
