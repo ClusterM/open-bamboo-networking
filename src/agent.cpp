@@ -955,6 +955,30 @@ bool patch_string_zero_to(std::string&       payload,
     return false;
 }
 
+// Adds `"thumbnail_url":"<url>"` to the frame's print object when the
+// firmware did not supply one. During an active print the frames that
+// carry no subtask_name keep the printer's zero ids, Studio's
+// is_sdcard_printing() flips true and StatusPanel::update_sdcard_subtask
+// reads only m_agent_thumbnail_url (populated exclusively from this
+// push_status field) — without the injection the panel shows the static
+// SD placeholder and never issues the cover GET.
+bool inject_thumbnail_url(std::string& payload, const std::string& url)
+{
+    if (url.empty()) return false;
+    if (payload.find("\"thumbnail_url\"") != std::string::npos) return false;
+    static const std::string kPrint = "\"print\":";
+    std::size_t pos = payload.find(kPrint);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + kPrint.size();
+    while (i < payload.size() &&
+           (payload[i] == ' ' || payload[i] == '\t' ||
+            payload[i] == '\r' || payload[i] == '\n'))
+        ++i;
+    if (i >= payload.size() || payload[i] != '{') return false;
+    payload.insert(i + 1, "\"thumbnail_url\":\"" + url + "\",");
+    return true;
+}
+
 // override_lan_ip: replace every "ip":<int64> inside the "net":{"info":[…]}
 // block with an int64 encoding of the connect_printer IP.  Studio parses
 // this field into MachineObject::dev_ip which then feeds the camera URL;
@@ -2086,6 +2110,14 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
             cover_cache::ensure(host, dev_id, user, pass,
                                 subtask_name, model_key, plate_idx,
                                 cover_version, bambu_ca_bundle_path());
+        }
+        // Hand Studio the cover URL in the frame itself: the sdcard
+        // branch of StatusPanel (active print, zero-id frames) reads only
+        // push_status thumbnail_url and would otherwise never GET us.
+        if (cover_server_) {
+            inject_thumbnail_url(
+                patched, cover_server_->url_for(subtask_name, plate_idx,
+                                                cover_version));
         }
     }
 
