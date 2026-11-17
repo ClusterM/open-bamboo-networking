@@ -59,6 +59,7 @@ void ensure(const std::string& host,
             const std::string& subtask_name,
             const std::string& model_key,
             int                plate_idx,
-            const std::string& version = {});
+            const std::string& version = {},
+            const std::string& ca_file = {});
 
 } // namespace obn::cover_cache

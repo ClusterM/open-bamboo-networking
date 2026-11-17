@@ -1975,8 +1975,10 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
                      host.empty() ? "; no LAN session, no cover fetch" : "");
         }
         if (!host.empty()) {
+            const std::string model_key = obn::cover_model_key(patched);
             cover_cache::ensure(host, dev_id, user, pass,
-                                subtask_name, plate_idx, cover_version);
+                                subtask_name, model_key, plate_idx,
+                                cover_version, bambu_ca_bundle_path());
         }
     }
 
