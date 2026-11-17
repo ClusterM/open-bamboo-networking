@@ -889,6 +889,68 @@ if(OBN_BUILD_TESTS)
         src/json_lite.cpp)
     target_include_directories(cover_key_test PRIVATE include)
     add_test(NAME cover_key COMMAND cover_key_test)
+
+    # Agent and its transitive deps: the tests below exercise pure helpers,
+    # but those live in translation units that reference the agent, so the
+    # whole core has to be linked in.
+    set(OBN_TEST_CORE_SOURCES
+        src/agent.cpp
+        src/auth.cpp
+        src/camera_url.cpp
+        src/cert_store.cpp
+        src/config.cpp
+        src/cloud_auth.cpp
+        src/cloud_presets.cpp
+        src/cloud_print.cpp
+        src/cloud_session.cpp
+        src/cover_cache.cpp
+        src/cover_key.cpp
+        src/cover_server.cpp
+        src/ftps.cpp
+        src/http_client.cpp
+        src/json_lite.cpp
+        src/lan_session.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/mqtt_client.cpp
+        src/print_job.cpp
+        src/print_job_naming.cpp
+        src/print_params_ftp_prefs.cpp
+        src/os_compat.cpp
+        src/state.cpp
+        src/signing.cpp
+        src/ssdp.cpp
+        src/tls_dial.cpp
+        src/tunnel_local.cpp
+        src/tunnel_upload.cpp
+        src/model_metadata.cpp
+        src/zip_read.cpp)
+    # Windows-only: agent.cpp's connect_cloud writes the vendored CA
+    # bundle, so tests linking agent.cpp need the same two TUs
+    # (empty elsewhere, matching OBN_CLOUD_CA_SOURCES above).
+    list(APPEND OBN_TEST_CORE_SOURCES ${OBN_CLOUD_CA_SOURCES})
+
+    # In-process tests for obn::Agent itself: SSDP bind-detect lookup,
+    # firmware JSON rendering, synthetic subtask ids, selected-printer memory
+    # from issue #78 and cloud callback registration. No printer is contacted,
+    # but the SSDP listener (UDP 2021) and the loopback cover_server are
+    # started and stopped.
+    add_executable(agent_test tests/agent_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(agent_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(agent_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(agent_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME agent COMMAND agent_test)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
@@ -1088,42 +1150,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
             ENABLE_EXPORTS ON)
     endif()
 
-    # Agent and its transitive deps: the tests below exercise pure helpers,
-    # but those live in translation units that reference the agent, so the
-    # whole core has to be linked in.
-    set(OBN_TEST_CORE_SOURCES
-        src/agent.cpp
-        src/auth.cpp
-        src/camera_url.cpp
-        src/cert_store.cpp
-        src/config.cpp
-        src/cloud_auth.cpp
-        src/cloud_presets.cpp
-        src/cloud_print.cpp
-        src/cloud_session.cpp
-        src/cover_cache.cpp
-        src/cover_key.cpp
-        src/cover_server.cpp
-        src/ftps.cpp
-        src/http_client.cpp
-        src/json_lite.cpp
-        src/lan_session.cpp
-        src/lan_tls.cpp
-        src/log.cpp
-        src/mqtt_client.cpp
-        src/print_job.cpp
-        src/print_job_naming.cpp
-        src/print_params_ftp_prefs.cpp
-        src/os_compat.cpp
-        src/state.cpp
-        src/signing.cpp
-        src/ssdp.cpp
-        src/tls_dial.cpp
-        src/tunnel_local.cpp
-        src/tunnel_upload.cpp
-        src/model_metadata.cpp
-        src/zip_read.cpp)
-
     # Pure-function tests for cloud_print.cpp (ams_mapping2_for_cloud,
     # build_task_body). OBN_TESTING promotes the anonymous-namespace
     # helpers to obn::cloud_print::test_* wrappers.
@@ -1144,27 +1170,6 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME cloud_print COMMAND cloud_print_test)
 
-    # In-process tests for obn::Agent itself: SSDP bind-detect lookup,
-    # firmware JSON rendering, synthetic subtask ids, selected-printer memory
-    # from issue #78 and cloud callback registration. No printer is contacted,
-    # but the SSDP listener (UDP 2021) and the loopback cover_server are
-    # started and stopped.
-    add_executable(agent_test tests/agent_test.cpp
-        ${OBN_TEST_CORE_SOURCES})
-    target_include_directories(agent_test PRIVATE include ${OBN_GENERATED_DIR})
-    target_compile_definitions(agent_test PRIVATE
-        OBN_TESTING
-        OBN_VERSION_STRING="${OBN_VERSION}"
-        ABI_VERSION=${OBN_ABI_VERSION_HEX}
-    )
-    target_link_libraries(agent_test PRIVATE
-        obn_mosquitto_iface
-        obn_curl_iface
-        OpenSSL::SSL
-        OpenSSL::Crypto
-        ZLIB::ZLIB
-    )
-    add_test(NAME agent COMMAND agent_test)
 
     add_executable(hms_filter_test tests/hms_filter_test.cpp
         ${OBN_TEST_CORE_SOURCES})
