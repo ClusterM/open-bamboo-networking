@@ -856,6 +856,7 @@ if(OBN_BUILD_TESTS)
     add_executable(cover_cache_test tests/cover_cache_test.cpp
         tests/config_stub.cpp
         src/cover_cache.cpp
+        src/ftps.cpp
         src/json_lite.cpp
         src/lan_tls.cpp
         src/log.cpp
