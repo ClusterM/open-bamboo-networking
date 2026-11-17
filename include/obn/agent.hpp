@@ -608,6 +608,13 @@ private:
         std::string version;
     };
     std::vector<std::pair<std::string, SyntheticSubtask>> synthetic_subtasks_;
+    // dev_id -> last cover URL handed out in notify_local_message.
+    // Identity frames (subtask_name + zero ids) only ride the printer's
+    // full push_status every few minutes; caching the URL lets the
+    // frequent id-less partial pushes carry thumbnail_url too, which is
+    // what StatusPanel::update_sdcard_subtask reads during an active
+    // print. Guarded by mu_.
+    std::map<std::string, std::string> cover_url_by_dev_;
 
     // Per-device firmware snapshot, populated from MQTT forwarded
     // through notify_local_message. Keyed by dev_id; value is the
