@@ -97,6 +97,12 @@ std::string slicer_crl_pem();
 // successful install for the device (Studio polls ~1 Hz).
 bool slicer_app_cert_usable();
 
+// True when a PEM blob carries the full 3-cert app chain firmware needs to
+// build a path to its BBL CA root (leaf -> intermediate -> application_root);
+// fewer blocks install as SUCCESS but every signed command then fails with
+// err 84033547 (research/08.04-lan.md). Empty blob -> false.
+bool app_cert_chain_complete(const std::string& pem);
+
 // True when a slicer private key (slicer_key.pem or obn.conf slicer_key_pem)
 // is loaded, i.e. maybe_sign() can actually produce a signature. Cheap: the
 // key is parsed once and cached.
