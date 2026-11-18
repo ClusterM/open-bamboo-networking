@@ -536,6 +536,20 @@ std::string base64_encode(const unsigned char* data, std::size_t len)
     return out;
 }
 
+bool app_cert_chain_complete(const std::string& pem)
+{
+    // Firmware path-builds the INSTALLED chain to its internal BBL CA root:
+    // leaf -> intermediate (*.bambulab.com) -> application_root. Fewer than
+    // 3 PEM blocks installs as SUCCESS (syntax check only) but every signed
+    // command is then rejected with err 84033547 (research/08.04-lan.md).
+    std::size_t blocks = 0;
+    for (std::size_t p = pem.find("-----BEGIN CERTIFICATE-----");
+         p != std::string::npos;
+         p = pem.find("-----BEGIN CERTIFICATE-----", p + 1))
+        ++blocks;
+    return blocks >= 3;
+}
+
 bool slicer_app_cert_usable()
 {
     // app_cert_install needs the app certificate PEM + CRL only (no private
@@ -545,12 +559,32 @@ bool slicer_app_cert_usable()
     // The cert id is logged once on the first successful check for the same
     // reason.
     static bool warned_cert_dates = false;
+    static bool warned_short_chain = false;
     static bool warned_crl_dates = false;
     static bool warned_revoked = false;
     static bool logged_cert_id = false;
 
     const std::string pem = slicer_cert_pem();
     if (pem.empty()) return false;
+    // A short chain (leaf only) installs as SUCCESS but makes every signed
+    // command fail with err 84033547, so refuse it here: callers then kick
+    // the shared-credential fetch instead of installing a broken chain.
+    if (!app_cert_chain_complete(pem)) {
+        if (!warned_short_chain) {
+            std::size_t blocks = 0;
+            for (std::size_t p = pem.find("-----BEGIN CERTIFICATE-----");
+                 p != std::string::npos;
+                 p = pem.find("-----BEGIN CERTIFICATE-----", p + 1))
+                ++blocks;
+            warned_short_chain = true;
+            OBN_WARN("signing: slicer_cert.pem carries %zu PEM block(s); "
+                     "firmware needs the full 3-cert chain (leaf, "
+                     "intermediate, application_root) — not installing, "
+                     "signed commands would fail with err 84033547",
+                     blocks);
+        }
+        return false;
+    }
     const std::string crl_pem = slicer_crl_pem();
     if (crl_pem.empty()) return false;
 
