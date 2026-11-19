@@ -468,6 +468,31 @@ static void test_replayed_config_dir_keeps_store()
 // main
 // ---------------------------------------------------------------------------
 
+static void test_connect_printer_switch_moves_selection()
+{
+    // Studio calls set_user_selected_machine() only at startup; switching
+    // printers in the device list arrives here as a bare connect_printer().
+    // The printer it connects to has to become the selected one, or the
+    // LAN watchdog keeps failing back to (and reconnecting) the old one.
+    const std::filesystem::path dir = fresh_config_dir("connect_switch");
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        a.set_user_selected_machine("00M00A000000001");
+        // Nothing listens here; the MQTT connect fails in the background.
+        a.connect_printer("00M00A000000002", "127.0.0.1", "bblp", "00000000", true);
+        CHECK(a.user_selected_machine() == "00M00A000000002");
+        a.disconnect_printer();
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000002");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 int main()
 {
     // Bind-detect lookup.
@@ -498,6 +523,7 @@ int main()
     test_selection_without_config_dir_is_session_only();
     test_selection_before_config_dir_is_persisted();
     test_replayed_config_dir_keeps_store();
+    test_connect_printer_switch_moves_selection();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
