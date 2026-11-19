@@ -4,6 +4,8 @@
 // OBN_COVER_DIR. Nothing here needs the Agent.
 
 #include "obn/cover_cache.hpp"
+#include "obn/os_compat.hpp"
+#include "obn/tls_dial.hpp"
 #include "obn/tunnel_upload.hpp"
 #include "obn/zip_read.hpp"
 
@@ -363,6 +365,22 @@ static void set_cover_dir(const fs::path& dir)
 #endif
 }
 
+// dial() must honor timeout_ms. The LAN camera probe asks for 400ms, but a
+// blocking connect() ignores SO_SNDTIMEO on Windows and ran the OS's ~21s
+// SYN-retry window against a black-holed IP (2026-11-19, every off-LAN
+// camera attempt). 203.0.113.0/24 is TEST-NET-3 (unrouted), so only the
+// dial deadline can end this connect.
+static void test_dial_honors_timeout()
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    const obn::os::socket_t fd = obn::tls::dial("203.0.113.1", 80, 500);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    CHECK(elapsed_ms < 8000); // pre-fix Windows: ~21000
+    if (obn::os::socket_valid(fd)) obn::os::close_socket(fd);
+}
+
 int main()
 {
     g_dir = fs::temp_directory_path() /
@@ -389,6 +407,9 @@ int main()
     test_unstage_drops_only_that_entry();
     test_expired_stage_is_ignored();
     test_stage_is_per_printer_name_and_plate();
+
+    // Transport: dial deadline against TEST-NET-3 (unrouted IP).
+    test_dial_honors_timeout();
 
     fs::remove_all(g_dir, ec);
     if (fail_count) {
