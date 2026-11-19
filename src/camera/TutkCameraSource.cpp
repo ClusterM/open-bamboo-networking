@@ -3,6 +3,7 @@
 #include "obn/log.hpp"
 
 #include <chrono>
+#include <thread>
 
 namespace obn {
 namespace camera {
@@ -121,21 +122,30 @@ bool TutkCameraSource::open()
         return false;
     }
 
-    session_.join(params_, [this](const uint8_t* d, int n, int64_t pts, bool key) {
-        push_frame(d, n, pts, key);
-    });
+    // One retry: the printer restarts tutk_server when it answers our
+    // liveview.prepare (and the Handy app viewer does the same), so a JOIN
+    // racing that restart window fails once. Second attempt lands after it.
+    bool got = false;
+    for (int attempt = 0; attempt < 2 && !got; ++attempt) {
+        if (attempt > 0)
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        session_.join(params_, [this](const uint8_t* d, int n, int64_t pts, bool key) {
+            push_frame(d, n, pts, key);
+        });
 
-    // The session gives up without notifying us, so poll its state as well.
-    const auto deadline = std::chrono::steady_clock::now() + kFirstFrameTimeout;
-    std::unique_lock<std::mutex> lk(mu_);
-    while (frames_.empty() && session_.is_joined() &&
-           std::chrono::steady_clock::now() < deadline)
-        cv_.wait_for(lk, std::chrono::milliseconds(200));
-    const bool got = !frames_.empty();
-    lk.unlock();
+        // The session gives up without notifying us, so poll its state as well.
+        const auto deadline =
+            std::chrono::steady_clock::now() + kFirstFrameTimeout;
+        std::unique_lock<std::mutex> lk(mu_);
+        while (frames_.empty() && session_.is_joined() &&
+               std::chrono::steady_clock::now() < deadline)
+            cv_.wait_for(lk, std::chrono::milliseconds(200));
+        got = !frames_.empty();
+        lk.unlock();
+        if (!got) session_.leave();
+    }
     if (!got) {
         OBN_WARN("camera: TUTK stream did not start uid=%.20s", params_.uid.c_str());
-        session_.leave();
         return false;
     }
 
