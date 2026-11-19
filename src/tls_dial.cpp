@@ -22,9 +22,11 @@
 #  include <windows.h>
 #else
 #  include <csignal>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
 #  include <unistd.h>
@@ -172,6 +174,108 @@ SSL_CTX* shared_ctx()
     return g_ctx_insecure;
 }
 
+// Blocking connect() ignores SO_SNDTIMEO/SO_RCVTIMEO: a SYN to a dead LAN
+// host retries for the OS's full retransmit window (~21s on Windows) while
+// the caller only asked for 400ms (abi_camera probe), so every off-LAN
+// camera attempt burned 21s before failing. Run the connect non-blocking,
+// wait for writability until `deadline`, then restore blocking mode — the
+// TLS I/O after this relies on blocking sockets + SO_*TIMEO.
+bool connect_addr(obn::os::socket_t fd, const addrinfo* ai, int timeout_ms,
+                  const std::chrono::steady_clock::time_point& deadline)
+{
+    auto blocking_restore = [fd]() {
+#if defined(_WIN32)
+        u_long nb = 0;
+        ::ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &nb);
+#else
+        const int fl = ::fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+#endif
+    };
+    auto do_connect = [&]() {
+#if defined(_WIN32)
+        return ::connect(static_cast<SOCKET>(fd), ai->ai_addr,
+                         static_cast<int>(ai->ai_addrlen)) == 0;
+#else
+        return ::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0;
+#endif
+    };
+
+    if (timeout_ms <= 0) return do_connect();
+
+#if defined(_WIN32)
+    int rc;
+    u_long nb = 1;
+    rc = ::ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &nb);
+    if (rc != 0) return false;
+    if (!do_connect()) {
+        const int e = WSAGetLastError();
+        if (e != WSAEWOULDBLOCK) return false;
+    } else {
+        blocking_restore();
+        return true;
+    }
+#else
+    const int old_fl = ::fcntl(fd, F_GETFL, 0);
+    if (old_fl < 0 || ::fcntl(fd, F_SETFL, old_fl | O_NONBLOCK) != 0)
+        return false;
+    if (!do_connect()) {
+        if (errno != EINPROGRESS) return false;
+    } else {
+        blocking_restore();
+        return true;
+    }
+#endif
+
+    bool ok = false;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) break;
+        auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - now).count();
+        if (remain < 1) remain = 1;
+        if (remain > 60000) remain = 60000;
+        // Both sets: a refused non-blocking connect lands in the exception
+        // set on Windows (write set never fires; SO_ERROR already holds the
+        // refusal), success lands in the write set. SO_ERROR below settles
+        // which happened, so POSIX behavior is unchanged.
+        fd_set wr, ex;
+        FD_ZERO(&wr);
+        FD_SET(fd, &wr);
+        FD_ZERO(&ex);
+        FD_SET(fd, &ex);
+        timeval tv{};
+        tv.tv_sec  = static_cast<long>(remain / 1000);
+        tv.tv_usec = static_cast<long>((remain % 1000) * 1000);
+        const int sel = ::select(static_cast<int>(fd) + 1, nullptr, &wr,
+                                 &ex, &tv);
+        if (sel == 0) break; // deadline hit
+        if (sel < 0) {
+#if defined(_WIN32)
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            break;
+        }
+        int soerr = 0;
+#if defined(_WIN32)
+        int len = sizeof(soerr);
+        if (::getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_ERROR,
+                         reinterpret_cast<char*>(&soerr), &len) != 0)
+            break;
+#else
+        socklen_t len = sizeof(soerr);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &len) != 0)
+            break;
+#endif
+        ok = soerr == 0;
+        break;
+    }
+    blocking_restore();
+    return ok;
+}
+
 obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
 {
     init_once();
@@ -206,15 +310,14 @@ obn::os::socket_t dial(const std::string& host, int port, int timeout_ms)
         BOOL one_b = TRUE;
         ::setsockopt(static_cast<SOCKET>(fd), IPPROTO_TCP, TCP_NODELAY,
                      reinterpret_cast<const char*>(&one_b), sizeof(one_b));
-        if (::connect(static_cast<SOCKET>(fd), ai->ai_addr,
-                      static_cast<int>(ai->ai_addrlen)) == 0) break;
+        if (connect_addr(fd, ai, timeout_ms, deadline)) break;
 #else
         timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         int one = 1;
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        if (::connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        if (connect_addr(fd, ai, timeout_ms, deadline)) break;
 #endif
         obn::os::close_socket(fd);
         fd = obn::os::kInvalidSocket;
