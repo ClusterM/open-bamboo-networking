@@ -102,6 +102,20 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     // argument (MediaPlayCtrl.cpp / MediaFilePanel.cpp).
     const std::string serial = dev_id.substr(0, dev_id.find('|'));
 
+    // 4th packed field marks the caller: the file browser sends "files"
+    // (MediaFilePanel / PartSkipDialog) so Storage always takes the TUTK
+    // route — P1S firmware 01.10.00.15 dropped the local :6000 CTRL
+    // service. Camera callers leave the field out (or send a refresh
+    // token) and keep prefer_lan_over_tutk.
+    std::string channel;
+    {
+        const auto p1 = dev_id.find('|');
+        const auto p2 = p1 == std::string::npos ? p1 : dev_id.find('|', p1 + 1);
+        const auto p3 = p2 == std::string::npos ? p2 : dev_id.find('|', p2 + 1);
+        if (p3 != std::string::npos) channel = dev_id.substr(p3 + 1);
+    }
+    const bool file_browser = channel == "files";
+
     auto* a = as_agent(agent);
     if (!a || serial.empty()) {
         if (callback) callback(std::string{});
@@ -114,7 +128,8 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     // (CTRL :6000) but carries no video, so prefer_lan_over_tutk must not
     // pick it.
     const bool lan_video_off = a->lan_liveview_off(serial);
-    const bool prefer_lan    = obn::config::current().prefer_lan_over_tutk;
+    const bool prefer_lan    = obn::config::current().prefer_lan_over_tutk &&
+                               !file_browser;
     if (prefer_lan && lan_video_off && !lan_url.empty())
         OBN_INFO("get_camera_url dev=%s: LAN liveview is off on the printer, "
                  "ignoring prefer_lan_over_tutk", serial.c_str());

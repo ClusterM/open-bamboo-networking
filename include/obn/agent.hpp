@@ -494,11 +494,14 @@ private:
     void harvest_access_code(const std::string& dev_id,
                              const std::string& json);
 
-    // Blocks until the printer reports it can take a TUTK session: either a
-    // liveview.prepare "succeed" newer than `since` (the reply to the
-    // cloud's prepare that follows a /user/ttcode mint) or tutk_server
-    // "enable". Returns false on timeout; the URL is still usable then, the
-    // first IOTC connect may just fail with -90 while the server starts.
+    // Blocks until the printer answers the prepare dispatched by the current
+    // camera_url call: a liveview.prepare "succeed" newer than `since` (the
+    // reply to the signed prepare that follows a /user/ttcode mint). The
+    // stale tutk_server "enable" flag of an earlier session must NOT count —
+    // the reply restarts the printer's tutk_server, so returning early hands
+    // the URL to the player before the restart, which kills the JOIN.
+    // Returns false on timeout; the URL is still handed over then, the first
+    // IOTC connect may just fail while the server starts (open() retries).
     bool wait_tutk_ready(const std::string& dev_id,
                          std::chrono::steady_clock::time_point since,
                          std::chrono::milliseconds timeout);
@@ -598,6 +601,13 @@ private:
         std::string version;
     };
     std::vector<std::pair<std::string, SyntheticSubtask>> synthetic_subtasks_;
+    // dev_id -> last cover URL handed out in notify_local_message.
+    // Identity frames (subtask_name + zero ids) only ride the printer's
+    // full push_status every few minutes; caching the URL lets the
+    // frequent id-less partial pushes carry thumbnail_url too, which is
+    // what StatusPanel::update_sdcard_subtask reads during an active
+    // print. Guarded by mu_.
+    std::map<std::string, std::string> cover_url_by_dev_;
 
     // Per-device firmware snapshot, populated from MQTT forwarded
     // through notify_local_message. Keyed by dev_id; value is the

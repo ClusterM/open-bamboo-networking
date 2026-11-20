@@ -20,6 +20,7 @@
 #include "obn/cloud_session.hpp"
 #include "obn/config.hpp"
 #include "obn/cover_cache.hpp"
+#include "obn/cover_key.hpp"
 #include "obn/cover_server.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
@@ -890,6 +891,30 @@ bool patch_string_zero_to(std::string&       payload,
     return false;
 }
 
+// Adds `"thumbnail_url":"<url>"` to the frame's print object when the
+// firmware did not supply one. During an active print the frames that
+// carry no subtask_name keep the printer's zero ids, Studio's
+// is_sdcard_printing() flips true and StatusPanel::update_sdcard_subtask
+// reads only m_agent_thumbnail_url (populated exclusively from this
+// push_status field) — without the injection the panel shows the static
+// SD placeholder and never issues the cover GET.
+bool inject_thumbnail_url(std::string& payload, const std::string& url)
+{
+    if (url.empty()) return false;
+    if (payload.find("\"thumbnail_url\"") != std::string::npos) return false;
+    static const std::string kPrint = "\"print\":";
+    std::size_t pos = payload.find(kPrint);
+    if (pos == std::string::npos) return false;
+    std::size_t i = pos + kPrint.size();
+    while (i < payload.size() &&
+           (payload[i] == ' ' || payload[i] == '\t' ||
+            payload[i] == '\r' || payload[i] == '\n'))
+        ++i;
+    if (i >= payload.size() || payload[i] != '{') return false;
+    payload.insert(i + 1, "\"thumbnail_url\":\"" + url + "\",");
+    return true;
+}
+
 // override_lan_ip: replace every "ip":<int64> inside the "net":{"info":[…]}
 // block with an int64 encoding of the connect_printer IP.  Studio parses
 // this field into MachineObject::dev_ip which then feeds the camera URL;
@@ -1367,12 +1392,16 @@ bool Agent::wait_tutk_ready(const std::string& dev_id,
                             std::chrono::steady_clock::time_point since,
                             std::chrono::milliseconds timeout)
 {
+    // Only a liveview.prepare "succeed" newer than `since` counts. The
+    // earlier tutk_server "enable" fallback made this return in ~12ms on
+    // the stale flag from a previous session, so the URL reached the
+    // player before this prepare's reply landed — and that reply restarts
+    // the printer's tutk_server mid-JOIN, failing the open 18s later
+    // (2026-11-19, replay after a working first view).
     std::unique_lock<std::mutex> lk(mu_);
     return tutk_ready_cv_.wait_for(lk, timeout, [&] {
         auto p = liveview_prepared_at_.find(dev_id);
-        if (p != liveview_prepared_at_.end() && p->second >= since) return true;
-        auto r = tutk_server_ready_by_dev_.find(dev_id);
-        return r != tutk_server_ready_by_dev_.end() && r->second;
+        return p != liveview_prepared_at_.end() && p->second >= since;
     });
 }
 
@@ -1790,8 +1819,8 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     if (wait_tutk_ready(serial, minted_at, std::chrono::seconds(5)))
         OBN_INFO("camera_url(remote): dev=%s ready for TUTK", serial.c_str());
     else
-        OBN_WARN("camera_url(remote): dev=%s no liveview.prepare / tutk_server enable "
-                 "within 5s; returning the URL anyway", serial.c_str());
+        OBN_WARN("camera_url(remote): dev=%s no liveview.prepare reply within 5s; "
+                 "returning the URL anyway", serial.c_str());
     return turl;
 }
 
@@ -1974,9 +2003,38 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
                      host.empty() ? "; no LAN session, no cover fetch" : "");
         }
         if (!host.empty()) {
+            const std::string model_key = obn::cover_model_key(patched);
             cover_cache::ensure(host, dev_id, user, pass,
-                                subtask_name, plate_idx, cover_version);
+                                subtask_name, model_key, plate_idx,
+                                cover_version, bambu_ca_bundle_path());
         }
+        // Hand Studio the cover URL in the frame itself: the sdcard
+        // branch of StatusPanel (active print, zero-id frames) reads only
+        // push_status thumbnail_url and would otherwise never GET us.
+        if (cover_server_) {
+            const std::string url = cover_server_->url_for(
+                subtask_name, plate_idx, cover_version);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                cover_url_by_dev_[dev_id] = url;
+            }
+            inject_thumbnail_url(patched, url);
+        }
+    }
+
+    // Identity frames (subtask_name + zero ids) only ride the printer's
+    // full push_status, roughly every five minutes — too late for a short
+    // print. Once a job's URL is known, staple it onto every later frame
+    // too, so the id-less partial pushes Studio polls during an active
+    // print carry thumbnail_url as well.
+    if (cover_id.empty() && cover_server_) {
+        std::string url;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            auto it = cover_url_by_dev_.find(dev_id);
+            if (it != cover_url_by_dev_.end()) url = it->second;
+        }
+        inject_thumbnail_url(patched, url);
     }
 
     OBN_DEBUG("notify_local_message dev=%s bytes=%zu cb=%d print_ids=%d "

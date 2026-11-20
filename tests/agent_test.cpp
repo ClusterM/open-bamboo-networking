@@ -219,6 +219,37 @@ static void test_synthetic_subtask_not_created_without_name()
     CHECK(!a.lookup_synthetic_subtask("lan-00000000", &info));
 }
 
+static void test_thumbnail_url_carried_by_partial_frames()
+{
+    obn::Agent a(".");
+    // Identity frame: mints the synthetic id, starts cover_server and
+    // carries thumbnail_url itself.
+    const std::string identity = R"({
+        "print":{
+            "command":"push_status",
+            "subtask_name":"bunny.gcode.3mf",
+            "task_id":"0","subtask_id":"0",
+            "project_id":"0","profile_id":"0",
+            "gcode_start_time":"1700000002"
+        }
+    })";
+    const std::string first = run_local_msg(a, "dev_tu", identity);
+    CHECK(first.find("\"thumbnail_url\":\"http://127.0.0.1:") !=
+          std::string::npos);
+
+    // A later partial push_status without subtask_name/ids must still
+    // carry the cached URL: during the first minutes of an active print
+    // these id-less partials are the only frames Studio sees, and
+    // StatusPanel's sdcard branch reads thumbnail_url off them.
+    const std::string partial = R"({
+        "print":{"command":"push_status","nozzle_temper":75.5,
+                 "gcode_state":"RUNNING"}
+    })";
+    const std::string second = run_local_msg(a, "dev_tu", partial);
+    CHECK(second.find("\"thumbnail_url\":\"http://127.0.0.1:") !=
+          std::string::npos);
+}
+
 static void test_synthetic_subtask_not_created_for_sentinel_name()
 {
     obn::Agent a(".");
@@ -490,6 +521,7 @@ int main()
     test_synthetic_subtask_id_varies_with_timestamp();
     test_cloud_subtask_id_is_not_mapped_to_local_cover();
     test_synthetic_subtask_history_drops_the_oldest();
+    test_thumbnail_url_carried_by_partial_frames();
 
     // Selected-printer memory.
     test_selection_survives_agent_restart();
