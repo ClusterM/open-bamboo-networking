@@ -49,6 +49,15 @@ constexpr auto kMqttKeepReconnectGracePeriod = std::chrono::seconds(3);
 constexpr auto kLanSilenceFailback = std::chrono::seconds(6);
 constexpr auto kLanWatchdogTick    = std::chrono::seconds(2);
 
+// How long a printer that refused security.app_cert_install is left alone.
+// The slicer asks us to install on its refresh timer (Orca every 5s for the
+// selected machine, Studio ~1 Hz), and a printer whose firmware does not
+// implement the command refuses every single one of them, so without a
+// cooldown we re-publish the whole app cert chain + CRL on that cadence
+// forever. Any reconnect clears the cooldown, so this only limits retries
+// within one session.
+constexpr auto kAppCertRetryAfterFailure = std::chrono::minutes(10);
+
 std::string trim_ip_string(std::string s)
 {
     while (!s.empty() &&
@@ -350,7 +359,7 @@ int Agent::disconnect_printer()
         cert_store::forget_printer(session->dev_id());
         std::lock_guard<std::mutex> lk(mu_);
         app_cert_install_sent_.erase(session->dev_id());
-        app_cert_install_failed_.erase(session->dev_id());
+        app_cert_install_cooldown_.erase(session->dev_id());
     }
     return BAMBU_NETWORK_SUCCESS;
 }
@@ -601,7 +610,7 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
         {
             std::lock_guard<std::mutex> lk(mu_);
             app_cert_install_sent_.erase(dev_id);
-            app_cert_install_failed_.erase(dev_id);
+            app_cert_install_cooldown_.erase(dev_id);
         }
         lan_report_failback(dev_id);
     }
@@ -1131,7 +1140,8 @@ void Agent::harvest_security_report(const std::string& dev_id,
             // printer had already declined.
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                app_cert_install_failed_[dev_id] = std::chrono::steady_clock::now();
+                app_cert_install_cooldown_[dev_id] =
+                    std::chrono::steady_clock::now() + kAppCertRetryAfterFailure;
             }
             app_cert_cv_.notify_all();
             return;
@@ -1189,7 +1199,7 @@ void Agent::harvest_security_report(const std::string& dev_id,
         {
             std::lock_guard<std::mutex> lk(mu_);
             certified_devs_.insert(dev_id);
-            app_cert_install_failed_.erase(dev_id);
+            app_cert_install_cooldown_.erase(dev_id);
             if (cert_on_disk && lan_session_ && lan_session_->dev_id() == dev_id)
                 ip = lan_session_->dev_ip();
         }
@@ -1396,6 +1406,13 @@ void Agent::maybe_install_app_cert(const std::string& dev_id)
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id))
             return; // SUCCESS already harvested this session
+        auto it = app_cert_install_cooldown_.find(dev_id);
+        if (it != app_cert_install_cooldown_.end() &&
+            std::chrono::steady_clock::now() < it->second) {
+            // The printer refused the last request. Don't re-publish the app
+            // cert chain + CRL on every refresh tick until the cooldown ends.
+            return;
+        }
     }
 
     if (!obn::signing::slicer_app_cert_usable()) return;
@@ -1516,16 +1533,19 @@ int Agent::send_message_to_printer(const std::string& dev_id,
 bool Agent::wait_for_app_cert(const std::string&        dev_id,
                               std::chrono::milliseconds timeout)
 {
-    // After a refused install, retry it at most this often; until then sign
-    // straight away, as the timeout path would have after waiting.
-    constexpr auto kRetryAfterFailure = std::chrono::minutes(10);
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id)) return true;
-        auto f = app_cert_install_failed_.find(dev_id);
-        if (f != app_cert_install_failed_.end() &&
-            std::chrono::steady_clock::now() - f->second < kRetryAfterFailure)
-            return false;
+        auto f = app_cert_install_cooldown_.find(dev_id);
+        if (f != app_cert_install_cooldown_.end()) {
+            // Still cooling down: sign straight away, as the timeout path
+            // would have after waiting.
+            if (std::chrono::steady_clock::now() < f->second) return false;
+            // Expired. Drop it here rather than date-comparing below, so a
+            // refusal that lands while we publish the retry cannot be mistaken
+            // for the stale one and leave the caller waiting out the timeout.
+            app_cert_install_cooldown_.erase(f);
+        }
     }
     // No shared app cert configured -> nothing to install, so don't stall the
     // publish; maybe_sign will pass the payload through unsigned anyway.
@@ -1539,22 +1559,24 @@ bool Agent::wait_for_app_cert(const std::string&        dev_id,
     // Block until harvest_security_report latches the SUCCESS ack (which
     // notifies app_cert_cv_) or the timeout elapses. cv release of mu_ lets
     // the MQTT report thread take mu_ and insert the ack.
-    // Wake on a SUCCESS ack, or on a failure reported after this wait began.
-    const auto started = std::chrono::steady_clock::now();
+    // Wake on a SUCCESS ack, or on the refusal of the install kicked above —
+    // the cooldown entry was cleared before publishing, so any entry here is
+    // the answer to that request.
     std::unique_lock<std::mutex> lk(mu_);
-    bool refused = false;
     const bool done = app_cert_cv_.wait_for(lk, timeout, [&] {
-        if (app_cert_install_sent_.count(dev_id) != 0) return true;
-        auto f = app_cert_install_failed_.find(dev_id);
-        refused = f != app_cert_install_failed_.end() && f->second >= started;
-        return refused;
+        return app_cert_install_sent_.count(dev_id) != 0 ||
+               app_cert_install_cooldown_.count(dev_id) != 0;
     });
-    const bool ok = done && !refused;
+    const bool refused = done && app_cert_install_sent_.count(dev_id) == 0;
+    const bool ok      = done && !refused;
     if (refused)
         OBN_WARN("send: app_cert_install refused by %s; signing anyway without "
-                 "waiting (next install attempt in %lld min)",
+                 "waiting (no further install attempt for %lld min)",
                  dev_id.c_str(),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::minutes>(kRetryAfterFailure).count()));
+                 static_cast<long long>(
+                     std::chrono::duration_cast<std::chrono::minutes>(
+                         kAppCertRetryAfterFailure)
+                         .count()));
     else if (!ok)
         OBN_WARN("send: app_cert_install not acknowledged for %s within %lldms; "
                  "signing anyway (printer may reject with 84033545)",
@@ -3136,6 +3158,13 @@ int Agent::disconnect_cloud()
             if (*it == lan_dev) ++it;
             else                it = app_cert_install_sent_.erase(it);
         }
+        // Same for the refusal cooldown, so a reconnect retries the install
+        // instead of signing unacknowledged until the cooldown runs out.
+        for (auto it = app_cert_install_cooldown_.begin();
+             it != app_cert_install_cooldown_.end(); ) {
+            if (it->first == lan_dev) ++it;
+            else                      it = app_cert_install_cooldown_.erase(it);
+        }
     }
     if (sess) sess->stop();
     // Release cached RSA pubkeys learned during this cloud session.
@@ -3219,7 +3248,7 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
             cloud_notified_devs_.erase(d);
             cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
-            app_cert_install_failed_.erase(d);
+            app_cert_install_cooldown_.erase(d);
         }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;

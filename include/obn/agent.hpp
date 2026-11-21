@@ -208,7 +208,8 @@ public:
     // Fire-and-forget app_cert_install when slicer_app_cert_usable().
     // Called from install_device_cert (Studio ABI ~1 Hz / after connect).
     // Skips if app_cert_install_sent_ already has a SUCCESS for this
-    // session; does not wait for the reply.
+    // session, or while app_cert_install_cooldown_ holds a refusal; does not
+    // wait for the reply.
     void maybe_install_app_cert(const std::string& dev_id);
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
@@ -671,12 +672,16 @@ private:
     // printer acknowledged security.app_cert_install). wait_for_app_cert()
     // waits on this instead of polling. Waits on mu_.
     std::condition_variable app_cert_cv_;
-    // Devices whose last app_cert_install was answered with a failure
-    // (result != SUCCESS or no printer_cert), and when. While a failure is
-    // recent, wait_for_app_cert() returns at once instead of blocking every
-    // signed publish for the full timeout on an install the printer already
-    // refused. Cleared by a later SUCCESS. Guarded by mu_; notifies app_cert_cv_.
-    std::map<std::string, std::chrono::steady_clock::time_point> app_cert_install_failed_;
+    // Negative cache for app_cert_install: dev_id -> time when we may ask
+    // again. Entered when the printer answers the install with a failure
+    // (result != SUCCESS or no printer_cert). While it stands,
+    // wait_for_app_cert() returns at once instead of blocking every signed
+    // publish for the full timeout on an install the printer already refused,
+    // and maybe_install_app_cert() stops re-publishing the request on the
+    // slicer's refresh tick. Cleared by a later SUCCESS and on reconnect.
+    // Guarded by mu_; notifies app_cert_cv_.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        app_cert_install_cooldown_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.
