@@ -465,6 +465,68 @@ static void test_replayed_config_dir_keeps_store()
 }
 
 // ---------------------------------------------------------------------------
+// Cloud message callback registration
+// ---------------------------------------------------------------------------
+
+static void test_cloud_message_callback_registered_after_connect()
+{
+    obn::Agent a(".");
+    // Orca can connect to the cloud while a non-Bambu printer is selected,
+    // then register the Bambu message handler when that printer is selected.
+    auto deliver = a.test_cloud_message_callback();
+    const std::string payload = R"({"print":{"command":"push_status","nozzle_temper":25}})";
+    deliver("CLOUD001", payload); // No handler yet.
+
+    int calls = 0;
+    int queued = 0;
+    a.set_queue_on_main_fn([&](std::function<void()>) { ++queued; });
+    a.set_on_message_fn([&](std::string dev_id, std::string json) {
+        ++calls;
+        CHECK(dev_id == "CLOUD001");
+        CHECK(json == payload);
+    });
+    deliver("CLOUD001", payload);
+    CHECK(calls == 1);
+    // Cloud messages must still dispatch directly: the slicer handles its
+    // own threading. queue_on_main is used for other notifications only.
+    CHECK(queued == 0);
+    a.set_on_message_fn(nullptr);
+    a.set_queue_on_main_fn(nullptr);
+}
+
+static void test_cloud_message_callback_replaced_and_cleared()
+{
+    obn::Agent a(".");
+    int original_calls = 0;
+    int replacement_calls = 0;
+    a.set_on_message_fn([&](std::string, std::string) { ++original_calls; });
+    auto deliver = a.test_cloud_message_callback();
+    deliver("CLOUD002", "{}");
+    CHECK(original_calls == 1);
+
+    a.set_on_message_fn([&](std::string, std::string) { ++replacement_calls; });
+    deliver("CLOUD002", "{}");
+    CHECK(original_calls == 1);
+    CHECK(replacement_calls == 1);
+
+    a.set_on_message_fn(nullptr);
+    deliver("CLOUD002", "{}");
+    CHECK(original_calls == 1);
+    CHECK(replacement_calls == 1);
+
+    // The callback must run outside Agent::mu_: setters take that same lock.
+    a.set_on_message_fn([&](std::string, std::string) {
+        ++replacement_calls;
+        a.set_on_message_fn(nullptr);
+    });
+    deliver("CLOUD002", "{}");
+    deliver("CLOUD002", "{}");
+    CHECK(original_calls == 1);
+    CHECK(replacement_calls == 2);
+    a.set_on_message_fn(nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -498,6 +560,10 @@ int main()
     test_selection_without_config_dir_is_session_only();
     test_selection_before_config_dir_is_persisted();
     test_replayed_config_dir_keeps_store();
+
+    // Cloud message handlers can change during a long-lived session.
+    test_cloud_message_callback_registered_after_connect();
+    test_cloud_message_callback_replaced_and_cleared();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
