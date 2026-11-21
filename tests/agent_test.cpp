@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -526,6 +527,39 @@ static void test_cloud_message_callback_replaced_and_cleared()
     a.set_on_message_fn(nullptr);
 }
 
+static void test_cloud_subscribe_failure_callback_follows_registration()
+{
+    obn::Agent a(".");
+    // Same registration race as the message handler: the cloud session is
+    // started once and keeps this callback for its whole life.
+    auto report = a.test_cloud_subscribe_failure_callback();
+    report("CLOUD003"); // No handler yet.
+
+    int calls = 0;
+    std::string seen;
+    a.set_on_subscribe_failure_fn([&](std::string dev_id) {
+        ++calls;
+        seen = dev_id;
+    });
+    report("CLOUD003");
+    CHECK(calls == 1);
+    CHECK(seen == "CLOUD003");
+
+    // Unlike report frames, this notification goes through queue_on_main
+    // when the slicer has registered one.
+    int queued = 0;
+    a.set_queue_on_main_fn([&](std::function<void()> fn) { ++queued; fn(); });
+    report("CLOUD003");
+    CHECK(calls == 2);
+    CHECK(queued == 1);
+
+    a.set_on_subscribe_failure_fn(nullptr);
+    report("CLOUD003");
+    CHECK(calls == 2);
+    CHECK(queued == 1); // Nothing to deliver, nothing queued.
+    a.set_queue_on_main_fn(nullptr);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -564,6 +598,7 @@ int main()
     // Cloud message handlers can change during a long-lived session.
     test_cloud_message_callback_registered_after_connect();
     test_cloud_message_callback_replaced_and_cleared();
+    test_cloud_subscribe_failure_callback_follows_registration();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

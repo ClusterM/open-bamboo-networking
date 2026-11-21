@@ -356,9 +356,11 @@ public:
     // connected. Returns BAMBU_NETWORK_* code.
     int  connect_cloud();
 #ifdef OBN_TESTING
-    // Exercise the real session callback without credentials or a broker.
+    // Exercise the real session callbacks without credentials or a broker.
     BBL::OnMessageFn test_cloud_message_callback()
         { return make_cloud_message_callback(); }
+    BBL::GetSubscribeFailureFn test_cloud_subscribe_failure_callback()
+        { return make_cloud_subscribe_failure_callback(); }
 #endif
     int  disconnect_cloud();
     bool cloud_connected() const;
@@ -469,7 +471,8 @@ public:
     std::string cloud_user_id() const;
 
 private:
-    BBL::OnMessageFn make_cloud_message_callback();
+    BBL::OnMessageFn           make_cloud_message_callback();
+    BBL::GetSubscribeFailureFn make_cloud_subscribe_failure_callback();
 
     // Scans an incoming MQTT report frame (LAN or cloud) for a
     // security.app_cert_install success response and installs the returned

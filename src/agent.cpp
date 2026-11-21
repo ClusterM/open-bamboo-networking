@@ -3039,8 +3039,8 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
         // (GUI_App::init_networking_callbacks -> command_request_push_all),
         // which is what fills the device panel — AMS trays, temperatures,
         // job state. Losing it leaves that panel empty until something else
-        // asks, so read the callback *fresh* here instead of using the
-        // snapshot taken when connect_cloud() ran: Studio may register it
+        // asks, so read the callback *fresh* here rather than capturing it
+        // when connect_cloud() builds this lambda: Studio may register it
         // after connect_server, and a stale null capture would stay null for
         // the whole session. For the same reason the notification latch is
         // separate from the seen-this-session set — a report that arrives
@@ -3074,6 +3074,10 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
         // session starts (e.g. when switching printer agents). Read it for
         // each report, then call it outside mu_ so it can re-enter Agent.
         // Keep direct delivery: the slicer handles message threading itself.
+        // Deliberately a second lock rather than a field of the snapshot
+        // above: without a queue_on_main_ the on_printer_connected hop runs
+        // inline, and a handler registered from inside it must still see
+        // this report.
         BBL::OnMessageFn on_msg;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -3083,22 +3087,30 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
     };
 }
 
+BBL::GetSubscribeFailureFn Agent::make_cloud_subscribe_failure_callback()
+{
+    return [this](std::string dev_id) {
+        BBL::GetSubscribeFailureFn on_sub_fail;
+        BBL::QueueOnMainFn         q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            on_sub_fail = on_subscribe_failure_;
+            q           = queue_on_main_;
+        }
+        if (!on_sub_fail) return;
+        auto invoke = [on_sub_fail, dev_id]() { on_sub_fail(dev_id); };
+        if (q) q(invoke); else invoke();
+    };
+}
+
 int Agent::connect_cloud()
 {
     auth::Session s;
-    BBL::OnServerConnectedFn on_server;
-    BBL::GetSubscribeFailureFn on_sub_fail;
-    BBL::QueueOnMainFn       queue;
-    BBL::OnPrinterConnectedFn on_printer_connected;
     std::shared_ptr<CloudSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (!cloud_session_) cloud_session_ = std::make_shared<CloudSession>();
-        session              = cloud_session_;
-        on_server            = on_server_connected_;
-        on_sub_fail          = on_subscribe_failure_;
-        queue                = queue_on_main_;
-        on_printer_connected = on_printer_connected_;
+        session = cloud_session_;
     }
 
     if (!auth_store_) {
@@ -3144,15 +3156,30 @@ int Agent::connect_cloud()
     // registered. The message callback is intentionally NOT queued:
     // DeviceManager::on_push_message() is thread-aware and has its own
     // fast-path handling.
-    auto on_connected_cb = [this, on_server, queue]
+    //
+    // None of the handlers below is captured by value. The session outlives
+    // any particular set of them: Orca re-registers the whole bundle when the
+    // user switches printer agents, and hands the agent it is leaving an empty
+    // one. A copy taken here would keep calling a handler the slicer has
+    // disconnected, or stay null for the rest of the session when it was taken
+    // before registration (#154). Read them under mu_ at the point of use and
+    // invoke outside it, so a handler may re-enter the Agent.
+    auto on_connected_cb = [this]
         (int status, int reason, std::string /*msg*/)
     {
         OBN_INFO("cloud: server_connected status=%d reason=%d", status, reason);
+        BBL::OnServerConnectedFn on_server;
+        BBL::QueueOnMainFn       q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            on_server = on_server_connected_;
+            q         = queue_on_main_;
+        }
         if (on_server) {
             auto invoke = [on_server, status, reason]() {
                 on_server(status, reason);
             };
-            if (queue) queue(invoke); else invoke();
+            if (q) q(invoke); else invoke();
         }
         // CONNACK re-applies the whole subscription set, so this is where the
         // devices Studio handed us before the connection came up become
@@ -3172,17 +3199,7 @@ int Agent::connect_cloud()
 
     auto on_msg_cb = make_cloud_message_callback();
 
-    auto on_sub_fail_cb = [this, on_sub_fail](std::string dev_id) {
-        if (on_sub_fail) {
-            BBL::QueueOnMainFn q;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                q = queue_on_main_;
-            }
-            auto invoke = [on_sub_fail, dev_id]() { on_sub_fail(dev_id); };
-            if (q) q(invoke); else invoke();
-        }
-    };
+    auto on_sub_fail_cb = make_cloud_subscribe_failure_callback();
 
     return session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
 }
