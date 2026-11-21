@@ -1,9 +1,10 @@
 // Cloud print pipeline (start_print / start_local_print_with_record).
 //
-// Shared cloud bookkeeping for both ABI entry points, then a delivery
-// fork that intentionally diverges from current stock hybrid behaviour
-// (stock uploads the main .3mf to S3 even on "LAN+record" and the
-// printer re-downloads it — see ../research/11.02-cloud-upload.md §11.2.2):
+// Shared cloud bookkeeping for both ABI entry points. Delivery matches
+// stock: both paths end with the main .3mf on S3 and the project
+// registered with the S3 URL, because the cloud dispatches whatever URL
+// was registered last and X1C firmware silently ignores a bare ftp://
+// dispatch (issue #23; X2D accepted it, X1C FW 1.08.02 did not).
 //
 //   [A]  POST   /v1/iot-service/api/user/project
 //   [B]  PUT    <presigned>                                       config 3mf
@@ -14,14 +15,14 @@
 //   [E]  FTPS STOR main .3mf first (Upload; WR_UPLOAD_FTP on fail)
 //   [A–D] then project + config S3 (Record) + notify
 //   [F]  PATCH  /v1/iot-service/api/user/project/<pid>            url=ftp://...
-//   [G]  POST   /v1/user-service/my/task                          mode=lan_file
+//   [G]  GET    /v1/iot-service/api/user/upload?models=...
+//   [H]  PUT    <presigned>                                       main 3mf (Record)
+//   [I]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3 (wins)
+//   [J]  POST   /v1/user-service/my/task                          mode=lan_file
 //
 //   use_lan_channel=false (start_print):
-//   Create, then [A–D], then:
-//   [E]  GET    /v1/iot-service/api/user/upload?models=...
-//   [F]  PUT    <presigned>                                       main 3mf (Upload)
-//   [G]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3
-//   [H]  POST   /v1/user-service/my/task                          mode=cloud_file
+//   Create, then [A–D], then [G]–[I] with Upload stage, then:
+//   [J]  POST   /v1/user-service/my/task                          mode=cloud_file
 //
 // Config upload [B]/[D] is required for Print History thumbnails.
 // Print start is cloud /my/task dispatch — the plugin does not publish
@@ -929,13 +930,21 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
         rc != 0) return rc;
 
     if (use_lan_channel) {
+        // First registration: the FTPS copy, so a blocked S3 still leaves a
+        // usable url on the project. Stock does this too, then overwrites it
+        // with the S3 URL below — the cloud dispatches the last registered
+        // URL, and X1C firmware will not print from a bare ftp:// dispatch
+        // (issue #23; X2D accepted it, X1C FW 1.08.02 silently did not).
         if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
                                    md5, p.plate_index, project_url, update_fn);
             rc != 0) return rc;
-    } else {
-        // ---------------------------------------------------------
-        // Cloud delivery: main .3mf to S3 + PATCH S3 URL.
-        // ---------------------------------------------------------
+    }
+
+    // ---------------------------------------------------------
+    // Main .3mf to S3 + second PATCH S3 URL — stock parity on both
+    // paths: the cloud dispatches whatever was registered last.
+    // ---------------------------------------------------------
+    {
         std::string main_upload_url;
         std::string plate_tag =
             std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
@@ -954,8 +963,10 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                     "filename not readable");
             return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
         }
+        const int main_stage = use_lan_channel ? BBL::PrintingStageRecord
+                                               : BBL::PrintingStageUpload;
         if (int rc = s3_put(main_upload_url, main_bytes, update_fn, cancel_fn,
-                            BBL::PrintingStageUpload,
+                            main_stage,
                             BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
             rc != 0) return rc;
 
@@ -979,9 +990,8 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
              p.dev_id.c_str(), info.project_id.c_str(), task_id.c_str(),
-             use_lan_channel ? "ftps" : "s3",
-             use_lan_channel ? project_url.c_str()
-                             : redact_url(project_url).c_str());
+             use_lan_channel ? "ftps+s3" : "s3",
+             redact_url(project_url).c_str());
     return 0;
 }
 
