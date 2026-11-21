@@ -350,6 +350,7 @@ int Agent::disconnect_printer()
         cert_store::forget_printer(session->dev_id());
         std::lock_guard<std::mutex> lk(mu_);
         app_cert_install_sent_.erase(session->dev_id());
+        app_cert_install_failed_.erase(session->dev_id());
     }
     return BAMBU_NETWORK_SUCCESS;
 }
@@ -600,6 +601,7 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
         {
             std::lock_guard<std::mutex> lk(mu_);
             app_cert_install_sent_.erase(dev_id);
+            app_cert_install_failed_.erase(dev_id);
         }
         lan_report_failback(dev_id);
     }
@@ -1123,6 +1125,15 @@ void Agent::harvest_security_report(const std::string& dev_id,
                      dev_id.c_str(),
                      result.empty() ? "<none>" : result.c_str(),
                      printer_cert.empty() ? "absent" : "present");
+            // Record the refusal and wake any wait_for_app_cert(): without this
+            // every signed publish waited out its full timeout (8 s, on the
+            // caller's thread, which is the slicer's UI thread) for an ack the
+            // printer had already declined.
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                app_cert_install_failed_[dev_id] = std::chrono::steady_clock::now();
+            }
+            app_cert_cv_.notify_all();
             return;
         }
         // printer_cert is a PEM chain (device leaf first, then its issuer CA);
@@ -1178,6 +1189,7 @@ void Agent::harvest_security_report(const std::string& dev_id,
         {
             std::lock_guard<std::mutex> lk(mu_);
             certified_devs_.insert(dev_id);
+            app_cert_install_failed_.erase(dev_id);
             if (cert_on_disk && lan_session_ && lan_session_->dev_id() == dev_id)
                 ip = lan_session_->dev_ip();
         }
@@ -1504,9 +1516,16 @@ int Agent::send_message_to_printer(const std::string& dev_id,
 bool Agent::wait_for_app_cert(const std::string&        dev_id,
                               std::chrono::milliseconds timeout)
 {
+    // After a refused install, retry it at most this often; until then sign
+    // straight away, as the timeout path would have after waiting.
+    constexpr auto kRetryAfterFailure = std::chrono::minutes(10);
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id)) return true;
+        auto f = app_cert_install_failed_.find(dev_id);
+        if (f != app_cert_install_failed_.end() &&
+            std::chrono::steady_clock::now() - f->second < kRetryAfterFailure)
+            return false;
     }
     // No shared app cert configured -> nothing to install, so don't stall the
     // publish; maybe_sign will pass the payload through unsigned anyway.
@@ -1520,11 +1539,23 @@ bool Agent::wait_for_app_cert(const std::string&        dev_id,
     // Block until harvest_security_report latches the SUCCESS ack (which
     // notifies app_cert_cv_) or the timeout elapses. cv release of mu_ lets
     // the MQTT report thread take mu_ and insert the ack.
+    // Wake on a SUCCESS ack, or on a failure reported after this wait began.
+    const auto started = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lk(mu_);
-    const bool ok = app_cert_cv_.wait_for(lk, timeout, [&] {
-        return app_cert_install_sent_.count(dev_id) != 0;
+    bool refused = false;
+    const bool done = app_cert_cv_.wait_for(lk, timeout, [&] {
+        if (app_cert_install_sent_.count(dev_id) != 0) return true;
+        auto f = app_cert_install_failed_.find(dev_id);
+        refused = f != app_cert_install_failed_.end() && f->second >= started;
+        return refused;
     });
-    if (!ok)
+    const bool ok = done && !refused;
+    if (refused)
+        OBN_WARN("send: app_cert_install refused by %s; signing anyway without "
+                 "waiting (next install attempt in %lld min)",
+                 dev_id.c_str(),
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::minutes>(kRetryAfterFailure).count()));
+    else if (!ok)
         OBN_WARN("send: app_cert_install not acknowledged for %s within %lldms; "
                  "signing anyway (printer may reject with 84033545)",
                  dev_id.c_str(), static_cast<long long>(timeout.count()));
@@ -3188,6 +3219,7 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
             cloud_notified_devs_.erase(d);
             cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
+            app_cert_install_failed_.erase(d);
         }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;
