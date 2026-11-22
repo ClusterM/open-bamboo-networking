@@ -8,9 +8,6 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
-#include <openssl/x509_vfy.h>
-#endif
 #include <openssl/x509v3.h>
 
 #if defined(_WIN32)
@@ -133,11 +130,10 @@ bool verify_peer_cn(SSL* ssl, const char* expected_cn)
     if (!expected_cn || !*expected_cn) return false;
     X509* cert = SSL_get1_peer_certificate(ssl);
     if (!cert) return false;
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
-    const int ok = X509_check_host(cert, expected_cn, std::strlen(expected_cn), (0 | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr);
-#else
-    const int ok = X509_check_host(cert, expected_cn, std::strlen(expected_cn), 0, nullptr);
-#endif
+    // ALWAYS_CHECK_SUBJECT: the printer leaf carries the serial in the CN and
+    // has no SAN, which OpenSSL 4.1 no longer falls back to (#157).
+    const int ok = X509_check_host(cert, expected_cn, std::strlen(expected_cn),
+                                   X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nullptr);
     X509_free(cert);
     return ok == 1;
 }

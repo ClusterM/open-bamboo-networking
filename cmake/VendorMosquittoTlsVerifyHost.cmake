@@ -8,6 +8,7 @@ function(obn_patch_mosquitto_tls_verify_host _src_root)
 
     set(_mark "obn: tls_verify_hostname")
     set(_partial_mark "obn: X509_V_FLAG_PARTIAL_CHAIN")
+    set(_hostflags_mark "obn: ALWAYS_CHECK_SUBJECT for LAN only")
 
     set(_internal "${_src_root}/lib/mosquitto_internal.h")
     file(READ "${_internal}" _body)
@@ -35,17 +36,62 @@ function(obn_patch_mosquitto_tls_verify_host _src_root)
         file(WRITE "${_net}" "${_body}")
     endif()
 
+    # Verify-param block on mosq->ssl_ctx. Re-runs on every configure (the
+    # FetchContent POPULATED guard in VendorMosquitto.cmake is per-cmake-run,
+    # not per source tree), so it has to recognise trees patched by an older
+    # OBN and upgrade them in place — otherwise a reused build directory keeps
+    # the old policy while a clean one gets the new (#157).
+    set(_set_flags "\t\t\t\t\tX509_VERIFY_PARAM_set_flags(vpm, X509_VERIFY_PARAM_get_flags(vpm) | X509_V_FLAG_PARTIAL_CHAIN);\n")
+    # ALWAYS_CHECK_SUBJECT is for the LAN printer only: its leaf is CN=<serial>
+    # with no subjectAltName, and OpenSSL 4.1 stopped consulting the subject DN.
+    # Cloud MQTT keeps the default SAN-only policy — there the flag would let a
+    # trusted certificate whose CN matches the broker pass with mismatched SANs.
+    # mosq->tls_verify_hostname is set (LAN) or left NULL (cloud) by
+    # obn::mqtt::Client::connect() before mosquitto_connect() builds the ctx.
+    set(_host_flags "\t\t\t\t\tif(mosq->tls_verify_hostname && mosq->tls_verify_hostname[0]){ /* ${_hostflags_mark} */\n\t\t\t\t\t\tX509_VERIFY_PARAM_set_hostflags(vpm, X509_VERIFY_PARAM_get_hostflags(vpm) | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT);\n\t\t\t\t\t}\n")
+    # Ungated host flags as first shipped in #157, before the LAN/cloud split.
+    set(_host_flags_v1 "\t\t\t\tX509_VERIFY_PARAM_set_hostflags(vpm, (X509_VERIFY_PARAM_get_hostflags(vpm) | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);\n")
+
     file(READ "${_net}" _body)
-    string(FIND "${_body}" "${_partial_mark}" _pos)
+    string(FIND "${_body}" "${_hostflags_mark}" _pos)
     if(_pos LESS 0)
-        string(REPLACE
-            "#include <openssl/ui.h>"
-            "#include <openssl/ui.h>\n#include <openssl/x509v3.h>\n#include <openssl/x509_vfy.h> /* ${_partial_mark} */"
-            _body "${_body}")
-        string(REPLACE
-            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t}"
-            "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t\tX509_VERIFY_PARAM *vpm = SSL_CTX_get0_param(mosq->ssl_ctx); /* ${_partial_mark} */\n\t\t\t\tif(vpm){\n\t\t\t\t\tX509_VERIFY_PARAM_set_flags(vpm, X509_VERIFY_PARAM_get_flags(vpm) | X509_V_FLAG_PARTIAL_CHAIN);\n\t\t\t\tX509_VERIFY_PARAM_set_hostflags(vpm, (X509_VERIFY_PARAM_get_hostflags(vpm) | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);\n\t\t\t\t}\n\t\t\t}"
-            _body "${_body}")
+        string(FIND "${_body}" "${_host_flags_v1}" _v1_pos)
+        string(FIND "${_body}" "${_partial_mark}" _partial_pos)
+        if(_v1_pos GREATER_EQUAL 0)
+            string(REPLACE "${_host_flags_v1}" "${_host_flags}" _body "${_body}")
+        elseif(_partial_pos GREATER_EQUAL 0)
+            string(FIND "${_body}" "${_set_flags}" _pos)
+            if(_pos LESS 0)
+                message(FATAL_ERROR
+                    "obn: mosquitto host flags upgrade: PARTIAL_CHAIN block not found "
+                    "in '${_net}' — re-check the patch")
+            endif()
+            string(REPLACE "${_set_flags}" "${_set_flags}${_host_flags}" _body "${_body}")
+        else()
+            set(_anchor "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t}")
+            string(FIND "${_body}" "${_anchor}" _pos)
+            if(_pos LESS 0)
+                message(FATAL_ERROR
+                    "obn: mosquitto verify-param patch: SSL_CTX_set_verify() call not "
+                    "found in '${_net}' — upstream layout changed, re-check the patch")
+            endif()
+            string(REPLACE
+                "${_anchor}"
+                "SSL_CTX_set_verify(mosq->ssl_ctx, SSL_VERIFY_PEER, mosquitto__server_certificate_verify);\n\t\t\t\tX509_VERIFY_PARAM *vpm = SSL_CTX_get0_param(mosq->ssl_ctx); /* ${_partial_mark} */\n\t\t\t\tif(vpm){\n${_set_flags}${_host_flags}\t\t\t\t}\n\t\t\t}"
+                _body "${_body}")
+        endif()
+        # Separately idempotent: a tree patched before #157 already has
+        # x509v3.h but not x509_vfy.h, where the host-flag accessors live.
+        # Reverse order: each one is inserted right after ui.h.
+        foreach(_hdr "openssl/x509_vfy.h" "openssl/x509v3.h")
+            string(FIND "${_body}" "${_hdr}" _pos)
+            if(_pos LESS 0)
+                string(REPLACE
+                    "#include <openssl/ui.h>"
+                    "#include <openssl/ui.h>\n#include <${_hdr}> /* ${_partial_mark} */"
+                    _body "${_body}")
+            endif()
+        endforeach()
         file(WRITE "${_net}" "${_body}")
     endif()
 

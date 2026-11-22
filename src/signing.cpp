@@ -113,11 +113,10 @@ static std::string leaf_serial_hex_lower(X509* cert)
 
 static std::string leaf_issuer_rfc2253(X509* cert)
 {
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 0)
+    // const since OpenSSL 4.0 (const-corrected X509 accessors); 3.x returns
+    // X509_NAME*, which converts, and X509_NAME_print_ex() has always taken a
+    // const name. One spelling works for both (#157).
     const X509_NAME* name = ::X509_get_issuer_name(cert);
-#else
-    X509_NAME* name = ::X509_get_issuer_name(cert);
-#endif
     if (!name) return {};
     BIO* bio = ::BIO_new(::BIO_s_mem());
     if (!bio) return {};

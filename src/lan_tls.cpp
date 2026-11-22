@@ -17,10 +17,8 @@
 #include <filesystem>
 
 #include <openssl/ssl.h>
-#include <openssl/x509v3.h>
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
 #include <openssl/x509_vfy.h>
-#endif
+#include <openssl/x509v3.h>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -392,10 +390,15 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
         const unsigned long flags = ::X509_VERIFY_PARAM_get_flags(vpm);
         ::X509_VERIFY_PARAM_set_flags(vpm, flags | X509_V_FLAG_PARTIAL_CHAIN);
 
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
+        // Printer leaves are CN=<serial> with no subjectAltName at all
+        // (research/06-channels.md), and OpenSSL 4.1 stopped consulting the
+        // subject DN when the certificate has no SAN of the requested type,
+        // which broke every LAN TLS path (#157). Ask for the CN explicitly.
+        // Not version-gated: for a SAN-less certificate this is what the
+        // default did on 3.x anyway, and CI only ever builds against 3.x.
         const unsigned int host_flags = ::X509_VERIFY_PARAM_get_hostflags(vpm);
-        ::X509_VERIFY_PARAM_set_hostflags(vpm, (host_flags | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
-#endif
+        ::X509_VERIFY_PARAM_set_hostflags(
+            vpm, host_flags | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT);
     }
     ::SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     return true;
