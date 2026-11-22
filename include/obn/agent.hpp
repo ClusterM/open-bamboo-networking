@@ -164,9 +164,17 @@ public:
     // when the current session already targets `dev_id` and is connected.
     // Blocks up to ~3s waiting for the MQTT CONNACK so an immediate publish
     // succeeds.
+    //
+    // `only_if_still_selected` is for autostart_lan_if_selected(), whose work
+    // happens on a detached thread: by the time it runs, the user may have
+    // switched printers, and opening this session would take the LAN session
+    // (and, through connect_printer, the selection) back from the printer they
+    // just picked. The print path leaves it false — it has to reach its target
+    // printer whether or not the device list still points at it.
     bool ensure_lan_session(const std::string& dev_id,
                             const std::string& ip_hint   = {},
-                            const std::string& code_hint = {});
+                            const std::string& code_hint = {},
+                            bool               only_if_still_selected = false);
 
     // Studio calls this every ~1 s from its refresh timer, plus once right
     // after on_printer_connected_fn. We only do real work the first time a
@@ -747,11 +755,13 @@ private:
     // Re-subscribes the cloud report topic for dev_id (failback) and clears its
     // LAN-priority state. Safe to call when not deferred (no-op-ish).
     void lan_report_failback(const std::string& dev_id);
-    // Called by connect_printer(): Studio connecting a printer is the switch.
-    // Studio only calls set_user_selected_machine() at startup, so without
-    // this the old printer stays "selected" and in lan_report_priority_; the
-    // watchdog then sees it silent and autostart_lan_if_selected() reconnects
-    // it, replacing the single LanSession of the printer just connected.
+    // Called by connect_printer(): connecting a printer *is* the LAN switch.
+    // set_user_selected_machine() is the cloud-mode counterpart (research
+    // §8.7); picking a LAN-mode printer reaches us only as connect_printer
+    // (§8.4). Without this the old printer stays "selected" and in
+    // lan_report_priority_, so the watchdog and every SSDP announcement of it
+    // call autostart_lan_if_selected() and reconnect it, replacing the single
+    // LanSession of the printer just connected.
     // Makes dev_id the selected machine and fails every other device out of
     // LAN priority (only one LAN session exists, so they cannot report).
     void adopt_lan_selection(const std::string& dev_id);

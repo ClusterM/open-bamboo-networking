@@ -211,6 +211,11 @@ int Agent::connect_printer(std::string dev_id,
                            std::string password,
                            bool        use_ssl)
 {
+    // Before the keep-connection fast path below: the slicers also call this
+    // for a printer we are already connected to, and on Orca that is the call
+    // that has to restore a selection its refresh timer just cleared (#78).
+    adopt_lan_selection(dev_id);
+
     if (obn::config::current().mqtt_keep_connection) {
         cancel_deferred_disconnect();
         std::string reuse_dev_id;
@@ -258,8 +263,6 @@ int Agent::connect_printer(std::string dev_id,
         std::lock_guard<std::mutex> lk(mu_);
         certified_devs_.clear();
     }
-
-    adopt_lan_selection(dev_id);
 
     std::string ca_file = bambu_ca_bundle_path();
     obn::lan_tls::registry_set_ca_file(ca_file);
@@ -368,7 +371,8 @@ int Agent::disconnect_printer()
 
 bool Agent::ensure_lan_session(const std::string& dev_id,
                                const std::string& ip_hint,
-                               const std::string& code_hint)
+                               const std::string& code_hint,
+                               bool               only_if_still_selected)
 {
     if (dev_id.empty()) return false;
 
@@ -397,6 +401,21 @@ bool Agent::ensure_lan_session(const std::string& dev_id,
         OBN_DEBUG("ensure_lan_session: dev=%s missing %s -> cannot open LAN MQTT",
                   dev_id.c_str(), ip.empty() ? "ip" : "access_code");
         return false;
+    }
+
+    // Re-checked here rather than only before the thread was spawned: the
+    // checks above and the cert snapshot inside connect_printer take long
+    // enough for a printer switch to land in between.
+    if (only_if_still_selected) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (user_selected_machine_ != dev_id) {
+            OBN_INFO("ensure_lan_session: dev=%s is no longer the selected "
+                     "printer; leaving the LAN session to %s",
+                     dev_id.c_str(),
+                     user_selected_machine_.empty()
+                         ? "nobody" : user_selected_machine_.c_str());
+            return false;
+        }
     }
 
     // connect_printer() tears down any session to a different printer,
@@ -456,7 +475,8 @@ void Agent::autostart_lan_if_selected(const std::string& dev_id)
     // run it off the caller's thread (SSDP dispatch / HTTP / Studio UI).
     try {
         std::thread([this, dev_id, ip, code]() {
-            ensure_lan_session(dev_id, ip, code);
+            ensure_lan_session(dev_id, ip, code,
+                               /*only_if_still_selected=*/true);
             std::lock_guard<std::mutex> lk(mu_);
             lan_autostart_inflight_.erase(dev_id);
         }).detach();
@@ -535,7 +555,7 @@ void Agent::adopt_lan_selection(const std::string& dev_id)
         for (const auto& dev : stale) last_lan_report_.erase(dev);
     }
     if (changed) {
-        OBN_INFO("connect_printer: selected printer is now %s", dev_id.c_str());
+        OBN_INFO("selected printer is now %s (connected to it)", dev_id.c_str());
         // Outside mu_, as in set_user_selected_machine().
         if (store) store->remember_machine(dev_id);
     }
