@@ -259,6 +259,8 @@ int Agent::connect_printer(std::string dev_id,
         certified_devs_.clear();
     }
 
+    adopt_lan_selection(dev_id);
+
     std::string ca_file = bambu_ca_bundle_path();
     obn::lan_tls::registry_set_ca_file(ca_file);
     obn::lan_tls::registry_put_ip_serial(dev_ip, dev_id);
@@ -510,6 +512,37 @@ void Agent::lan_report_failback(const std::string& dev_id)
         OBN_INFO("lan-priority: failing dev=%s back to cloud report subscription",
                  dev_id.c_str());
         cloud_add_subscribe({dev_id});
+    }
+}
+
+void Agent::adopt_lan_selection(const std::string& dev_id)
+{
+    if (dev_id.empty()) return;
+
+    std::vector<std::string>           stale;
+    std::shared_ptr<obn::state::Store> store;
+    bool                               changed = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (user_selected_machine_ != dev_id) {
+            user_selected_machine_ = dev_id;
+            remembered_machine_    = dev_id;
+            store                  = state_store_;
+            changed                = true;
+        }
+        for (const auto& dev : lan_report_priority_)
+            if (dev != dev_id) stale.push_back(dev);
+        for (const auto& dev : stale) last_lan_report_.erase(dev);
+    }
+    if (changed) {
+        OBN_INFO("connect_printer: selected printer is now %s", dev_id.c_str());
+        // Outside mu_, as in set_user_selected_machine().
+        if (store) store->remember_machine(dev_id);
+    }
+    for (const auto& dev : stale) {
+        OBN_INFO("lan-priority: dev=%s no longer has the LAN session; "
+                 "dropping it from the watchdog", dev.c_str());
+        lan_report_failback(dev);
     }
 }
 

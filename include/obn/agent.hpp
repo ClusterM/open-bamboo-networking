@@ -747,6 +747,14 @@ private:
     // Re-subscribes the cloud report topic for dev_id (failback) and clears its
     // LAN-priority state. Safe to call when not deferred (no-op-ish).
     void lan_report_failback(const std::string& dev_id);
+    // Called by connect_printer(): Studio connecting a printer is the switch.
+    // Studio only calls set_user_selected_machine() at startup, so without
+    // this the old printer stays "selected" and in lan_report_priority_; the
+    // watchdog then sees it silent and autostart_lan_if_selected() reconnects
+    // it, replacing the single LanSession of the printer just connected.
+    // Makes dev_id the selected machine and fails every other device out of
+    // LAN priority (only one LAN session exists, so they cannot report).
+    void adopt_lan_selection(const std::string& dev_id);
 
     // Silence watchdog: re-subscribes cloud report for any LAN-priority device
     // that hasn't sent a LAN report within kLanSilenceFailback.
