@@ -18,6 +18,9 @@
 
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
+#include <openssl/x509_vfy.h>
+#endif
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -388,6 +391,11 @@ bool configure_lan_ssl_verify(SSL_CTX*           ctx,
     if (X509_VERIFY_PARAM* vpm = ::SSL_CTX_get0_param(ctx)) {
         const unsigned long flags = ::X509_VERIFY_PARAM_get_flags(vpm);
         ::X509_VERIFY_PARAM_set_flags(vpm, flags | X509_V_FLAG_PARTIAL_CHAIN);
+
+#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
+        const unsigned int host_flags = ::X509_VERIFY_PARAM_get_hostflags(vpm);
+        ::X509_VERIFY_PARAM_set_hostflags(vpm, (host_flags | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
+#endif
     }
     ::SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     return true;
