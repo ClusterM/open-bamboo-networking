@@ -153,6 +153,8 @@ Response perform(const Request& req)
         hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     }
 
+    char errbuf[CURL_ERROR_SIZE] = {0};
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER,        errbuf);   // detailed TLS failure reason in resp.error
     curl_easy_setopt(curl, CURLOPT_URL,              req.url.c_str());
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,    method_verb(req.method));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   static_cast<long>(req.connect_timeout_s));
@@ -191,12 +193,27 @@ Response perform(const Request& req)
         curl_easy_setopt(curl, CURLOPT_CAINFO, req.ca_file.c_str());
     }
 
+#if defined(_WIN32) && defined(CURLSSLOPT_NO_REVOKE)
+    // Schannel checks certificate revocation (CRL/OCSP) online during every
+    // TLS handshake by default; when that lookup is unreachable the whole
+    // handshake fails with CRYPT_E_REVOCATION_OFFLINE (0x80092013) and every
+    // API call dies with "SSL connect error" (issues #26, #27). Skip the
+    // online lookup only; chain and hostname verification stay on, matching
+    // what browsers do with revocation data they cannot fetch.
+    // NOTE: the macro is CURLSSLOPT_NO_REVOKE; CURLSSLOPT_NO_REVOCATION does
+    // not exist in any curl release, so the old guard compiled this out.
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS,
+                     static_cast<long>(CURLSSLOPT_NO_REVOKE));
+#endif
+
     OBN_DEBUG("http %s %s (body=%zu)",
               method_verb(req.method), req.url.c_str(), req.body.size());
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {
-        resp.error = curl_easy_strerror(rc);
+        // Prefer curl's detailed buffer ("schannel: ...") over the generic
+        // "SSL connect error" so users' logs name the real TLS failure.
+        resp.error = (errbuf[0] != '\0') ? errbuf : curl_easy_strerror(rc);
     } else {
         long status = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
