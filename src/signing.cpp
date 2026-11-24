@@ -315,15 +315,31 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub,
 
 // Builds the command dump ({...sorted keys...}) after optional field encryption.
 // Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
+// When siblings_out is given it also receives the trailing top-level entries
+// (each as ,"<key>":<value>) from this same parse — the signer needs both and
+// parsing the payload twice per publish would be wasteful.
 std::string build_command_dump(const std::string& root_key,
                                const std::string& payload,
                                EVP_PKEY*          device_pub,
-                               bool               developer_mode)
+                               bool               developer_mode,
+                               std::string*       siblings_out = nullptr)
 {
     auto root = obn::json::parse(payload);
     if (!root) return {};
     const obn::json::Value& cmd = root->find(root_key.c_str());
     if (cmd.kind() != obn::json::Value::Kind::Object) return {};
+    if (siblings_out) {
+        for (const auto& kv : root->as_object()) {
+            // "header" is ours alone: carrying a payload-supplied one would
+            // emit two header keys and put a header inside the signed
+            // pre-image, which is exactly what the signature must exclude.
+            if (kv.first == root_key || kv.first == "header") continue;
+            *siblings_out += ',';
+            *siblings_out += obn::json::Value(kv.first).dump(); // quoted+escaped
+            *siblings_out += ':';
+            *siblings_out += kv.second.dump();
+        }
+    }
     obn::json::Object obj = cmd.as_object(); // copy for mutation
     encrypt_print_fields(obj, device_pub, developer_mode);
     return obn::json::Value(std::move(obj)).dump();
@@ -391,30 +407,16 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
     EVP_PKEY* pkey = slicer_pkey();
     if (!pkey) return payload_json;
 
-    const std::string dump =
-        build_command_dump(root_key, payload_json, device_pub, developer_mode);
-    if (dump.empty()) return payload_json; // malformed; pass through
-
     // Trailing top-level siblings (e.g. "user_id" next to "print" or next to
     // "liveview") are part of the signed envelope-minus-header per the farm
-    // consensus (research/10.04, "Trailing-sibling invariant"): re-emit every
-    // top-level entry other than root_key after the root object. Skipping
-    // root_key (not the literal "print") keeps a sibling next to "liveview"
-    // from being dropped the same way. Zero siblings -> empty suffix -> the
-    // previous byte-exact single-root wire format.
+    // consensus (research/10.04, "Trailing-sibling invariant"), so they are
+    // re-emitted after the root object; "header" is dropped there. Zero
+    // siblings -> empty suffix -> the previous byte-exact single-root wire
+    // format, which is what every capture we have looks like.
     std::string siblings;
-    {
-        auto root = obn::json::parse(payload_json); // parse succeeded above
-        if (root && root->is_object()) {
-            for (const auto& kv : root->as_object()) {
-                if (kv.first == root_key) continue;
-                siblings += ',';
-                siblings += obn::json::Value(kv.first).dump(); // quoted+escaped
-                siblings += ':';
-                siblings += kv.second.dump();
-            }
-        }
-    }
+    const std::string dump = build_command_dump(root_key, payload_json, device_pub,
+                                                developer_mode, &siblings);
+    if (dump.empty()) return payload_json; // malformed; pass through
     const std::string body = dump + siblings;
 
     // INVARIANT: to_sign is exactly {"<root_key>":<body>} — the wire envelope

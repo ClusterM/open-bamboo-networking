@@ -580,6 +580,33 @@ static int test_trailing_sibling_reconstruction()
     return 0;
 }
 
+static int test_payload_header_sibling_is_dropped()
+{
+    // A payload-supplied top-level "header" must never be carried as a
+    // sibling: the envelope would then hold two header keys, and the signed
+    // pre-image would contain a header — the one thing the signature excludes.
+    const std::string payload =
+        R"({"print":{"command":"pause","sequence_id":"11"},"header":{"evil":1}})";
+    const std::string env = obn::signing::maybe_sign(payload);
+    CHECK(env != payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+
+    // Exactly one "header" key, and it is ours (the payload's is gone).
+    CHECK(env.find("\"header\"") == 1);                     // ours leads the envelope
+    CHECK(env.find("\"header\"", 2) == std::string::npos);  // no second one
+    CHECK(env.find("\"evil\"") == std::string::npos);
+
+    // Signed == wire still holds for the header-free reconstruction.
+    const std::size_t kpos = env.find("\"print\":");
+    CHECK(kpos != std::string::npos);
+    const std::string to_sign = "{" + env.substr(kpos);
+    CHECK(static_cast<std::size_t>(val->find("header.payload_len").as_number())
+          == to_sign.size());
+    CHECK(verify_b64_sig(to_sign, envelope_field(env, "sign_string")));
+    return 0;
+}
+
 namespace obn::config {
     Settings& test_settings();
     std::string& test_dir();
@@ -656,6 +683,7 @@ int main()
     if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
     if (test_liveview_prepare_ttcode_encrypted() != 0) rc = 1;
     if (test_trailing_sibling_reconstruction() != 0) rc = 1;
+    if (test_payload_header_sibling_is_dropped() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";
 
