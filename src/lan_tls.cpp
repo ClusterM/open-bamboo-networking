@@ -27,6 +27,7 @@
 #  include <windows.h>
 #else
 #  include <cerrno>
+#  include <dlfcn.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
 #endif
@@ -107,6 +108,48 @@ std::string config_dir_snapshot()
     return g_config_dir;
 }
 
+// Directory holding the shared object this code is linked into, absolute and
+// symlink-resolved. Empty when the platform cannot tell us.
+std::filesystem::path this_module_dir()
+{
+    static const std::filesystem::path cached = [] {
+        std::filesystem::path self;
+#if defined(_WIN32)
+        HMODULE mod = nullptr;
+        if (::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCWSTR>(&this_module_dir),
+                                 &mod) &&
+            mod) {
+            std::wstring buf(MAX_PATH, L'\0');
+            for (;;) {
+                const DWORD n = ::GetModuleFileNameW(
+                    mod, buf.data(), static_cast<DWORD>(buf.size()));
+                if (n == 0) break;
+                if (n < buf.size()) {
+                    buf.resize(n);
+                    self = buf;
+                    break;
+                }
+                if (buf.size() >= 32768) break;
+                buf.resize(buf.size() * 2);
+            }
+        }
+#else
+        Dl_info info{};
+        if (::dladdr(reinterpret_cast<void*>(&this_module_dir), &info) &&
+            info.dli_fname && *info.dli_fname) {
+            self = info.dli_fname;
+        }
+#endif
+        if (self.empty()) return std::filesystem::path{};
+        std::error_code ec;
+        const auto resolved = std::filesystem::weakly_canonical(self, ec);
+        return (ec ? self : resolved).parent_path();
+    }();
+    return cached;
+}
+
 std::vector<std::filesystem::path> state_file_search_paths()
 {
     std::vector<std::filesystem::path> out;
@@ -116,21 +159,15 @@ std::vector<std::filesystem::path> state_file_search_paths()
     };
     if (const std::string cfg = config_dir_snapshot(); !cfg.empty()) add(cfg);
     if (const char* cfg = env_var_get_os(kEnvConfigDir)) add(cfg);
-#if defined(_WIN32)
-    if (const char* appdata = std::getenv("APPDATA")) {
-        add(std::filesystem::path(appdata) / "OrcaSlicer");
-        add(std::filesystem::path(appdata) / "BambuStudio");
+    // Last resort, for libBambuSource: it never receives set_config_dir, and on
+    // Windows it may not see the process env the plugin wrote either. Both
+    // libraries are installed into <config_dir>/plugins, so the config dir is
+    // the parent of our own directory. The flat case is kept for unpacked
+    // builds that keep obn.env next to the library.
+    if (const std::filesystem::path self = this_module_dir(); !self.empty()) {
+        add(self.parent_path());
+        add(self);
     }
-#else
-    if (const char* xdg = std::getenv("XDG_CONFIG_HOME")) {
-        add(std::filesystem::path(xdg) / "OrcaSlicer");
-        add(std::filesystem::path(xdg) / "BambuStudio");
-    }
-    if (const char* home = std::getenv("HOME")) {
-        add(std::filesystem::path(home) / ".config" / "OrcaSlicer");
-        add(std::filesystem::path(home) / ".config" / "BambuStudio");
-    }
-#endif
     return out;
 }
 

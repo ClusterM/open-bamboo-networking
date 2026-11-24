@@ -8,6 +8,10 @@
 // Windows: do not rely on getenv() across DLLs — networking writes with
 // SetEnvironmentVariableA + _putenv_s; BambuSource reads GetEnvironmentVariableA
 // and, on miss, loads obn.env (CRT getenv alone is not enough).
+//
+// BambuSource is never given the config dir, so it locates obn.env from
+// OBN_CONFIG_DIR or from the parent of its own install directory: both
+// libraries land in <config_dir>/plugins.
 
 #include <chrono>
 #include <cstdlib>
