@@ -1296,39 +1296,6 @@ void Agent::harvest_security_report(const std::string& dev_id,
     }
 }
 
-void Agent::harvest_security_flags(const std::string& dev_id,
-                                   const std::string& json)
-{
-    // Prefilter: only pushall/push_status frames carry flag3.
-    if (json.find("flag3") == std::string::npos) return;
-
-    std::string perr;
-    auto root = obn::json::parse(json, &perr);
-    if (!root) return;
-    const auto& f3 = root->find("print.flag3");
-    if (!f3.is_number()) return;
-
-    // Bit 16 = new authorization-control system enabled (reverse-networking
-    // "5. MQTT.md"). Latch it once true; never clear so an incremental frame
-    // that omits the bit doesn't undo a prior pushall.
-    const bool supported = ((f3.as_int() >> 16) & 1) != 0;
-    if (!supported) return;
-    std::lock_guard<std::mutex> lk(mu_);
-    bool& latched = sec_new_auth_by_dev_[dev_id];
-    if (!latched) {
-        latched = true;
-        OBN_INFO("dev=%s advertises new authorization-control system "
-                 "(flag3 bit16)", dev_id.c_str());
-    }
-}
-
-bool Agent::printer_supports_new_auth(const std::string& dev_id) const
-{
-    std::lock_guard<std::mutex> lk(mu_);
-    auto it = sec_new_auth_by_dev_.find(dev_id);
-    return it != sec_new_auth_by_dev_.end() && it->second;
-}
-
 void Agent::harvest_developer_mode(const std::string& dev_id,
                                    const std::string& json)
 {
@@ -1972,7 +1939,6 @@ void Agent::notify_http_error(unsigned int status, const std::string& body)
 void Agent::notify_local_message(const std::string& dev_id, const std::string& json)
 {
     harvest_security_report(dev_id, json);
-    harvest_security_flags(dev_id, json);
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
     harvest_tutk_server_status(dev_id, json);
@@ -3069,7 +3035,6 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
         (std::string dev_id, std::string json)
     {
         harvest_security_report(dev_id, json);
-        harvest_security_flags(dev_id, json);
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
         harvest_tutk_server_status(dev_id, json);

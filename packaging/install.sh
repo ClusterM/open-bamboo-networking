@@ -174,30 +174,49 @@ fi
 
 CONF_FILE="$PREFIX/$CONF_NAME"
 
-if [ "$CLIENT" = "orca_slicer" ]; then
-    # Orca Slicer: always use 02.03.00 ABI (the version Orca ships by default).
-    # The installer patches OrcaSlicer.conf to match, so the user does not need
-    # to pick a specific network_plugin_version in Preferences.
-    ABI_PREFIX="02.03.00"
-    DETECTED_SOURCE="fixed"
-else
-    # Bambu Studio: detect version from slicer conf.
-    if [ ! -f "$CONF_FILE" ]; then
-        die "$CONF_NAME not found at $CONF_FILE
+if [ ! -f "$CONF_FILE" ]; then
+    die "$CONF_NAME not found at $CONF_FILE
   Launch $CLIENT_LABEL at least once to create its config, then re-run this installer."
-    fi
+fi
 
-    DETECTED_VER=$(sed -n \
-        "s/^[[:space:]]*\"${VERSION_KEY}\"[[:space:]]*:[[:space:]]*\"\([0-9][0-9.]*\)\".*/\1/p" \
-        "$CONF_FILE" | head -n1)
+conf_value() {
+    sed -n \
+        "s/^[[:space:]]*\"$1\"[[:space:]]*:[[:space:]]*\"\([0-9][0-9.]*\)\".*/\1/p" \
+        "$CONF_FILE" | head -n1
+}
 
-    if [ -n "$DETECTED_VER" ]; then
-        DETECTED_SOURCE="$CLIENT_LABEL v$DETECTED_VER"
+if [ "$CLIENT" = "orca_slicer" ]; then
+    # Orca refuses to call a plug-in series it has no host-side ABI for, so the
+    # installer has to pick the newest series *this* Orca knows. 2.5.0 added
+    # 02.08.04 (OrcaSlicer#16202); everything older tops out at 02.03.00, which
+    # 2.5.x still accepts but only as a debugging fallback. The installer then
+    # patches network_plugin_version so the user does not have to pick it in
+    # Preferences.
+    ORCA_VER=$(conf_value "version")
+    ORCA_MAJOR=$(echo "$ORCA_VER" | cut -d. -f1)
+    ORCA_MINOR=$(echo "$ORCA_VER" | cut -d. -f2)
+    case "$ORCA_MAJOR" in ''|*[!0-9]*) ORCA_MAJOR="" ;; esac
+    case "$ORCA_MINOR" in ''|*[!0-9]*) ORCA_MAJOR="" ;; esac
+
+    if [ -z "$ORCA_MAJOR" ]; then
+        ABI_PREFIX="02.03.00"
+        DETECTED_SOURCE="fallback (no usable \"version\" in $CONF_NAME)"
+        warn "Cannot read Orca Slicer's version from $CONF_FILE; falling back to the $ABI_PREFIX plug-in series."
+    elif [ "$ORCA_MAJOR" -gt 2 ] || { [ "$ORCA_MAJOR" -eq 2 ] && [ "$ORCA_MINOR" -ge 5 ]; }; then
+        ABI_PREFIX="02.08.04"
+        DETECTED_SOURCE="$CLIENT_LABEL v$ORCA_VER"
+    else
+        ABI_PREFIX="02.03.00"
+        DETECTED_SOURCE="$CLIENT_LABEL v$ORCA_VER"
     fi
+else
+    # Bambu Studio: the conf carries the plug-in version Studio itself expects.
+    DETECTED_VER=$(conf_value "$VERSION_KEY")
 
     if [ -z "$DETECTED_VER" ]; then
         die "Cannot determine ABI version: key \"$VERSION_KEY\" not found in $CONF_FILE."
     fi
+    DETECTED_SOURCE="$CLIENT_LABEL v$DETECTED_VER"
 
     # Extract major.minor.patch (first 3 components)
     ABI_PREFIX=$(echo "$DETECTED_VER" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')

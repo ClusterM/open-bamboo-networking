@@ -208,11 +208,6 @@ public:
     // app_certs_by_dev_. Returns false on publish failure.
     bool request_app_cert_list(const std::string& dev_id);
 
-    // True once the printer has advertised the new authorization-control
-    // system (print.flag3 bit 16) in a push_status frame. Latched by
-    // harvest_security_flags().
-    bool printer_supports_new_auth(const std::string& dev_id) const;
-
     // Fire-and-forget app_cert_install when slicer_app_cert_usable().
     // Called from install_device_cert (Studio ABI ~1 Hz / after connect).
     // Skips if app_cert_install_sent_ already has a SUCCESS for this
@@ -489,12 +484,6 @@ private:
     void harvest_security_report(const std::string& dev_id,
                                  const std::string& json);
 
-    // Scans a push_status frame for print.flag3 and latches whether the
-    // printer supports the new authorization-control system (bit 16). Cheap
-    // substring prefilter; full JSON parse only on candidate frames.
-    void harvest_security_flags(const std::string& dev_id,
-                                const std::string& json);
-
     // Scans a push_status frame for print.fun (a hex-string capability
     // bitmask) and records the printer's Developer Mode from bit 29 (clear =
     // on, set = secured) into dev_mode_on_by_dev_. Cheap substring prefilter;
@@ -629,11 +618,9 @@ private:
     // reach them.
     std::map<std::string, DeviceFw> device_fw_;
 
-    // Command-security capability + provisioning state, keyed by dev_id.
-    // sec_new_auth_by_dev_: latched true when print.flag3 bit 16 is seen.
-    // app_certs_by_dev_: cert_ids the printer reported as trusted via the
-    // security.app_cert_list response. Both guarded by mu_.
-    std::map<std::string, bool>                 sec_new_auth_by_dev_;
+    // Command-security provisioning state, keyed by dev_id: cert_ids the
+    // printer reported as trusted via the security.app_cert_list response.
+    // Guarded by mu_.
     std::map<std::string, std::set<std::string>> app_certs_by_dev_;
 
     // Printer Developer Mode, harvested from push_status print.fun bit 29

@@ -135,27 +135,45 @@ if (-not (Test-Path $LibDir)) {
     Wait-And-Exit
 }
 
+function Detect-VersionFromConf {
+    param([string]$ConfPath, [string]$Key)
+    if (-not (Test-Path $ConfPath)) { return "" }
+    $line = Select-String -Path $ConfPath `
+        -Pattern "`"$Key`"\s*:\s*`"([0-9][0-9.]*)`"" `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($line -and $line.Matches.Count -gt 0 -and $line.Matches[0].Groups.Count -ge 2) {
+        return $line.Matches[0].Groups[1].Value
+    }
+    return ""
+}
+
 if ($Client -eq "orca_slicer") {
-    # Orca Slicer: always use 02.03.00 ABI (the version Orca ships by default).
-    # The installer patches OrcaSlicer.conf to match, so the user does not need
-    # to pick a specific network_plugin_version in Preferences.
-    $AbiPrefix = "02.03.00"
-    $detectedSource = "fixed"
-} else {
-    # Bambu Studio: detect from exe version in the registry.
-    function Detect-VersionFromConf {
-        param([string]$ConfPath, [string]$Key)
-        if (-not (Test-Path $ConfPath)) { return "" }
-        $line = Select-String -Path $ConfPath `
-            -Pattern "`"$Key`"\s*:\s*`"([0-9][0-9.]*)`"" `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($line -and $line.Matches.Count -gt 0 -and $line.Matches[0].Groups.Count -ge 2) {
-            return $line.Matches[0].Groups[1].Value
-        }
-        return ""
+    # Orca refuses to call a plug-in series it has no host-side ABI for, so the
+    # installer has to pick the newest series *this* Orca knows. 2.5.0 added
+    # 02.08.04 (OrcaSlicer#16202); everything older tops out at 02.03.00, which
+    # 2.5.x still accepts but only as a debugging fallback. The installer then
+    # patches network_plugin_version so the user does not have to pick it in
+    # Preferences.
+    $orcaVer = Detect-VersionFromConf -ConfPath $ConfPath -Key "version"
+    $orcaSemver = $null
+    if ($orcaVer -match '^(\d+)\.(\d+)') {
+        $orcaSemver = [int]$Matches[1] * 1000 + [int]$Matches[2]
     }
 
+    if ($null -eq $orcaSemver) {
+        $AbiPrefix = "02.03.00"
+        $detectedSource = "fallback (no usable `"version`" in $ConfName)"
+        Write-Warn "Cannot read Orca Slicer's version from $ConfPath; falling back to the $AbiPrefix plug-in series."
+    } elseif ($orcaSemver -ge 2005) {
+        $AbiPrefix = "02.08.04"
+        $detectedSource = "$ClientLabel v$orcaVer"
+    } else {
+        $AbiPrefix = "02.03.00"
+        $detectedSource = "$ClientLabel v$orcaVer"
+    }
+} else {
+    # Bambu Studio: detect from exe version in the registry.
     function Detect-VersionFromExe {
         param([string]$Name)
         $regPaths = @(

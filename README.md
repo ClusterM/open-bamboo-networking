@@ -156,13 +156,25 @@ Compatibility with plugin ABI depends on the first three numbers in the version 
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
 
 **Orca Slicer — supported, with caveats.** Orca tracks the plugin ABI
-separately from its own app version, so the installer always installs the
-**`02.03.00`** series and patches `network_plugin_version` in `OrcaSlicer.conf`
-to match — you do not have to pick a version in Preferences. That is the series
-Orca has shipped since **Orca Slicer v2.3.2**; earlier releases ask for
-`02.01.01`, which this project does not build, so v2.3.2 is the minimum. The
-library file name must carry the version (`libbambu_networking_<ver>.so`), which
-the installer also handles. Expect these differences from Studio:
+separately from its own app version and refuses to call a series it has no
+host-side ABI for, so the installer reads Orca's version out of
+`OrcaSlicer.conf` and installs the newest series that version can call, then
+patches `network_plugin_version` to match — you do not have to pick a version
+in Preferences:
+
+| Orca Slicer | Plugin series installed |
+| --- | --- |
+| v2.5.0 and newer | **`02.08.04`** |
+| v2.3.2 – v2.4.x | **`02.03.00`** |
+| older than v2.3.2 | unsupported |
+
+**v2.3.2 is the minimum**: earlier releases ask for `02.01.01`, which this
+project does not build. Orca v2.5.0 was the release that added `02.08.04`
+support ([OrcaSlicer#16202](https://github.com/OrcaSlicer/OrcaSlicer/pull/16202));
+it still accepts `02.03.00`, but only as a debugging fallback, and that series
+cannot carry the newer `PrintParams` fields. The library file name must carry
+the version (`libbambu_networking_<ver>.so`), which the installer also handles.
+Expect these differences from Studio:
 
 - **No current-print thumbnail.** Orca routes `get_subtask_info` through its
   own `OrcaCloudServiceAgent` stub instead of the plugin, so the Device panel
