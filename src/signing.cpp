@@ -1,5 +1,5 @@
 // Classifies, signs, and wraps outbound MQTT payloads.
-// Only {"print":{...}} messages receive an envelope; all others pass through.
+// Only privileged families receive an envelope; all others pass through.
 // Envelope: {"header":{"cert_id":"...","payload_len":N,"sign_alg":"RSA_SHA256",
 //            "sign_string":"...","sign_ver":"v1.0"},"print":{...sorted keys...}}
 
@@ -238,7 +238,15 @@ std::string rsa_pkcs1_sign_raw_b64(EVP_PKEY* pkey,
     return base64_encode(sig.data(), siglen);
 }
 
-// Returns "print", "liveview" (only for prepare commands), or empty if neither.
+// Returns the privileged family key to sign under, or empty when the frame is
+// not one: "print", "upgrade", or "liveview" (prepare commands only).
+//
+// This stays a whitelist rather than "sign everything but X" on purpose. The
+// trust store is bootstrapped over MQTT itself: security.app_cert_install must
+// go out unsigned, because the printer has no reason to trust our leaf until it
+// lands. Agent::publish_json gates on would_sign() to wait for that ack
+// (research/08.04-lan.md §8.4.7), so a family that bootstraps signing can never
+// be signable without deadlocking against its own install.
 std::string signable_root_key(const std::string& payload) noexcept
 {
     const char* p   = payload.data();
@@ -254,6 +262,12 @@ std::string signable_root_key(const std::string& payload) noexcept
     if (p >= end) return {};
     std::string key(kstart, p - kstart);
     if (key == "print") return key;
+    // Firmware flashing: upgrade_confirm, consistency_confirm, start,
+    // wtm_upgrade — every command either slicer emits in this family, all of
+    // them privileged, none of them a query. A P1S on 01.10.00.15 answered an
+    // unsigned upgrade_confirm with err_code 84033543 "mqtt message verify
+    // failed", the same no-envelope rejection print frames get.
+    if (key == "upgrade") return key;
     if (key == "liveview") {
         if (payload.find("\"prepare\"") != std::string::npos) return key;
     }

@@ -156,7 +156,7 @@ static std::string rsa_decrypt_blocks_b64(const std::string& b64)
 
 static int test_non_print_passthrough()
 {
-    // system, info, upgrade, etc. must pass through unchanged.
+    // system, info, etc. must pass through unchanged.
     const std::string sys  = R"({"system":{"command":"get_access_code"}})";
     const std::string info = R"({"info":{"command":"get_version"}})";
     CHECK(obn::signing::maybe_sign(sys)  == sys);
@@ -580,6 +580,33 @@ static int test_trailing_sibling_reconstruction()
     return 0;
 }
 
+static int test_upgrade_confirm_is_signed()
+{
+    // Verbatim frame Studio published for a P1S firmware update: unsigned it
+    // came back with err_code 84033543 "mqtt message verify failed".
+    const std::string payload =
+        R"({"upgrade":{"command":"upgrade_confirm","sequence_id":"20013","src_id":1}})";
+    CHECK(obn::signing::would_sign(payload));
+    const std::string env = obn::signing::maybe_sign(payload);
+    CHECK(env != payload);
+    auto val = obn::json::parse(env);
+    CHECK(val);
+    CHECK(val->find("upgrade.command").as_string() == "upgrade_confirm");
+
+    // src_id is a JSON number: it must survive the dump as 1, not 1.0 — the
+    // signature would still match the wire either way, so only the firmware
+    // would notice.
+    CHECK(env.find("\"src_id\":1") != std::string::npos);
+
+    const std::size_t kpos = env.find("\"upgrade\":");
+    CHECK(kpos != std::string::npos);
+    const std::string to_sign = "{" + env.substr(kpos);
+    CHECK(static_cast<std::size_t>(val->find("header.payload_len").as_number())
+          == to_sign.size());
+    CHECK(verify_b64_sig(to_sign, envelope_field(env, "sign_string")));
+    return 0;
+}
+
 static int test_payload_header_sibling_is_dropped()
 {
     // A payload-supplied top-level "header" must never be carried as a
@@ -683,6 +710,7 @@ int main()
     if (test_blockwise_multiblock_roundtrip() != 0) rc = 1;
     if (test_liveview_prepare_ttcode_encrypted() != 0) rc = 1;
     if (test_trailing_sibling_reconstruction() != 0) rc = 1;
+    if (test_upgrade_confirm_is_signed() != 0) rc = 1;
     if (test_payload_header_sibling_is_dropped() != 0) rc = 1;
 
     if (rc == 0) std::cout << "signing_test: ok\n";

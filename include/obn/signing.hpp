@@ -30,7 +30,8 @@ std::string maybe_sign(const std::string& payload_json,
                        bool developer_mode = false);
 
 // True when maybe_sign() would actually sign `payload_json` — i.e. it carries a
-// top-level "print" or signable "liveview" object and a slicer key is configured.
+// top-level "print", "upgrade" or signable "liveview" object and a slicer key is
+// configured.
 // Callers use this to gate a signed publish on the printer having installed the
 // app cert this session (a secured printer rejects a signature made before install
 // with 84033545 "need reset device pub key").
