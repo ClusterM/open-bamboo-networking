@@ -1245,6 +1245,14 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME print_queue_stub COMMAND print_queue_stub_test)
 
+    # start_print / start_local_print_with_record route lists per cloud_print
+    # mode and Studio's PrintParams::comments.
+    add_executable(print_route_test tests/print_route_test.cpp)
+    target_include_directories(print_route_test PRIVATE include)
+    target_compile_definitions(print_route_test PRIVATE
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    add_test(NAME print_route COMMAND print_route_test)
+
     # Hermetic unit tests for obn::oss — pins the SHA-256/HMAC primitives and
     # the AWS SigV4 signing-key derivation against the vendors' published
     # test vectors, plus config parsing and header construction.

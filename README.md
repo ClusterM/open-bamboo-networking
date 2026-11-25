@@ -151,6 +151,7 @@ every feature is verified against Studio. Supported ABI series:
 - Bambu Studio **02.08.03**._xx_
 - Bambu Studio **02.08.04**._xx_
 - Bambu Studio **02.09.01**._xx_
+- Bambu Studio **02.09.02**._xx_
 
 Compatibility with plugin ABI depends on the first three numbers in the version number, e.g.
 any Bambu Studio v**02**.**03**.**04**._xx_ is compatible with any plugin with a version v**02**.**03**.**04**._xx_.
@@ -260,9 +261,11 @@ only the *record* goes to Bambu — a project entry, a task entry
 (`mode=lan_file`) and a small config `.3mf` that print history uses for its
 thumbnails. That record is exactly what buys you the cloud extras: print
 history in Studio and Handy, and the ability to rate models on MakerWorld. The
-full model is uploaded to Bambu's servers only when Studio dispatches a pure
-cloud print (`start_print`), e.g. for a printer that is not reachable on your
-LAN.
+full model is uploaded to Bambu's servers only when that LAN delivery fails or
+cannot be tried, e.g. for a printer that is not reachable on your LAN.
+Bambu Studio 2.9.2 no longer asks the plugin for the LAN delivery and goes
+straight to a pure cloud print (`start_print`); the plugin then tries the LAN
+delivery first on its own, so the behaviour stays the same on every version.
 
 **You can limit even that:** set `cloud_print = try_lan_first` or `lan_only` to
 print over the LAN without writing a cloud record at all, and

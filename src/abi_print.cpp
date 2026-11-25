@@ -6,6 +6,7 @@
 #include "obn/config.hpp"
 #include "obn/log.hpp"
 #include "obn/model_metadata.hpp"
+#include "obn/print_route.hpp"
 
 using obn::as_agent;
 
@@ -66,6 +67,89 @@ obn::config::CloudPrintMode effective_mode(const char* which,
     }
     return out;
 }
+
+// Shared by both print entry points; see obn/print_route.hpp. An attempt
+// that is followed by another one reports its errors to the log only, so
+// Studio does not show the failure of a print that then succeeds.
+int run_print_routes(obn::Agent*                  a,
+                     obn::print_route::Entry      entry,
+                     const char*                  which,
+                     const BBL::PrintParams&      params,
+                     const BBL::OnUpdateStatusFn& update_fn,
+                     const BBL::WasCancelledFn&   cancel_fn)
+{
+    namespace pr = obn::print_route;
+    const auto mode   = effective_mode(which, params);
+    const bool lan_ok = pr::lan_step_allowed(params.comments);
+    const auto routes = pr::routes(mode, entry, lan_ok);
+
+    std::string plan;
+    for (auto r : routes) plan += std::string(plan.empty() ? "" : ",") + pr::route_name(r);
+    OBN_INFO("%s: cloud_print=%s comments='%s' -> routes [%s]", which,
+             cloud_print_mode_name(mode), params.comments.c_str(), plan.c_str());
+
+    if (routes.empty()) {
+        const char* configured =
+            cloud_print_mode_name(obn::config::current().cloud_print);
+        OBN_WARN("%s: refused by cloud_print=%s", which, configured);
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_INVALID_HANDLE,
+                                 std::string("cloud_print=") + configured);
+        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    }
+
+    struct HeldError {
+        bool        set = false;
+        int         stage = 0;
+        int         code  = 0;
+        std::string info;
+    };
+
+    int ret = BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    for (size_t i = 0; i < routes.size(); ++i) {
+        const pr::Route route = routes[i];
+        const bool      last  = i + 1 == routes.size();
+        const char*     name  = pr::route_name(route);
+
+        HeldError             held;
+        BBL::OnUpdateStatusFn attempt_fn = update_fn;
+        if (!last && update_fn) {
+            attempt_fn = [&update_fn, &held, which, name](int stage, int code, std::string info) {
+                if (pr::is_error_update(stage, code)) {
+                    OBN_WARN("%s: %s attempt: stage=%d code=%d info=%s", which, name,
+                             stage, code, info.c_str());
+                    held = {true, stage, code, std::move(info)};
+                    return;
+                }
+                update_fn(stage, code, std::move(info));
+            };
+        }
+
+        switch (route) {
+        case pr::Route::LanRecord:
+            ret = a->run_cloud_print_job(params, attempt_fn, cancel_fn,
+                                         /*use_lan_channel=*/true);
+            break;
+        case pr::Route::Local:
+            ret = a->run_local_print_job(params, attempt_fn, cancel_fn);
+            break;
+        case pr::Route::Cloud:
+            ret = a->run_cloud_print_job(params, attempt_fn, cancel_fn,
+                                         /*use_lan_channel=*/false);
+            break;
+        }
+        if (ret >= 0) return ret;
+        if (last) break;
+        if (pr::stops_fallback(ret) || (cancel_fn && cancel_fn())) {
+            OBN_WARN("%s: %s failed (%d), not falling back", which, name, ret);
+            if (update_fn && held.set) update_fn(held.stage, held.code, held.info);
+            return ret;
+        }
+        OBN_WARN("%s: %s failed (%d), trying %s", which, name, ret,
+                 pr::route_name(routes[i + 1]));
+    }
+    return ret;
+}
 } // namespace
 
 OBN_ABI int bambu_network_start_print(void* agent,
@@ -77,19 +161,8 @@ OBN_ABI int bambu_network_start_print(void* agent,
     log_print_params("start_print", params);
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-
-    const auto mode = effective_mode("start_print", params);
-    if (mode == obn::config::CloudPrintMode::LanOnly) {
-        const char* configured =
-            cloud_print_mode_name(obn::config::current().cloud_print);
-        OBN_WARN("start_print: refused by cloud_print=%s", configured);
-        if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                 BAMBU_NETWORK_ERR_INVALID_HANDLE,
-                                 std::string("cloud_print=") + configured);
-        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-    }
-    return a->run_cloud_print_job(params, update_fn, cancel_fn,
-                                  /*use_lan_channel=*/false);
+    return run_print_routes(a, obn::print_route::Entry::StartPrint, "start_print",
+                            params, update_fn, cancel_fn);
 }
 
 OBN_ABI int bambu_network_start_local_print_with_record(void* agent,
@@ -101,18 +174,8 @@ OBN_ABI int bambu_network_start_local_print_with_record(void* agent,
     log_print_params("start_local_print_with_record", params);
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
-
-    const auto mode = effective_mode("start_local_print_with_record", params);
-    if (mode == obn::config::CloudPrintMode::TryLanFirst ||
-        mode == obn::config::CloudPrintMode::LanOnly) {
-        OBN_INFO("start_local_print_with_record: cloud_print=%s → local print",
-                 cloud_print_mode_name(mode));
-        // Success → 0 (Studio does not fall back). Failure → <0 so Studio
-        // may call start_print (allowed only when cloud_print=try_lan_first).
-        return a->run_local_print_job(params, update_fn, cancel_fn);
-    }
-    return a->run_cloud_print_job(params, update_fn, cancel_fn,
-                                  /*use_lan_channel=*/true);
+    return run_print_routes(a, obn::print_route::Entry::WithRecord,
+                            "start_local_print_with_record", params, update_fn, cancel_fn);
 }
 
 OBN_ABI int bambu_network_start_send_gcode_to_sdcard(void* agent,

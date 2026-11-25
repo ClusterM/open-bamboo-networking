@@ -224,9 +224,10 @@ client_name = OpenBambooNetworking
 # with record" path (typical for a printer that is linked to your
 # Bambu account). This does not change pure LAN-only printers.
 #
-#   cloud_only     — Default. The slicer first tries to put the model on
-#                    the printer over your local network (LAN). If that
-#                    fails, the full model is uploaded to the cloud instead.
+#   cloud_only     — Default. The model is first put on the printer over
+#                    your local network (LAN); Bambu Studio 2.9.2 and newer
+#                    no longer ask for that, so the plugin does it itself.
+#                    If that fails, the full model is uploaded to the cloud.
 #                    Either way the cloud is required for print history /
 #                    reporting and to start the job — without a working
 #                    cloud connection, printing will not work.

@@ -13,12 +13,13 @@ inline constexpr const char* kConfigFileName = "obn.conf";
 // Idle device-panel JPEG (MediaPlayCtrl downloads this slot).
 inline constexpr const char* kCameraPreviewMemPath = "mem:/26";
 
-// How start_local_print_with_record / start_print deliver the job.
+// How start_local_print_with_record / start_print deliver the job; the
+// per-entry route lists live in obn/print_route.hpp.
 // Orthogonal to block_cloud (background MQTT/REST).
 enum class CloudPrintMode {
-    CloudOnly,    // both ABIs → run_cloud_print_job (default)
-    TryLanFirst,  // _with_record → local; fail lets Studio fall back to cloud
-    LanOnly,      // _with_record → local; start_print always refused
+    CloudOnly,    // LAN delivery with a cloud record, then full cloud upload (default)
+    TryLanFirst,  // local print, then full cloud upload
+    LanOnly,      // local print only; never uploads the model
     // Per job: CloudOnly when the .3mf carries a MakerWorld DesignModelId,
     // LanOnly otherwise.
     CloudForMakerWorldOnly,

@@ -776,10 +776,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
              p.project_name.c_str(),
              use_lan_channel ? "lan" : "cloud");
 
-    // Studio's PrintJob::process picks the ABI entry point:
-    //   start_local_print_with_record -> use_lan_channel=true
-    //   start_print                   -> use_lan_channel=false
-    // On LAN failure we return < 0 so Studio can fall back to start_print.
+    // Called from run_print_routes (abi_print.cpp): use_lan_channel=true is
+    // the LanRecord route, false the full S3 upload. On failure we return < 0
+    // so the next route, or Studio itself, can fall back.
 
     if (p.filename.empty()) {
         if (update_fn) update_fn(BBL::PrintingStageERROR,
