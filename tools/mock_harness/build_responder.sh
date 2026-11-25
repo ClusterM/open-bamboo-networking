@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the clean-room :3000 detect sidecar (plan 04-02) into the gitignored
+# Build the clean-room :3000 detect sidecar into the gitignored
 # .cache/mock_harness/build-responder/ tree. Run from anywhere; works inside
-# WSL (D-07 venue). Idempotent: re-running reconfigures and rebuilds.
+# WSL. Idempotent: re-running reconfigures and rebuilds.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."   # repo root (bambu_network_oss)

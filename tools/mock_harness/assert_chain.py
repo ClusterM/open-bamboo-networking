@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""assert_chain.py — D-08 pass/fail verdict for plugin_runner --log-out JSONL.
+"""assert_chain.py — pass/fail verdict for plugin_runner --log-out JSONL.
 
-Pass contract (D-08, tools/plugin_runner/README.md section 9 golden stream):
+Pass contract (tools/plugin_runner/README.md section 9 golden stream):
     bind_detect rc=0 -> connect_printer_call rc=0 -> local_connect status=0
     -> session_ready got=true -> start_subscribe -> kickstart_pushall rc=0
     -> idle_done
@@ -22,10 +22,10 @@ CHAIN = ["bind_detect", "connect_printer_call", "local_connect",
 
 
 def main():
-    ap = argparse.ArgumentParser(description="D-08 ordered JSONL chain assertion")
+    ap = argparse.ArgumentParser(description="ordered JSONL chain assertion")
     ap.add_argument("--log", required=True, help="plugin_runner --log-out file")
     ap.add_argument("--ssdp", choices=["off", "soft", "hard"], default="off",
-                    help="ssdp_msg assert mode (run_harness.sh derives it from README)")
+                    help="ssdp_msg assert mode (run_harness.sh passes its default)")
     args = ap.parse_args()
 
     first = {}   # kind -> first event dict (line order)
@@ -54,7 +54,7 @@ def main():
 
     failures = []
 
-    # --- payload checks (D-08 explicit fails) ---
+    # --- payload checks (explicit fails) ---
     bd = first.get("bind_detect")
     if bd is None:
         failures.append("FAIL missing bind_detect")
@@ -112,7 +112,7 @@ def main():
         for f in failures:
             print(f)
         return 1
-    print("PASS D-08 chain")
+    print("PASS connect chain")
     return 0
 
 

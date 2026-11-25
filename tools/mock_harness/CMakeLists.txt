@@ -1,11 +1,13 @@
-# Standalone project for the clean-room :3000 detect sidecar (plan 04-02).
+# Standalone project for the clean-room :3000 detect sidecar.
 # Lives under tools/mock_harness/ so the sidecar builds WITHOUT configuring
-# the repo root CMakeLists (root build files stay untouched -- D-08/D-10).
+# the repo root CMakeLists (root build files stay untouched).
 #
 # The source closure mirrors the proven lan_bind_tcp_test target in the root
 # CMakeLists.txt (same six sources, include dirs, ABI_VERSION define and
-# OpenSSL link): detect_responder only needs our own obn::lan_bind_tcp codec
-# and obn::json -- no curl, no minizip, no plugin code.
+# OpenSSL link) -- keep the two in sync when any of those six sources or
+# their dependencies change (the root target carries the matching pointer
+# back to this file). detect_responder only needs our own obn::lan_bind_tcp
+# codec and obn::json -- no curl, no minizip, no plugin code.
 cmake_minimum_required(VERSION 3.20)
 project(mock_harness LANGUAGES CXX)
 
@@ -18,10 +20,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Same shape as tools/plugin_runner/CMakeLists.txt: the ABI macro gates
-# include/obn/bambu_networking.hpp layout. Default matches the OQ3 pin
-# (--abi 02.08.01); override with -DOBN_ABI_VERSION_HEX=0xMMmmpp.
-set(OBN_ABI_VERSION_HEX "0x020801" CACHE STRING
-    "Hex literal for ABI_VERSION (e.g. 0x020801).")
+# include/obn/bambu_networking.hpp layout. Default matches this repo's
+# current OBN_VERSION (02.08.04); override with -DOBN_ABI_VERSION_HEX=0xMMmmpp.
+set(OBN_ABI_VERSION_HEX "0x020804" CACHE STRING
+    "Hex literal for ABI_VERSION (e.g. 0x020804).")
 
 find_package(OpenSSL REQUIRED COMPONENTS SSL Crypto)
 

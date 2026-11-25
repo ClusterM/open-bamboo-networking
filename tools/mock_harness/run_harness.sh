@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
-# run_harness.sh — the single CI-able command for TEST-01 (D-06/D-07).
+# run_harness.sh — the single command that runs the mock-harness regression net.
 #
 # Starts the pinned external openbu-mock + the clean-room :3000 sidecar,
-# drives tools/plugin_runner --action none against them, asserts the D-08
-# ordered JSONL chain (assert_chain.py), tears everything down, and exits
-# with the ASSERTION's code. The runner's own exit code is informational
-# only (`--action none` exits 0 even on flow failure).
+# drives tools/plugin_runner --action none against them, asserts the ordered
+# connect chain (assert_chain.py), tears everything down, and exits with the
+# ASSERTION's code. The runner's own exit code is informational only
+# (`--action none` exits 0 even on flow failure).
 #
-# Exit: 0 = D-08 chain passed, 1 = assertion failed.
+# Exit: 0 = chain passed, 1 = assertion failed.
 #
 # Usage: tools/mock_harness/run_harness.sh [flags]
-#   --abi MM.mm.pp            plugin ABI (default: README OQ3 resolved value)
+#   --abi MM.mm.pp            plugin ABI (default: derived from build/CMakeCache.txt OBN_VERSION, else 02.08.04)
+#   --plugin-path PATH        .so to load (default: build/libbambu_networking.so = our own build;
+#                             pass a CDN-cached stock .so explicitly to test stock instead)
 #   --model MODEL             mock model (default: P1S)
 #   --access-code CODE        pinned mock access code (default: 12345678)
 #   --timeout SECONDS         --action none idle window (default: 6)
 #   --connect-settle-ms MS    local_connect wait cap (default: 15000)
 #   --log-out PATH            JSONL transcript (default: .cache/openbu-mock/run/harness.jsonl)
-#   --ssdp {off,soft,hard}    ssdp_msg assert (default: derived from README)
+#   --ssdp {off,soft,hard}    ssdp_msg assert (default: hard)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -26,7 +28,11 @@ RUN=".cache/openbu-mock/run"
 MOCK_BIN=".cache/openbu-mock/out/openbu-mock"
 SIDECAR=".cache/mock_harness/build-responder/detect_responder"
 HARNESS_DIR="tools/mock_harness"
-README="$HARNESS_DIR/README.md"
+
+# Defaults are CONSTANTS here; README.md documents them. Never parse prose.
+DEFAULT_SSDP="hard"
+DEFAULT_ABI_FALLBACK="02.08.04"
+DEFAULT_PLUGIN="$ROOT/build/libbambu_networking.so"
 
 die() { printf 'run_harness: %s\n' "$*" >&2; exit 1; }
 log() { printf 'run_harness: %s\n' "$*"; }
@@ -34,35 +40,37 @@ log() { printf 'run_harness: %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
-ABI="" MODEL="P1S" ACCESS_CODE="12345678" TIMEOUT_S="6" SETTLE_MS="15000"
-LOG_OUT="$RUN/harness.jsonl" SSDP=""
+ABI="" PLUGIN_PATH="" MODEL="P1S" ACCESS_CODE="12345678" TIMEOUT_S="6" SETTLE_MS="15000"
+LOG_OUT="$RUN/harness.jsonl" SSDP="$DEFAULT_SSDP"
 while (( $# > 0 )); do
     case "$1" in
         --abi)              ABI="$2"; shift 2 ;;
+        --plugin-path)      PLUGIN_PATH="$2"; shift 2 ;;
         --model)            MODEL="$2"; shift 2 ;;
         --access-code)      ACCESS_CODE="$2"; shift 2 ;;
         --timeout)          TIMEOUT_S="$2"; shift 2 ;;
         --connect-settle-ms) SETTLE_MS="$2"; shift 2 ;;
         --log-out)          LOG_OUT="$2"; shift 2 ;;
         --ssdp)             SSDP="$2"; shift 2 ;;
-        -h|--help)          sed -n '3,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)          sed -n '3,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)                  die "unknown flag: $1 (see --help)" ;;
     esac
 done
 
-# Default --abi from the recorded OQ3 resolution (README).
+# Default --plugin-path: OUR build (the only .so this repo can regress).
+[[ -n "$PLUGIN_PATH" ]] || PLUGIN_PATH="$DEFAULT_PLUGIN"
+[[ -f "$PLUGIN_PATH" ]] || die "plugin not found: $PLUGIN_PATH — build this repo first (./configure && cmake --build build), or pass --plugin-path"
+
+# Default --abi: the ABI our build was configured with (OBN_VERSION in
+# build/CMakeCache.txt), so bridge and plugin struct layouts match.
 if [[ -z "$ABI" ]]; then
-    ABI="$(awk '/^OQ3 resolved: --abi /{print $4; exit}' "$README" 2>/dev/null || true)"
-    [[ -n "$ABI" ]] || die "cannot derive default --abi from $README (expected an 'OQ3 resolved: --abi MM.mm.pp' line); pass --abi explicitly"
-fi
-# Default --ssdp from the recorded assert decision (README): hard only if
-# README literally records 'assert decision: hard', else soft.
-if [[ -z "$SSDP" ]]; then
-    if grep -q 'assert decision: hard' "$README" 2>/dev/null; then
-        SSDP="hard"
-    else
-        SSDP="soft"
+    if [[ -f build/CMakeCache.txt ]]; then
+        _ver="$(sed -n 's/^OBN_VERSION:STRING=//p' build/CMakeCache.txt | head -n1)"
+        if [[ "$_ver" =~ ^([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            ABI="${BASH_REMATCH[1]}"
+        fi
     fi
+    [[ -n "$ABI" ]] || ABI="$DEFAULT_ABI_FALLBACK"
 fi
 [[ "$SSDP" =~ ^(off|soft|hard)$ ]] || die "--ssdp must be off|soft|hard, got '$SSDP'"
 
@@ -80,7 +88,7 @@ pkg-config --exists libcurl 2>/dev/null   || die "pkg-config: libcurl not found 
 pkg-config --exists minizip 2>/dev/null   || die "pkg-config: minizip not found — install libminizip-dev"
 
 # ---------------------------------------------------------------------------
-# 2. Ensure artifacts: pinned mock binary (D-04) + clean-room sidecar (D-01)
+# 2. Ensure artifacts: pinned mock binary + clean-room sidecar
 # ---------------------------------------------------------------------------
 if [[ ! -x "$MOCK_BIN" ]]; then
     log "mock binary missing — running $HARNESS_DIR/fetch_mock.sh (needs Docker daemon for the build)"
@@ -151,17 +159,16 @@ source "$RUN/identity.env"
 log "identity: ip=$IP serial=$SERIAL name=$NAME model=$MODEL"
 
 # ---------------------------------------------------------------------------
-# 5. Trust anchors per the recorded OQ1 resolution: slicer_base64.cer AND
-#    printer.cer = PEM copies of the mock's ca.pem (stock's LAN TLS verify
-#    loads printer.cer from this folder — without it the client aborts
-#    before ClientHello).
+# 5. Trust anchors: slicer_base64.cer AND printer.cer = PEM copies of the
+#    mock's ca.pem (stock's LAN TLS verify loads printer.cer from this
+#    folder — without it the client aborts before ClientHello).
 # ---------------------------------------------------------------------------
 [[ -f "$RUN/ca.pem" ]] || die "$RUN/ca.pem not found — mock should generate it at startup"
 cp "$RUN/ca.pem" "$RUN/slicer_base64.cer"
 cp "$RUN/ca.pem" "$RUN/printer.cer"
 
 # ---------------------------------------------------------------------------
-# 6. Start the clean-room sidecar with identity.env values + OQ5 defaults
+# 6. Start the clean-room sidecar with identity.env values
 # ---------------------------------------------------------------------------
 : > "$RUN/detect.log"
 "$SIDECAR" --id "$SERIAL" --name "$NAME" --model C12 --version 01.09.01.00 \
@@ -186,12 +193,13 @@ fi
 log "ready: mock=$IP:8883 sidecar=:3000"
 
 # ---------------------------------------------------------------------------
-# 8. Drive the stock plugin; runner_rc= is EVIDENCE ONLY
+# 8. Drive the plugin under test; runner_rc= is EVIDENCE ONLY
 # ---------------------------------------------------------------------------
 mkdir -p "$(dirname "$LOG_OUT")"
 rm -f "$LOG_OUT" "$LOG_OUT.out" "$LOG_OUT.err"
 runner_rc=0
-tools/plugin_runner.sh --abi "$ABI" --action none --timeout "$TIMEOUT_S" \
+tools/plugin_runner.sh --abi "$ABI" --plugin-path "$PLUGIN_PATH" \
+    --action none --timeout "$TIMEOUT_S" \
     --dev-id "$SERIAL" --dev-ip "$IP" --access-code "$ACCESS_CODE" \
     --cert-file "$RUN/slicer_base64.cer" \
     --connect-settle-ms "$SETTLE_MS" --log-out "$LOG_OUT" \
@@ -199,7 +207,7 @@ tools/plugin_runner.sh --abi "$ABI" --action none --timeout "$TIMEOUT_S" \
 echo "runner_rc=$runner_rc (informational only — the verdict comes from assert_chain.py)"
 
 # ---------------------------------------------------------------------------
-# 9-10. Verdict: D-08 chain assertion; exit with ITS code after teardown
+# 9-10. Verdict: ordered chain assertion; exit with ITS code after teardown
 # ---------------------------------------------------------------------------
 verdict_rc=0
 python3 "$HARNESS_DIR/assert_chain.py" --log "$LOG_OUT" --ssdp "$SSDP" || verdict_rc=$?

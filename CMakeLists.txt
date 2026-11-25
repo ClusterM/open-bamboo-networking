@@ -1264,6 +1264,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     add_test(NAME oss_sign COMMAND oss_sign_test)
 
     # Hermetic round-trip for TCP :3000 bind framing (A5 A5|u16le|JSON|A7 A7).
+    # NOTE: tools/mock_harness/CMakeLists.txt builds the same six-source
+    # closure for the harness sidecar — keep both lists in sync.
     add_executable(lan_bind_tcp_test tests/lan_bind_tcp_test.cpp
         src/lan_bind_tcp.cpp
         src/config.cpp

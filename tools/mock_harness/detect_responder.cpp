@@ -1,7 +1,7 @@
 // detect_responder -- clean-room :3000 login/detect sidecar for the
-// openbu-mock harness (plan 04-02, decision D-01).
+// openbu-mock harness.
 //
-// Clean-room per D-01 - sources: research/08.06-bind.md 8.6.2 + obn::lan_bind_tcp codec
+// Clean-room - sources: research/08.06-bind.md 8.6.2 + obn::lan_bind_tcp codec
 //
 // Wire facts, all from research/08.06-bind.md section 8.6.2: stock opens a
 // plaintext TCP connection to dev_ip:3000, sends one framed request
@@ -11,8 +11,8 @@
 // model, name, version, bind, connect (sequence_id echoed as a JSON number
 // in the captured reply dialect), then closes. Our own
 // obn::lan_bind_tcp::encode_frame / drain_frames perform all framing -- no
-// framing byte is written by hand here ("Don't Hand-Roll", plan 04-02) and
-// nothing from the openbu-mock source was read.
+// framing byte is written by hand here and nothing from the openbu-mock
+// source was read.
 //
 // The reply must satisfy our stock-equivalent parser in
 // src/lan_bind_tcp.cpp:326-339: field reads as listed above and a hard
@@ -42,8 +42,8 @@ struct Options {
     std::string model      = "C12";       // P1S model code (research 8.6.2 reply dialect)
     std::string name;
     std::string version    = "01.09.01.00";
-    std::string bind_state = "free";      // OQ5 provisional default
-    std::string connect    = "lan";       // OQ5 provisional default
+    std::string bind_state = "free";      // reply value the harness run locked
+    std::string connect    = "lan";       // reply value the harness run locked
     long long   seq        = 20000;       // JSON number, per the captured reply
 };
 
