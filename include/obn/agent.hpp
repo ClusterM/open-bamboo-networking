@@ -492,7 +492,8 @@ private:
                                 const std::string& json);
 
     // Records the printer's print.ipcam.tutk_server status ("enable" /
-    // "disable") into tutk_server_ready_by_dev_ and the time of the last
+    // "disable") into tutk_server_ready_by_dev_, the time it last flipped to
+    // "enable" into tutk_server_enabled_at_ and the time of the last
     // liveview.prepare "succeed" into liveview_prepared_at_; wakes
     // wait_tutk_ready(). Cheap substring prefilter; full JSON parse only on
     // candidate frames.
@@ -504,14 +505,13 @@ private:
     void harvest_access_code(const std::string& dev_id,
                              const std::string& json);
 
-    // Blocks until the printer answers the prepare dispatched by the current
-    // camera_url call: a liveview.prepare "succeed" newer than `since` (the
-    // reply to the signed prepare that follows a /user/ttcode mint). The
-    // stale tutk_server "enable" flag of an earlier session must NOT count —
-    // the reply restarts the printer's tutk_server, so returning early hands
-    // the URL to the player before the restart, which kills the JOIN.
-    // Returns false on timeout; the URL is still handed over then, the first
-    // IOTC connect may just fail while the server starts (open() retries).
+    // Blocks until the printer answers the prepare that follows the
+    // /user/ttcode mint at `since`: a liveview.prepare "succeed" or a
+    // tutk_server flip to "enable", either newer than `since`. An "enable"
+    // left over from an earlier session does not count: the prepare reply
+    // restarts tutk_server, and a player handed the URL before that loses
+    // its JOIN. Returns false on timeout; the URL is still handed over then,
+    // the first IOTC connect may just fail while the server starts.
     bool wait_tutk_ready(const std::string& dev_id,
                          std::chrono::steady_clock::time_point since,
                          std::chrono::milliseconds timeout);
@@ -637,6 +637,8 @@ private:
     // TUTK readiness per dev_id, see harvest_tutk_server_status(). Guarded
     // by mu_; tutk_ready_cv_ is notified on every update.
     std::map<std::string, bool>                 tutk_server_ready_by_dev_;
+    std::map<std::string, std::chrono::steady_clock::time_point>
+                                                tutk_server_enabled_at_;
     std::map<std::string, std::chrono::steady_clock::time_point>
                                                 liveview_prepared_at_;
     std::condition_variable                     tutk_ready_cv_;

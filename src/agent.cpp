@@ -1406,8 +1406,13 @@ void Agent::harvest_tutk_server_status(const std::string& dev_id,
         if (has_server) {
             const bool ready = server.as_string() == "enable";
             auto it = tutk_server_ready_by_dev_.find(dev_id);
-            const bool changed = it == tutk_server_ready_by_dev_.end() || it->second != ready;
+            const bool known   = it != tutk_server_ready_by_dev_.end();
+            const bool changed = !known || it->second != ready;
             tutk_server_ready_by_dev_[dev_id] = ready;
+            // Only a seen disable -> enable flip: the first report after
+            // connecting may carry an "enable" from long ago.
+            if (ready && known && changed)
+                tutk_server_enabled_at_[dev_id] = std::chrono::steady_clock::now();
             if (changed)
                 OBN_INFO("dev=%s tutk_server status: %s", dev_id.c_str(),
                          ready ? "enable" : "disable");
@@ -1444,16 +1449,13 @@ bool Agent::wait_tutk_ready(const std::string& dev_id,
                             std::chrono::steady_clock::time_point since,
                             std::chrono::milliseconds timeout)
 {
-    // Only a liveview.prepare "succeed" newer than `since` counts. The
-    // earlier tutk_server "enable" fallback made this return in ~12ms on
-    // the stale flag from a previous session, so the URL reached the
-    // player before this prepare's reply landed — and that reply restarts
-    // the printer's tutk_server mid-JOIN, failing the open 18s later
-    // (2026-11-19, replay after a working first view).
     std::unique_lock<std::mutex> lk(mu_);
+    const auto newer = [&](const auto& by_dev) {
+        auto it = by_dev.find(dev_id);
+        return it != by_dev.end() && it->second >= since;
+    };
     return tutk_ready_cv_.wait_for(lk, timeout, [&] {
-        auto p = liveview_prepared_at_.find(dev_id);
-        return p != liveview_prepared_at_.end() && p->second >= since;
+        return newer(liveview_prepared_at_) || newer(tutk_server_enabled_at_);
     });
 }
 
@@ -1902,8 +1904,8 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     if (wait_tutk_ready(serial, minted_at, std::chrono::seconds(5)))
         OBN_INFO("camera_url(remote): dev=%s ready for TUTK", serial.c_str());
     else
-        OBN_WARN("camera_url(remote): dev=%s no liveview.prepare reply within 5s; "
-                 "returning the URL anyway", serial.c_str());
+        OBN_WARN("camera_url(remote): dev=%s no liveview.prepare reply / tutk_server "
+                 "enable within 5s; returning the URL anyway", serial.c_str());
     return turl;
 }
 
