@@ -253,6 +253,22 @@ static bool write_test_slicer_cert(const char* path, EVP_PKEY* key)
     return ok == 1;
 }
 
+static int test_app_cert_chain_complete()
+{
+    // Firmware path-builds the installed chain to its BBL CA root: fewer
+    // than 3 PEM blocks installs as SUCCESS but every signed command then
+    // fails with err 84033547 (research/08.04-lan.md).
+    const std::string block =
+        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    CHECK(!obn::signing::app_cert_chain_complete(""));
+    CHECK(!obn::signing::app_cert_chain_complete("not a pem"));
+    CHECK(!obn::signing::app_cert_chain_complete(block));              // leaf only
+    CHECK(!obn::signing::app_cert_chain_complete(block + block));      // leaf + int
+    CHECK(obn::signing::app_cert_chain_complete(block + block + block));
+    CHECK(obn::signing::app_cert_chain_complete(block + block + block + block));
+    return 0;
+}
+
 static int test_sign_alg_and_ver()
 {
     const std::string payload = R"({"print":{"command":"stop","sequence_id":"3"}})";
@@ -693,6 +709,7 @@ int main()
     if (test_print_payload_gets_header()   != 0) rc = 1;
     if (test_cert_id_constant()            != 0) rc = 1;
     if (test_app_certification_id_http_format() != 0) rc = 1;
+    if (test_app_cert_chain_complete()      != 0) rc = 1;
     if (test_sign_alg_and_ver()            != 0) rc = 1;
     if (test_payload_len_matches_to_sign() != 0) rc = 1;
     if (test_signature_verifies()          != 0) rc = 1;
