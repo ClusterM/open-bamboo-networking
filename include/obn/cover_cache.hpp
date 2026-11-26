@@ -46,12 +46,20 @@ void unstage(const std::string& dev_id,
 
 // Background fetcher: if path_for(...) is missing, spawn a thread that
 // connects on TLS :6000, reuses the file-browser wire path, writes PNG.
+//
+// COVER-01: `subtask_name` remains the IDENTITY (gate, inflight/neg-cache
+// key, path_for, Studio url_for) while `model_key` is the LISTING-MATCH
+// key handed to fetch_model_tile_thumbnail — gcode_file basename when the
+// frame carried one, empty when it didn't (fetch then matches on
+// subtask_name, i.e. pre-COVER-01 behavior).
 void ensure(const std::string& host,
             const std::string& dev_id,
             const std::string& user,
             const std::string& password,
             const std::string& subtask_name,
+            const std::string& model_key,
             int                plate_idx,
-            const std::string& version = {});
+            const std::string& version = {},
+            const std::string& ca_file = {});
 
 } // namespace obn::cover_cache

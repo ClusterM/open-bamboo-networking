@@ -1,9 +1,11 @@
 #include "obn/cover_cache.hpp"
 
+#include "obn/ftps.hpp"
 #include "obn/log.hpp"
 #include "obn/tunnel_upload.hpp"
 #include "obn/zip_read.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -152,10 +154,124 @@ long long ms_since(SteadyClock::time_point t0)
                SteadyClock::now() - t0).count();
 }
 
+// FTPS fallback for printers whose :6000 CTRL service is gone (P1S
+// firmware 01.10.00.15 reports file.local=none and closes the session):
+// download the print's .3mf over FTPS and pull this plate's image out of
+// the zip. Returns empty when no candidate file is on the printer or the
+// archive carries no plate image.
+std::vector<std::uint8_t> ftps_fetch_plate_png(
+    const obn::tunnel_upload::ConnectParams& cp,
+    const std::string&                       ca_file,
+    const std::string&                       model_key,
+    const std::string&                       subtask_name,
+    int                                      plate_idx,
+    SteadyClock::time_point                  t0)
+{
+    obn::ftps::ConnectConfig cfg;
+    cfg.host     = cp.dev_ip;
+    cfg.port     = 990;
+    cfg.username = cp.username.empty() ? std::string{"bblp"} : cp.username;
+    cfg.password = cp.password;
+    cfg.ca_file             = ca_file;
+    cfg.tls_verify_hostname = cp.dev_id;
+    cfg.use_tls             = true;
+
+    obn::ftps::Client cli;
+    std::string err = cli.connect(cfg);
+    if (!err.empty()) {
+        // Some units expose plain FTP only (see obn/ftps.hpp).
+        cfg.use_tls = false;
+        cfg.port    = 21;
+        std::string plain = cli.connect(cfg);
+        if (!plain.empty()) {
+            OBN_DEBUG("cover_cache: FTPS connect %s failed (tls: %s, plain: %s)",
+                      cp.dev_ip.c_str(), err.c_str(), plain.c_str());
+            return {};
+        }
+    }
+
+    // Where dispatched prints live: FTPS root (hybrid LAN prints) and
+    // /cache (cloud-dispatched downloads).
+    std::vector<std::string> names;
+    if (!model_key.empty()) names.push_back(model_key);
+    if (!subtask_name.empty()) {
+        names.push_back(subtask_name + ".gcode.3mf");
+        names.push_back(subtask_name);
+    }
+    std::vector<std::string> candidates;
+    for (const char* dir : {"", "/cache"}) {
+        for (const auto& name : names) {
+            std::string p = std::string(dir) + "/" + name;
+            if (std::find(candidates.begin(), candidates.end(), p) ==
+                candidates.end())
+                candidates.push_back(std::move(p));
+        }
+    }
+
+    constexpr std::uint64_t kMaxBytes = 512ull * 1024 * 1024;
+    for (const auto& path : candidates) {
+        std::uint64_t sz = 0;
+        if (cli.size(path, &sz).empty() && sz > kMaxBytes) {
+            OBN_DEBUG("cover_cache: FTPS %s is %llu bytes, skipping",
+                      path.c_str(), static_cast<unsigned long long>(sz));
+            continue;
+        }
+        const fs::path tmp =
+            fs::path(temp_dir()) /
+            ("ftps-" + std::to_string(fnv1a_32(path)) + "-" +
+             std::to_string(plate_idx) + ".3mf");
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) continue;
+        std::uint64_t total   = 0;
+        bool          too_big = false;
+        std::string   rerr =
+            cli.retr(path, [&](const void* data, std::size_t len) {
+                total += len;
+                if (total > kMaxBytes) {
+                    too_big = true;
+                    return false;
+                }
+                out.write(static_cast<const char*>(data),
+                          static_cast<std::streamsize>(len));
+                return out.good();
+            });
+        out.close();
+        if (!rerr.empty() || too_big) {
+            fs::remove(tmp);
+            if (too_big) {
+                OBN_DEBUG("cover_cache: FTPS %s over %llu bytes, skipping",
+                          path.c_str(),
+                          static_cast<unsigned long long>(kMaxBytes));
+            }
+            continue;
+        }
+        std::vector<std::uint8_t> png;
+        std::string               entry, eerr;
+        if (read_local_thumbnail(tmp.string(), plate_idx, &png, &entry,
+                                 &eerr) &&
+            !png.empty()) {
+            OBN_DEBUG("cover_cache: FTPS %s -> %s (%zu bytes) in %lld ms",
+                      path.c_str(), entry.c_str(), png.size(), ms_since(t0));
+            fs::remove(tmp);
+            cli.quit();
+            return png;
+        }
+        OBN_DEBUG("cover_cache: FTPS %s downloaded but has no plate image: %s",
+                  path.c_str(), eerr.c_str());
+        fs::remove(tmp);
+    }
+    cli.quit();
+    return {};
+}
+
 // Sources, best first: the archive this plugin uploaded for the print (no
-// network, always this plate's image), then the printer's copy over :6000.
+// network, always this plate's image), the printer's copy over :6000, then
+// the printer's copy over FTPS (firmware that dropped the :6000 CTRL
+// service, e.g. P1S 01.10.00.15).
 void fetch_worker(obn::tunnel_upload::ConnectParams cp,
+                  std::string ca_file,
                   std::string subtask_name,
+                  std::string model_key,
                   int         plate_idx,
                   std::string version,
                   std::string inflight)
@@ -168,45 +284,59 @@ void fetch_worker(obn::tunnel_upload::ConnectParams cp,
 
     if (write_staged(cp.dev_id, subtask_name, plate_idx, version)) return;
 
-    // TODO: add FTPS fallback — when :6000 is unreachable (A1 Mini and
-    // other printers that don't expose the BambuTunnel port), download
-    // /cache/<subtask_name>.gcode.3mf via FTPS RETR and extract
-    // Metadata/plate_N.png from the zip archive instead.
     OBN_DEBUG("cover_cache: fetching '%s' plate %d ver=%s from %s over :6000",
               subtask_name.c_str(), plate_idx,
               version.empty() ? "-" : version.c_str(), cp.dev_ip.c_str());
-    obn::tunnel_upload::Connection conn;
-    std::string err;
-    if (conn.connect(cp, &err) != 0) {
-        OBN_DEBUG("cover_cache: :6000 connect %s failed after %lld ms: %s; "
-                  "no cover for '%s' for the next %lld s",
-                  cp.dev_ip.c_str(), ms_since(t0), err.c_str(),
+    std::vector<std::uint8_t> png;
+    std::string               src;
+    {
+        obn::tunnel_upload::Connection conn;
+        std::string                    err;
+        if (conn.connect(cp, &err) != 0) {
+            OBN_DEBUG("cover_cache: :6000 connect %s failed after %lld ms: %s",
+                      cp.dev_ip.c_str(), ms_since(t0), err.c_str());
+        } else {
+            // COVER-01: match the listing on the chosen model_key (gcode_file
+            // basename when the frame carried one); empty falls back to
+            // subtask_name, i.e. the pre-COVER-01 behavior. The cache identity
+            // below (path_for, inflight key) stays keyed on subtask_name.
+            const obn::tunnel_upload::ModelThumbnailOutcome thumb =
+                conn.fetch_model_tile_thumbnail(
+                    model_key.empty() ? subtask_name : model_key, plate_idx);
+            if (thumb.ok) {
+                png = thumb.data;
+                src = thumb.path;
+            } else {
+                OBN_DEBUG("cover_cache: %s for '%s' (model_key '%s') plate %d "
+                          "after %lld ms",
+                          thumb.error.c_str(), subtask_name.c_str(),
+                          model_key.c_str(), plate_idx, ms_since(t0));
+            }
+        }
+    }
+
+    if (png.empty()) {
+        png = ftps_fetch_plate_png(cp, ca_file, model_key, subtask_name,
+                                   plate_idx, t0);
+        if (!png.empty()) src = "FTPS";
+    }
+
+    if (png.empty()) {
+        OBN_DEBUG("cover_cache: no cover for '%s' for the next %lld s",
                   subtask_name.c_str(),
                   static_cast<long long>(kNegCacheTimeout.count()));
         mark_neg_cache(inflight);
         return;
     }
 
-    const obn::tunnel_upload::ModelThumbnailOutcome thumb =
-        conn.fetch_model_tile_thumbnail(subtask_name, plate_idx);
-    if (!thumb.ok) {
-        OBN_DEBUG("cover_cache: %s for '%s' plate %d after %lld ms; "
-                  "no cover for the next %lld s",
-                  thumb.error.c_str(), subtask_name.c_str(), plate_idx,
-                  ms_since(t0), static_cast<long long>(kNegCacheTimeout.count()));
-        mark_neg_cache(inflight);
-        return;
-    }
-
     fs::path out = path_for(subtask_name, plate_idx, version);
-    if (!write_atomic(out, thumb.data)) {
+    if (!write_atomic(out, png)) {
         OBN_DEBUG("cover_cache: write %s failed", out.string().c_str());
         mark_neg_cache(inflight);
         return;
     }
     OBN_INFO("cover_cache: wrote %s (%zu bytes) from %s in %lld ms",
-             out.string().c_str(), thumb.data.size(), thumb.path.c_str(),
-             ms_since(t0));
+             out.string().c_str(), png.size(), src.c_str(), ms_since(t0));
 }
 
 } // namespace
@@ -336,9 +466,13 @@ void ensure(const std::string& host,
             const std::string& user,
             const std::string& password,
             const std::string& subtask_name,
+            const std::string& model_key,
             int                plate_idx,
-            const std::string& version)
+            const std::string& version,
+            const std::string& ca_file)
 {
+    // Unchanged guard: identity (subtask_name) must exist for the cache
+    // path, inflight key and Studio URL — model_key never widens this.
     if (host.empty() || subtask_name.empty()) return;
 
     std::string target = path_for(subtask_name, plate_idx, version);
@@ -362,8 +496,8 @@ void ensure(const std::string& host,
     cp.password = password;
     cp.username = user.empty() ? "bblp" : user;
 
-    std::thread(fetch_worker, std::move(cp), subtask_name, plate_idx, version,
-                std::move(key)).detach();
+    std::thread(fetch_worker, std::move(cp), ca_file, subtask_name, model_key,
+                plate_idx, version, std::move(key)).detach();
 }
 
 #ifdef OBN_TESTING
@@ -374,7 +508,8 @@ void test_fetch(const obn::tunnel_upload::ConnectParams& cp,
                 int                                      plate_idx,
                 const std::string&                       version)
 {
-    fetch_worker(cp, subtask_name, plate_idx, version,
+    fetch_worker(cp, /*ca_file=*/{}, subtask_name, /*model_key=*/"",
+                 plate_idx, version,
                  inflight_key(subtask_name, plate_idx, version));
 }
 
