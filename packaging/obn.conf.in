@@ -224,13 +224,11 @@ client_name = OpenBambooNetworking
 # with record" path (typical for a printer that is linked to your
 # Bambu account). This does not change pure LAN-only printers.
 #
-#   cloud_only     — Default. The model is first put on the printer over
-#                    your local network (LAN); Bambu Studio 2.9.2 and newer
-#                    no longer ask for that, so the plugin does it itself.
-#                    If that fails, the full model is uploaded to the cloud.
-#                    Either way the cloud is required for print history /
-#                    reporting and to start the job — without a working
-#                    cloud connection, printing will not work.
+#   cloud_only     — Default. Always print through the cloud, even when the
+#                    printer is reachable on your local network. The cloud
+#                    starts the job and keeps the print history, so without
+#                    a working cloud connection printing does not work at
+#                    all. See slim_cloud below for what goes to Bambu.
 #
 #   try_lan_first  — Prefer a fully private local send (same as when the
 #                    printer is in LAN-only mode): put the file on the
@@ -255,6 +253,25 @@ client_name = OpenBambooNetworking
 #                    printed like lan_only and leaves no cloud print history.
 
 cloud_print = cloud_only
+
+# What a cloud print sends to Bambu when the printer is also reachable on
+# your local network (cloud_only, or cloud_for_makerworld_only for a
+# MakerWorld project). The model is always put on the printer over the
+# LAN first.
+#
+#   0 — Default, same as the official plugin: the full model is uploaded
+#       to Bambu as well, and the printer downloads that copy from the
+#       cloud.
+#   1 — Do not send the model to Bambu; the printer prints the copy that
+#       is already on its storage. Bambu still gets the print record and
+#       a small config file for the history thumbnail. This does not work
+#       on every printer and firmware: some silently never start the
+#       print. If that happens, set this back to 0.
+#
+# No effect on try_lan_first / lan_only, or on a print where the printer
+# cannot be reached locally (the full model is uploaded then anyway).
+
+slim_cloud = 0
 
 # Hide cloud print history on the Bambu Studio home page (return an
 # empty task list). Useful with true LAN print modes (try_lan_first /

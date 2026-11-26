@@ -17,7 +17,7 @@ inline constexpr const char* kCameraPreviewMemPath = "mem:/26";
 // per-entry route lists live in obn/print_route.hpp.
 // Orthogonal to block_cloud (background MQTT/REST).
 enum class CloudPrintMode {
-    CloudOnly,    // LAN delivery with a cloud record, then full cloud upload (default)
+    CloudOnly,    // always a cloud print: LAN copy + record, else full upload (default)
     TryLanFirst,  // local print, then full cloud upload
     LanOnly,      // local print only; never uploads the model
     // Per job: CloudOnly when the .3mf carries a MakerWorld DesignModelId,
@@ -47,6 +47,11 @@ struct Settings {
 
     // Print delivery for cloud-facing ABIs (see CloudPrintMode)
     CloudPrintMode cloud_print    = CloudPrintMode::CloudOnly;
+
+    // Hybrid cloud print (LanRecord route): stop after registering the
+    // ftp:// copy instead of also uploading the full model to S3. Not every
+    // printer / firmware prints from an ftp:// dispatch.
+    bool slim_cloud               = false;
 
     // When true, get_user_tasks returns an empty history envelope.
     bool cloud_hide_history       = false;

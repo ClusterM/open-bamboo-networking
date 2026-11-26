@@ -26,7 +26,8 @@ enum class Entry {
 };
 
 enum class Route {
-    LanRecord, // run_cloud_print_job(use_lan_channel=true): FTPS + cloud record
+    LanRecord, // run_cloud_print_job(use_lan_channel=true): FTPS + cloud record,
+               // plus the S3 copy the printer downloads unless slim_cloud
     Local,     // run_local_print_job: FTPS + MQTT, no cloud record
     Cloud,     // run_cloud_print_job(use_lan_channel=false): full upload to S3
 };

@@ -1,33 +1,36 @@
 // Cloud print pipeline (start_print / start_local_print_with_record).
 //
-// Shared cloud bookkeeping for both ABI entry points. Delivery matches
-// stock: both paths end with the main .3mf on S3 and the project
-// registered with the S3 URL, because the cloud dispatches whatever URL
-// was registered last and X1C firmware silently ignores a bare ftp://
-// dispatch (issue #23; X2D accepted it, X1C FW 1.08.02 did not).
+// Shared cloud bookkeeping for both ABI entry points, then the model
+// delivery. The cloud dispatches whichever model URL the project was
+// registered with last, so that registration decides where the printer
+// takes the file from (research/08.08-print-abi.md §8.8.3,
+// research/13.05-cloud-print.md §3).
 //
 //   [A]  POST   /v1/iot-service/api/user/project
 //   [B]  PUT    <presigned>                                       config 3mf
 //   [C]  PUT    /v1/iot-service/api/user/notification
 //   [D]  GET    /v1/iot-service/api/user/notification?action=upload&ticket=..
-//
-//   use_lan_channel=true  (_with_record):
-//   [E]  FTPS STOR main .3mf first (Upload; WR_UPLOAD_FTP on fail)
-//   [A–D] then project + config S3 (Record) + notify
+//   [E]  FTPS STOR main .3mf
 //   [F]  PATCH  /v1/iot-service/api/user/project/<pid>            url=ftp://...
 //   [G]  GET    /v1/iot-service/api/user/upload?models=...
-//   [H]  PUT    <presigned>                                       main 3mf (Record)
-//   [I]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3 (wins)
-//   [J]  POST   /v1/user-service/my/task                          mode=lan_file
+//   [H]  PUT    <presigned>                                       main 3mf
+//   [I]  PATCH  /v1/iot-service/api/user/project/<pid>            url=S3
+//   [J]  POST   /v1/user-service/my/task
 //
-//   use_lan_channel=false (start_print):
-//   Create, then [A–D], then [G]–[I] with Upload stage, then:
-//   [J]  POST   /v1/user-service/my/task                          mode=cloud_file
+//   use_lan_channel=true (LanRecord route): [E] under Upload (WR_UPLOAD_FTP
+//   on failure), then [A]-[D], [F], [G]-[I] and [J] mode=lan_file under
+//   Record. As in stock, the S3 URL from [I] wins and the printer downloads
+//   that copy. slim_cloud skips [G]-[I]: the printer prints its FTPS copy
+//   and the full model never reaches Bambu, but not every firmware starts
+//   an ftp:// dispatch.
+//
+//   use_lan_channel=false (Cloud route): Create, then [A]-[D], [G]-[I] and
+//   [J] mode=cloud_file, all under Upload.
 //
 // Config upload [B]/[D] is required for Print History thumbnails.
 // Print start is cloud /my/task dispatch — the plugin does not publish
-// MQTT project_file (would double-fire). On LAN failure the plugin
-// returns < 0 so Studio can fall back to start_print.
+// MQTT project_file (would double-fire). On failure the plugin returns
+// < 0 so the next route, or Studio itself, can fall back.
 
 #include "obn/agent.hpp"
 
@@ -124,7 +127,7 @@ std::string slurp_file(const std::string& path, std::string* err)
 // in PATCH profile_print_3mf[].md5 (uppercase hex). Studio never fills
 // PrintParams.ftp_file_md5 — the field exists only on the ABI struct.
 // Cloud accepts an all-zero placeholder (OBN used to send one) but
-// stock never does; see stock_hybrid.mitm 2026-07-19.
+// stock never does (stock hybrid MITM, 2026-07-19).
 std::string md5_file_hex_upper(const std::string& path)
 {
     std::ifstream ifs(path, std::ios::binary);
@@ -496,11 +499,9 @@ int poll_upload(const std::string& api, const std::string& token,
 }
 
 // PATCH /project/<pid> with the profile_print_3mf descriptor that
-// points at where the print-ready 3mf now lives. Studio issues this
-// twice - once with a throw-away ftp:// placeholder before the real
-// OSS upload, once more with the real URL afterwards. We copy that
-// pattern because the server-side state machine seems to care about
-// the first call being present.
+// points at where the print-ready 3mf now lives. Hybrid stock issues it
+// twice, ftp:// for the FTPS copy and then the S3 URL; start_print only
+// the S3 one. The cloud dispatches the URL registered last.
 int patch_project(const std::string& api, const std::string& token,
                   const std::string& user_id,
                   const std::string& project_id,
@@ -561,6 +562,46 @@ int get_upload_url(const std::string& api, const std::string& token,
         return fail_stage(update_fn, BAMBU_NETWORK_ERR_PRINT_WR_GET_USER_UPLOAD_FAILED,
                           "get_upload_url missing url", resp);
     OBN_DEBUG("cloud_print: get_upload_url -> %s", redact_url(*out_url).c_str());
+    return 0;
+}
+
+// [G]-[I]: the main .3mf to S3, then register that URL on the project.
+// *out_url is set only when all three steps succeed.
+int upload_main_to_s3(const std::string& api, const std::string& token,
+                      const std::string& user_id,
+                      const BBL::PrintParams& p, const ProjectInfo& info,
+                      const std::string& md5, int stage,
+                      BBL::OnUpdateStatusFn update_fn,
+                      BBL::WasCancelledFn   cancel_fn,
+                      std::string*          out_url)
+{
+    const std::string plate_tag =
+        std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
+    const std::string model_slot =
+        info.model_id + "_" + info.profile_id + "_" + plate_tag + ".3mf";
+    std::string upload_url;
+    if (int rc = get_upload_url(api, token, user_id, model_slot, &upload_url,
+                                update_fn);
+        rc != 0) return rc;
+
+    std::string err;
+    const std::string bytes = slurp_file(p.filename, &err);
+    if (bytes.empty()) {
+        OBN_ERROR("cloud_print: main read %s: %s", p.filename.c_str(), err.c_str());
+        if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                 BAMBU_NETWORK_ERR_FILE_NOT_EXIST,
+                                 "filename not readable");
+        return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
+    }
+    if (int rc = s3_put(upload_url, bytes, update_fn, cancel_fn, stage,
+                        BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
+        rc != 0) return rc;
+
+    if (int rc = patch_project(api, token, user_id, info.project_id,
+                               info.profile_id, md5, p.plate_index, upload_url,
+                               update_fn);
+        rc != 0) return rc;
+    *out_url = std::move(upload_url);
     return 0;
 }
 
@@ -813,14 +854,14 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     const std::string uid   = session.user_id;
 
     // Stock start_print emits Create; start_local_print_with_record does
-    // not (stock_hybrid / stock_block_lan Studio logs, 2026-07-19).
+    // not (stock Studio logs, 2026-07-19).
     if (!use_lan_channel && update_fn)
         update_fn(BBL::PrintingStageCreate, 0, "");
     if (cancel_fn && cancel_fn()) return BAMBU_NETWORK_ERR_CANCELED;
 
     std::string remote_name = print_job::pick_remote_name(p);
     // Stock ignores ftp_file_md5 (Studio leaves it empty) and hashes
-    // the print-ready file. Uppercase hex, same as stock_hybrid.mitm.
+    // the print-ready file. Uppercase hex, as stock sends it.
     std::string md5 = md5_file_hex_upper(p.filename);
     if (md5.empty()) {
         OBN_ERROR("cloud_print: md5 %s failed", p.filename.c_str());
@@ -835,7 +876,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
 
     // Hybrid stock does FTPS of the main .3mf first (Upload), then the
     // cloud bookkeeping. A blocked LAN therefore fails with WR_UPLOAD_FTP
-    // before Create — matching stock_block_lan.log.
+    // before any cloud call, as stock does.
     if (use_lan_channel) {
         if (p.dev_ip.empty() || p.password.empty()) {
             OBN_ERROR("cloud_print: lan channel requested but no dev_ip/access_code");
@@ -869,14 +910,11 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                  lan_remote_path.c_str(), project_url.c_str());
     }
 
-    // Hybrid stock switches to Record as soon as FTPS finishes, covering
-    // POST /user/project + the config S3 PUT. start_print stays on Upload.
-    if (update_fn) {
-        if (use_lan_channel)
-            update_fn(BBL::PrintingStageRecord, 0, "");
-        else
-            update_fn(BBL::PrintingStageUpload, 0, "");
-    }
+    // Hybrid stock switches to Record as soon as FTPS finishes and reports
+    // every cloud upload under it; start_print stays on Upload.
+    const int cloud_stage = use_lan_channel ? BBL::PrintingStageRecord
+                                            : BBL::PrintingStageUpload;
+    if (update_fn) update_fn(cloud_stage, 0, "");
 
     // -------------------------------------------------------------
     // [A] Create the cloud project and get the first presigned URL
@@ -890,7 +928,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     // -------------------------------------------------------------
     // [B] Upload the config 3mf (small). Required for Print History
     // thumbnails even when the main model is delivered over FTPS.
-    // Hybrid stock reports this as Record; start_print as Upload.
     // -------------------------------------------------------------
     std::string config_path = p.config_filename;
     if (p.config_filename.empty()) {
@@ -908,12 +945,10 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                                  "config_filename not readable");
         return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
     }
-    const int config_stage = use_lan_channel ? BBL::PrintingStageRecord
-                                             : BBL::PrintingStageUpload;
     OBN_INFO("cloud_print: uploading config %s to S3 (stage=%d)",
-             config_path.c_str(), config_stage);
+             config_path.c_str(), cloud_stage);
     if (int rc = s3_put(info.upload_url, config_bytes, update_fn, cancel_fn,
-                        config_stage,
+                        cloud_stage,
                         BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_CONFIG_TO_OSS_FAILED);
         rc != 0) return rc;
 
@@ -928,50 +963,21 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
                              update_fn, cancel_fn);
         rc != 0) return rc;
 
+    // -------------------------------------------------------------
+    // [F]-[I] Register the model. The cloud dispatches the URL
+    // registered last: the S3 copy in stock order, the FTPS copy when
+    // slim_cloud stops after [F]. Not every firmware starts an ftp://
+    // dispatch (research/08.08-print-abi.md §8.8.3).
+    // -------------------------------------------------------------
+    const bool slim = use_lan_channel && obn::config::current().slim_cloud;
     if (use_lan_channel) {
-        // First registration: the FTPS copy, so a blocked S3 still leaves a
-        // usable url on the project. Stock does this too, then overwrites it
-        // with the S3 URL below — the cloud dispatches the last registered
-        // URL, and X1C firmware will not print from a bare ftp:// dispatch
-        // (issue #23; X2D accepted it, X1C FW 1.08.02 silently did not).
         if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
                                    md5, p.plate_index, project_url, update_fn);
             rc != 0) return rc;
     }
-
-    // ---------------------------------------------------------
-    // Main .3mf to S3 + second PATCH S3 URL — stock parity on both
-    // paths: the cloud dispatches whatever was registered last.
-    // ---------------------------------------------------------
-    {
-        std::string main_upload_url;
-        std::string plate_tag =
-            std::to_string(p.plate_index <= 0 ? 1 : p.plate_index);
-        std::string model_slot =
-            info.model_id + "_" + info.profile_id + "_" + plate_tag + ".3mf";
-        if (int rc = get_upload_url(api, token, uid, model_slot,
-                                    &main_upload_url, update_fn);
-            rc != 0) return rc;
-
-        std::string main_bytes = slurp_file(p.filename, &slurp_err);
-        if (main_bytes.empty()) {
-            OBN_ERROR("cloud_print: main read %s: %s",
-                      p.filename.c_str(), slurp_err.c_str());
-            if (update_fn) update_fn(BBL::PrintingStageERROR,
-                                    BAMBU_NETWORK_ERR_FILE_NOT_EXIST,
-                                    "filename not readable");
-            return BAMBU_NETWORK_ERR_FILE_NOT_EXIST;
-        }
-        const int main_stage = use_lan_channel ? BBL::PrintingStageRecord
-                                               : BBL::PrintingStageUpload;
-        if (int rc = s3_put(main_upload_url, main_bytes, update_fn, cancel_fn,
-                            main_stage,
-                            BAMBU_NETWORK_ERR_PRINT_WR_UPLOAD_3MF_TO_OSS_FAILED);
-            rc != 0) return rc;
-
-        project_url = main_upload_url;
-        if (int rc = patch_project(api, token, uid, info.project_id, info.profile_id,
-                                   md5, p.plate_index, project_url, update_fn);
+    if (!slim) {
+        if (int rc = upload_main_to_s3(api, token, uid, p, info, md5, cloud_stage,
+                                       update_fn, cancel_fn, &project_url);
             rc != 0) return rc;
     }
 
@@ -989,7 +995,7 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
              p.dev_id.c_str(), info.project_id.c_str(), task_id.c_str(),
-             use_lan_channel ? "ftps+s3" : "s3",
+             slim ? "ftps (slim_cloud)" : use_lan_channel ? "ftps+s3" : "s3",
              redact_url(project_url).c_str());
     return 0;
 }

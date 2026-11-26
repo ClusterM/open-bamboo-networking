@@ -789,7 +789,7 @@ static void test_queue_plate_id_absent_from_project_file()
 
 static void test_format_upload_info_matches_stock()
 {
-    // Values from stock_hybrid.mitm (2026-07-19): main 1195684, config 241613.
+    // Values from a stock hybrid MITM (2026-07-19): main 1195684, config 241613.
     CHECK(obn::print_job::format_upload_info(0, 1195684) == "0.0K/1.1M");
     CHECK(obn::print_job::format_upload_info(1195684, 1195684) == "1.1M/1.1M");
     CHECK(obn::print_job::format_upload_info(0, 241613) == "0.0K/0.2M");

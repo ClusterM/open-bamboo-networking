@@ -68,6 +68,10 @@ static int test_create_template()
     CHECK(content.find("block_cloud = 1") != std::string::npos);
     CHECK(content.find("cloud_print = cloud_only") != std::string::npos);
     CHECK(content.find("cloud_hide_history = 0") != std::string::npos);
+    // slim_cloud qualifies cloud_print, so the template keeps it right after.
+    CHECK(content.find("slim_cloud = 0") != std::string::npos);
+    CHECK(content.find("cloud_print = cloud_only") < content.find("slim_cloud = 0"));
+    CHECK(content.find("slim_cloud = 0") < content.find("cloud_hide_history = 0"));
 
     write_conf(dir, "log_level = warn\n");
     (void)obn::config::load_or_create(dir.string());
@@ -156,6 +160,7 @@ static int test_new_keys()
                "cloud_mqtt_port = 1883\n"
                "block_cloud = false\n"
                "cloud_print = try_lan_first\n"
+               "slim_cloud = 1\n"
                "cloud_hide_history = 1\n"
                "force_timelapse_external = 1\n"
                "force_ftps = 1\n"
@@ -176,6 +181,7 @@ static int test_new_keys()
     CHECK(cfg.cloud_mqtt_port == 1883);
     CHECK(cfg.block_cloud == false);
     CHECK(cfg.cloud_print == obn::config::CloudPrintMode::TryLanFirst);
+    CHECK(cfg.slim_cloud == true);
     CHECK(cfg.cloud_hide_history == true);
     CHECK(cfg.force_timelapse_external == true);
     CHECK(cfg.force_ftps == true);
@@ -203,6 +209,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.cloud_mqtt_port == 8883);
     CHECK(cfg.block_cloud == true);
     CHECK(cfg.cloud_print == obn::config::CloudPrintMode::CloudOnly);
+    CHECK(cfg.slim_cloud == false);
     CHECK(cfg.cloud_hide_history == false);
     CHECK(cfg.force_timelapse_external == false);
     CHECK(cfg.force_ftps == false);

@@ -100,6 +100,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
             out.cloud_print = CloudPrintMode::CloudOnly;
         }
     }
+    else if (key == "slim_cloud")                out.slim_cloud = truthy(val);
     else if (key == "force_timelapse_external")  out.force_timelapse_external = truthy(val);
     else if (key == "force_ftps")                out.force_ftps = truthy(val);
     else if (key == "disable_camera_preview")      out.disable_camera_preview = truthy(val);
